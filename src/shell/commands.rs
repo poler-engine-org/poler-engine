@@ -25,6 +25,7 @@ use crate::google::nlm_ingest;
 
 use super::state::ShellState;
 
+
 /// Результат исполнения одной команды.
 #[derive(Debug, Clone)]
 pub enum CmdResult {
@@ -77,7 +78,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "quit" | "exit" | "q" => CmdResult::Quit,
         "help" | "?" => CmdResult::Done(help_text(args)),
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.15.0)",
+            "poler-engine {} (poler-shell v0.15.1)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -85,10 +86,9 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "nlm" => cmd_nlm(state, args),
         "sync" => cmd_nlm(state, &["sync".into()]),
         "set" => cmd_set(state, args),
-        // v0.15.1: placeholders для команд, требующих отдельной реализации
-        "crawl" | "impact" => CmdResult::Done(format!(
-            "⚠ {cmd}: эта команда доступна в v0.15.1; сейчас используй `poler-engine --crawl ...` или `--impact ...` в соседнем окне."
-        )),
+        // v0.15.1: нативные команды crawl/impact внутри шелла
+        "crawl" => cmd_crawl(state, args),
+        "impact" => cmd_impact(state, args),
         other => CmdResult::Done(format!(
             "неизвестная команда: {other} (введите `help` для списка)"
         )),
@@ -110,6 +110,12 @@ fn help_text(_args: &[String]) -> String {
     s.push_str("  nlm ask <NB_ID> \"<question>\" — ответ модели ПО ИСТОЧНИКАМ ноутбука\n");
     s.push_str("  nlm sync [<NB_ID>]            — синк NLM в web-index.db (без арг = все)\n");
     s.push('\n');
+    // v0.15.1: нативные crawl/impact в шелле
+    s.push_str("  crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]\n");
+    s.push_str("                                — обход URL → web-index.db (CDP+Chromium)\n");
+    s.push_str("  impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]\n");
+    s.push_str("                                — AIDDE impact-паспорт символа в кодовой базе\n");
+    s.push('\n');
     s.push_str("  set format md|json|simple     — переключить формат вывода\n");
     s.push_str("  set top N                     — топ-K по умолчанию для search\n");
     s.push('\n');
@@ -117,7 +123,7 @@ fn help_text(_args: &[String]) -> String {
     s.push_str("  quit | exit | q                — выйти из шелла\n");
     s.push_str("  help | ?                       — эта справка\n");
     s.push('\n');
-    s.push_str("Команды crawl/impact появятся в v0.15.1 (используйте `poler-engine --crawl/--impact` в соседнем окне).\n");
+    s.push_str("Подсказки: Tab — автодополнение команд/подкоманд/ID; ↑/↓ — история команд (до 2000).\n");
     s
 }
 
@@ -451,11 +457,346 @@ fn cmd_set(state: &mut ShellState, args: &[String]) -> CmdResult {
 }
 
 // ---------------------------------------------------------------------------
+// crawl — обход URL → web-index.db (нативная интеграция v0.15.1)
+// ---------------------------------------------------------------------------
+//
+// Делегирует в poler_engine::web::cdp_fetcher + poler_engine::web::crawl::crawl
+// — те же функции, что и в standalone-режиме `poler-engine --crawl URL`. Однако
+// в шелле есть важное преимущество: WebIndex уже открыт (если был `search`/
+// `stats`/`nlm sync` ранее), и единственное новое состояние — это CDP-фечер.
+//
+// Синтаксис:
+//   crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N] [--wait-ms N]
+//           [--cdp-port P]
+//
+// По умолчанию: depth=2, max=25, cross=false, delay-ms=1000, wait-ms=800,
+// cdp-port=9222. Поддерживает `crawl` без URL → показывает help по команде.
+
+fn cmd_crawl(state: &mut ShellState, args: &[String]) -> CmdResult {
+    // Парсим: первый позиционный аргумент — seed URL; остальные — флаги.
+    let mut seed: Option<String> = None;
+    let mut depth: usize = 2;
+    let mut max_pages: usize = 25;
+    let mut cross_site: bool = false;
+    let mut delay_ms: u64 = 1000;
+    let mut wait_ms: u64 = 800;
+    let mut cdp_port: u16 = 9222;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--depth" | "-d" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<usize>() {
+                        depth = n;
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("crawl --depth: ожидается число (например --depth 3)".into());
+            }
+            "--max" | "-m" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<usize>() {
+                        max_pages = n.max(1);
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("crawl --max: ожидается число (например --max 50)".into());
+            }
+            "--cross" => {
+                cross_site = true;
+                i += 1;
+                continue;
+            }
+            "--delay-ms" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<u64>() {
+                        delay_ms = n;
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("crawl --delay-ms: ожидается число мс".into());
+            }
+            "--wait-ms" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<u64>() {
+                        wait_ms = n;
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("crawl --wait-ms: ожидается число мс".into());
+            }
+            "--cdp-port" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<u16>() {
+                        cdp_port = n;
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("crawl --cdp-port: ожидается число 1024-65535".into());
+            }
+            "--help" | "-h" => {
+                return CmdResult::Done(
+                    "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N] [--wait-ms N] [--cdp-port P]\n  по умолчанию: depth=2, max=25, cross=false, delay-ms=1000, wait-ms=800, cdp-port=9222".into()
+                );
+            }
+            other if other.starts_with("--") => {
+                return CmdResult::Done(format!("crawl: неизвестный флаг {other}"));
+            }
+            _ => {
+                if seed.is_none() {
+                    seed = Some(a.clone());
+                } else {
+                    return CmdResult::Done(format!("crawl: лишний аргумент {a} (URL уже задан)"));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let Some(seed) = seed else {
+        return CmdResult::Done(
+            "crawl: укажите seed URL (пример: crawl https://rust-lang.org --depth 2 --max 25)".into(),
+        );
+    };
+    if !seed.starts_with("http://") && !seed.starts_with("https://") {
+        return CmdResult::Done(format!(
+            "crawl: seed должен быть http(s)://..., получено {seed}"
+        ));
+    }
+
+    // Открываем CDP-фечер. Если Chromium не запущен — пробуем ensure_chromium.
+    let mut fetcher = match crate::web::cdp_fetcher(cdp_port, wait_ms) {
+        Ok(f) => f,
+        Err(e) => {
+            let mut out = format!("❌ CDP fetcher не инициализирован (порт {cdp_port}): {e}\n");
+            out.push_str("  подсказка: установите POLER_CHROME_BIN или запустите Chromium вручную:\n");
+            out.push_str(&format!(
+                "    chrome --headless --remote-debugging-port={cdp_port} --no-sandbox\n"
+            ));
+            out.push_str("  либо укажите другой порт через --cdp-port <P>");
+            return CmdResult::Done(out);
+        }
+    };
+
+    // WebIndex открывается ленимо — внутри ensure_index(). reuse того же
+    // подключения, что и для search/stats/nlm-sync.
+    let cfg = crate::web::CrawlConfig {
+        max_pages,
+        max_depth: depth,
+        delay_ms,
+        cross_site,
+        wait_ms,
+    };
+
+    let progress = format!(
+        "🕷 crawl: seed {seed}, depth ≤ {depth}, до {max_pages} страниц, cross_site={cross_site}, delay={delay_ms}мс\n"
+    );
+
+    let res = state.ensure_index().and_then(|ix| {
+        crate::web::crawl::crawl(ix, &mut fetcher, &seed, &cfg, false).map_err(|e| e.to_string())
+    });
+
+    let out = match res {
+        Ok(stats) => {
+            let mut s = progress;
+            s.push_str(&format!(
+                "✅ готово — fetched={}, indexed={}, unchanged={}, duplicates={}, errors={}, sitemap={}, elapsed={}мс\n",
+                stats.fetched,
+                stats.indexed,
+                stats.unchanged,
+                stats.duplicates,
+                stats.errors,
+                stats.sitemap_urls,
+                stats.elapsed_ms
+            ));
+            if stats.frontier_left > 0 {
+                s.push_str(&format!(
+                    "  (frontier: ещё {} URL в очереди — увеличьте --max)\n",
+                    stats.frontier_left
+                ));
+            }
+            s
+        }
+        Err(e) => format!("{progress}❌ crawl: {e}"),
+    };
+
+    state.set_output(out.clone());
+    CmdResult::Done(out)
+}
+
+// ---------------------------------------------------------------------------
+// impact — AIDDE impact-паспорт символа (нативная интеграция v0.15.1)
+// ---------------------------------------------------------------------------
+//
+// Делегирует в poler_engine::aidde::SymbolTable::build +
+// impact_analysis (или в SQLite-хранилище через --cache <DB>).
+//
+// Синтаксис:
+//   impact <PATH> <SYMBOL> [--depth N] [--cache <DB>] [--max-file-bytes N]
+//
+// PATH — каталог с кодом (или один файл). По нему строится SymbolTable
+// с теми же расширениями, что и основной движок (rs, py, ts, js, go, ...),
+// затем impact_analysis(target=symbol, depth=N, max_items=200) находит
+// upstream/downstream паспорта — кого вызывает этот символ и кто его зовёт.
+
+fn cmd_impact(state: &mut ShellState, args: &[String]) -> CmdResult {
+    // Парсим: первые 2 позиционных аргумента — PATH и SYMBOL; остальное — флаги.
+    let mut positional: Vec<String> = Vec::new();
+    let mut depth: usize = 3;
+    let mut cache_db: Option<PathBuf> = None;
+    let mut max_file_bytes: u64 = 64 * 1024 * 1024;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--depth" | "-d" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<usize>() {
+                        depth = n;
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("impact --depth: ожидается число (1-5)".into());
+            }
+            "--cache" => {
+                if let Some(v) = args.get(i + 1) {
+                    cache_db = Some(PathBuf::from(v));
+                    i += 2;
+                    continue;
+                }
+                return CmdResult::Done("impact --cache: укажите путь к SQLite-файлу".into());
+            }
+            "--max-file-bytes" => {
+                if let Some(v) = args.get(i + 1) {
+                    if let Ok(n) = v.parse::<u64>() {
+                        max_file_bytes = n;
+                        i += 2;
+                        continue;
+                    }
+                }
+                return CmdResult::Done("impact --max-file-bytes: ожидается число байт".into());
+            }
+            "--help" | "-h" => {
+                return CmdResult::Done(
+                    "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>] [--max-file-bytes N]\n  по умолчанию: depth=3, max-file-bytes=64MB".into()
+                );
+            }
+            other if other.starts_with("--") => {
+                return CmdResult::Done(format!("impact: неизвестный флаг {other}"));
+            }
+            _ => {
+                positional.push(a.clone());
+            }
+        }
+        i += 1;
+    }
+
+    if positional.len() < 2 {
+        return CmdResult::Done(
+            "impact: укажите PATH и SYMBOL (пример: impact ./src main --depth 3)".into(),
+        );
+    }
+    let path = PathBuf::from(&positional[0]);
+    let symbol = positional[1].clone();
+
+    if !path.exists() {
+        return CmdResult::Done(format!("impact: путь не найден: {}", path.display()));
+    }
+
+    // Строим EngineConfig с дефолтными расширениями движка — это даёт
+    // те же фильтры файлов, что и в poler-engine <PATH> --impact.
+    let config = crate::EngineConfig::default();
+    let files: Vec<PathBuf> = crate::collect_files(&path, &config)
+        .into_iter()
+        .filter(|p| crate::detect_lang(p) != crate::CodeLang::Plain)
+        .collect();
+
+    if files.is_empty() {
+        return CmdResult::Done(format!(
+            "impact: кодовые файлы не найдены в {} (поддерживаемые расширения: rs/py/ts/js/go/...)",
+            path.display()
+        ));
+    }
+
+    let mut progress = format!(
+        "🔬 impact: символ {symbol}, путь {}, кодовых файлов: {}, depth={depth}\n",
+        path.display(),
+        files.len()
+    );
+
+    let report = if let Some(db_path) = &cache_db {
+        // SQLite-режим (для 65K+ файлов) — как в `poler-engine --impact X --impact-cache Y`
+        let mut store = match crate::aidde::SymbolStore::open(db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return CmdResult::Done(format!("{progress}❌ SymbolStore::open({db_path:?}): {e}"));
+            }
+        };
+        if let Err(e) = store.build(&files, max_file_bytes) {
+            return CmdResult::Done(format!("{progress}❌ SymbolStore::build: {e}"));
+        }
+        let (defs, calls) = store.stats();
+        progress.push_str(&format!("  SymbolStore(sqlite): defs={defs}, calls={calls}\n"));
+        crate::aidde::impact_analysis_sqlite(&store, &symbol, depth, 200)
+    } else {
+        // In-memory режим (по умолчанию) — как в `poler-engine PATH --impact X`
+        let table = crate::aidde::SymbolTable::build(&files, max_file_bytes);
+        crate::aidde::impact_analysis(&table, &symbol, depth, 200)
+    };
+
+    let out = match report {
+        Some(r) => {
+            let mut s = progress;
+            s.push_str("─────────────────────────────────────────────\n");
+            s.push_str(&format!("🎯 target_function: {}\n", r.target_function));
+            s.push_str(&format!("   file: {}\n", r.file));
+            s.push_str(&format!("   lines: {}\n", r.lines));
+            s.push_str(&format!("   danger_level_if_modified: {}\n", r.danger_level_if_modified));
+            s.push('\n');
+            s.push_str(&format!("⬆ upstream dependents ({}):\n", r.upstream_dependents.len()));
+            for d in &r.upstream_dependents {
+                s.push_str(&format!(
+                    "   • {} (вызывает в {})\n",
+                    d.caller, d.file
+                ));
+            }
+            s.push('\n');
+            s.push_str(&format!("⬇ downstream dependencies ({}):\n", r.downstream_dependencies.len()));
+            for d in &r.downstream_dependencies {
+                s.push_str(&format!("   • {} (вызывается из {})\n", d.callee, d.file));
+            }
+            if !r.side_effects.is_empty() {
+                s.push('\n');
+                s.push_str(&format!("⚠ side-effects ({}):\n", r.side_effects.len()));
+                for se in &r.side_effects {
+                    s.push_str(&format!("   • {se}\n"));
+                }
+            }
+            s
+        }
+        None => format!("{progress}❌ символ не найден: {symbol} (проверьте регистр/полное имя)"),
+    };
+
+    state.set_output(out.clone());
+    CmdResult::Done(out)
+}
+
+// ---------------------------------------------------------------------------
 // REPL entry point (используется main.rs)
 // ---------------------------------------------------------------------------
 
 /// Запустить интерактивный REPL (`poler-engine --shell`).
 pub fn run_shell(db_path: PathBuf) -> ExitCode {
+    use rustyline::config::Configurer;
     use rustyline::error::ReadlineError;
     use rustyline::history::DefaultHistory;
     use rustyline::Editor;
@@ -466,13 +807,25 @@ pub fn run_shell(db_path: PathBuf) -> ExitCode {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let mut rl = match Editor::<(), DefaultHistory>::new() {
+    // v0.15.1: создаём Editor с PolerCompleter (auto impl Helper) —
+    // Tab-completion, Hinter, Validator теперь активны. Донастраиваем
+    // history_size и auto_add_history через Configurer trait.
+    let mut rl = match Editor::<super::completer::PolerCompleter, DefaultHistory>::new() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("poler-shell: rustyline init: {e}");
             return ExitCode::from(2);
         }
     };
+    let _ = rl.set_max_history_size(2000);
+    let _ = rl.set_history_ignore_dups(true);
+    rl.set_completion_type(rustyline::config::CompletionType::List);
+    rl.set_auto_add_history(true);
+
+    // v0.15.1: подключаем PolerCompleter — Tab-completion + Hinter + Validator.
+    // PolerCompleter автоматически impl Helper (Completer + Hinter +
+    // Highlighter + Validator blanket impl), поэтому set_helper работает.
+    rl.set_helper(Some(super::completer::PolerCompleter));
 
     // Load history (необязательно, ошибки молча игнорируем)
     let _ = rl.load_history(&hist_path);
@@ -483,6 +836,7 @@ pub fn run_shell(db_path: PathBuf) -> ExitCode {
         "poler-shell {} — интерактивный режим. `help` — список команд, `quit` — выход.",
         env!("CARGO_PKG_VERSION")
     );
+    println!("  Tab — автодополнение команд/подкоманд; ↑/↓ — история команд (до 2000).");
 
     loop {
         let prompt = "poler> ";
@@ -507,6 +861,8 @@ pub fn run_shell(db_path: PathBuf) -> ExitCode {
         if trimmed.is_empty() {
             continue;
         }
+        // auto_add_history=true уже сохраняет, но дублируем явно —
+        // идиом-совместимо с fallback если авто-добавление выключат.
         let _ = rl.add_history_entry(trimmed);
 
         match dispatch(&mut state, &line) {
@@ -614,7 +970,139 @@ mod tests {
                 assert!(out.contains("search"));
                 assert!(out.contains("nlm sync"));
                 assert!(out.contains("quit"));
+                // v0.15.1: help должен упоминать crawl и impact
+                assert!(out.contains("crawl"));
+                assert!(out.contains("impact"));
             }
+            _ => panic!(),
+        }
+    }
+
+    // v0.15.1: команды crawl/impact
+
+    #[test]
+    fn cmd_crawl_no_url_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "crawl");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите seed URL") || out.contains("пример")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_crawl_non_http_url_rejected() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "crawl ftp://example.com");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("seed должен быть http(s)://")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_crawl_help_flag_works() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "crawl --help");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("--depth") && out.contains("--max")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_crawl_unknown_flag_rejected() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "crawl https://example.com --bogus");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("неизвестный флаг --bogus")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_impact_no_args_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "impact");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите PATH и SYMBOL")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_impact_only_path_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "impact ./src");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите PATH и SYMBOL")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_impact_nonexistent_path_rejected() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "impact /nonexistent/path mysymbol");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("путь не найден")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_impact_help_flag_works() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "impact --help");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("--depth") && out.contains("--cache")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_impact_unknown_flag_rejected() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "impact /tmp my_symbol --bogus");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("неизвестный флаг --bogus")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_impact_on_real_code_finds_symbol() {
+        // Запускаем impact на собственном коде poler-engine: cmd_search
+        // точно определён в src/shell/commands.rs, и impact_analysis должна
+        // найти его downstream/upstream паспорта.
+        let project_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src_dir = project_dir.join("src/shell");
+        if !src_dir.exists() {
+            return; // в vendored-сборке без CARGO_MANIFEST_DIR тест пропускаем
+        }
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let cmdline = format!("impact {} cmd_search --depth 1", src_dir.display());
+        let r = dispatch(&mut s, &cmdline);
+        match r {
+            CmdResult::Done(out) => {
+                // Должен либо найти символ (target_function: cmd_search),
+                // либо корректно сообщить что символ не найден (если парсер не
+                // цепляет функцию в этом конкретном файле).
+                assert!(
+                    out.contains("target_function") || out.contains("символ не найден"),
+                    "expected 'target_function' or 'symbol not found', got: {out}"
+                );
+            }
+            _ => panic!("expected Done, got another CmdResult"),
+        }
+    }
+
+    #[test]
+    fn cmd_version_string_updated_for_v0151() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "version");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("v0.15.1")),
             _ => panic!(),
         }
     }

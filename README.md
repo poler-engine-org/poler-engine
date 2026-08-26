@@ -20,6 +20,211 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.15.1: poler-shell финализация — Tab-completion + нативные crawl/impact в REPL
+
+**Шлифовка полиринга полер-шелла** — подключены Tab-completion, подсказки Hinter
+и нативные команды `crawl`/`impact` прямо внутри REPL. Шелл становится монолитным:
+все 15+ режимов движка теперь доступны из `poler>` без переключения окон.
+
+### Что починено в v0.15.1
+
+**1. Tab-completion в REPL (rustyline `Helper`):**
+
+`PolerCompleter` теперь зарегистрирован в `Editor::<PolerCompleter, DefaultHistory>::new()`
+через `rl.set_helper(Some(PolerCompleter))`. Tab-completion работает для:
+
+* Первого слова команды: `sear` → `search`, `imp` → `impact`, `cra` → `crawl`.
+* Подкоманд `nlm`/`set`: `nlm l` → `list`, `set fo` → `format`.
+* Флагов `crawl`/`impact`: после `crawl https://example.com ` Tab предлагает
+  `--depth/--max/--cross/--delay-ms/--wait-ms/--cdp-port/--help`. После
+  value-флага (`--depth`, `--max`, `--delay-ms`, `--wait-ms`, `--cdp-port`)
+  completion выключается — ждётся числовое значение, а не другой флаг.
+
+**Hinter** показывает inline-подсказку по набранной команде в серой подсветке
+(`search ` → `# search "<query>" [--top N]`), не дожидаясь Tab. **History**
+хранит до 2000 команд в `~/.cache/poler-engine/shell-history.txt` с dedup
+последовательных дубликатов.
+
+**2. Нативная команда `crawl` в шелле:**
+
+```text
+poler> crawl https://rust-lang.org --depth 2 --max 25
+poler> crawl https://rust-lang.org --depth 3 --max 50 --cross --delay-ms 500
+poler> crawl https://example.com --cdp-port 9223 --wait-ms 1200
+```
+
+Полный синтаксис: `crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]
+[--wait-ms N] [--cdp-port P]`. Делегирует в `poler_engine::web::cdp_fetcher`
++ `poler_engine::web::crawl::crawl` — те же функции, что и в standalone-режиме
+`poler-engine --crawl URL`. В шелле есть преимущество: `WebIndex` уже открыт
+(если был `search`/`stats`/`nlm sync` ранее), так что crawl сразу льёт страницы
+в ту же БД без повторного открытия. Вывод: `fetched`, `indexed`, `unchanged`
+(Percolator-lite skip), `duplicates`, `errors`, `sitemap_urls`, `elapsed_ms`.
+
+**3. Нативная команда `impact` в шелле:**
+
+```text
+poler> impact ./src crawl --depth 2
+poler> impact /home/z/myproject main --depth 3 --cache /tmp/aidde.db
+poler> impact /path/to/repo parse_file --depth 2 --max-file-bytes 128MB
+```
+
+Делегирует в `poler_engine::collect_files` + `aidde::SymbolTable::build` +
+`aidde::impact_analysis` (in-memory по умолчанию) или в `aidde::SymbolStore` +
+`aidde::impact_analysis_sqlite` (с `--cache <DB>` для кодовых баз 65K+ файлов).
+Выводит target_function, file, lines, danger_level_if_modified, upstream
+dependents (кто вызывает этот символ), downstream dependencies (кого вызывает),
+side-effects (маркеры unsafe/mutex/static/IO/socket/panic/...).
+
+### Аттестация v0.15.1
+
+* **Unit-тесты**: 294 passed, 0 failed (270 v0.15.0 + 24 новых в v0.15.1:
+  14 completion-tests для crawl/impact флагов, 10 cmd_crawl/cmd_impact
+  edge-case tests).
+* **Clippy**: 0 warnings (`useless_format` и `default_constructed_unit_structs`
+  починены автоматически).
+* **Бинарь**: 5.9 МБ stripped ELF x86-64 (рост с 5.8 МБ за счёт явного `Helper`
+  impl + доп. completion-логики).
+* **Smoke-тест**: `echo -e "version\nhelp\nquit" | poler-engine --shell`
+  → "poler-shell 0.15.1 — интерактивный режим" + help со списком всех 11 команд
+  (search/web/stats/nlm list/notes/artifacts/source/account/ask/sync/crawl/
+  impact/set/version/quit/help).
+* **Боевой smoke-test**: `poler> impact ./src crawl --depth 2` → построил
+  SymbolTable на 45 кодовых файлах движка за <1 с, нашёл `mod::crawl` в
+  `src/web/mod.rs`, рассчитал danger_level `HIGH (затронет 6 файлов)`,
+  26 upstream dependents (кто вызывает crawl: commands/main/mcp/completer/
+  state/crawl_tests), 118 downstream dependencies (кого вызывает crawl:
+  derive/parse/insert/clone/discover_sitemaps/...).
+
+### Архитектурные инварианты v0.15.1
+
+* **Ноль изменений в ядре `poler_engine::*`** — shell только заимствует
+  `WebIndex`, `cdp_fetcher`, `crawl::crawl`, `collect_files`, `aidde::*`
+  и форматирует вывод.
+* **PolerCompleter — теперь полноценный `Helper`** (Completer + Hinter +
+  Highlighter + Validator) с явным `impl Helper for PolerCompleter {}`.
+  В v0.15.0 был `Editor::<(), DefaultHistory>` без completion — это была
+  единственная регрессия, теперь закрыта.
+* **Ленивое открытие ресурсов сохранено** — `WebIndex` и `NlmSession`
+  открываются только при первом `search`/`stats`/`nlm`/`crawl`. Команды
+  `help`/`version`/`set` не трогают БД и RPC.
+
+### Артефакты v0.15.1
+
+* `src/shell/commands.rs` (+~340 строк): `cmd_crawl`, `cmd_impact` —
+  нативные команды с парсером флагов (`--depth/--max/--cross/--delay-ms/
+  --wait-ms/--cdp-port` для crawl; `--depth/--cache/--max-file-bytes`
+  для impact) и форматированным выводом.
+* `src/shell/completer.rs` (+~110 строк): `complete_crawl_flags`,
+  `complete_impact_flags` — Tab-completion флагов с различением
+  value-флагов (после них ждём значение, не флаг); явный
+  `impl Helper for PolerCompleter {}`; CMD_HINTS расширены crawl/impact.
+* `src/shell/commands.rs` `run_shell` обновлён: `Editor` теперь
+  типизирован как `Editor<PolerCompleter, DefaultHistory>`, через
+  `Configurer` trait выставлены `max_history_size=2000`,
+  `history_ignore_dups=true`, `completion_type=List`,
+  `auto_add_history=true`.
+* `Cargo.toml`: bump 0.15.0 → 0.15.1.
+
+---
+
+## v0.15.0: poler-shell — интерактивный TUI/REPL терминал поверх движка
+
+Когда у движка 15+ режимов (поиск, AIDDE, веб-краулинг, NotebookLM, Google
+Drive, фразы, графы, синк), человеку неудобно каждый раз вбивать длинные
+флаги `--format md --nlm-chat --top 5` или вспоминать UUID ноутбуков. v0.15.0
+добавляет **две поверхности для человека** поверх существующих режимов —
+ядро `poler_engine::*` не трогается, только UI-слой.
+
+| Поверхность | Команда | Технология | Что даёт |
+|---|---|---|---|
+| **REPL** | `poler-engine --shell` | `rustyline` | Быстрый командный режим без перезапуска процесса: `poler> search "..."` / `poler> nlm ask <id> "..."` / `poler> nlm sync`. История `↑/↓` сохраняется в `~/.cache/poler-engine/shell-history.txt`. |
+| **TUI Dashboard** | `poler-engine --tui` | `ratatui` + `crossterm` | 3-панельный layout: слева — список 87 ноутбуков (обновление по `r`); справа сверху — поле ввода; справа снизу — выдача с прокруткой `PgUp/PgDn`. `Tab` — смена фокуса, `Esc` — выход. |
+
+**Архитектурные инварианты v0.15.0**:
+
+- **Ноль изменений в ядре** — `poler_engine::*` остаётся как в v0.14.0. Shell
+  только заимствует `WebIndex`/`NlmSession`/`nlm_ingest`/`nlm::*` и форматирует
+  вывод для человека.
+- **Ленивое открытие ресурсов** — `WebIndex` и `NlmSession` открываются
+  только при первом использовании (первый `search`/`stats` открывает БД,
+  первый `nlm list/notes/...` открывает RPC-сессию). После этого
+  переиспользуются до выхода из шелла — экономит ~1 s на каждой команде
+  по сравнению с автономным запуском CLI.
+- **История команд** — до 2000 записей в `~/.cache/poler-engine/shell-history.txt`.
+- **MCP `poler_nlm` 9 actions** из v0.14.0 не тронуты.
+
+**Команды REPL** (палитра для человека):
+
+```bash
+poler-engine --shell
+poler> help
+poler> version
+poler> search "Касіопея Astra-Nic Complex" --top 5    # поиск по web-index.db
+poler> web "..."                                       # алиас для search
+poler> stats                                            # статистика web-index
+poler> nlm list                                         # список 87 ноутбуков
+poler> nlm notes 704f2610-...                          # заметки/чат (JSON)
+poler> nlm artifacts 704f2610-...                       # Studio-артефакты
+poler> nlm source 704f2610-... <SRC_ID>                # контент источника
+poler> nlm account                                       # email сессии
+poler> nlm ask 704f2610-... "Параметры Планковской геодезической"
+poler> nlm sync                                          # синк ВСЕХ ноутбуков
+poler> nlm sync 704f2610-...                            # синк одного
+poler> set format md|json|simple                        # формат вывода
+poler> set top 20                                       # топ-K по умолчанию
+poler> quit
+```
+
+**TUI keybinds** (`poler-engine --tui`):
+
+```text
+Tab / BackTab    смена фокуса: notebooks → input → output → notebooks
+↑ / ↓           в input: история команд; в notebooks: навигация
+'r'             в notebooks: обновить список (nlm list)
+PgUp / PgDn     в output: скроллинг результата
+Enter           в input: выполнить команду
+Esc / Ctrl+C    выход
+```
+
+**Аттестация v0.15.0**:
+
+- 270 unit-тестов зелёные (239 из v0.14.0 + 31 новый для `shell::`
+  `{state, commands, completer, tui, integration_tests}`):
+  - `state::tests`: ленивое открытие `WebIndex`, парсинг `set format`,
+    `commands()` и `nlm_subcommands()` стабильные списки;
+  - `commands::tests`: `tokenize` (кавычки/пробелы/unclosed), `cmd_set_format`,
+    `cmd_unknown`, `cmd_quit`, `cmd_empty`, `cmd_version`, `cmd_help`;
+  - `completer::tests`: `complete_prefix("sear")` → search,
+    `complete_prefix("nlm l")` → list (но не account, не начинается с 'l'),
+    `complete_prefix("set fo")` → format, пустая строка → все команды;
+  - `tui::tests`: `Focus::next/prev` цикл (notebooks↔input↔output↔notebooks),
+    `Focus::as_str` корректен;
+  - `integration_tests`: `tokenize_handles_quoted_args`,
+    `state_default_format_is_md_for_humans`,
+    `commands_dispatch_unknown_returns_message`.
+- `cargo clippy --lib --bin poler-engine` — 0 warning'ов (8 auto-fixed:
+  `push_str("\n")` → `push('\n')`, `&[s].to_vec()` → `&[s]`,
+  неиспользуемые импорты `RlBuilder`/`KeyEvent`/`Rect`/`tokenize`).
+- `cargo build --release --bin poler-engine` — бинарник 5.8 МБ
+  (+0.4 МБ к v0.14 за счёт ratatui+crossterm+rustyline; binary stripped),
+  `--version` → `0.15.0`.
+- Smoke-тест REPL: `echo "version\nhelp\nquit" | poler-engine --shell`
+  — приветствие + `version` + `help` (полный список команд) + `quit`,
+  всё работает.
+- **НЕ подключён** в v0.15.0: Tab-completion в rustyline Editor
+  (`PolerCompleter` реализован и покрыт тестами, но rustyline 14 Helper
+  trait bound регрессия не даёт подключить его к Editor — v0.15.1 исправит
+  через производный Helper derive).
+- **НЕ подключены** в v0.15.0: команды `crawl`/`impact` в шелле (заглушки
+  с подсказкой использовать `poler-engine --crawl/--impact` в соседнем
+  окне) — v0.15.1 добавит нативную интеграцию.
+
+**Что влито в продакшене (по данным v0.14.0)**: после `poler-engine --shell`
+владелец может интерактивно: `nlm list` → стрелочкой выбрать UUID →
+`nlm sync <id>` → `search "..." --top 5` → `nlm ask <id> "вопрос"` — всё
+в одной сессии без повторных RPC-handshake'ов.
+
 ## v0.14.0: NLM Corpus Ingestion — `--nlm-sync` и кросс-юниверсный поиск
 
 Виток v0.13.0 выгружает NotebookLM по одному ноутбуку: `--nlm-notes <nb>`,

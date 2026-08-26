@@ -21,6 +21,8 @@ static CMD_HINTS: &[(&str, &str)] = &[
     ("stats", "stats"),
     ("nlm", "nlm list|notes|artifacts|source|account|ask|sync"),
     ("sync", "sync (синк NLM в web-index)"),
+    ("crawl", "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]"),
+    ("impact", "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]"),
     ("set", "set format|top <value>"),
     ("help", "help"),
     ("quit", "quit"),
@@ -83,7 +85,86 @@ pub fn complete_prefix(prefix: &str) -> (usize, Vec<String>) {
         return (replace_from, cands);
     }
 
+    // v0.15.1: crawl/impact — завершаем флаги (--depth/--max/...)
+    // после первого слова. После флага со значением можно продолжать.
+    if first == "crawl" {
+        return complete_crawl_flags(prefix, &tokens, in_first_token);
+    }
+    if first == "impact" {
+        return complete_impact_flags(prefix, &tokens, in_first_token);
+    }
+
     (prefix.len(), Vec::new())
+}
+
+/// v0.15.1: Завершение флагов `crawl`. Если курсор в начале нового токена
+/// (префикс заканчивается пробелом) и предыдущий токен — value-флаг
+/// (требует значение, например --depth), то не предлагаем флаги (ждём число).
+/// Иначе предлагаем флаги, начинающиеся с введённого префикса.
+fn complete_crawl_flags(prefix: &str, tokens: &[&str], in_first_token: bool) -> (usize, Vec<String>) {
+    const FLAGS: &[&str] = &[
+        "--depth", "--max", "--cross", "--delay-ms", "--wait-ms", "--cdp-port", "--help",
+    ];
+    // value-флаги: после них ждётся число, а не другой флаг
+    const VALUE_FLAGS: &[&str] = &["--depth", "--max", "--delay-ms", "--wait-ms", "--cdp-port"];
+
+    // Текущий токен (если курсор в нём) или пустой (если курсор после пробела)
+    let cur = if in_first_token { tokens.last().copied().unwrap_or("") } else { "" };
+
+    // Если курсор сразу после пробела и предыдущий токен — value-флаг, не дополняем.
+    if !in_first_token {
+        if let Some(prev) = tokens.last() {
+            if VALUE_FLAGS.contains(prev) {
+                return (prefix.len(), Vec::new());
+            }
+        }
+        // после пробела — предлагать все флаги
+        let cands: Vec<String> = FLAGS.iter().map(|s| (*s).to_string()).collect();
+        let replace_from = prefix.len();
+        return (replace_from, cands);
+    }
+
+    // Курсор в токене — фильтруем по префиксу (только если начинается с --)
+    if !cur.starts_with('-') {
+        return (prefix.len(), Vec::new());
+    }
+    let cands: Vec<String> = FLAGS
+        .iter()
+        .filter(|f| f.starts_with(cur))
+        .map(|s| (*s).to_string())
+        .collect();
+    let replace_from = prefix.len() - cur.len();
+    (replace_from, cands)
+}
+
+/// v0.15.1: Завершение флагов `impact`. Аналогично crawl, но свой набор.
+fn complete_impact_flags(prefix: &str, tokens: &[&str], in_first_token: bool) -> (usize, Vec<String>) {
+    const FLAGS: &[&str] = &["--depth", "--cache", "--max-file-bytes", "--help"];
+    const VALUE_FLAGS: &[&str] = &["--depth", "--cache", "--max-file-bytes"];
+
+    let cur = if in_first_token { tokens.last().copied().unwrap_or("") } else { "" };
+
+    if !in_first_token {
+        if let Some(prev) = tokens.last() {
+            if VALUE_FLAGS.contains(prev) {
+                return (prefix.len(), Vec::new());
+            }
+        }
+        let cands: Vec<String> = FLAGS.iter().map(|s| (*s).to_string()).collect();
+        let replace_from = prefix.len();
+        return (replace_from, cands);
+    }
+
+    if !cur.starts_with('-') {
+        return (prefix.len(), Vec::new());
+    }
+    let cands: Vec<String> = FLAGS
+        .iter()
+        .filter(|f| f.starts_with(cur))
+        .map(|s| (*s).to_string())
+        .collect();
+    let replace_from = prefix.len() - cur.len();
+    (replace_from, cands)
 }
 
 impl Completer for PolerCompleter {
@@ -129,6 +210,20 @@ pub fn hint_for_line(line: &str) -> Option<String> {
 impl rustyline::highlight::Highlighter for PolerCompleter {}
 
 impl rustyline::validate::Validator for PolerCompleter {}
+
+/// v0.15.1: PolerCompleter реализует все 4 трейта (Completer + Hinter +
+/// Highlighter + Validator). Helper — это supertrait, который требует всех
+/// четырёх, но blanket impl в rustyline НЕ предусмотрен — нужно явное объявление
+/// `impl Helper for PolerCompleter {}`. Это и позволяет подключить его в
+/// `Editor::<PolerCompleter, _>::new()` в `commands::run_shell` —
+/// Tab-completion, hints, validation включены.
+impl rustyline::Helper for PolerCompleter {}
+
+#[cfg(test)]
+fn _poler_completer_implements_helper() {
+    fn assert_helper<H: rustyline::Helper>(_h: H) {}
+    assert_helper(PolerCompleter::default());
+}
 
 #[cfg(test)]
 mod tests {
@@ -204,5 +299,103 @@ mod tests {
         let h = hint_for_line("nlm ");
         assert!(h.is_some());
         assert!(h.unwrap().contains("list"));
+    }
+
+    // v0.15.1: crawl/impact completion tests
+
+    #[test]
+    fn complete_crawl_first_token() {
+        let (start, cands) = complete_prefix("cra");
+        assert!(cands.iter().any(|c| c == "crawl"));
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn complete_crawl_flags_after_space() {
+        let (_, cands) = complete_prefix("crawl https://example.com ");
+        assert!(cands.iter().any(|c| c == "--depth"));
+        assert!(cands.iter().any(|c| c == "--max"));
+        assert!(cands.iter().any(|c| c == "--cross"));
+        assert!(cands.iter().any(|c| c == "--help"));
+    }
+
+    #[test]
+    fn complete_crawl_flag_prefix() {
+        let (start, cands) = complete_prefix("crawl https://example.com --de");
+        assert!(cands.iter().any(|c| c == "--depth"));
+        assert!(!cands.iter().any(|c| c == "--max"));
+        assert!(start > 0, "replace_from must point to '--' position");
+    }
+
+    #[test]
+    fn complete_crawl_after_value_flag_returns_empty() {
+        // После --depth (value-флаг) ждём число, не флаги
+        let (_, cands) = complete_prefix("crawl https://example.com --depth ");
+        assert!(cands.is_empty(), "after --depth (value flag) we expect no flag completions");
+    }
+
+    #[test]
+    fn complete_crawl_no_flag_completion_for_url() {
+        // Курсор в URL (не --) — не предлагаем флаги
+        let (_, cands) = complete_prefix("crawl https://example.com");
+        assert!(cands.is_empty(), "no flag completions when typing URL");
+    }
+
+    #[test]
+    fn complete_crawl_max_flag() {
+        let (start, cands) = complete_prefix("crawl https://example.com --m");
+        assert!(cands.iter().any(|c| c == "--max"));
+        assert!(!cands.iter().any(|c| c == "--depth"));
+        assert!(start > 0);
+    }
+
+    #[test]
+    fn complete_impact_first_token() {
+        let (start, cands) = complete_prefix("imp");
+        assert!(cands.iter().any(|c| c == "impact"));
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn complete_impact_flags_after_space() {
+        let (_, cands) = complete_prefix("impact ./src main ");
+        assert!(cands.iter().any(|c| c == "--depth"));
+        assert!(cands.iter().any(|c| c == "--cache"));
+        assert!(cands.iter().any(|c| c == "--help"));
+    }
+
+    #[test]
+    fn complete_impact_flag_prefix() {
+        let (start, cands) = complete_prefix("impact ./src main --c");
+        assert!(cands.iter().any(|c| c == "--cache"));
+        assert!(!cands.iter().any(|c| c == "--depth"));
+        assert!(start > 0);
+    }
+
+    #[test]
+    fn complete_impact_after_value_flag_returns_empty() {
+        let (_, cands) = complete_prefix("impact ./src main --depth ");
+        assert!(cands.is_empty(), "after --depth we expect no flag completions");
+    }
+
+    #[test]
+    fn complete_impact_no_flag_completion_for_symbol() {
+        // Курсор в symbol (не --) — не предлагаем флаги
+        let (_, cands) = complete_prefix("impact ./src mai");
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn hint_for_crawl_command() {
+        let h = hint_for_line("crawl ");
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("URL"));
+    }
+
+    #[test]
+    fn hint_for_impact_command() {
+        let h = hint_for_line("impact ");
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("PATH"));
     }
 }
