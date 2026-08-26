@@ -334,8 +334,9 @@ fn gitignore_is_respected() {
 }
 
 #[test]
-fn fast_prefilter_skips_files_without_literal() {
-    // GNU grep kwset-техника: ASCII-запрос -> SIMD-предфильтр до токенизации
+fn literal_prefilter_always_on_preserves_corpus_stats() {
+    // Предфильтр (GNU grep kwset-техника) активен всегда, но статистика
+    // считается по ВСЕМУ корпусу: отброшенные файлы участвуют в N_total.
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join("hit.md"),
@@ -344,65 +345,214 @@ fn fast_prefilter_skips_files_without_literal() {
     .unwrap();
     fs::write(
         dir.path().join("miss.md"),
-        "# Другая глава\n\nЗдесь нет искомого литерала совсем.\n",
+        "# Другая глава\n\nЗдесь нет искомого литерала совсем. Совсем другое содержимое.\n",
     )
     .unwrap();
 
-    let mut cfg = EngineConfig::default();
-    cfg.prefilter = true;
-    let (_, stats) = scan_path_with_stats(dir.path(), "process_data", &cfg);
+    let (res, stats) = scan_path_with_stats(dir.path(), "process_data", &EngineConfig::default());
     assert_eq!(stats.files_scanned, 2);
-    // miss.md не индексировался вовсе: его токены не попали в total_tokens
-    assert!(stats.total_tokens < 15, "total_tokens={}", stats.total_tokens);
+    assert_eq!(stats.files_with_hits, 1);
+    // оба файла в статистике корпуса
+    assert!(stats.total_tokens >= 15, "total_tokens={}", stats.total_tokens);
+    // якоря только из hit-файла
+    assert!(res.total_hits >= 1);
+    assert!(res.anchors.iter().all(|a| a.file.contains("hit.md")));
 }
 
 #[test]
-fn fast_prefilter_ascii_case_insensitive() {
+fn ascii_query_case_insensitive() {
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join("code.rs"),
         "fn ALPHA_FUNC() {\n    let x = 1;\n}\n",
     )
     .unwrap();
-    let mut cfg = EngineConfig::default();
-    cfg.prefilter = true;
-    let res = scan_path(dir.path(), "alpha_func", &cfg);
+    let res = scan_path(dir.path(), "alpha_func", &EngineConfig::default());
     assert!(res.total_hits >= 1, "CI-предфильтр не нашёл вхождение");
 }
 
 #[test]
-fn fast_prefilter_non_ascii_falls_back_to_full() {
-    // кириллица: предфильтр не применим (регистр меняет байты) -> полный путь
+fn non_ascii_query_full_path() {
+    // кириллица: предфильтр через lowercase-contains, полный путь
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join("ch.md"),
         "# Глава\n\nНокс действует решительно.\n",
     )
     .unwrap();
-    let mut cfg = EngineConfig::default();
-    cfg.prefilter = true;
-    let res = scan_path(dir.path(), "нокс", &cfg);
+    let res = scan_path(dir.path(), "нокс", &EngineConfig::default());
     assert!(res.total_hits >= 1);
 }
 
 #[test]
-fn graph_export_sql_follows_superz_schema() {
-    // Схема super-z-skills memory_graph: entities/relations + UNIQUE
+fn graph_triples_budget_is_enforced() {
     let dir = write_fixture("chapter_36.md", CH36);
-    let sql_path = dir.path().join("graph.sql");
     let mut cfg = EngineConfig::default();
-    cfg.graph_export = Some(sql_path.clone());
-    let _ = scan_path(dir.path(), "нокс", &cfg);
+    cfg.max_graph_triples = 3;
+    let (_, stats) = scan_path_with_stats(dir.path(), "нокс", &cfg);
+    assert!(stats.graph_edges <= 3, "edges={}", stats.graph_edges);
+}
 
-    let sql = fs::read_to_string(&sql_path).expect("SQL-дамп создан");
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS entities"));
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS relations"));
-    assert!(sql.contains("UNIQUE(name)"));
-    assert!(sql.contains("UNIQUE(subject, predicate, object)"));
-    assert!(sql.contains("INSERT OR IGNORE INTO entities"));
-    assert!(sql.contains("'Нокс'"));
-    assert!(sql.contains("вонзила_когти"));
-    assert!(sql.contains("1300°C"));
+// ---------------------------------------------------------------------------
+// Watcher: инкрементальный рескан по mtime/size
+// ---------------------------------------------------------------------------
+
+#[test]
+fn watcher_detects_modification_and_stability() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("scene.md"), "# Глава\n\nНокс тут.\n").unwrap();
+
+    let mut engine = poler_engine::Engine::new(EngineConfig::default(), true);
+    let (res1, _) = engine.scan(dir.path(), "нокс");
+    assert_eq!(res1.total_hits, 1);
+
+    // без изменений: пустое событие, стабильный результат
+    let (ev0, res0, _) = engine.rescan(dir.path(), "нокс");
+    assert!(ev0.is_empty(), "{ev0:?}");
+    assert_eq!(res0.total_hits, 1);
+
+    // модификация файла
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::write(
+        dir.path().join("scene.md"),
+        "# Глава\n\nНокс тут. И снова Нокс.\n",
+    )
+    .unwrap();
+    let (ev1, res1, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(ev1.changed.len(), 1, "{ev1:?}");
+    assert_eq!(res1.total_hits, 2);
+
+    // повторный рескан без изменений — результат сохранён
+    let (ev2, res2, _) = engine.rescan(dir.path(), "нокс");
+    assert!(ev2.is_empty());
+    assert_eq!(res2.total_hits, 2);
+}
+
+#[test]
+fn watcher_add_and_remove_files() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.md"), "# A\n\nНокс первый.\n").unwrap();
+
+    let mut engine = poler_engine::Engine::new(EngineConfig::default(), true);
+    let (res, _) = engine.scan(dir.path(), "нокс");
+    assert_eq!(res.total_hits, 1);
+
+    // добавление файла
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::write(dir.path().join("b.md"), "# B\n\nНокс второй.\n").unwrap();
+    let (ev, res, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(ev.added.len(), 1, "{ev:?}");
+    assert_eq!(res.total_hits, 2);
+
+    // удаление файла
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::remove_file(dir.path().join("a.md")).unwrap();
+    let (ev, res, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(ev.removed.len(), 1, "{ev:?}");
+    assert_eq!(res.total_hits, 1);
+    assert!(res.anchors.iter().all(|a| a.file.contains("b.md")));
+}
+
+#[test]
+fn watcher_stats_survive_removal() {
+    // удалённый файл исключается из глобальной статистики
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.md"), "# A\n\nНокс и ещё немного слов для статистики.\n").unwrap();
+    fs::write(dir.path().join("b.md"), "# B\n\nНокс и другие слова тут.\n").unwrap();
+
+    let mut engine = poler_engine::Engine::new(EngineConfig::default(), true);
+    let (_, s1) = engine.scan(dir.path(), "нокс");
+    assert_eq!(s1.files_scanned, 2);
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::remove_file(dir.path().join("b.md")).unwrap();
+    let (_, _, s2) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(s2.files_scanned, 1);
+    assert!(s2.total_tokens < s1.total_tokens, "токены удалённого файла должны уйти");
+}
+
+// ---------------------------------------------------------------------------
+// AIDDE: таблица символов + impact-паспорт
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aidde_impact_passport_upstream_downstream() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("core.rs"),
+        "pub fn core_fn(x: i32) -> i32 {\n    x + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("mid.rs"), "pub fn mid() {\n    core_fn(1);\n}\n").unwrap();
+    fs::write(dir.path().join("top.rs"), "pub fn top() {\n    mid();\n}\n").unwrap();
+
+    let files = vec![
+        dir.path().join("core.rs"),
+        dir.path().join("mid.rs"),
+        dir.path().join("top.rs"),
+    ];
+    let table = poler_engine::aidde::SymbolTable::build(&files, 1024 * 1024);
+    let report = poler_engine::aidde::impact_analysis(&table, "core_fn", 3, 100)
+        .expect("impact для core_fn");
+
+    assert!(report.file.ends_with("core.rs"));
+    // upstream: mid (прямые) и top (транзитивно)
+    let callers: Vec<&str> = report
+        .upstream_dependents
+        .iter()
+        .map(|d| d.caller.as_str())
+        .collect();
+    assert!(callers.contains(&"mid::mid"), "{callers:?}");
+    assert!(callers.contains(&"top::top"), "{callers:?}");
+    // 2 файла затронуты
+    assert!(report.danger_level_if_modified.contains("MEDIUM"), "{}", report.danger_level_if_modified);
+
+    // downstream от top: mid и core_fn
+    let down = poler_engine::aidde::impact_analysis(&table, "top", 3, 100).unwrap();
+    let callees: Vec<&str> = down
+        .downstream_dependencies
+        .iter()
+        .map(|d| d.callee.as_str())
+        .collect();
+    assert!(callees.contains(&"mid"), "{callees:?}");
+    assert!(callees.contains(&"core_fn"), "{callees:?}");
+}
+
+#[test]
+fn aidde_side_effects_reported() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("sys.rs"),
+        "pub fn alloc_buffer(n: usize) -> Vec<u8> {\n    unsafe { GLOBAL_GAUGE += 1 };\n    ALLOC_MUTEX.lock();\n    std::fs::write(\"/tmp/x\", b\"y\").ok();\n    vec![0; n]\n}\n",
+    )
+    .unwrap();
+    let files = vec![dir.path().join("sys.rs")];
+    let table = poler_engine::aidde::SymbolTable::build(&files, 1024 * 1024);
+    let report = poler_engine::aidde::impact_analysis(&table, "alloc_buffer", 2, 100).unwrap();
+    assert!(report.side_effects.iter().any(|s| s.contains("unsafe")), "{:?}", report.side_effects);
+    assert!(report.side_effects.iter().any(|s| s.contains("мьютекса")), "{:?}", report.side_effects);
+    assert_eq!(report.danger_level_if_modified, "LOW (прямых зависимых не найдено)");
+}
+
+#[test]
+fn aidde_python_cross_file() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("proc.py"), "def process(data):\n    return data\n").unwrap();
+    fs::write(dir.path().join("run.py"), "def run():\n    return process(1)\n").unwrap();
+    let files = vec![dir.path().join("proc.py"), dir.path().join("run.py")];
+    let table = poler_engine::aidde::SymbolTable::build(&files, 1024 * 1024);
+    let report = poler_engine::aidde::impact_analysis(&table, "process", 2, 100).unwrap();
+    assert!(
+        report.upstream_dependents.iter().any(|d| d.caller == "run::run"),
+        "{:?}",
+        report.upstream_dependents
+    );
+}
+
+#[test]
+fn aidde_missing_symbol() {
+    let table = poler_engine::aidde::SymbolTable::build(&[], 1024 * 1024);
+    assert!(poler_engine::aidde::impact_analysis(&table, "nope", 2, 10).is_none());
 }
 
 #[test]

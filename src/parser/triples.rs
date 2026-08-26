@@ -102,7 +102,7 @@ static CALL_RE: LazyLock<Regex> =
 static IMPORT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|\n)\s*(?:use|import|require)\s+([A-Za-z0-9_:{}. ,]+?);").unwrap());
 
-const CALL_KEYWORDS: &[&str] = &[
+pub(crate) const CALL_KEYWORDS: &[&str] = &[
     "if", "else", "while", "for", "match", "loop", "return", "unsafe", "fn", "let", "pub",
     "struct", "enum", "impl", "trait", "mod", "use", "crate", "super", "self", "Self", "move",
     "async", "await", "where", "as", "in", "ref", "const", "static", "type", "dyn", "box",

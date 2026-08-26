@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -29,6 +29,8 @@ regex = "1.10"
 aho-corasick = "1.1"
 # Крейт из состава ripgrep (BurntSushi): параллельный обход дерева с .gitignore
 ignore = "0.4"
+# Обработка SIGINT для watcher-режима
+ctrlc = "3.4"
 # SIMD-поиск байтов: literal prefilter в стиле ripgrep / kwset GNU grep
 memchr = "2"
 

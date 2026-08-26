@@ -71,6 +71,132 @@ static SIGNATURE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Байтовые спаны строковых литералов и комментариев (для фильтрации
+/// ложных вызовов в AIDDE): `[(start, end)]` в порядке следования.
+pub fn string_comment_spans(source: &str) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Normal,
+        LineComment,
+        BlockComment,
+        Str(u8),
+        RawStr(u8),
+        Template,
+    }
+    let b = source.as_bytes();
+    let mut spans = Vec::new();
+    let mut mode = Mode::Normal;
+    let mut span_start = 0usize;
+    let mut i = 0usize;
+
+    while i < b.len() {
+        match mode {
+            Mode::Normal => match b[i] {
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    span_start = i;
+                    mode = Mode::LineComment;
+                    i += 2;
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                    span_start = i;
+                    mode = Mode::BlockComment;
+                    i += 2;
+                }
+                b'"' => {
+                    let (is_raw, hashes) = raw_string_prefix(b, i);
+                    span_start = i;
+                    mode = if is_raw {
+                        Mode::RawStr(hashes)
+                    } else {
+                        Mode::Str(b'"')
+                    };
+                    i += 1;
+                }
+                b'\'' => {
+                    // char-литерал или lifetime: пропускаем, lifetime не строка
+                    i = skip_char_or_lifetime(b, i);
+                }
+                b'`' => {
+                    span_start = i;
+                    mode = Mode::Template;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            Mode::LineComment => {
+                if b[i] == b'\n' {
+                    spans.push((span_start, i));
+                    mode = Mode::Normal;
+                }
+                i += 1;
+            }
+            Mode::BlockComment => {
+                if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
+                    spans.push((span_start, i + 2));
+                    mode = Mode::Normal;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Mode::Str(q) => match b[i] {
+                b'\\' => i += 2,
+                c if c == q => {
+                    spans.push((span_start, i + 1));
+                    mode = Mode::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            Mode::RawStr(hashes) => {
+                if b[i] == b'"' {
+                    let mut h = hashes;
+                    let mut j = i + 1;
+                    while h > 0 && j < b.len() && b[j] == b'#' {
+                        h -= 1;
+                        j += 1;
+                    }
+                    if h == 0 {
+                        spans.push((span_start, j));
+                        mode = Mode::Normal;
+                        i = j;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            Mode::Template => match b[i] {
+                b'\\' => i += 2,
+                b'`' => {
+                    spans.push((span_start, i + 1));
+                    mode = Mode::Normal;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+    match mode {
+        Mode::Normal => {}
+        _ => spans.push((span_start, b.len())),
+    }
+    spans
+}
+
+/// Лёгкий lookup имени сигнатуры скоупа, начинающегося в `byte_begin`.
+pub fn light_signature(source: &str, byte_begin: usize) -> Option<String> {
+    find_signature(source, byte_begin).1
+}
+
+/// Сигнатура одной строки: (вид, имя) — для таблицы символов AIDDE.
+pub(crate) fn signature_of(line: &str) -> Option<(String, String)> {
+    let caps = SIGNATURE_RE.captures(line)?;
+    Some((
+        caps.get(1)?.as_str().to_string(),
+        caps.get(2)?.as_str().to_string(),
+    ))
+}
+
 /// Точка входа: возвращает enclosing scope для байтового смещения.
 pub fn extract_enclosing_scope(source: &str, byte_offset: usize, lang: CodeLang) -> CodeScope {
     let off = byte_offset.min(source.len());

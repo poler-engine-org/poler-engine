@@ -1,15 +1,23 @@
 //! CLI poler-engine: AI-Native Topographical, Resonant and Graph Search Engine.
 //!
+//! Режимы:
+//! * поиск: `poler-engine <PATH> -q <QUERY> [--watch]`
+//! * impact-анализ (AIDDE): `poler-engine <PATH> --impact <SYMBOL>`
+//!
 //! Коды выхода (grep-совместимые): 0 — есть совпадения, 1 — совпадений нет,
-//! 2 — ошибка (путь не найден, пустой запрос).
+//! 2 — ошибка.
 
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
+use poler_engine::aidde::{impact_analysis, SymbolTable};
 use poler_engine::{
-    render_markdown, render_simple, scan_path_with_stats, EngineConfig, PiiMode, ResonanceMode,
-    DEFAULT_EXTENSIONS,
+    collect_files, render_markdown, render_simple, Engine, EngineConfig, PiiMode, ResonanceMode,
+    CodeLang, DEFAULT_EXTENSIONS, SearchResult,
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -44,9 +52,9 @@ enum ResonanceArg {
     version,
     author = "POLER Engineering Core",
     about = "AI-Native Topographical, Resonant and Graph Search Engine",
-    long_about = "Поисково-аналитический движок для LLM-агентов: возвращает полный логический \
-                  скоуп (сцена/функция целиком), информационную плотность ε, резонанс R(t) и \
-                  K-hop подграф связей сущностей вместо изолированных строк grep."
+    long_about = "Поисково-аналитический движок для LLM-агентов: полный логический скоуп \
+                  (сцена/функция целиком), информационная плотность ε, резонанс R(t), \
+                  K-hop подграф связей и AIDDE impact-анализ вместо изолированных строк grep."
 )]
 struct Cli {
     /// Путь к файлу или корню репозитория.
@@ -54,7 +62,23 @@ struct Cli {
 
     /// Поисковый запрос: слово или фраза (в кавычках).
     #[arg(short, long)]
-    query: String,
+    query: Option<String>,
+
+    /// AIDDE impact-анализ символа (call graph + upstream/downstream паспорт).
+    #[arg(long)]
+    impact: Option<String>,
+
+    /// Глубина BFS impact-анализа.
+    #[arg(long = "impact-depth", default_value_t = 3)]
+    impact_depth: usize,
+
+    /// Watcher-режим: инкрементальный рескан по mtime/size.
+    #[arg(long)]
+    watch: bool,
+
+    /// Интервал watcher-опроса в секундах.
+    #[arg(long = "interval-secs", default_value_t = 2)]
+    interval: u64,
 
     /// Число топ-результатов.
     #[arg(short = 't', long, default_value_t = 10)]
@@ -101,7 +125,7 @@ struct Cli {
     extensions: String,
 
     /// Пропускать файлы больше N мегабайт.
-    #[arg(long = "max-file-size", default_value_t = 32)]
+    #[arg(long = "max-file-size", default_value_t = 64)]
     max_file_mb: u64,
 
     /// Максимум байт enclosing_scope в якоре.
@@ -112,12 +136,11 @@ struct Cli {
     #[arg(long = "max-relations", default_value_t = 64)]
     max_relations: usize,
 
-    /// Литеральный SIMD-предфильтр: файлы без ASCII-литерала запроса не
-    /// токенизируются (техника GNU grep kwset / ripgrep prefilter).
-    #[arg(long, default_value_t = false)]
-    fast: bool,
+    /// Бюджет рёбер графа сущностей.
+    #[arg(long = "max-graph-triples", default_value_t = 200_000)]
+    max_graph_triples: usize,
 
-    /// Показывать скрытые файлы/директории (аналог rg --hidden).
+    /// Показывать скрытые файлы/директории (rg --hidden).
     #[arg(long, default_value_t = false)]
     hidden: bool,
 
@@ -132,6 +155,18 @@ struct Cli {
     /// Подробная статистика прогона в stderr.
     #[arg(short = 'v', long)]
     verbose: bool,
+}
+
+fn print_result(res: &SearchResult, format: Format) {
+    match format {
+        Format::AiJson => {
+            println!("{}", serde_json::to_string_pretty(res).unwrap_or_default());
+        }
+        Format::Md => print!("{}", render_markdown(res)),
+        Format::Simple => print!("{}", render_simple(res)),
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 fn main() -> ExitCode {
@@ -149,10 +184,6 @@ fn main() -> ExitCode {
 
     if !cli.path.exists() {
         eprintln!("poler-engine: путь не найден: {}", cli.path.display());
-        return ExitCode::from(2);
-    }
-    if cli.query.trim().is_empty() {
-        eprintln!("poler-engine: пустой запрос");
         return ExitCode::from(2);
     }
 
@@ -181,38 +212,117 @@ fn main() -> ExitCode {
         max_file_bytes: cli.max_file_mb.saturating_mul(1024 * 1024),
         max_scope_bytes: cli.max_scope,
         max_relations: cli.max_relations,
-        prefilter: cli.fast,
         include_hidden: cli.hidden,
         graph_export: cli.graph_export.clone(),
+        max_graph_triples: cli.max_graph_triples,
     };
 
-    let (result, stats) = scan_path_with_stats(&cli.path, &cli.query, &config);
+    // ---------- Режим AIDDE: Impact Passport ----------
+    if let Some(symbol) = &cli.impact {
+        if cli.query.is_some() {
+            eprintln!("poler-engine: --impact и --query взаимоисключающие");
+            return ExitCode::from(2);
+        }
+        let files: Vec<PathBuf> = collect_files(&cli.path, &config)
+            .into_iter()
+            .filter(|p| poler_engine::detect_lang(p) != CodeLang::Plain)
+            .collect();
+        if cli.verbose {
+            eprintln!("poler-engine AIDDE: кодовых файлов: {}", files.len());
+        }
+        let table = SymbolTable::build(&files, config.max_file_bytes);
+        match impact_analysis(&table, symbol, cli.impact_depth, 200) {
+            Some(report) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("poler-engine: символ не найден: {symbol}");
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        // ---------- Режим поиска ----------
+        let Some(query) = cli.query.clone() else {
+            eprintln!("poler-engine: укажите --query <QUERY> или --impact <SYMBOL>");
+            return ExitCode::from(2);
+        };
+        if query.trim().is_empty() {
+            eprintln!("poler-engine: пустой запрос");
+            return ExitCode::from(2);
+        }
 
+        if cli.watch {
+            return watch_mode(cli, config, query);
+        }
+
+        let mut engine = Engine::new(config, false);
+        let (result, stats) = engine.scan(&cli.path, &query);
+        if cli.verbose {
+            eprintln!(
+                "poler-engine: файлов просканировано={}, с совпадениями={}, токенов={}, \
+                 хитов={}, узлов графа={}, рёбер={}, время={}мс",
+                stats.files_scanned,
+                stats.files_with_hits,
+                stats.total_tokens,
+                stats.total_hits,
+                stats.graph_nodes,
+                stats.graph_edges,
+                stats.elapsed_ms
+            );
+        }
+        print_result(&result, cli.format);
+        if result.total_hits == 0 {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Watcher-режим: первичный полный скан, затем инкрементальные rescans
+/// по mtime/size; выход по Ctrl-C (SIGINT).
+fn watch_mode(cli: Cli, config: EngineConfig, query: String) -> ExitCode {
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
+    }
+
+    let mut engine = Engine::new(config, true);
+    let (result, stats) = engine.scan(&cli.path, &query);
     if cli.verbose {
         eprintln!(
-            "poler-engine: файлов просканировано={}, с совпадениями={}, токенов={}, \
-             хитов={}, узлов графа={}, рёбер={}, время={}мс",
-            stats.files_scanned,
-            stats.files_with_hits,
-            stats.total_tokens,
-            stats.total_hits,
-            stats.graph_nodes,
-            stats.graph_edges,
-            stats.elapsed_ms
+            "poler-engine watch: начальный скан — файлов={}, хитов={}, время={}мс",
+            stats.files_scanned, stats.total_hits, stats.elapsed_ms
         );
     }
+    print_result(&result, cli.format);
 
-    match cli.format {
-        Format::AiJson => {
-            println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+    let interval = cli.interval.max(1);
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_secs(interval));
+        if stop.load(Ordering::SeqCst) {
+            break;
         }
-        Format::Md => print!("{}", render_markdown(&result)),
-        Format::Simple => print!("{}", render_simple(&result)),
+        let (event, result, stats) = engine.rescan(&cli.path, &query);
+        if event.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "poler-engine watch: добавлено={}, изменено={}, удалено={} (файлов={}, хитов={}, время={}мс)",
+            event.added.len(),
+            event.changed.len(),
+            event.removed.len(),
+            stats.files_scanned,
+            stats.total_hits,
+            stats.elapsed_ms
+        );
+        print_result(&result, cli.format);
     }
-
-    if result.total_hits == 0 {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
+    eprintln!("poler-engine watch: остановлено");
+    ExitCode::SUCCESS
 }

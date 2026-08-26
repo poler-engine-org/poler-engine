@@ -92,6 +92,111 @@ fn parse_heading(line: &str) -> Option<(usize, String)> {
     Some((hashes, strip_inline_md(rest)))
 }
 
+/// Лёгкие метаданные сцены: всё, кроме текста сцены (никаких клонов
+/// enclosing_scope) — используется в проходе 2 потокового конвейера.
+#[derive(Debug, Clone, Default)]
+pub struct LightSceneMeta {
+    pub chapter: String,
+    pub temporal_metric: Option<String>,
+    pub metric_tag: Option<String>,
+    pub location: Option<String>,
+    pub subjects: Vec<String>,
+    pub subject_names: Vec<String>,
+    pub subject_pairs: Vec<(String, String)>,
+}
+
+/// Есть ли в тексте markdown-заголовки (для reconstructed bounds).
+pub fn has_headings(text: &str) -> bool {
+    text.lines().any(|l| parse_heading(l).is_some())
+}
+
+/// Парсит карточку метаданных сцены (структурированной или txt-фолбэк).
+pub fn light_meta(text: &str, bounds: &SceneBounds) -> LightSceneMeta {
+    let start = bounds.start.min(text.len());
+    let end = bounds.end.min(text.len()).max(start);
+    let scope_raw = &text[start..end];
+
+    let mut m = LightSceneMeta {
+        chapter: bounds.chapter.clone(),
+        ..LightSceneMeta::default()
+    };
+
+    if bounds.structured {
+        // метаданные — карточка сцены: первые 60 строк от начала сцены
+        for line in scope_raw.lines().take(60) {
+            let lower = line.to_lowercase();
+            let cleaned = strip_inline_md(line);
+            if m.temporal_metric.is_none() && lower.contains("метрика:") {
+                let value = after_colon(&cleaned);
+                if !value.is_empty() {
+                    m.metric_tag = extract_metric_tag(&value);
+                    m.temporal_metric = Some(format!("Метрика: {value}"));
+                }
+            }
+            if m.location.is_none()
+                && (lower.contains("локация:") || lower.contains("место:"))
+            {
+                let value = after_colon(&cleaned);
+                if !value.is_empty() {
+                    m.location = Some(format!("Локация: {value}"));
+                }
+            }
+            if m.subjects.is_empty()
+                && (lower.contains("субъекты:")
+                    || lower.contains("персонажи:")
+                    || lower.contains("герои:")
+                    || lower.contains("действующие лица:"))
+            {
+                let value = after_colon(&cleaned);
+                if !value.is_empty() {
+                    m.subjects.push(format!("Субъекты: {value}"));
+                    let (names, pairs) = parse_subjects(&value);
+                    m.subject_names = names;
+                    m.subject_pairs = pairs;
+                }
+            }
+            if m.temporal_metric.is_some() && m.location.is_some() && !m.subjects.is_empty() {
+                break; // карточка прочитана целиком
+            }
+        }
+    } else {
+        // txt-фолбэк: метаданные ищутся строками выше абзаца (макс. 50)
+        for line in text[..start].lines().rev().take(50) {
+            let lower = line.to_lowercase();
+            let cleaned = strip_inline_md(line);
+            if m.temporal_metric.is_none() && lower.contains("метрика:") {
+                let value = after_colon(&cleaned);
+                if !value.is_empty() {
+                    m.metric_tag = extract_metric_tag(&value);
+                    m.temporal_metric = Some(format!("Метрика: {value}"));
+                }
+            }
+            if m.location.is_none()
+                && (lower.contains("локация:") || lower.contains("место:"))
+            {
+                let value = after_colon(&cleaned);
+                if !value.is_empty() {
+                    m.location = Some(format!("Локация: {value}"));
+                }
+            }
+            if m.subjects.is_empty()
+                && (lower.contains("субъекты:")
+                    || lower.contains("персонажи:")
+                    || lower.contains("герои:"))
+            {
+                let value = after_colon(&cleaned);
+                if !value.is_empty() {
+                    m.subjects.push(format!("Субъекты: {value}"));
+                    let (names, pairs) = parse_subjects(&value);
+                    m.subject_names = names;
+                    m.subject_pairs = pairs;
+                }
+            }
+        }
+    }
+    m
+}
+
 impl SceneContext {
     /// Лёгкая локализация сцены для байтового смещения (без клонирования
     /// текста) — вызывается на каждое совпадение.
@@ -158,102 +263,38 @@ impl SceneContext {
     }
 
     /// Полное построение SceneContext по границам — один раз на уникальную
-    /// сцену (кэшируется вызывающим кодом).
+    /// сцену (кэшируется вызывающим кодом). Делегирует разбор карточки
+    /// метаданных [`light_meta`].
     pub fn build(text: &str, bounds: &SceneBounds, _file_path: &Path) -> SceneContext {
         let start = bounds.start.min(text.len());
         let end = bounds.end.min(text.len()).max(start);
         let scope_raw = &text[start..end];
-
-        let mut temporal_metric = None;
-        let mut metric_tag = None;
-        let mut location = None;
-        let mut subjects: Vec<String> = Vec::new();
-        let mut subject_names: Vec<String> = Vec::new();
-        let mut subject_pairs: Vec<(String, String)> = Vec::new();
-
-        if bounds.structured {
-            // метаданные — карточка сцены: первые 60 строк от начала сцены
-            for line in scope_raw.lines().take(60) {
-                let lower = line.to_lowercase();
-                let cleaned = strip_inline_md(line);
-                if temporal_metric.is_none() && lower.contains("метрика:") {
-                    let value = after_colon(&cleaned);
-                    if !value.is_empty() {
-                        metric_tag = extract_metric_tag(&value);
-                        temporal_metric = Some(format!("Метрика: {value}"));
-                    }
-                }
-                if location.is_none()
-                    && (lower.contains("локация:") || lower.contains("место:"))
-                {
-                    let value = after_colon(&cleaned);
-                    if !value.is_empty() {
-                        location = Some(format!("Локация: {value}"));
-                    }
-                }
-                if subjects.is_empty()
-                    && (lower.contains("субъекты:")
-                        || lower.contains("персонажи:")
-                        || lower.contains("герои:")
-                        || lower.contains("действующие лица:"))
-                {
-                    let value = after_colon(&cleaned);
-                    if !value.is_empty() {
-                        subjects.push(format!("Субъекты: {value}"));
-                        (subject_names, subject_pairs) = parse_subjects(&value);
-                    }
-                }
-                if temporal_metric.is_some() && location.is_some() && !subjects.is_empty() {
-                    break; // карточка прочитана целиком
-                }
-            }
-        } else {
-            // txt-фолбэк: метаданные ищутся строками выше абзаца (макс. 50)
-            let mut lines_above: Vec<&str> = Vec::new();
-            for line in text[..start].lines().rev().take(50) {
-                lines_above.push(line);
-            }
-            for line in lines_above {
-                let lower = line.to_lowercase();
-                let cleaned = strip_inline_md(line);
-                if temporal_metric.is_none() && lower.contains("метрика:") {
-                    let value = after_colon(&cleaned);
-                    if !value.is_empty() {
-                        metric_tag = extract_metric_tag(&value);
-                        temporal_metric = Some(format!("Метрика: {value}"));
-                    }
-                }
-                if location.is_none()
-                    && (lower.contains("локация:") || lower.contains("место:"))
-                {
-                    let value = after_colon(&cleaned);
-                    if !value.is_empty() {
-                        location = Some(format!("Локация: {value}"));
-                    }
-                }
-                if subjects.is_empty()
-                    && (lower.contains("субъекты:")
-                        || lower.contains("персонажи:")
-                        || lower.contains("герои:"))
-                {
-                    let value = after_colon(&cleaned);
-                    if !value.is_empty() {
-                        subjects.push(format!("Субъекты: {value}"));
-                        (subject_names, subject_pairs) = parse_subjects(&value);
-                    }
-                }
-            }
-        }
+        let meta = light_meta(text, bounds);
 
         SceneContext {
-            chapter: bounds.chapter.clone(),
-            temporal_metric,
-            location,
-            subjects,
+            chapter: meta.chapter,
+            temporal_metric: meta.temporal_metric,
+            location: meta.location,
+            subjects: meta.subjects,
             enclosing_scope: scope_raw.trim().to_string(),
-            metric_tag,
-            subject_names,
-            subject_pairs,
+            metric_tag: meta.metric_tag,
+            subject_names: meta.subject_names,
+            subject_pairs: meta.subject_pairs,
+        }
+    }
+
+    /// SceneContext из одних метаданных (enclosing_scope пуст) — для
+    /// извлечения троек в проходе 2 без клонирования текста сцены.
+    pub fn from_meta(meta: &LightSceneMeta) -> Self {
+        Self {
+            chapter: meta.chapter.clone(),
+            temporal_metric: meta.temporal_metric.clone(),
+            location: meta.location.clone(),
+            subjects: meta.subjects.clone(),
+            enclosing_scope: String::new(),
+            metric_tag: meta.metric_tag.clone(),
+            subject_names: meta.subject_names.clone(),
+            subject_pairs: meta.subject_pairs.clone(),
         }
     }
 
