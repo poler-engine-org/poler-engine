@@ -23,6 +23,7 @@ pub mod api;
 pub mod companion;
 pub mod nlm;
 pub mod nlm_ingest;
+pub mod nlm_notes_sync;
 pub mod oauth;
 
 use std::io::{Read, Write};

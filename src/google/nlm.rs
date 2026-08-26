@@ -46,6 +46,12 @@ pub const RPC_GET_NOTES: &str = "cFji9";
 pub const RPC_LIST_ARTIFACTS: &str = "gArtLc";
 /// Аккаунт сессии (GET_OR_CREATE_ACCOUNT).
 pub const RPC_ACCOUNT: &str = "ZwVcOc";
+/// Создать заметку (CREATE_NOTE; тот же id, что SAVE_MIND_MAP — различаются параметрами).
+pub const RPC_CREATE_NOTE: &str = "CYK0Xb";
+/// Обновить содержимое/заголовок заметки (UPDATE_NOTE).
+pub const RPC_UPDATE_NOTE: &str = "cYAfTb";
+/// Удалить заметку (DELETE_NOTE; тот же id, что DELETE_MIND_MAP).
+pub const RPC_DELETE_NOTE: &str = "AH0mwd";
 
 /// Запасной `bl` (сборка фронтенда), если `WIZ_global_data.cfb2h` пуст —
 /// то же значение, что использует расширение NLMTools.
@@ -314,6 +320,83 @@ pub fn parse_single_notebook(data: &Value) -> Option<Notebook> {
             if let Some(nb) = parse_notebook(elem) {
                 return Some(nb);
             }
+        }
+    }
+    None
+}
+
+/// Заметка NotebookLM (только заметки; mind maps отфильтрованы).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NlmNote {
+    pub id: String,
+    pub title: String,
+    pub text: String,
+}
+
+/// Mind map хранится в том же сторе, что заметки: контент — JSON
+/// с ключами `children`/`nodes`. Такие элементы в заметки не попадают.
+fn is_mind_map_json(content: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(content) else {
+        return false;
+    };
+    v.is_object() && (v.get("children").is_some() || v.get("nodes").is_some())
+}
+
+/// Ответ `GET_NOTES` (cFji9) → заметки без mind maps и удалённых.
+///
+/// Формат: `[[[note_id, [note_id, text, meta, None, title], status], …], ts]`
+/// (удалённые: `status == 2` или `data == null`).
+pub fn parse_nlm_notes(data: &Value) -> Vec<NlmNote> {
+    // bare vs wrapped: data = [items_array, metadata] vs data = items_array
+    let items = if at(data, 0).is_array() && at(at(data, 0), 0).is_array() {
+        at(data, 0)
+    } else {
+        data
+    };
+    let Some(arr) = items.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(id) = at(item, 0).as_str() else { continue };
+        if id.is_empty() {
+            continue;
+        }
+        let inner = at(item, 1);
+        // удалённые: status==2 или data==null
+        if at(item, 2).as_i64() == Some(2) || inner.is_null() {
+            continue;
+        }
+        let Some(text) = at(inner, 1).as_str() else {
+            continue;
+        };
+        if text.is_empty() || is_mind_map_json(text) {
+            continue;
+        }
+        let title = at(inner, 4)
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Заметка NLM")
+            .to_string();
+        out.push(NlmNote {
+            id: id.to_string(),
+            title,
+            text: text.to_string(),
+        });
+    }
+    out
+}
+
+/// Ответ `CREATE_NOTE` (CYK0Xb) → id новой заметки.
+pub fn parse_created_note_id(data: &Value) -> Option<String> {
+    // [[note_id, …]] | [note_id, …] | "note_id"
+    let first = at(data, 0);
+    if let Some(id) = first.as_str() {
+        return Some(id.to_string());
+    }
+    if first.is_array() {
+        if let Some(id) = at(first, 0).as_str() {
+            return Some(id.to_string());
         }
     }
     None
@@ -654,6 +737,52 @@ impl NlmSession {
     /// Заметки ноутбука (raw-JSON).
     pub fn notes(&mut self, notebook_id: &str) -> Result<Value, String> {
         self.rpc(RPC_GET_NOTES, &serde_json::json!([notebook_id]), Some(notebook_id))
+    }
+
+    /// Заметки ноутбука (структурно; без mind maps и удалённых).
+    pub fn list_notes_structured(&mut self, notebook_id: &str) -> Result<Vec<NlmNote>, String> {
+        let data = self.notes(notebook_id)?;
+        Ok(parse_nlm_notes(&data))
+    }
+
+    /// Создать заметку в NLM: CREATE_NOTE + UPDATE_NOTE с контентом
+    /// (двухшаговый протокол, как в NLMTools). Возвращает id новой заметки.
+    pub fn create_note(
+        &mut self,
+        notebook_id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<String, String> {
+        let title = if title.trim().is_empty() { "New Note" } else { title };
+        // RPC-формат CREATE_NOTE: [notebook_id, "", [1], null, title]
+        let data = self.rpc(
+            RPC_CREATE_NOTE,
+            &serde_json::json!([notebook_id, "", [1], null, title]),
+            Some(notebook_id),
+        )?;
+        let note_id = parse_created_note_id(&data)
+            .ok_or_else(|| "CREATE_NOTE: не найден id новой заметки".to_string())?;
+        if !content.is_empty() {
+            self.update_note(notebook_id, &note_id, content, title)?;
+        }
+        Ok(note_id)
+    }
+
+    /// Обновить содержимое/заголовок заметки (RPC UPDATE_NOTE / cYAfTb).
+    pub fn update_note(
+        &mut self,
+        notebook_id: &str,
+        note_id: &str,
+        content: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        // RPC-формат UPDATE_NOTE: [notebook_id, note_id, [[[content, title, [], 0]]]]
+        self.rpc(
+            RPC_UPDATE_NOTE,
+            &serde_json::json!([notebook_id, note_id, [[[content, title, [], 0]]]]),
+            Some(notebook_id),
+        )?;
+        Ok(())
     }
 
     /// Studio-объекты ноутбука: аудио, отчёты, квизы, миндмэпы.
@@ -1192,5 +1321,67 @@ mod tests {
         let md2 = format_source_content(&sc, "nb-1");
         assert!(md2.contains("# Источник: Doc"));
         assert!(md2.contains("## Медиа (1)"));
+    }
+
+    // ------- M5: заметки (GET_NOTES / CREATE_NOTE / UPDATE_NOTE) -------
+
+    #[test]
+    fn parse_nlm_notes_wrapped_filters_mind_maps_and_deleted() {
+        // wrapped: [items, ts]; item = [id, [id, text, meta, null, title], status]
+        let data = json!([
+            [
+                ["n-1", ["n-1", "Текст заметки", null, null, "Моя заметка"], 1],
+                ["n-2", ["n-2", "{\"children\":[{\"title\":\"мм\"}]}", null, null, "Mind map"], 1],
+                ["n-3", ["n-3", "удалённая", null, null, "Del"], 2],
+                ["n-4", null, 1],
+                ["n-5", ["n-5", "", null, null, "Пустая"], 1]
+            ],
+            1735689600000u64
+        ]);
+        let notes = parse_nlm_notes(&data);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, "n-1");
+        assert_eq!(notes[0].title, "Моя заметка");
+        assert_eq!(notes[0].text, "Текст заметки");
+    }
+
+    #[test]
+    fn parse_nlm_notes_bare_and_default_title() {
+        // bare: data = items без обёртки; title пустой → дефолт
+        let data = json!([
+            ["n-9", ["n-9", "Контент", null, null, ""], 1]
+        ]);
+        let notes = parse_nlm_notes(&data);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Заметка NLM");
+    }
+
+    #[test]
+    fn parse_nlm_notes_mind_map_nodes_key_filtered() {
+        // mind map c ключом "nodes" (вторая форма) — тоже фильтруется
+        let data = json!([
+            [["m-1", ["m-1", "{\"nodes\":{}}", null, null, "MM"], 1]]
+        ]);
+        assert!(parse_nlm_notes(&data).is_empty());
+    }
+
+    #[test]
+    fn parse_created_note_id_variants() {
+        // [[id, …]] — основная форма ответа CREATE_NOTE
+        assert_eq!(parse_created_note_id(&json!([["nb-note-77", 1, 2]])), Some("nb-note-77".into()));
+        // [id, …]
+        assert_eq!(parse_created_note_id(&json!(["nb-note-78", 1])), Some("nb-note-78".into()));
+        // мусор
+        assert_eq!(parse_created_note_id(&json!([null, 2])), None);
+        assert_eq!(parse_created_note_id(&json!([])), None);
+    }
+
+    #[test]
+    fn is_mind_map_json_discriminator() {
+        assert!(is_mind_map_json(r#"{"children":[]}"#));
+        assert!(is_mind_map_json(r#"{"nodes":{"a":1}}"#));
+        assert!(!is_mind_map_json("обычный текст"));
+        assert!(!is_mind_map_json(r#"{"title":"нет ключей"}"#));
+        assert!(!is_mind_map_json("[1,2,3]"));
     }
 }

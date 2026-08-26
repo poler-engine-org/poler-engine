@@ -49,6 +49,8 @@ pub enum NoteSource {
     Manual,
     AiReply,
     Imported,
+    /// Пришла из NotebookLM при синке (nlm_notes_sync).
+    Nlm,
 }
 
 impl NoteSource {
@@ -57,12 +59,14 @@ impl NoteSource {
             NoteSource::Manual => "manual",
             NoteSource::AiReply => "ai-reply",
             NoteSource::Imported => "imported",
+            NoteSource::Nlm => "nlm",
         }
     }
     pub fn from_str(s: &str) -> Self {
         match s {
             "ai-reply" => NoteSource::AiReply,
             "imported" => NoteSource::Imported,
+            "nlm" => NoteSource::Nlm,
             _ => NoteSource::Manual,
         }
     }
