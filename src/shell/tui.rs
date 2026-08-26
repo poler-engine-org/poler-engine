@@ -104,10 +104,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         "  Drag мышью по Chat panel → Ctrl+Y → буфер обмена".into(),
         String::new(),
     ];
-    let mut output_scroll: usize = 0;
-    let mut output_state = ListState::default();
-    output_state.select(None);
-
+    let mut output_scroll: usize = usize::MAX; // row-offset для Paragraph::scroll; usize::MAX = прилипить к низу
     // Список ноутбуков (левая панель)
     let mut notebooks: Vec<String> = vec!["(нажмите 'r' для nlm list)".into()];
     let mut notebook_ids: Vec<String> = Vec::new();
@@ -144,20 +141,30 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         output_lines.push(l.to_string());
     }
     output_lines.push(String::new());
-    output_scroll = output_lines.len().saturating_sub(1);
+    // output_scroll уже usize::MAX (прилипить к низу) — нормализация в цикле
 
     // Главная петля событий
     while !should_quit {
         // Снапшот layout — нужен для hit-testing мыши
         let term_size = terminal.size().unwrap_or_default();
         let layout_snapshot = compute_layout(Rect::new(0, 0, term_size.width, term_size.height));
+        // Нормализация скролла: сентинел usize::MAX / перелимит → точный bottom-offset.
+        // Wrap-оценка: строки длиннее ширины панели занимают >1 рендер-строки.
+        {
+            let inner_w = layout_snapshot.chat_area.width.saturating_sub(2).max(1) as usize;
+            let inner_h = layout_snapshot.chat_area.height.saturating_sub(2).max(1) as usize;
+            let bottom = chat_bottom_offset(&output_lines, inner_w, inner_h);
+            if output_scroll == usize::MAX || output_scroll > bottom {
+                output_scroll = bottom;
+            }
+        }
         let _ = terminal.draw(|f| {
             render_ui(
                 f,
                 &layout_snapshot,
                 &input_buf,
                 &output_lines,
-                &output_state,
+                output_scroll,
                 &notebooks,
                 &nb_state,
                 &notes_items,
@@ -208,7 +215,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                             }
                             Err(e) => output_lines.push(format!("❌ {e}")),
                         }
-                        output_scroll = output_lines.len().saturating_sub(1);
+                        output_scroll = usize::MAX; // прилипить к низу
                         Mode::Normal
                     }
                     NoteEditorResult::Cancel => Mode::Normal,
@@ -280,7 +287,6 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut input_history_idx,
                     &mut output_lines,
                     &mut output_scroll,
-                    &mut output_state,
                     &mut notebooks,
                     &mut notebook_ids,
                     &mut nb_state,
@@ -304,7 +310,6 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut input_history_idx,
                     &mut output_lines,
                     &mut output_scroll,
-                    &mut output_state,
                     &mut notebooks,
                     &mut notebook_ids,
                     &mut nb_state,
@@ -467,12 +472,36 @@ fn compute_layout(area: Rect) -> LayoutSnapshot {
 }
 
 #[allow(clippy::too_many_arguments)]
+
+// ---------------------------------------------------------------------------
+// v0.17.3-fix: Wrap-оценка высоты чата для скролла
+// ---------------------------------------------------------------------------
+
+/// Сколько рендер-строк займёт логическая строка при Wrap по ширине `width`.
+/// Оценка по chars().count() — точна для кириллицы/латиницы (глиф ≈ 1 колонка).
+fn wrapped_rows(line: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let len = line.chars().count();
+    if len == 0 {
+        return 1;
+    }
+    (len + width - 1) / width
+}
+
+/// Row-offset, при котором виден самый низ лога (с учётом Wrap и высоты панели).
+fn chat_bottom_offset(lines: &[String], width: usize, height: usize) -> usize {
+    let total_rows: usize = lines.iter().map(|l| wrapped_rows(l, width)).sum();
+    total_rows.saturating_sub(height)
+}
+
 fn render_ui(
     f: &mut ratatui::Frame,
     layout: &LayoutSnapshot,
     input_buf: &str,
     output_lines: &[String],
-    output_state: &ListState,
+    output_scroll: usize,
     notebooks: &[String],
     nb_state: &ListState,
     notes_items: &[String],
@@ -515,7 +544,12 @@ fn render_ui(
     let chat_inner = chat_block.inner(layout.chat_area);
     // Рендерим текст как один Paragraph (с Wrap)
     let chat_text = output_lines.join("\n");
-    let chat_para = Paragraph::new(chat_text).wrap(Wrap { trim: false });
+    // v0.17.3-fix: скролл чата теперь применяется к Paragraph (раньше значение
+    // писалось, но не читалось — чат не прокручивался). Смещение в рендер-строках.
+    let scroll_rows = (output_scroll.min(u16::MAX as usize)) as u16;
+    let chat_para = Paragraph::new(chat_text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_rows, 0));
     f.render_widget(chat_para, chat_inner);
 
     // Drag-select overlay — рамка выделения
@@ -703,7 +737,6 @@ fn handle_key_event(
     input_history_idx: &mut Option<usize>,
     output_lines: &mut Vec<String>,
     output_scroll: &mut usize,
-    output_state: &mut ListState,
     notebooks: &mut Vec<String>,
     notebook_ids: &mut Vec<String>,
     nb_state: &mut ListState,
@@ -752,7 +785,7 @@ fn handle_key_event(
             } else {
                 output_lines.push("ℹ Нет выделения и нет последнего вывода".into());
             }
-            *output_scroll = output_lines.len().saturating_sub(1);
+            *output_scroll = usize::MAX; // прилипить к низу
         }
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
             // Ctrl+N: новая заметка (встроенный редактор)
@@ -785,7 +818,7 @@ fn handle_key_event(
                 }
                 Err(e) => output_lines.push(format!("❌ {e}")),
             }
-            *output_scroll = output_lines.len().saturating_sub(1);
+            *output_scroll = usize::MAX; // прилипить к низу
         }
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
             // Ctrl+E: редактировать выбранную заметку → открыть редактор
@@ -830,7 +863,7 @@ fn handle_key_event(
                                 }
                                 Err(e) => output_lines.push(format!("❌ {e}")),
                             }
-                            *output_scroll = output_lines.len().saturating_sub(1);
+                            *output_scroll = usize::MAX; // прилипить к низу
                         }
                     }
                 }
@@ -847,7 +880,7 @@ fn handle_key_event(
                                 }
                                 Err(e) => output_lines.push(format!("❌ {e}")),
                             }
-                            *output_scroll = output_lines.len().saturating_sub(1);
+                            *output_scroll = usize::MAX; // прилипить к низу
                         }
                     }
                 }
@@ -871,7 +904,7 @@ fn handle_key_event(
                                 Err(e) => output_lines.push(format!("❌ {e}")),
                             }
                             refresh_sources_list(state, sources_items);
-                            *output_scroll = output_lines.len().saturating_sub(1);
+                            *output_scroll = usize::MAX; // прилипить к низу
                         }
                     }
                 }
@@ -910,7 +943,7 @@ fn handle_key_event(
                     }
                 }
             }
-            *output_scroll = output_lines.len().saturating_sub(1);
+            *output_scroll = usize::MAX; // прилипить к низу
         }
         (KeyCode::Char('?'), _) => {
             // ? palette
@@ -940,14 +973,14 @@ fn handle_key_event(
                 }
                 *notebooks = new_list;
             }
-            *output_scroll = output_lines.len().saturating_sub(1);
+            *output_scroll = usize::MAX; // прилипить к низу
         }
         (KeyCode::PageUp, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
             *output_scroll = output_scroll.saturating_sub(5);
         }
         (KeyCode::PageDown, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
-            let max = output_lines.len().saturating_sub(1);
-            *output_scroll = (*output_scroll + 5).min(max);
+            // клампит нормализация в главном цикле (bottom-offset с учётом Wrap)
+            *output_scroll = (*output_scroll).saturating_add(5);
         }
         (KeyCode::Up, _) if matches!(focus, Focus::Input) => {
             if !input_history.is_empty() {
@@ -1041,7 +1074,7 @@ fn handle_key_event(
                         output_lines.push(l.to_string());
                     }
                     output_lines.push(String::new());
-                    *output_scroll = output_lines.len().saturating_sub(1);
+                    *output_scroll = usize::MAX; // прилипить к низу
                 }
             }
         }
@@ -1135,7 +1168,6 @@ fn handle_mouse_event(
     input_history_idx: &mut Option<usize>,
     output_lines: &mut Vec<String>,
     output_scroll: &mut usize,
-    _output_state: &mut ListState,
     notebooks: &mut Vec<String>,
     notebook_ids: &mut Vec<String>,
     nb_state: &mut ListState,
@@ -1184,7 +1216,7 @@ fn handle_mouse_event(
                             )),
                             Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
                         }
-                        *output_scroll = output_lines.len().saturating_sub(1);
+                        *output_scroll = usize::MAX; // прилипить к низу
                     } else {
                         // Это был одиночный клик — обрабатываем как клик
                         handle_single_click(
@@ -1251,11 +1283,11 @@ fn handle_mouse_event(
                             match crate::sources::open_source(conn, id) {
                                 Ok(()) => {
                                     output_lines.push(format!("✓ #{id}: отправлено в xdg-open"));
-                                    *output_scroll = output_lines.len().saturating_sub(1);
+                                    *output_scroll = usize::MAX; // прилипить к низу
                                 }
                                 Err(e) => {
                                     output_lines.push(format!("❌ {e}"));
-                                    *output_scroll = output_lines.len().saturating_sub(1);
+                                    *output_scroll = usize::MAX; // прилипить к низу
                                 }
                             }
                         }
@@ -1301,7 +1333,7 @@ fn handle_single_click(
                 let id = notebook_ids[local_row].clone();
                 state.set_active_notebook(Some(id.clone()));
                 output_lines.push(format!("✓ Активирован ноутбук {} ({})", local_row + 1, &id[..id.len().min(8)]));
-                *output_scroll = output_lines.len().saturating_sub(1);
+                *output_scroll = usize::MAX; // прилипить к низу
                 // Двойной клик → nlm sync <id>
                 let now = Instant::now();
                 let is_double = last_click_time
@@ -1315,7 +1347,7 @@ fn handle_single_click(
                             output_lines.push(l.to_string());
                         }
                         output_lines.push(String::new());
-                        *output_scroll = output_lines.len().saturating_sub(1);
+                        *output_scroll = usize::MAX; // прилипить к низу
                     }
                 }
                 *last_click_time = Some(now);
