@@ -90,7 +90,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
             }
         }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.17.1 — TUI Redesign + Companion Bridge: MiMo Code-style 4-pane + mouse + CRUD + оф. NotebookLM API I/O)",
+            "poler-engine {} (poler-shell v0.17.3 — TUI Redesign + Companion Bridge M2+M3+M4: real GcpEnterpriseProvider calls + HybridProvider routing + TUI Enter-handler + оф. NotebookLM API I/O)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -1751,7 +1751,7 @@ mod tests {
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("0.17.1"));
+                assert!(out.contains("0.17.3"));
                 assert!(out.contains("poler-shell"));
             }
             _ => panic!(),
@@ -1765,7 +1765,7 @@ mod tests {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("0.17.1")),
+            CmdResult::Done(out) => assert!(out.contains("0.17.3")),
             _ => panic!(),
         }
     }

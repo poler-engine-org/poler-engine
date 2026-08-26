@@ -27,11 +27,16 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{read_http_head, tokens_path, write_http_response, GoogleHttp};
+use super::{gcp_tokens_path, read_http_head, tokens_path, write_http_response, GoogleHttp};
 use crate::web::cdp::random_key_16;
 
 pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 pub const DRIVE_READONLY: &str = "https://www.googleapis.com/auth/drive.readonly";
+
+/// Cloud-platform — «корневой» скоуп GCP, даёт доступ к Discovery Engine API
+/// (NotebookLM Enterprise). Применяется ТОЛЬКО для `GcpEnterpriseProvider` и
+/// хранится отдельно в `gcp_tokens.json`, чтобы не смешивать с Gmail/Drive.
+pub const CLOUD_PLATFORM: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// Consent-эндпоинт (переопределяется POLER_GOOGLE_AUTH_URI для тестов).
 pub fn auth_uri() -> String {
@@ -382,6 +387,43 @@ pub fn load_tokens() -> Result<StoredTokens, String> {
 }
 
 // ---------------------------------------------------------------------------
+// GCP-токены (cloud-platform scope, отдельный файл gcp_tokens.json)
+// ---------------------------------------------------------------------------
+
+/// Сохранить GCP-токены в `gcp_tokens.json`.
+pub fn save_gcp_tokens(t: &StoredTokens) -> Result<PathBuf, String> {
+    let p = gcp_tokens_path();
+    save_tokens_at(&p, t)?;
+    Ok(p)
+}
+
+/// Загрузить GCP-токены из `gcp_tokens.json`.
+pub fn load_gcp_tokens() -> Result<StoredTokens, String> {
+    let p = gcp_tokens_path();
+    let text = std::fs::read_to_string(&p).map_err(|_| {
+        format!(
+            "GCP-токены не найдены ({}). Выполни один раз: poler-engine --gcp-auth\n\
+             Это запустит OAuth с скоупом cloud-platform (нужен для NotebookLM Enterprise API).",
+            p.display()
+        )
+    })?;
+    serde_json::from_str(&text).map_err(|e| format!("GCP-токены повреждены: {e}"))
+}
+
+/// Загрузить GCP-токены и при необходимости тихо обновить (через GoogleHttp
+/// с тем же client_secret). Сохраняет свежие токены обратно в gcp_tokens.json.
+pub fn ensure_gcp_fresh(http: &mut GoogleHttp) -> Result<StoredTokens, String> {
+    let tokens = load_gcp_tokens()?;
+    if !tokens.needs_refresh() {
+        return Ok(tokens);
+    }
+    let (secret, _) = load_client_secret()?;
+    let fresh = refresh_tokens(http, &secret, &tokens)?;
+    save_gcp_tokens(&fresh)?;
+    Ok(fresh)
+}
+
+// ---------------------------------------------------------------------------
 // обмен кода и обновление токенов (HTTPS делает google-браузер)
 // ---------------------------------------------------------------------------
 
@@ -550,6 +592,62 @@ pub fn run_auth(extra_scopes: &[String]) -> Result<StoredTokens, String> {
          (приложение «{}»)",
         secret.client_id.split('-').next().unwrap_or("poler-engine")
     );
+    Ok(tokens)
+}
+
+// ---------------------------------------------------------------------------
+// GCP-авторизация (CLI --gcp-auth) — cloud-platform scope для Companion Bridge
+// ---------------------------------------------------------------------------
+
+/// Запустить OAuth-поток для GCP (скоуп `cloud-platform`).
+///
+/// Токены сохраняются в `gcp_tokens.json` отдельно от `google_tokens.json`:
+/// так пользователь может отозвать GCP-доступ, не затрагивая Gmail/Drive.
+///
+/// **Важно:** Google Cloud Console → OAuth consent screen → Test users
+/// должен содержать твой email. Иначе будет 403 access_denied.
+pub fn run_gcp_auth() -> Result<StoredTokens, String> {
+    let (secret, secret_path) = load_client_secret()?;
+    let scopes: Vec<String> = vec![CLOUD_PLATFORM.to_string()];
+    let scope_refs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
+
+    let state = random_state();
+    let lb = start_loopback()?;
+    let url = build_auth_url(&secret.client_id, &lb.redirect_uri, &scope_refs, &state);
+
+    println!("poler gcp-auth: OAuth 2.0 loopback для Companion Bridge (NotebookLM Enterprise API)");
+    println!("client_secret: {}", secret_path.display());
+    println!("скоупы: {}", scopes.join(" "));
+    println!();
+    println!("Этот скоуп даёт доступ к Discovery Engine API (NotebookLM Enterprise).");
+    println!("Токены сохраняются отдельно в gcp_tokens.json — отозвать можно будет");
+    println!("независимо от Gmail/Drive-доступа на myaccount.google.com/permissions.");
+    println!();
+    println!("Открываю браузер для согласия Google…");
+    println!("Если окно не открылось — скопируй URL вручную:");
+    println!();
+    println!("{url}");
+    println!();
+    super::open_in_user_browser(&url);
+
+    let code = wait_for_code(lb.listener, &state, Duration::from_secs(180))?;
+
+    // HTTPS-обмен делает google-браузер движка (TLS бесплатно)
+    let mut http = GoogleHttp::connect(super::google_cdp_port())?;
+    let tokens = exchange_code(&mut http, &secret, &code, &lb.redirect_uri)?;
+    let path = save_gcp_tokens(&tokens)?;
+    println!("GCP-токены сохранены: {} (права 0600)", path.display());
+    println!(
+        "Отзыв в любой момент: https://myaccount.google.com/permissions \
+         (приложение «{}»)",
+        secret.client_id.split('-').next().unwrap_or("poler-engine")
+    );
+    println!();
+    println!("Теперь доступны:");
+    println!("  poler-engine --gcp-status");
+    println!("  poler-engine --nlm-upload <NB_ID> <PATH>   # POST sources:uploadFile");
+    println!("  poler-engine --nlm-aoview <NB_ID>          # POST audioOverviews");
+    println!("  poler-engine --nlm-aodel <NB_ID>           # DELETE audioOverviews/default");
     Ok(tokens)
 }
 

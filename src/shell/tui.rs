@@ -1,4 +1,4 @@
-//! # poler-shell TUI v0.17.1 — MiMo Code-style 4-pane Dashboard + Companion Bridge
+//! # poler-shell TUI v0.17.3 — MiMo Code-style 4-pane Dashboard + Companion Bridge (M2+M3+M4)
 //!
 //! Полная переработка TUI: 4-панельный layout с поддержкой мыши,
 //! drag-select, встроенным редактором заметок (tui-textarea) и
@@ -15,7 +15,7 @@
 //! │              │ • ↑/↓ history • Tab completion     │ SOURCES CRUD │
 //! │              │ • Enter — выполнить              │ • list/add/rm│
 //! ├──────────────┴──────────────────────────────────┴──────────────┤
-//! │ poler-shell 0.17.1  db:web-index.db  fmt:md  top:10  F2:Chat   │
+//! │ poler-shell 0.17.3  db:web-index.db  fmt:md  top:10  F2:Chat   │
 //! └────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -23,14 +23,27 @@
 //! - **Tab/BackTab** — смена фокуса между панелями
 //! - **↑/↓** — навигация в списках / история ввода
 //! - **PgUp/PgDn** — прокрутка Chat panel
-//! - **Enter** — выполнить команду
+//! - **Enter** — выполнить команду (Input) / открыть источник (Sources)
 //! - **Ctrl+N** — новая заметка (встроенный tui-textarea редактор)
 //! - **Ctrl+S** — сохранить последний AI-ответ как заметку
 //! - **Ctrl+Y** — копировать текущее выделение в буфер
 //! - **?** — палитра 10 сценариев
 //! - **Ctrl+E** — редактировать выделенную заметку
 //! - **Ctrl+D** — удалить выделенную заметку/источник (с подтверждением)
+//! - **Ctrl+T** — тестировать выбранный источник (Sources panel)
 //! - **Esc / Ctrl+C** — выход
+//!
+//! ## M4: Enter-handler на источнике (Sources panel)
+//!
+//! Источник из `poler_sources` (file/url/repo) маппится в
+//! `companion::SourceKind` и через `enter_action()` превращается в
+//! `EnterAction`:
+//!
+//! | Источник | SourceKind | EnterAction |
+//! |---|---|---|
+//! | `file` (`/path/to/x.md`) | `FileUpload { local_path }` | `EditLocal(path)` → `$EDITOR` |
+//! | `url`  (`https://...`) | `Web { url }` | `OpenUrl(url)` → `xdg-open` |
+//! | `repo` (`owner/name`) | `Web { "https://github.com/{owner/name}" }` | `OpenUrl` |
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -85,7 +98,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     let mut input_history: Vec<String> = Vec::new();
     let mut input_history_idx: Option<usize> = None;
     let mut output_lines: Vec<String> = vec![
-        "poler-shell TUI Dashboard v0.17.1 — MiMo Code-style + Companion Bridge".into(),
+        "poler-shell TUI Dashboard v0.17.3 — MiMo Code-style + Companion Bridge (M2+M3+M4)".into(),
         "  ↑↓ — история ввода; Enter — выполнить; Tab — сменить фокус; Esc — выход".into(),
         "  Ctrl+N — новая заметка; Ctrl+S — сохранить AI-ответ; ? — палитра".into(),
         "  Drag мышью по Chat panel → Ctrl+Y → буфер обмена".into(),
@@ -864,6 +877,41 @@ fn handle_key_event(
                 }
             }
         }
+        (KeyCode::Enter, _) if matches!(focus, Focus::Sources) => {
+            // M4: Enter-handler на источнике → companion::SourceKind::enter_action.
+            // Источник из poler_sources маппится в SourceKind Companion Bridge:
+            //   File  → FileUpload { local_path } → EditLocal(path)
+            //   Url   → Web { url } → OpenUrl(url)
+            //   Repo  → Web { "https://github.com/{value}" } → OpenUrl
+            if let Some(idx) = sources_state.selected() {
+                if let Ok(conn) = state.ensure_sources_conn() {
+                    let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
+                    if idx < all.len() {
+                        let src = &all[idx];
+                        let kind = match src.kind {
+                            crate::sources::SourceKind::File => {
+                                crate::google::companion::SourceKind::FileUpload {
+                                    local_path: src.value.clone(),
+                                }
+                            }
+                            crate::sources::SourceKind::Url => {
+                                crate::google::companion::SourceKind::Web {
+                                    url: src.value.clone(),
+                                }
+                            }
+                            crate::sources::SourceKind::Repo => {
+                                crate::google::companion::SourceKind::Web {
+                                    url: format!("https://github.com/{}", src.value),
+                                }
+                            }
+                        };
+                        let action = kind.enter_action(&src.id.to_string());
+                        execute_enter_action(&action, output_lines);
+                    }
+                }
+            }
+            *output_scroll = output_lines.len().saturating_sub(1);
+        }
         (KeyCode::Char('?'), _) => {
             // ? palette
             *mode = Mode::Palette;
@@ -999,6 +1047,82 @@ fn handle_key_event(
         }
         _ => {}
     }
+}
+
+/// M4: Выполнить `companion::EnterAction` для источника из poler_sources.
+///
+/// | EnterAction | Действие |
+/// |---|---|
+/// | `OpenUrl(url)` | `crate::google::open_in_user_browser(url)` (xdg-open) |
+/// | `EditLocal(path)` | spawn `$EDITOR` с локальным файлом (fire-and-forget) |
+/// | `EditTemp { content, filename }` | записать в `/tmp/{filename}` + spawn `$EDITOR` |
+/// | `FallbackFetch { src_id }` | сообщение: HybridProvider.get_source_content ещё skeleton |
+///
+/// TUI raw-mode остаётся активным — spawned editor открывается в отдельном
+/// процессе; для интерактивного редактирования пользователь переключается
+/// на него (Ctrl+Z в большинстве терминалов), либо завершает TUI и
+/// повторно открывает. Это сознательное упрощение M4: интегрировать
+/// `tui-textarea` как viewer произвольных файлов — отдельная задача.
+fn execute_enter_action(
+    action: &crate::google::companion::EnterAction,
+    output_lines: &mut Vec<String>,
+) {
+    use crate::google::companion::EnterAction;
+    match action {
+        EnterAction::OpenUrl(url) => {
+            crate::google::open_in_user_browser(url);
+            output_lines.push(format!("→ открыть в браузере: {}", url));
+        }
+        EnterAction::EditLocal(path) => {
+            if !std::path::Path::new(path).exists() {
+                output_lines.push(format!("❌ файл не найден: {}", path));
+                return;
+            }
+            spawn_editor(path);
+            output_lines.push(format!(
+                "→ открыть в $EDITOR ({}): {}",
+                std::env::var("EDITOR").unwrap_or_else(|_| "(nano)".into()),
+                path
+            ));
+        }
+        EnterAction::EditTemp {
+            content,
+            suggested_filename,
+        } => {
+            let tmp = std::env::temp_dir().join(suggested_filename);
+            if let Err(e) = std::fs::write(&tmp, content) {
+                output_lines.push(format!(
+                    "❌ не удалось записать {}: {}",
+                    tmp.display(),
+                    e
+                ));
+                return;
+            }
+            let s = tmp.to_string_lossy().to_string();
+            spawn_editor(&s);
+            output_lines.push(format!("→ открыть в $EDITOR (temp): {}", s));
+        }
+        EnterAction::FallbackFetch { src_id } => {
+            output_lines.push(format!(
+                "↻ источник #{}: тип неизвестен. HybridProvider.get_source_content ещё skeleton — \
+                 M5/M6 добавит CdpBatchexecuteProvider.get_source_content (batchexecute hizoJc).",
+                src_id
+            ));
+        }
+    }
+}
+
+/// Spawn `$EDITOR` (fallback `nano`) с путём. Fire-and-forget: не блокирует
+/// TUI, но оставляет child-процесс запущенным. Пользователь переключается
+/// вручную (терминальный Ctrl+Z или открытие нового окна терминала).
+fn spawn_editor(path: &str) {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
+    let _ = std::process::Command::new(&editor)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 #[allow(clippy::too_many_arguments)]

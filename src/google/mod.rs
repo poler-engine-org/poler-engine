@@ -58,6 +58,20 @@ pub fn tokens_path() -> PathBuf {
     config_dir().join("google_tokens.json")
 }
 
+/// Путь к файлу GCP-токенов (скоуп `cloud-platform` для NotebookLM Enterprise API):
+/// `$POLER_GCP_TOKENS` → конфиг/gcp_tokens.json.
+///
+/// Отдельный файл от `google_tokens.json`, чтобы:
+/// 1. Не требовать повторный consent от пользователя при добавлении скоупа в существующий набор.
+/// 2. Изолировать более привилегированный токен (cloud-platform даёт доступ ко всему GCP).
+/// 3. Дать возможность отозвать только GCP-доступ, не затрагивая Gmail/Drive.
+pub fn gcp_tokens_path() -> PathBuf {
+    if let Ok(p) = std::env::var("POLER_GCP_TOKENS") {
+        return PathBuf::from(p);
+    }
+    config_dir().join("gcp_tokens.json")
+}
+
 /// Персистентный профиль браузера: `$POLER_GOOGLE_PROFILE` →
 /// `~/.cache/poler-engine/google-profile`. Здесь живут куки Google-сессии
 /// (NotebookLM и др.) между запусками.

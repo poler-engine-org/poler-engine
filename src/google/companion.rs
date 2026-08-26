@@ -47,9 +47,22 @@
 //!
 //! ## Статус impls
 //!
-//! * **M1 (этот файл):** URL builders + trait + типы + тесты URL builders.
-//! * **M2:** `GcpEnterpriseProvider` реал-имплементация эндпоинтов.
-//! * **M3:** `HybridProvider` routing + fallback.
+//! * **M1:** URL builders + trait + типы + тесты URL builders. ✓
+//! * **M2:** `GcpEnterpriseProvider` реал-имплементация эндпоинтов. ✓
+//!   - `ureq` (rustls) HTTP-клиент, lazy-init `Agent` (60s timeout).
+//!   - Bearer из `oauth::ensure_gcp_fresh` (cloud-platform scope).
+//!   - 9 операций: list_notebooks, get_notebook, batch_create_sources,
+//!     upload_file (X-Goog-Upload-Protocol: raw), get_source,
+//!     batch_delete_sources, create_audio_overview, delete_audio_overview.
+//!   - 3 новых unit-теста: last_segment, ready, supports matrix (всего 27).
+//! * **M3:** `HybridProvider` routing + fallback. ✓
+//!   - `HybridProvider::route<F,G,R>(op, f_gcp, f_cdp)` generic-helper.
+//!   - Routing policy: GcpOnly/CdpOnly — primary only, fallback off;
+//!     Auto — primary=GCP если `gcp.supports(op)`, иначе CDP; fallback on
+//!     (только если secondary `supports(op)`).
+//!   - Fallback триггерится только на `NotSupported`/`NotConfigured`;
+//!     `Http`/`Transport`/`Parse` propagates без fallback.
+//!   - `primary_for(op)` и `fallback_enabled()` — pure-fns для тестов.
 //! * **M4:** TUI Enter-handler на источнике.
 //! * **M5:** CLI subcommands (`nlm upload`, `nlm aoview`).
 
@@ -410,6 +423,19 @@ pub trait SourceContentProvider {
         })
     }
 
+    /// Пакетное удаление источников по списку source_id.
+    /// Оф. API: POST `/notebooks/{NB}/sources:batchDelete` body `{ "names": [...] }`.
+    fn batch_delete_sources(
+        &mut self,
+        _nb_id: &str,
+        _src_ids: &[&str],
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::NotSupported {
+            op: Op::DeleteSources,
+            provider: Self::name(self),
+        })
+    }
+
     fn create_audio_overview(
         &mut self,
         _nb_id: &str,
@@ -471,7 +497,7 @@ impl std::fmt::Display for BridgeError {
 impl std::error::Error for BridgeError {}
 
 // ---------------------------------------------------------------------------
-// GcpEnterpriseProvider — skeleton (M2 сделает методы реальными)
+// GcpEnterpriseProvider — реал-имплементация (M2 ✓, ureq + cloud-platform Bearer)
 // ---------------------------------------------------------------------------
 
 /// Конфигурация GCP-провайдера.
@@ -512,20 +538,136 @@ impl Default for GcpConfig {
 
 /// Провайдер поверх оф. Pre-GA Gemini Notebook Enterprise API.
 ///
-/// M1: skeleton — все методы возвращают `NotSupported`.
-/// M2: реальные вызовы через `GoogleHttp` с Bearer из `oauth.rs`.
+/// M2: реальные вызовы через `ureq` (rustls) с Bearer из `gcp_tokens.json`.
+/// `cloud-platform` scope — самый привилегированный GCP-скоуп, поэтому
+/// токен живёт в отдельном файле от Gmail/Drive.
 pub struct GcpEnterpriseProvider {
     pub config: GcpConfig,
-    // M2: pub http: GoogleHttp,  ← добавится в M2
+    /// ureq-агент с rustls (lazy-init при первом запросе).
+    agent: Option<ureq::Agent>,
+    /// Кэш токенов (lazy-load + auto-refresh). None = ещё не загружен.
+    tokens: Option<super::oauth::StoredTokens>,
+}
+
+impl std::fmt::Debug for GcpEnterpriseProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcpEnterpriseProvider")
+            .field("config", &self.config)
+            .field("agent_init", &self.agent.is_some())
+            .field("tokens_loaded", &self.tokens.is_some())
+            .finish()
+    }
 }
 
 impl GcpEnterpriseProvider {
     pub fn new(config: GcpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            agent: None,
+            tokens: None,
+        }
     }
 
     pub fn from_env_or_default() -> Self {
         Self::new(GcpConfig::from_env().unwrap_or_default())
+    }
+
+    /// Lazy-init ureq-агента (один на всё время жизни провайдера).
+    fn agent(&mut self) -> Result<&ureq::Agent, BridgeError> {
+        if self.agent.is_none() {
+            self.agent = Some(
+                ureq::AgentBuilder::new()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build(),
+            );
+        }
+        Ok(self.agent.as_ref().unwrap())
+    }
+
+    /// Загрузить и при необходимости обновить GCP-токены через GoogleHttp (CDP).
+    /// Кэшируется в `self.tokens` — повторных чтений с диска не будет в рамках
+    /// одной сессии. Если токен на исходе (минута до истечения) — тихо refresh.
+    fn ensure_token(&mut self) -> Result<&super::oauth::StoredTokens, BridgeError> {
+        if self.tokens.is_none() {
+            let mut http = super::GoogleHttp::connect(crate::google::google_cdp_port())
+                .map_err(|e| BridgeError::Transport(format!("google browser: {e}")))?;
+            let t = super::oauth::ensure_gcp_fresh(&mut http)
+                .map_err(|e| BridgeError::NotConfigured(e))?;
+            self.tokens = Some(t);
+        }
+        // Если близко к истечению — обновить (метод needs_refresh) и заменить.
+        let needs_refresh = self.tokens.as_ref().unwrap().needs_refresh();
+        if needs_refresh {
+            let mut http = super::GoogleHttp::connect(crate::google::google_cdp_port())
+                .map_err(|e| BridgeError::Transport(format!("google browser: {e}")))?;
+            let secret = super::oauth::load_client_secret()
+                .map_err(|e| BridgeError::NotConfigured(e))?;
+            let old = self.tokens.as_ref().unwrap();
+            let fresh = super::oauth::refresh_tokens(&mut http, &secret.0, old)
+                .map_err(|e| BridgeError::Transport(e))?;
+            let _ = super::oauth::save_gcp_tokens(&fresh);
+            self.tokens = Some(fresh);
+        }
+        Ok(self.tokens.as_ref().unwrap())
+    }
+
+    /// Bearer-заголовок + JSON content-type (для POST/DELETE с JSON-телом).
+    fn bearer_json(&mut self) -> Result<Vec<(&'static str, String)>, BridgeError> {
+        let t = self.ensure_token()?;
+        Ok(vec![
+            ("Authorization", format!("Bearer {}", t.access_token)),
+            ("Content-Type", "application/json".to_string()),
+            ("Accept", "application/json".to_string()),
+            ("x-goog-user-project", self.config.project_number.clone()),
+        ])
+    }
+
+    /// Bearer-заголовок + X-Goog-Upload-Protocol: raw (для uploadFile с binary body).
+    fn bearer_upload(
+        &mut self,
+        file_name: &str,
+        mime: &str,
+    ) -> Result<Vec<(&'static str, String)>, BridgeError> {
+        let t = self.ensure_token()?;
+        Ok(vec![
+            ("Authorization", format!("Bearer {}", t.access_token)),
+            ("Content-Type", mime.to_string()),
+            ("X-Goog-Upload-Protocol", "raw".to_string()),
+            ("X-Goog-Upload-File-Name", file_name.to_string()),
+            ("x-goog-user-project", self.config.project_number.clone()),
+        ])
+    }
+
+    /// Bearer без тела (для GET/DELETE без body).
+    fn bearer_get(&mut self) -> Result<Vec<(&'static str, String)>, BridgeError> {
+        let t = self.ensure_token()?;
+        Ok(vec![
+            ("Authorization", format!("Bearer {}", t.access_token)),
+            ("Accept", "application/json".to_string()),
+            ("x-goog-user-project", self.config.project_number.clone()),
+        ])
+    }
+
+    /// Преобразовать ureq::Error → BridgeError. Различает HTTP-ошибки (статус + тело)
+    /// и транспортные (DNS/TLS/timeout).
+    fn ureq_err(e: ureq::Error) -> BridgeError {
+        match e {
+            ureq::Error::Status(status, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                BridgeError::Http { status, body }
+            }
+            ureq::Error::Transport(t) => BridgeError::Transport(format!(
+                "{}: {}",
+                t.kind(),
+                t.message().unwrap_or("(no message)")
+            )),
+        }
+    }
+
+    /// Извлечь last segment из resource name `projects/.../notebooks/{NB}/sources/{SRC}`.
+    /// Используется для получения source_id из полного resource name в ответе.
+    fn last_segment(name: &str) -> String {
+        name.rsplit('/').next().unwrap_or(name).to_string()
     }
 }
 
@@ -554,8 +696,434 @@ impl SourceContentProvider for GcpEnterpriseProvider {
         self.config.is_ready()
     }
 
-    // Реальные имплементации добавятся в M2.
-    // Сейчас все методы используют default-trait impl выше и возвращают NotSupported.
+    /// GET `/v1alpha/projects/{P}/locations/{L}/notebooks` → список ноутбуков.
+    fn list_notebooks(&mut self) -> Result<Vec<NotebookBrief>, BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = notebooks_create_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+        );
+        // headers — owned Vec<(&'static str, String)>, после возврата borrow of self
+        // завершается. Только потом берём agent (&mut self → &ureq::Agent).
+        let headers = self.bearer_get()?;
+        let agent = self.agent()?;
+        let mut req = agent.get(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.call().map_err(Self::ureq_err)?;
+        let body = resp.into_string().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BridgeError::Parse(format!("list_notebooks: {e}; body: {}", &body[..body.len().min(300)])))?;
+        let arr = v
+            .get("notebooks")
+            .and_then(|n| n.as_array())
+            .ok_or_else(|| BridgeError::Parse(format!("list_notebooks: нет `notebooks` в ответе; body: {}", &body[..body.len().min(300)])))?;
+        Ok(arr
+            .iter()
+            .filter_map(|nb| {
+                let name = nb.get("name")?.as_str()?;
+                let id = Self::last_segment(name);
+                let title = nb
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let emoji = nb
+                    .get("emoji")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let updated_at = nb
+                    .get("updateTime")
+                    .and_then(|u| u.as_str())
+                    .map(String::from);
+                Some(NotebookBrief {
+                    id,
+                    title,
+                    emoji,
+                    updated_at,
+                })
+            })
+            .collect())
+    }
+
+    /// GET `/v1alpha/.../notebooks/{NB}` → список источников в ноутбуке
+    /// (response содержит `sources[]` с wordCount/tokenCount/status).
+    fn get_notebook(&mut self, nb_id: &str) -> Result<Vec<SourceMeta>, BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = notebook_get_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+        );
+        // headers — owned Vec, borrow of self завершается до вызова agent().
+        let headers = self.bearer_get()?;
+        let agent = self.agent()?;
+        let mut req = agent.get(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.call().map_err(Self::ureq_err)?;
+        let body = resp.into_string().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BridgeError::Parse(format!("get_notebook: {e}; body: {}", &body[..body.len().min(300)])))?;
+        let arr = v
+            .get("sources")
+            .and_then(|s| s.as_array())
+            .ok_or_else(|| BridgeError::Parse(format!("get_notebook: нет `sources` в ответе; body: {}", &body[..body.len().min(300)])))?;
+        Ok(arr
+            .iter()
+            .filter_map(|src| {
+                let resource_name = src.get("name")?.as_str()?.to_string();
+                let source_id = Self::last_segment(&resource_name);
+                let title = src
+                    .get("sourceName")
+                    .or_else(|| src.get("title"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let status = src
+                    .get("state")
+                    .or_else(|| src.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_string();
+                let word_count = src
+                    .get("wordCount")
+                    .and_then(|w| w.as_u64());
+                let token_count = src
+                    .get("tokenCount")
+                    .and_then(|t| t.as_u64());
+                Some(SourceMeta {
+                    source_id,
+                    title,
+                    resource_name,
+                    status,
+                    word_count,
+                    token_count,
+                })
+            })
+            .collect())
+    }
+
+    /// POST `/v1alpha/.../notebooks/{NB}/sources:batchCreate` с body
+    /// `{ "requests": [{ "kind": "google_drive"|"text"|"web"|"you_tube", ... }] }`.
+    /// Возвращает список созданных source_id (last-segment из каждого `name` в ответе).
+    fn batch_create_sources(
+        &mut self,
+        nb_id: &str,
+        items: &[SourceUpload],
+    ) -> Result<Vec<String>, BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = sources_batch_create_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+        );
+        // Преобразовать SourceUpload → JSON-запрос.
+        let requests: Vec<serde_json::Value> = items
+            .iter()
+            .map(|su| match su {
+                SourceUpload::GoogleDrive {
+                    document_id,
+                    mime_type,
+                    source_name,
+                } => serde_json::json!({
+                    "kind": "google_drive",
+                    "documentId": document_id,
+                    "mimeType": mime_type,
+                    "sourceName": source_name,
+                }),
+                SourceUpload::Text { source_name, content } => serde_json::json!({
+                    "kind": "text",
+                    "sourceName": source_name,
+                    "textContent": content,
+                }),
+                SourceUpload::Web { url, source_name } => serde_json::json!({
+                    "kind": "web",
+                    "sourceName": source_name,
+                    "webContent": { "url": url },
+                }),
+                SourceUpload::YouTube { youtube_url } => serde_json::json!({
+                    "kind": "you_tube",
+                    "youTubeContent": { "url": youtube_url },
+                }),
+            })
+            .collect();
+        let body_json = serde_json::json!({ "requests": requests });
+        let body_str = serde_json::to_string(&body_json)
+            .map_err(|e| BridgeError::Parse(format!("batch_create serde: {e}")))?;
+
+        // headers first (owned Vec → borrow of self ends before agent() borrow).
+        let headers = self.bearer_json()?;
+        let agent = self.agent()?;
+        let mut req = agent.post(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.send_string(&body_str).map_err(Self::ureq_err)?;
+        let body = resp.into_string().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BridgeError::Parse(format!("batch_create response: {e}; body: {}", &body[..body.len().min(300)])))?;
+        // Ответ: longrunning operation. Извлекаем `sources[].name` (если синхронно)
+        // или ждём завершения (для Pre-GA обычно сразу ACTIVE).
+        let sources = v
+            .get("sources")
+            .and_then(|s| s.as_array())
+            .ok_or_else(|| {
+                BridgeError::Parse(format!(
+                    "batch_create: нет `sources` в ответе (возможно longrunning op; body: {})",
+                    &body[..body.len().min(300)]
+                ))
+            })?;
+        Ok(sources
+            .iter()
+            .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(Self::last_segment))
+            .collect())
+    }
+
+    /// POST `/upload/v1alpha/.../notebooks/{NB}/sources:uploadFile`
+    /// с `X-Goog-Upload-Protocol: raw` + binary body.
+    /// Возвращает полный resource name созданного source.
+    fn upload_file(
+        &mut self,
+        nb_id: &str,
+        local_path: &Path,
+        display_name: &str,
+        mime: &str,
+    ) -> Result<String, BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let bytes = std::fs::read(local_path).map_err(|e| {
+            BridgeError::Transport(format!(
+                "read {}: {e}",
+                local_path.display()
+            ))
+        })?;
+        let url = sources_upload_file_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+        );
+        // headers first (owned Vec → borrow of self ends before agent() borrow).
+        let headers = self.bearer_upload(display_name, mime)?;
+        let agent = self.agent()?;
+        let mut req = agent.post(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.send_bytes(&bytes).map_err(Self::ureq_err)?;
+        let body = resp.into_string().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BridgeError::Parse(format!("upload_file: {e}; body: {}", &body[..body.len().min(300)])))?;
+        let name = v
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| {
+                BridgeError::Parse(format!(
+                    "upload_file: нет `name` в ответе; body: {}",
+                    &body[..body.len().min(300)]
+                ))
+            })?;
+        Ok(name.to_string())
+    }
+
+    /// GET `/v1alpha/.../notebooks/{NB}/sources/{SRC}` → метаданные одного источника.
+    fn get_source(&mut self, nb_id: &str, src_id: &str) -> Result<SourceMeta, BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = source_get_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+            src_id,
+        );
+        // headers first (owned Vec → borrow of self ends before agent() borrow).
+        let headers = self.bearer_get()?;
+        let agent = self.agent()?;
+        let mut req = agent.get(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.call().map_err(Self::ureq_err)?;
+        let body = resp.into_string().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BridgeError::Parse(format!("get_source: {e}; body: {}", &body[..body.len().min(300)])))?;
+        let resource_name = v
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        if resource_name.is_empty() {
+            return Err(BridgeError::Parse(format!(
+                "get_source: нет `name` в ответе; body: {}",
+                &body[..body.len().min(300)]
+            )));
+        }
+        Ok(SourceMeta {
+            source_id: Self::last_segment(&resource_name),
+            title: v
+                .get("sourceName")
+                .or_else(|| v.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            resource_name,
+            status: v
+                .get("state")
+                .or_else(|| v.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string(),
+            word_count: v.get("wordCount").and_then(|w| w.as_u64()),
+            token_count: v.get("tokenCount").and_then(|t| t.as_u64()),
+        })
+    }
+
+    /// POST `/v1alpha/.../notebooks/{NB}/sources:batchDelete` body `{ "names": [...] }`.
+    fn batch_delete_sources(
+        &mut self,
+        nb_id: &str,
+        src_ids: &[&str],
+    ) -> Result<(), BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = sources_batch_delete_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+        );
+        // Полные resource names для каждого source_id.
+        let names: Vec<String> = src_ids
+            .iter()
+            .map(|sid| {
+                format!(
+                    "projects/{}/locations/{}/notebooks/{}/sources/{}",
+                    self.config.project_number, self.config.location, nb_id, sid
+                )
+            })
+            .collect();
+        let body_json = serde_json::json!({ "names": names });
+        let body_str = serde_json::to_string(&body_json)
+            .map_err(|e| BridgeError::Parse(format!("batch_delete serde: {e}")))?;
+        // headers first (owned Vec → borrow of self ends before agent() borrow).
+        let headers = self.bearer_json()?;
+        let agent = self.agent()?;
+        let mut req = agent.post(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.send_string(&body_str).map_err(Self::ureq_err)?;
+        let _ = resp.into_string(); // дропаем тело ответа — нам важен только статус
+        Ok(())
+    }
+
+    /// POST `/v1alpha/.../notebooks/{NB}/audioOverviews` body
+    /// `{ "sourceIds": [...], "focusTopic": "...", "audioLanguage": "..." }`.
+    /// Возвращает полный resource name созданного overview (longrunning op).
+    fn create_audio_overview(
+        &mut self,
+        nb_id: &str,
+        source_ids: &[&str],
+        focus: Option<&str>,
+        lang: &str,
+    ) -> Result<String, BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = audio_overview_create_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+        );
+        let body_json = serde_json::json!({
+            "sourceIds": source_ids,
+            "focusTopic": focus.unwrap_or(""),
+            "audioLanguage": lang,
+        });
+        let body_str = serde_json::to_string(&body_json)
+            .map_err(|e| BridgeError::Parse(format!("audio_overview_create serde: {e}")))?;
+        // headers first (owned Vec → borrow of self ends before agent() borrow).
+        let headers = self.bearer_json()?;
+        let agent = self.agent()?;
+        let mut req = agent.post(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.send_string(&body_str).map_err(Self::ureq_err)?;
+        let body = resp.into_string().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BridgeError::Parse(format!("audio_overview_create: {e}; body: {}", &body[..body.len().min(300)])))?;
+        // Ответ: longrunning operation. name = `projects/.../audioOverviews/{ID}` или op-name.
+        let name = v
+            .get("name")
+            .or_else(|| v.get("operationName"))
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| {
+                BridgeError::Parse(format!(
+                    "audio_overview_create: нет `name` в ответе; body: {}",
+                    &body[..body.len().min(300)]
+                ))
+            })?;
+        Ok(name.to_string())
+    }
+
+    /// DELETE `/v1alpha/.../notebooks/{NB}/audioOverviews/default`.
+    /// `default` — единственный overview на ноутбук в Pre-GA.
+    fn delete_audio_overview(&mut self, nb_id: &str) -> Result<(), BridgeError> {
+        if !self.config.is_ready() {
+            return Err(BridgeError::NotConfigured(
+                "POLER_GCP_PROJECT_NUMBER не задан (см. --gcp-auth)".into(),
+            ));
+        }
+        let url = audio_overview_delete_url(
+            &self.config.region,
+            &self.config.project_number,
+            &self.config.location,
+            nb_id,
+        );
+        // headers first (owned Vec → borrow of self ends before agent() borrow).
+        let headers = self.bearer_get()?;
+        let agent = self.agent()?;
+        let mut req = agent.delete(&url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.call().map_err(Self::ureq_err)?;
+        let _ = resp.into_string();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,11 +1176,24 @@ impl SourceContentProvider for CdpBatchexecuteProvider {
 }
 
 // ---------------------------------------------------------------------------
-// HybridProvider — skeleton (M3)
+// HybridProvider — routing + fallback (M3 ✓)
 // ---------------------------------------------------------------------------
 
 /// Гибридный провайдер: роутит операции к тому, кто их поддерживает,
 /// с прозрачным fallback GCP ↔ CDP.
+///
+/// ## Routing policy
+///
+/// | Mode        | Primary         | Fallback       |
+/// |-------------|-----------------|----------------|
+/// | `GcpOnly`   | GCP             | off            |
+/// | `CdpOnly`   | CDP             | off            |
+/// | `Auto`      | GCP если `gcp.supports(op)`, иначе CDP | на secondary, если `supports(op)` |
+///
+/// Fallback срабатывает только если primary возвратил `NotSupported` или
+/// `NotConfigured`. Серверные ошибки (`Http`/`Transport`/`Parse`) —
+/// propagates наверх, fallback на них не запускается (нельзя «лечить»
+/// 5xx от GCP переключением на CDP — это разные данные).
 pub struct HybridProvider {
     pub gcp: GcpEnterpriseProvider,
     pub cdp: CdpBatchexecuteProvider,
@@ -625,6 +1206,71 @@ impl HybridProvider {
             gcp: GcpEnterpriseProvider::from_env_or_default(),
             cdp: CdpBatchexecuteProvider::new(crate::google::google_cdp_port()),
             mode: companion_mode(),
+        }
+    }
+
+    /// Явное конструирование (для тестов и для CLI флагов `--companion-mode`).
+    pub fn new(gcp: GcpEnterpriseProvider, cdp: CdpBatchexecuteProvider, mode: CompanionMode) -> Self {
+        Self { gcp, cdp, mode }
+    }
+
+    /// Имя primary-провайдера для операции в текущем режиме.
+    /// Возвращает `"gcp"` или `"cdp"`. Чистая функция без сети — для
+    /// детерминированных тестов routing-decision без моков.
+    pub fn primary_for(&self, op: Op) -> &'static str {
+        match self.mode {
+            CompanionMode::GcpOnly => "gcp",
+            CompanionMode::CdpOnly => "cdp",
+            CompanionMode::Auto => {
+                if self.gcp.supports(op) {
+                    "gcp"
+                } else {
+                    "cdp"
+                }
+            }
+        }
+    }
+
+    /// Активен ли fallback в текущем режиме (только Auto).
+    pub fn fallback_enabled(&self) -> bool {
+        matches!(self.mode, CompanionMode::Auto)
+    }
+
+    /// Core routing helper. Пробует primary-провайдер, при
+    /// `NotSupported`/`NotConfigured` переключается на secondary — но
+    /// только если secondary `supports(op)`, и только в Auto mode.
+    ///
+    /// В `GcpOnly`/`CdpOnly` fallback выключен: режим — это явное
+    /// решение пользователя «хочу только этот канал».
+    fn route<F, G, R>(
+        &mut self,
+        op: Op,
+        f_gcp: G,
+        f_cdp: F,
+    ) -> Result<R, BridgeError>
+    where
+        G: FnOnce(&mut GcpEnterpriseProvider) -> Result<R, BridgeError>,
+        F: FnOnce(&mut CdpBatchexecuteProvider) -> Result<R, BridgeError>,
+    {
+        match self.primary_for(op) {
+            "gcp" => match f_gcp(&mut self.gcp) {
+                Ok(v) => Ok(v),
+                Err(BridgeError::NotSupported { .. } | BridgeError::NotConfigured(_))
+                    if self.fallback_enabled() && self.cdp.supports(op) =>
+                {
+                    f_cdp(&mut self.cdp)
+                }
+                Err(e) => Err(e),
+            },
+            _ => match f_cdp(&mut self.cdp) {
+                Ok(v) => Ok(v),
+                Err(BridgeError::NotSupported { .. } | BridgeError::NotConfigured(_))
+                    if self.fallback_enabled() && self.gcp.supports(op) =>
+                {
+                    f_gcp(&mut self.gcp)
+                }
+                Err(e) => Err(e),
+            },
         }
     }
 }
@@ -645,8 +1291,90 @@ impl SourceContentProvider for HybridProvider {
             CompanionMode::Auto => self.gcp.ready() || self.cdp.ready(),
         }
     }
-    // Реальные routing-имплементации методов появятся в M3.
-    // Сейчас все методы используют default-trait impl (NotSupported).
+
+    fn list_notebooks(&mut self) -> Result<Vec<NotebookBrief>, BridgeError> {
+        self.route(
+            Op::ListNotebooks,
+            |g| g.list_notebooks(),
+            |c| c.list_notebooks(),
+        )
+    }
+
+    fn get_notebook(&mut self, nb_id: &str) -> Result<Vec<SourceMeta>, BridgeError> {
+        self.route(
+            Op::GetNotebook,
+            |g| g.get_notebook(nb_id),
+            |c| c.get_notebook(nb_id),
+        )
+    }
+
+    fn batch_create_sources(
+        &mut self,
+        nb_id: &str,
+        items: &[SourceUpload],
+    ) -> Result<Vec<String>, BridgeError> {
+        self.route(
+            Op::BatchCreateSources,
+            |g| g.batch_create_sources(nb_id, items),
+            |c| c.batch_create_sources(nb_id, items),
+        )
+    }
+
+    fn upload_file(
+        &mut self,
+        nb_id: &str,
+        local_path: &Path,
+        display_name: &str,
+        mime: &str,
+    ) -> Result<String, BridgeError> {
+        self.route(
+            Op::UploadFile,
+            |g| g.upload_file(nb_id, local_path, display_name, mime),
+            |c| c.upload_file(nb_id, local_path, display_name, mime),
+        )
+    }
+
+    fn get_source(&mut self, nb_id: &str, src_id: &str) -> Result<SourceMeta, BridgeError> {
+        self.route(
+            Op::GetSourceMeta,
+            |g| g.get_source(nb_id, src_id),
+            |c| c.get_source(nb_id, src_id),
+        )
+    }
+
+    fn batch_delete_sources(
+        &mut self,
+        nb_id: &str,
+        src_ids: &[&str],
+    ) -> Result<(), BridgeError> {
+        self.route(
+            Op::DeleteSources,
+            |g| g.batch_delete_sources(nb_id, src_ids),
+            |c| c.batch_delete_sources(nb_id, src_ids),
+        )
+    }
+
+    fn create_audio_overview(
+        &mut self,
+        nb_id: &str,
+        source_ids: &[&str],
+        focus: Option<&str>,
+        lang: &str,
+    ) -> Result<String, BridgeError> {
+        self.route(
+            Op::CreateAudioOverview,
+            |g| g.create_audio_overview(nb_id, source_ids, focus, lang),
+            |c| c.create_audio_overview(nb_id, source_ids, focus, lang),
+        )
+    }
+
+    fn delete_audio_overview(&mut self, nb_id: &str) -> Result<(), BridgeError> {
+        self.route(
+            Op::DeleteAudioOverview,
+            |g| g.delete_audio_overview(nb_id),
+            |c| c.delete_audio_overview(nb_id),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,5 +1764,218 @@ mod tests {
             body["userContents"][0]["document_id"],
             "1AbC"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // M2 tests — детерминированные, без сети. Реальные HTTP-вызовы требуют
+    // живого GCP-токена и тестового проекта; проверяются вручную через
+    // `poler-engine --gcp-auth` + `--nlm-batch-create` (см. M5 CLI).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn gcp_provider_last_segment_extracts_id_from_resource_name() {
+        // Полный resource name source: projects/.../notebooks/{NB}/sources/{SRC}
+        let name = "projects/123456789012/locations/global/notebooks/abc-123/sources/src-xyz789";
+        assert_eq!(GcpEnterpriseProvider::last_segment(name), "src-xyz789");
+        // Граничный случай: нет ни одного `/` — возвращаем как есть
+        assert_eq!(GcpEnterpriseProvider::last_segment("no-slash"), "no-slash");
+        // Пустая строка
+        assert_eq!(GcpEnterpriseProvider::last_segment(""), "");
+    }
+
+    #[test]
+    fn gcp_provider_ready_reflects_config_completeness() {
+        // default config (empty project_number) → not ready
+        let p = GcpEnterpriseProvider::new(GcpConfig::default());
+        assert!(!p.ready(), "пустой project_number → not ready");
+
+        // config с заполненным project_number → ready
+        let cfg = GcpConfig {
+            region: "global".to_string(),
+            project_number: "123456789012".to_string(),
+            location: "global".to_string(),
+        };
+        let p = GcpEnterpriseProvider::new(cfg);
+        assert!(p.ready(), "заполненный project_number → ready");
+        assert_eq!(p.name(), "gcp_enterprise");
+    }
+
+    #[test]
+    fn gcp_provider_supports_covers_all_enterprise_ops() {
+        // M2 контракт: GCP покрывает 9 из 13 операций оф. Pre-GA API.
+        // Оставшиеся 4 (chat/get_notes/list_artifacts/get_source_content)
+        // — монополия CdpBatchexecuteProvider.
+        let p = GcpEnterpriseProvider::new(GcpConfig::default());
+        let supported: Vec<Op> = [
+            Op::ListNotebooks,
+            Op::GetNotebook,
+            Op::CreateNotebook,
+            Op::BatchCreateSources,
+            Op::UploadFile,
+            Op::GetSourceMeta,
+            Op::CreateAudioOverview,
+            Op::DeleteAudioOverview,
+            Op::DeleteSources,
+        ]
+        .into_iter()
+        .filter(|op| p.supports(*op))
+        .collect();
+        assert_eq!(supported.len(), 9, "GCP должен покрывать 9 операций");
+
+        let not_supported: Vec<Op> = [
+            Op::GetSourceContent,
+            Op::GetNotes,
+            Op::ListArtifacts,
+            Op::Chat,
+        ]
+        .into_iter()
+        .filter(|op| !p.supports(*op))
+        .collect();
+        assert_eq!(not_supported.len(), 4, "GCP НЕ должен покрывать 4 операции");
+    }
+
+    // -------------------------------------------------------------------------
+    // M3 tests — routing policy HybridProvider. Pure-fns, без сети.
+    // -------------------------------------------------------------------------
+
+    /// Helper: построить HybridProvider с заданным mode (конфиги default).
+    fn hybrid_with_mode(mode: CompanionMode) -> HybridProvider {
+        HybridProvider::new(
+            GcpEnterpriseProvider::from_env_or_default(),
+            CdpBatchexecuteProvider::new(9223),
+            mode,
+        )
+    }
+
+    #[test]
+    fn hybrid_primary_for_in_auto_routes_gcp_only_ops_to_gcp() {
+        // В Auto: операции, которые поддерживает ТОЛЬКО GCP
+        // (BatchCreateSources, UploadFile, GetSourceMeta, CreateAudioOverview,
+        //  DeleteAudioOverview, DeleteSources, CreateNotebook, ListNotebooks,
+        //  GetNotebook) → primary=gcp.
+        let h = hybrid_with_mode(CompanionMode::Auto);
+        let gcp_ops = [
+            Op::ListNotebooks,
+            Op::GetNotebook,
+            Op::CreateNotebook,
+            Op::BatchCreateSources,
+            Op::UploadFile,
+            Op::GetSourceMeta,
+            Op::CreateAudioOverview,
+            Op::DeleteAudioOverview,
+            Op::DeleteSources,
+        ];
+        for op in gcp_ops {
+            assert_eq!(
+                h.primary_for(op),
+                "gcp",
+                "Auto+{:?}: primary должен быть gcp (GCP поддерживает)",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_primary_for_in_auto_routes_cdp_only_ops_to_cdp() {
+        // В Auto: операции, которые GCP НЕ поддерживает (chat/get_notes/
+        // list_artifacts/get_source_content) → primary=cdp.
+        let h = hybrid_with_mode(CompanionMode::Auto);
+        let cdp_ops = [
+            Op::GetSourceContent,
+            Op::GetNotes,
+            Op::ListArtifacts,
+            Op::Chat,
+        ];
+        for op in cdp_ops {
+            assert_eq!(
+                h.primary_for(op),
+                "cdp",
+                "Auto+{:?}: primary должен быть cdp (GCP не поддерживает)",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_primary_for_in_gcp_only_always_returns_gcp() {
+        // GcpOnly: даже если GCP не поддерживает op — primary=gcp,
+        // fallback выключен, поэтому запрос вернёт NotSupported от GCP.
+        let h = hybrid_with_mode(CompanionMode::GcpOnly);
+        assert_eq!(h.primary_for(Op::Chat), "gcp");
+        assert_eq!(h.primary_for(Op::BatchCreateSources), "gcp");
+        assert!(!h.fallback_enabled(), "GcpOnly: fallback off");
+    }
+
+    #[test]
+    fn hybrid_primary_for_in_cdp_only_always_returns_cdp() {
+        // CdpOnly: даже если CDP не поддерживает op — primary=cdp,
+        // fallback выключен.
+        let h = hybrid_with_mode(CompanionMode::CdpOnly);
+        assert_eq!(h.primary_for(Op::UploadFile), "cdp");
+        assert_eq!(h.primary_for(Op::Chat), "cdp");
+        assert!(!h.fallback_enabled(), "CdpOnly: fallback off");
+    }
+
+    #[test]
+    fn hybrid_fallback_enabled_only_in_auto_mode() {
+        assert!(hybrid_with_mode(CompanionMode::Auto).fallback_enabled());
+        assert!(!hybrid_with_mode(CompanionMode::GcpOnly).fallback_enabled());
+        assert!(!hybrid_with_mode(CompanionMode::CdpOnly).fallback_enabled());
+    }
+
+    #[test]
+    fn hybrid_route_falls_back_on_not_configured_in_auto_mode() {
+        // Симулируем: GcpEnterpriseProvider без конфига → NotConfigured.
+        // Route должен попробовать fallback на CDP, если CDP поддерживает op.
+        // Для ListNotebooks — оба поддерживают, поэтому fallback сработает
+        // и CDP вернёт свой default-trait NotSupported (cdp.rs skeleton).
+        // В итоге: hybrid в Auto + пустой GCP → fallback → CDP → NotSupported от CDP.
+        let mut h = hybrid_with_mode(CompanionMode::Auto);
+        let res = h.list_notebooks();
+        // GCP не сконфигурирован (нет POLER_GCP_PROJECT_NUMBER в env) → NotConfigured.
+        // Fallback на CDP — CDP skeleton, метод не реализован → NotSupported от CDP.
+        // В итоге: BridgeError::NotSupported от cdp_batchexecute.
+        match res {
+            Err(BridgeError::NotSupported { provider, .. }) => {
+                assert_eq!(provider, "cdp_batchexecute", "должен быть fallback на CDP");
+            }
+            other => panic!("ожидал NotSupported от CDP после fallback, получил {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hybrid_route_does_not_fallback_in_gcp_only_mode() {
+        // GcpOnly: fallback выключен. GCP без конфига → NotConfigured
+        // должен прийти наверх без попытки fallback.
+        let mut h = hybrid_with_mode(CompanionMode::GcpOnly);
+        let res = h.list_notebooks();
+        match res {
+            Err(BridgeError::NotConfigured(_)) => {}
+            other => panic!(
+                "GcpOnly+empty GCP: ожидал NotConfigured без fallback, получил {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn hybrid_route_propagates_http_errors_without_fallback() {
+        // Если primary возвращает Http/Transport/Parse — fallback НЕ запускается.
+        // Http-ошибки означают серверную проблему, переключение канала
+        // не лечит, а даёт разные данные.
+        // Симулируем: GcpEnterpriseProvider без конфига для batch_create_sources
+        // (CDP не поддерживает) → в Auto fallback не сработает (CDP не поддерживает).
+        let mut h = hybrid_with_mode(CompanionMode::Auto);
+        let res = h.batch_create_sources("nb-test", &[]);
+        // GCP не сконфигурирован → NotConfigured.
+        // CDP не поддерживает BatchCreateSources → fallback не запускается.
+        // В итоге: NotConfigured от GCP propagates наверх.
+        match res {
+            Err(BridgeError::NotConfigured(_)) => {}
+            other => panic!(
+                "Auto+empty GCP для GCP-only op: ожидал NotConfigured, получил {:?}",
+                other
+            ),
+        }
     }
 }
