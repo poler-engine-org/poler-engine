@@ -111,6 +111,12 @@ struct Cli {
     #[arg(long = "crawl-delay-ms", default_value_t = 1000)]
     crawl_delay_ms: u64,
 
+    /// MCP-СЕРВЕР (Model Context Protocol): poler-engine как нативный
+    /// инструмент LLM-агентов поверх stdio JSON-RPC.
+    /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search.
+    #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact"])]
+    mcp: bool,
+
     /// Разрешить краулеру переход на другие хосты.
     #[arg(long = "cross-site", default_value_t = false)]
     cross_site: bool,
@@ -317,6 +323,13 @@ fn main() -> ExitCode {
         }
     }
 
+    // ---------- MCP-сервер: stdio JSON-RPC для LLM-агентов ----------
+    if cli.mcp {
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let code = poler_engine::mcp::run(cli.cdp_port, cli.web_wait_ms, db);
+        return ExitCode::from(code as u8);
+    }
+
     // ---------- Веб-индекс: статистика ----------
     if cli.web_stats {
         let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
@@ -395,11 +408,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let mut fetcher = match poler_engine::web::CdpFetcher::new(cli.cdp_port, cli.web_wait_ms) {
+        let mut fetcher = match poler_engine::web::cdp_fetcher(cli.cdp_port, cli.web_wait_ms) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("poler-engine: Chromium CDP (порт {}): {e}", cli.cdp_port);
-                eprintln!("  запустите: chrome --headless --remote-debugging-port={} --no-sandbox", cli.cdp_port);
+                eprintln!("  автозапуск не удался: установите POLER_CHROME_BIN или запустите вручную:");
+                eprintln!("  chrome --headless --remote-debugging-port={} --no-sandbox", cli.cdp_port);
                 return ExitCode::from(2);
             }
         };
@@ -436,6 +450,10 @@ fn main() -> ExitCode {
         let url = path_arg.to_string_lossy().to_string();
         if !url.starts_with("http://") && !url.starts_with("https://") {
             eprintln!("poler-engine: --web ожидает URL (http(s)://...), получено: {url}");
+            return ExitCode::from(2);
+        }
+        if let Err(e) = poler_engine::web::ensure_chromium(cli.cdp_port) {
+            eprintln!("poler-engine web: {e}");
             return ExitCode::from(2);
         }
         match poler_engine::web::ingest_url(&url, cli.cdp_port, cli.web_wait_ms) {

@@ -16,7 +16,8 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use super::extract::{clean_text, snippet_for, title_from_text, web_tokenize};
+use super::extract::{clean_text, snippet_for, title_from_text};
+use super::stem::tokenize_stem;
 use super::simhash::{near_duplicate, simhash};
 
 /// Веса POLER WebRank v1.
@@ -158,8 +159,8 @@ impl WebIndex {
     /// Возвращает (page_id, была ли переиндексирована).
     pub fn upsert_page(&mut self, doc: &WebDoc) -> rusqlite::Result<(i64, bool)> {
         let text = clean_text(&doc.text, 256 * 1024);
-        let body_tokens = web_tokenize(&text);
-        let title_tokens = web_tokenize(&doc.title);
+        let body_tokens = tokenize_stem(&text);
+        let title_tokens = tokenize_stem(&doc.title);
         // ЗАГОЛОВОК — ЧАСТЬ ДОКУМЕНТА: его термы индексируются тоже
         // (иначе запрос по слову из title не находит страницу).
         let mut tokens = body_tokens;
@@ -361,7 +362,7 @@ impl WebIndex {
 
     /// Поиск по веб-индексу. Возвращает Top-N отсортированных хитов.
     pub fn search(&mut self, query: &str, top_n: usize) -> rusqlite::Result<Vec<WebHit>> {
-        let q_terms = web_tokenize(query);
+        let q_terms = tokenize_stem(query);
         if q_terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -624,6 +625,8 @@ pub fn content_hash(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // SimHash-дедуп работает по поверхностным формам (без стемминга)
+    use crate::web::extract::web_tokenize;
 
     fn doc(url: &str, title: &str, text: &str, links: Vec<&str>) -> WebDoc {
         WebDoc {

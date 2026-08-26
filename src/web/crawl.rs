@@ -241,9 +241,11 @@ pub fn crawl(
         }
         visited.insert(fkey.to_string());
 
-        // текст → токены → дедуп SimHash
+        // текст → токены → дедуп SimHash. Токены — стемминг-путь: тот же,
+        // что в upsert_page (иначе отпечатки в БД и сравниваемые разъедутся),
+        // и падежный шум уходит из отпечатка — near-дубли ловятся надёжнее.
         let text = super::extract::clean_text(&page.text, 256 * 1024);
-        let tokens = super::extract::web_tokenize(&text);
+        let tokens = super::stem::tokenize_stem(&text);
         let lang = if page.lang.is_empty() {
             super::extract::detect_lang(&text).to_string()
         } else {

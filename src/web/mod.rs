@@ -27,13 +27,20 @@ pub mod extract;
 pub mod index;
 pub mod robots;
 pub mod simhash;
+pub mod stem;
 pub mod urlnorm;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use cdp::{CdpSession, WebPage};
 pub use crawl::{CrawlConfig, CrawlStats, PageFetcher};
 pub use index::{WebHit, WebIndex};
+
+/// Ленивая обёртка: CdpFetcher с автозапуском Chromium при необходимости.
+pub fn cdp_fetcher(cdp_port: u16, wait_ms: u64) -> Result<CdpFetcher, String> {
+    ensure_chromium(cdp_port)?;
+    CdpFetcher::new(cdp_port, wait_ms)
+}
 
 /// Реальный PageFetcher поверх Chromium CDP (одна живая сессия).
 pub struct CdpFetcher {
@@ -85,8 +92,103 @@ pub fn web_cache_dir() -> PathBuf {
     d
 }
 
+// ---------------------------------------------------------------------------
+// Автозапуск Chromium: AI-агент не должен думать о браузере — движок сам
+// поднимает headless-инстанс, если CDP-порт молчит.
+// ---------------------------------------------------------------------------
+
+/// Жив ли CDP на порту (tcp-коннект достаточно: DevTools слушает только его).
+fn cdp_alive(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+/// Поиск бинаря браузера: $POLER_CHROME_BIN → PATH → известные абсолютные пути.
+fn find_browser() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("POLER_CHROME_BIN") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for name in [
+        "chrome-headless-shell",
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome",
+    ] {
+        if let Some(path) = std::env::var("PATH")
+            .ok()?
+            .split(':')
+            .map(|dir| Path::new(dir).join(name))
+            .find(|p| p.is_file())
+        {
+            return Some(path);
+        }
+    }
+    // известные точки размещения (в т.ч. bundle движка)
+    [
+        "/home/z/my-project/browser/chrome-headless-shell-linux64/chrome-headless-shell",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/snap/bin/chromium",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_file())
+}
+
+/// Гарантирует живой Chromium с CDP на `port`: молча возвращается, если уже
+/// слушает; иначе находит бинарь, поднимает headless и ждёт готовности ~15 с.
+/// Дочерний процесс живёт, пока жив родитель (CLI-ран или MCP-сервер).
+pub fn ensure_chromium(port: u16) -> Result<(), String> {
+    if cdp_alive(port) {
+        return Ok(());
+    }
+    let bin = find_browser().ok_or_else(|| {
+        "Chromium не найден. Установите POLER_CHROME_BIN=/путь/к/chrome-headless-shell \
+         или положите бинарь в PATH"
+            .to_string()
+    })?;
+    let log = std::env::temp_dir().join("poler-chromium.log");
+    let log_f = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("лог {log:?}: {e}"))?;
+    let mut child = std::process::Command::new(&bin)
+        .args([
+            "--headless",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--disable-blink-features=AutomationControlled",
+            &format!("--remote-debugging-port={port}"),
+            "about:blank",
+        ])
+        .stdout(log_f.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log_f)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("запуск {:?}: {e}", bin))?;
+    // готовность: до ~15 с (холодный старт на слабых машинах)
+    for _ in 0..60 {
+        if cdp_alive(port) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    Err(format!(
+        "Chromium не поднялся на порт {port} за 15 с (лог: {log:?})"
+    ))
+}
+
 /// Детерминированное имя файла для URL (fnv-подобный хеш).
-fn url_slug(url: &str) -> String {
+pub fn url_slug(url: &str) -> String {
     // простой стабильный хеш (FNV-1a 64)
     let mut h: u64 = 0xcbf29ce484222325;
     for b in url.bytes() {

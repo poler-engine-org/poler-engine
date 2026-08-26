@@ -46,6 +46,7 @@
 pub mod aidde;
 pub mod engine;
 pub mod graph;
+pub mod mcp;
 pub mod output;
 pub mod parser;
 pub mod poler;

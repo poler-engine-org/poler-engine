@@ -335,7 +335,35 @@ impl CdpSession {
         let mut s = Self { ws, next_id: 1 };
         s.command("Page.enable", "{}")?;
         s.command("Network.enable", "{}")?;
+        s.apply_stealth()?;
         Ok(s)
+    }
+
+    /// Десктопный UA вместо «HeadlessChrome/…» (выдаёт автоматизацию
+    /// простым фильтрам) + navigator.webdriver → undefined. Реальный
+    /// рендер остаётся честным: это всё ещё полный Chromium 152.
+    fn apply_stealth(&mut self) -> Result<(), String> {
+        let ua = std::env::var("POLER_USER_AGENT").unwrap_or_else(|_| {
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/152.0.7977.54 Safari/537.36"
+                .to_string()
+        });
+        self.command(
+            "Network.setUserAgentOverride",
+            &serde_json::json!({
+                "userAgent": ua,
+                "acceptLanguage": "uk-UA,uk;q=0.9,ru;q=0.8,en-US;q=0.7,en;q=0.6",
+            })
+            .to_string(),
+        )?;
+        self.command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            &serde_json::json!({
+                "source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            })
+            .to_string(),
+        )?;
+        Ok(())
     }
 
     /// Отправка CDP-команды; события по пути складываются в `events`
