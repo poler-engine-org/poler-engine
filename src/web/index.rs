@@ -86,6 +86,13 @@ pub struct WebIndex {
 }
 
 impl WebIndex {
+    /// Доступ к соединению (только чтение) — для инспекции статистик,
+    /// прямых запросов `pages`/`terms`/`links` в тестах и клиентском коде.
+    /// Запись — только через методы `upsert_page`/`recompute_pagerank`/
+    /// `record_duplicate` (транзакционная целостность).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
     /// Открытие (с созданием схемы) базы веб-индекса.
     pub fn open(db_path: &Path) -> rusqlite::Result<Self> {
         if let Some(dir) = db_path.parent() {

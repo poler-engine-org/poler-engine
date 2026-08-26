@@ -429,7 +429,7 @@ impl McpServer {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
-            .ok_or("аргумент action обязателен: notebooks | source | notes | artifacts | account | chat | media | shot")?
+            .ok_or("аргумент action обязателен: notebooks | source | notes | artifacts | account | chat | media | shot | sync")?
             .to_string();
         let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_owned);
         let notebook_id = get("notebook_id");
@@ -544,8 +544,59 @@ impl McpServer {
                 Ok(format!("NotebookLM-ответ по источникам ноутбука {nb}:\n\n{answer}"))
             }
 
+            "sync" => {
+                // Синк NotebookLM в web-index: заметки/источники/артефакты
+                // становятся страницами в общем индексе; --web-search после
+                // sync пробивает NLM-корпус наравне с проползенным вебом.
+                use crate::google::nlm_ingest;
+                use crate::web::{WebIndex, default_db_path};
+                let db_path = std::env::var("POLER_WEB_DB")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| default_db_path());
+                let mut ix = WebIndex::open(&db_path)
+                    .map_err(|e| format!("web-index {db_path:?}: {e}"))?;
+                let mut s = NlmSession::open()?;
+                Ok(match notebook_id {
+                    Some(nb) if !nb.is_empty() => {
+                        let nbs = s.list_notebooks().unwrap_or_default();
+                        let target = nbs.iter().find(|x| x.id == nb).cloned();
+                        match target {
+                            Some(nb_meta) => {
+                                let mut stats = nlm_ingest::IngestStats {
+                                    notebooks: 1,
+                                    ..Default::default()
+                                };
+                                if let Err(e) = nlm_ingest::ingest_notebook(&mut ix, &mut s, &nb_meta, &mut stats) {
+                                    stats.errors.push(format!("ingest_notebook {nb}: {e}"));
+                                }
+                                let _ = ix.recompute_pagerank(20);
+                                format!(
+                                    "NLM sync (notebook {nb}): {} страниц ({} new/changed, {} unchanged).                                      Ошибок: {}. После sync используй poler_web_search — NLM-корпус                                      влит в общий индекс (URL вида nlm://notebook/{nb}/…).",
+                                    stats.total_pages(),
+                                    stats.total_reindexed(),
+                                    stats.total_unchanged(),
+                                    stats.errors.len(),
+                                )
+                            }
+                            None => format!("ноутбук {nb} не найден в аккаунте (см. action notebooks)"),
+                        }
+                    }
+                    _ => {
+                        let stats = nlm_ingest::sync_all(&mut ix, &mut s)?;
+                        format!(
+                            "NLM sync (all): {} notebooks processed, {} страниц ({} new/changed,                              {} unchanged by Percolator-lite). Ошибок: {}.                              После sync используй poler_web_search — NLM-корпус влит в общий индекс.",
+                            stats.notebooks,
+                            stats.total_pages(),
+                            stats.total_reindexed(),
+                            stats.total_unchanged(),
+                            stats.errors.len(),
+                        )
+                    }
+                })
+            }
+
             other => Err(format!(
-                "неизвестный action: {other} (доступны notebooks | source | notes | artifacts | account | chat | media | shot)"
+                "неизвестный action: {other} (доступны notebooks | source | notes | artifacts | account | chat | media | shot | sync)"
             )),
         }
     }
@@ -666,7 +717,7 @@ account — профиль аккаунта; chat — вопрос к модел
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["notebooks", "source", "notes", "artifacts", "account", "chat", "media", "shot"],
+                        "enum": ["notebooks", "source", "notes", "artifacts", "account", "chat", "media", "shot", "sync"],
                         "description": "Режим работы"
                     },
                     "notebook_id": {"type": "string", "description": "id ноутбука — из action notebooks"},

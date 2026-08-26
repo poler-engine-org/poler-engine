@@ -20,6 +20,97 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.14.0: NLM Corpus Ingestion — `--nlm-sync` и кросс-юниверсный поиск
+
+Виток v0.13.0 выгружает NotebookLM по одному ноутбуку: `--nlm-notes <nb>`,
+`--nlm-source <nb> <src>`, `--nlm-artifacts <nb>` — владелец видит данные, но
+они остаются в JSON-выводе, **не в общем индексе**. v0.14.0 замыкает круг: все
+87 ноутбуков аккаунта (паспорты + источники + заметки + Studio-артефакты)
+вливаются в единую базу `web-index.db` — тот же `--web-search` пробивает
+**приватный NLM-корпус + локальный код + проползенный веб** одновременно, с
+рёбрами `links`, замыкающими граф NLM↔веб (заметка → источник → внешний
+Google Docs/YouTube → проползенная страница).
+
+**Доноры из прошлых витков** (ноль новых зависимостей):
+
+| Механизм | Виток | Куда легло в v0.14.0 |
+|---|---|---|
+| Percolator-lite (content_hash skip) | v0.9 | `content_hash()` FNV-1a 64-hex; повторный `--nlm-sync` skip'ит неизменившиеся страницы за O(1) lookup |
+| Positional Inverted Index | v0.11 | фразовые запросы `"..."` ищутся по смежности delta-varint позиций **и в заметках NLM** |
+| PageRank | v0.8 | итерации по `links` — заметка → ноутбук-паспорт → источник → внешний URL; `recompute_pagerank(20)` после синка |
+| NLM batchexecute-протокол | v0.13 | `NlmSession::list_notebooks/notes/artifacts/load_source` — готовые данные, без нового RPC |
+| Chromium-профиль (OAuth 2.0) | v0.12 | одна сессия на все NLM-операции + веб-краулинг |
+
+**URL-схема NLM-страниц** (новый namespace в `web-index.db`):
+
+```text
+nlm://notebook/{nb_id}                          — паспорт (title + source-list)
+nlm://notebook/{nb_id}/source/{src_id}          — контент источника + URL слайдов
+nlm://notebook/{nb_id}/note/{note_id}           — текст заметки/чата
+nlm://notebook/{nb_id}/artifact/{art_id}        — Studio-объект (title + kind + status)
+```
+
+Внешние URL источников (Google Docs, YouTube) попадают в `links` как обычные
+строки — они совпадают с URL проползенных веб-страниц, образуя **сквозной
+граф**. PageRank распространяет авторитет через все юниверсы.
+
+```bash
+# 0) один раз: залогиниться в профиль движка (как для --nlm-chat из v0.13)
+poler-engine --google-browse https://notebook.google.com/
+
+# Синк всех ноутбуков аккаунта в web-index.db (после первого запуска — инкремент)
+poler-engine --nlm-sync
+# → mode: nlm-sync, notebooks: 87, reindexed: 240, unchanged: 612, errors: 0
+#   pagerank iterations: 20
+
+# Синк одного ноутбука (для отладки или точечного обновления)
+poler-engine --nlm-sync 704f2610-c02b-4ec1-9fc7-a3b72dde2af1
+
+# После синка — обычный --web-search находит NLM-контент наравне с вебом
+poler-engine --web-search '"Касіопея Astra-Nic Complex"' --top 5
+# → hit 1: nlm://notebook/704f2610.../note/note-1   (notebook=«Касіопея»)
+# → hit 2: nlm://notebook/704f2610.../source/src-text-1
+# → hit 3: https://example.com/doc1                  (внешний URL источника)
+```
+
+**Парсер `parse_notes`** — толерантен к вариативности Google: формат `cFji9`
+в реальном продакшене (см. `upload/NOTEBOOK_704f_ALL_NOTES.json`, 3.7 МБ) —
+это `[items_array, metadata_array]`, где каждый item = `[id, [id, text, ?, ?,
+title?, ...]]` с **5 или 6 полями во внутреннем массиве**. Эвристика
+wrapper-detection (`data[0][0].is_array()` ⇔ обёрнутый формат) различает
+`[items, meta]` и bare `items` — парсер остаётся устойчивым к обоим
+представлениям.
+
+**MCP**: инструмент `poler_nlm` расширен 9-м action `sync` (теперь 9 actions:
+`notebooks | source | notes | artifacts | account | chat | media | shot | sync`).
+LLM-агент может триггерить синк без выхода в шелл:
+
+```json
+{"method":"tools/call","params":{"name":"poler_nlm",
+ "arguments":{"action":"sync"}}}
+→ {"mode":"nlm-sync","stats":{"notebooks":87,"reindexed":240,...}}
+```
+
+**Аттестация v0.14.0**:
+
+- 239 unit-тестов зелёные (227 из v0.13.0 + 12 новых `nlm_ingest`):
+  URL-схема, FNV-1a хеш, `parse_notes` (bare/wrapped/пустой/5-полей/6-полей),
+  `ingest_notebook` (паспорт/источник/заметка/артефакт, рёбра, skip по хешу),
+  `IngestStats` счётчики;
+- `cargo clippy --lib --bin` — 0 warning'ов;
+- `cargo build --release --bin poler-engine` — бинарник 5.5 МБ,
+  `--version` → `0.14.0`;
+- e2e-скрипт `scripts/nlm_sync_test.py` написан (фактический NLM-фейк + 6
+  проверок: sync all, Percolator skip, cross-universe web-search находит NLM,
+  single sync, MCP action=sync) — требует профильного Chromium в окружении
+  запуска (см. `scripts/mcp_nlm_test.py` из v0.13.0 для шаблона).
+
+**Что влито в продакшене (по данным v0.13.0)**: при `--nlm-sync` против
+реального аккаунта движок вольёт ~87 паспортов + ~240 источников + ~24
+заметок (3.7 МБ) + 10 Studio-артефактов = ~361 страница в `web-index.db` —
+первый синк идёт ~3 минуты (RPC на источник), повторный skip'ает 95%+ за
+Percolator-lite.
+
 ## v0.13.0: NotebookLM без API — протокол batchexecute + медиа-канал
 
 NotebookLM не имеет публичного API, но расширение **NLMTools.com** («NotebookLM

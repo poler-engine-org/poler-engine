@@ -158,39 +158,46 @@ struct Cli {
 
     /// Все ноутбуки NotebookLM с источниками (RPC wXbhsf из протокола
     /// NLMTools.com, сессия персистентного профиля — без пароля).
-    #[arg(long = "nlm-notebooks", conflicts_with_all = ["nlm_source", "nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    #[arg(long = "nlm-notebooks", conflicts_with_all = ["nlm_source", "nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
     nlm_notebooks: bool,
 
     /// Контент источника: текст и/или URL картинок слайдов (RPC hizoJc).
     /// NOTEBOOK SRC — id из --nlm-notebooks.
-    #[arg(long = "nlm-source", value_names = ["NOTEBOOK", "SOURCE"], num_args = 2, conflicts_with_all = ["nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    #[arg(long = "nlm-source", value_names = ["NOTEBOOK", "SOURCE"], num_args = 2, conflicts_with_all = ["nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
     nlm_source: Option<Vec<String>>,
 
     /// Заметки ноутбука (RPC cFji9, raw-JSON).
-    #[arg(long = "nlm-notes", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    #[arg(long = "nlm-notes", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
     nlm_notes: Option<String>,
 
     /// Studio-объекты: аудио-обзоры, отчёты, квизы, миндмэпы (RPC gArtLc).
-    #[arg(long = "nlm-artifacts", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    #[arg(long = "nlm-artifacts", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
     nlm_artifacts: Option<String>,
 
     /// Аккаунт сессии NotebookLM (RPC ZwVcOc) — проверка логина профиля.
-    #[arg(long = "nlm-account", conflicts_with_all = ["nlm_chat", "nlm_media", "nlm_shot"])]
+    #[arg(long = "nlm-account", conflicts_with_all = ["nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
     nlm_account: bool,
 
     /// Спросить ноутбук: вопрос печатается в чат страницы, ответ
     /// читается после стабилизации (UI-автоматизация, без пароля).
-    #[arg(long = "nlm-chat", value_names = ["NOTEBOOK", "QUESTION"], num_args = 2, conflicts_with_all = ["nlm_media", "nlm_shot"])]
+    #[arg(long = "nlm-chat", value_names = ["NOTEBOOK", "QUESTION"], num_args = 2, conflicts_with_all = ["nlm_media", "nlm_shot", "nlm_sync"])]
     nlm_chat: Option<Vec<String>>,
 
     /// Скачать медиа-файл (картинка слайда и т.п.) авторизованным
     /// профилем: poler-engine --nlm-media URL → poler-media-N.<ext>.
-    #[arg(long = "nlm-media", value_name = "URL", conflicts_with_all = ["nlm_shot"])]
+    #[arg(long = "nlm-media", value_name = "URL", conflicts_with_all = ["nlm_shot", "nlm_sync"])]
     nlm_media: Option<String>,
 
     /// Скриншот страницы в профиле (PNG): медиа глазами юзера.
     #[arg(long = "nlm-shot", value_name = "URL")]
     nlm_shot: Option<String>,
+
+    /// Синк NotebookLM в web-index: --nlm-sync [NOTEBOOK_ID] вливает
+    /// заметки/источники/артефакты в общий индекс poler-engine —
+    /// дальше они находятся через --web-search наравне с вебом.
+    /// Без NOTEBOOK_ID — синк всех ноутбуков аккаунта.
+    #[arg(long = "nlm-sync", value_name = "NOTEBOOK_ID", num_args = 0..=1, default_missing_value = "")]
+    nlm_sync: Option<String>,
 
     /// Максимум результатов Gmail/Drive [default: 10].
     #[arg(long = "google-max", default_value_t = 10)]
@@ -654,10 +661,96 @@ fn run_nlm(cli: &Cli) -> ExitCode {
         };
     }
 
+    // ---------- v0.14: синк NotebookLM в web-index ----------
+    if let Some(nb) = cli.nlm_sync.clone() {
+        use poler_engine::google::nlm_ingest;
+        use poler_engine::web::WebIndex;
+        let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let mut ix = match WebIndex::open(&db_path) {
+            Ok(ix) => ix,
+            Err(e) => return fail(format!("web-index {db_path:?}: {e}")),
+        };
+        return if nb.is_empty() {
+            // --nlm-sync без аргумента — все ноутбуки аккаунта
+            eprintln!("poler-engine nlm: синк всех ноутбуков в {db_path:?} (до RPC на источник)…");
+            match nlm_ingest::sync_all(&mut ix, &mut s) {
+                Ok(stats) => {
+                    if cli.format == Format::AiJson {
+                        let out = serde_json::json!({
+                            "engine": "poler-engine",
+                            "mode": "nlm-sync",
+                            "scope": "all",
+                            "stats": stats,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                    } else {
+                        println!("{}", format_stats(&stats));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e),
+            }
+        } else {
+            // --nlm-sync NOTEBOOK_ID — один ноутбук
+            let nbs = s.list_notebooks().unwrap_or_default();
+            let target = nbs.iter().find(|x| x.id == nb).cloned();
+            match target {
+                Some(nb_meta) => {
+                    let mut stats = nlm_ingest::IngestStats {
+                        notebooks: 1,
+                        ..Default::default()
+                    };
+                    if let Err(e) = nlm_ingest::ingest_notebook(&mut ix, &mut s, &nb_meta, &mut stats) {
+                        stats.errors.push(format!("ingest_notebook {}: {e}", nb));
+                    }
+                    let _ = ix.recompute_pagerank(20);
+                    if cli.format == Format::AiJson {
+                        let out = serde_json::json!({
+                            "engine": "poler-engine",
+                            "mode": "nlm-sync",
+                            "scope": "single",
+                            "notebook": nb,
+                            "stats": stats,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                    } else {
+                        println!("{}", format_stats(&stats));
+                    }
+                    ExitCode::SUCCESS
+                }
+                None => fail(format!("ноутбук {nb} не найден в аккаунте")),
+            }
+        };
+    }
+
     fail("nlm: не выбран режим (см. --help)".to_string())
 }
 
 /// Сохранить байты в неиспользуемый файл poler-<prefix>-N.<ext> в CWD.
+/// Человекочитаемый отчёт о синке NLM в web-index.
+fn format_stats(s: &poler_engine::google::nlm_ingest::IngestStats) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("NLM sync: {} notebooks processed\n", s.notebooks));
+    out.push_str(&format!("  passports:   {} reindexed, {} unchanged\n",
+        s.notebooks_reindexed, s.notebooks_unchanged));
+    out.push_str(&format!("  sources:      {} reindexed, {} unchanged\n",
+        s.sources_reindexed, s.sources_unchanged));
+    out.push_str(&format!("  notes:        {} reindexed, {} unchanged\n",
+        s.notes_reindexed, s.notes_unchanged));
+    out.push_str(&format!("  artifacts:    {} reindexed, {} unchanged\n",
+        s.artifacts_reindexed, s.artifacts_unchanged));
+    out.push_str(&format!("  TOTAL:        {} pages ({} new/changed, {} skipped by Percolator-lite)\n",
+        s.total_pages(), s.total_reindexed(), s.total_unchanged()));
+    if !s.errors.is_empty() {
+        out.push_str(&format!("\n  errors ({}):\n", s.errors.len()));
+        for e in &s.errors {
+            out.push_str(&format!("    - {e}\n"));
+        }
+    }
+    out.push_str("\nТеперь web-search пробивает NLM-корпус наравне с вебом.\n");
+    out
+}
+
 fn save_unique(prefix: &str, ext: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
     for n in 1..10_000 {
         let p = std::path::PathBuf::from(format!("{prefix}-{n:02}.{ext}"));
@@ -839,6 +932,7 @@ fn main() -> ExitCode {
         || cli.nlm_chat.is_some()
         || cli.nlm_media.is_some()
         || cli.nlm_shot.is_some()
+        || cli.nlm_sync.is_some()
     {
         return run_nlm(&cli);
     }

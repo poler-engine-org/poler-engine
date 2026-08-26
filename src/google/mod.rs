@@ -21,6 +21,7 @@
 
 pub mod api;
 pub mod nlm;
+pub mod nlm_ingest;
 pub mod oauth;
 
 use std::io::{Read, Write};
