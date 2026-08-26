@@ -118,6 +118,19 @@ struct Cli {
     #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact"])]
     mcp: bool,
 
+    // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
+
+    /// Интерактивный REPL (poler> search/nlm/crawl/sync...).
+    /// База web-index.db и NlmSession открываются ленимо и переиспользуются
+    /// между командами (история в ~/.cache/poler-engine/shell-history.txt).
+    #[arg(long = "shell", conflicts_with_all = ["tui", "mcp", "web_search", "crawl", "web_stats", "impact", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    shell: bool,
+
+    /// TUI Dashboard на ratatui (3 панели: ноутбуки | ввод | результаты).
+    /// Tab — смена фокуса, Esc — выход. Команды как в --shell.
+    #[arg(long = "tui", conflicts_with_all = ["shell", "mcp", "web_search", "crawl", "web_stats", "impact", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    tui: bool,
+
     // ---------- Google-интеграция без пароля (v0.12.0) ----------
 
     /// OAuth 2.0 loopback: согласие Google в ТВОЁМ браузере (пароль не
@@ -780,6 +793,16 @@ fn main() -> ExitCode {
         let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
         let code = poler_engine::mcp::run(cli.cdp_port, cli.web_wait_ms, db);
         return ExitCode::from(code as u8);
+    }
+
+    // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
+    if cli.shell {
+        let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        return poler_engine::shell::run_shell(db_path);
+    }
+    if cli.tui {
+        let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        return poler_engine::shell::run_tui(db_path);
     }
 
     // ---------- Google-сервисы: OAuth без пароля (v0.12.0) ----------

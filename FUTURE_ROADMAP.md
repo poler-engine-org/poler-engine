@@ -92,3 +92,131 @@ poler-engine развивается не как «ещё один grep», а к�
    когда им есть чем управляться в текущем корпусе.
 4. Границы честности фиксируются в README (пример: аутентификационные
    стены notebook.google.com — это граница, а не сбой).
+
+
+---
+
+## 6. v0.15+: poler-shell (TUI/REPL) и Unified VCS & Data Mesh
+
+> Зафиксировано 2026-08-26 (post-v0.14.0). Инициатива владельца: обернуть
+> движок в терминал для человеческого удобства + нативная интеграция со
+> всеми VCS/датасет-платформами (GitHub/GitLab/Gitea/Git LFS/DVC/Hugging
+> Face Hub/Oxen/ParamLake/HugeSCM/Lit) — Unified Code & Data Mesh.
+
+### 6.1. poler-shell — интерактивный терминал (v0.15.0)
+
+Когда у движка 15+ режимов (поиск, AIDDE, веб-краулинг, NotebookLM, Google
+Drive, фразы, графы, синк), человеку неудобно каждый раз вбивать длинные
+флаги `--format md --nlm-chat --top 5` или вспоминать UUID ноутбуков.
+
+**Два уровня интерфейса:**
+
+| Уровень | Библиотека | Что даёт | Аудитория |
+|---|---|---|---|
+| **TUI Dashboard** | `ratatui` + `crossterm` | Левая панель — живой список 87 ноутбуков NLM + локальные репозитории (с эмодзи 🌌 Касіопея, 📈 Бухгалтерия доверия). Правая верхняя — поле ввода поиска/чата с автодополнением Tab. Правая нижняя — выдача с подсветкой синтаксиса, значениями ε/R и K-hop деревом как интерактивным деревом. | Человек-владелец |
+| **REPL `poler>`** | `rustyline` | Быстрый командный режим без перезапуска процесса: `poler> search "Касіопея Astra-Nic"` / `poler> nlm ask "Параметры Планковской геодезической"` / `poler> crawl https://rust-lang.org` / `poler> impact dissect_packet --depth 3`. Tab-Completion по командам+флагам, история стрелочками ↑/↓. | Скриптовый человек+скрипт-обёртки |
+
+**Преимущества**: постоянно открытая `WebIndex` + `NlmSession` → As-You-Type
+Search за 1 ms при вводе; UUID ноутбуков не нужно помнить — выбор из списка
+стрелочками; контекст команд сохраняется в рамках сессии.
+
+**Архитектурные последствия**: текущий `main.rs` — «запустили, отдали,
+вышли». v0.15 введёт `Shell` стейт-машину поверх существующих
+`poler_engine::*` функций (без переделки ядра — `ratatui` только UI слой).
+
+### 6.2. Unified VCS & Data Mesh (v0.16.0+)
+
+Превращение poler-engine из локального инструмента в **Универсальную Сеть
+Кода и Данных** — единый пульт, нативно работающий с любыми репозиториями:
+
+```
+              ┌─────────────────────────────────────────┐
+              │   POLER-ENGINE UNIFIED DATA MESH        │
+              └────────────────────┬────────────────────┘
+                                   │
+   ┌─────────────────┬─────────────┴─────────────┬─────────────────┐
+   ▼                 ▼                           ▼                 ▼
+┌──────────┐  ┌──────────────┐          ┌──────────────┐    ┌──────────────┐
+│КОД VCS   │  │ДАННЫЕ        │          │ИИ/МОДЕЛИ     │    │ЗНАНИЯ/ОБЛАКО │
+│• gix     │  │• Git LFS     │          │• HF Hub      │    │• NotebookLM  │
+│• GitHub  │  │• DVC         │          │  (Models/DS) │    │• Google Drive│
+│• GitLab  │  │• Oxen.ai     │          │• ParamLake   │    │• Gmail       │
+│• Gitea   │  │• HugeSCM(Ant)│          │• ONNX/GGUF   │    │• Web Crawler │
+│• Lit(Rust│  │              │          │              │    │              │
+│ VCS)     │  │              │          │              │    │              │
+└──────────┘  └──────────────┘          └──────────────┘    └──────────────┘
+```
+
+**Адаптер-модель** (по образцу `google/` модуля v0.12–v0.13): каждый VCS —
+отдельный `src/vcs/<name>.rs` с тривиальным трейтом `VcsAdapter`:
+
+```rust
+trait VcsAdapter {
+    fn list_repos(&self) -> Result<Vec<RepoId>, String>;
+    fn list_commits(&self, repo: &RepoId) -> Result<Vec<Commit>, String>;
+    fn list_issues(&self, repo: &RepoId) -> Result<Vec<Issue>, String>;
+    fn fetch_blob(&self, repo: &RepoId, oid: &str) -> Result<Vec<u8>, String>;
+    fn url_scheme(&self) -> &str;  // "gh://", "gl://", "lfs://", "hf://", "ox://"
+}
+```
+
+Каждый VCS-объект (коммит, issue, PR, файл, датасет, модель) становится
+страницей в `web-index.db` по своей URL-схеме: `gh://user/repo/commit/<sha>`,
+`hf://datasets/<owner>/<name>`, `lfs://<repo>/<path>`, `ox://<repo>/<rev>/<path>`.
+
+**Сквозной запрос**:
+```bash
+poler-engine search "термогеодезическая функция" --all
+# → hit 1: nlm://notebook/704f.../note/note-1            (NotebookLM)
+# → hit 2: gh://user/repo/commit/a1b2c3d4                (GitHub commit)
+# → hit 3: hf://models/owner/model-x                     (Hugging Face model card)
+# → hit 4: https://rust-lang.org/...                      (проползенный веб)
+```
+
+**Работа с гигантскими монорепами без скачивания** (HugeSCM / LFS): движок
+парсит AST и строит AIDDE Call Graph по удалённым репозиториям **через
+API**, не забивая локальный диск сотнями гигабайт. Git LFS `.gitattributes`
++ pointer-файлы парсятся на лету для resolve `lfs://` URL без full fetch.
+
+**Донорские технологии** (что заимствуем и улучшаем):
+
+| Донор | Что берём | Куда легло |
+|---|---|---|
+| `gh` CLI (GitHub) | REST+GraphQL API (commits/issues/PR/codeowners), Actions artefacts | `src/vcs/github.rs` |
+| `glab` CLI (GitLab) | REST API v4, merge requests, pipelines | `src/vcs/gitlab.rs` |
+| `tea` CLI (Gitea) | REST API (forgejo-compatible) | `src/vcs/gitea.rs` |
+| `gix` crate | Pure-Rust git: коммиты/trees/blobs без git-CLI | `src/vcs/local.rs` |
+| `git-lfs` pointer protocol | `version https://git-lfs/...` + oid:size: | `src/vcs/lfs.rs` |
+| `dvc` `.dvc` files | Outs files + remote storage (S3/Azure/SSH) | `src/vcs/dvc.rs` |
+| `huggingface_hub` API | `/api/models`, `/api/datasets`, model cards | `src/vcs/hf.rs` |
+| `oxen` CLI / SDK | Oxen.ai remote data versioning | `src/vcs/oxen.rs` |
+| `hugescm` (Ant Group) | China-scale monorepo, server-side resolve | `src/vcs/hugescm.rs` |
+| `lit` (Rust VCS) | Pure-Rust SCM alternative | `src/vcs/lit.rs` |
+
+### 6.3. Приоритеты в этом направлении
+
+1. **v0.15.0 — poler-shell**: TUI+REPL поверх существующих режимов.
+   Зависимости: `ratatui`, `crossterm`, `rustyline` (всё mature, ноль
+   новых рисков). Никаких изменений в ядре движка — только UI слой.
+2. **v0.16.0 — GitHub + GitLab adapters**: REST+GraphQL, коммиты+issues+PR
+   в web-index.db. Это закроет 80% use-case'ов VCS-поиска.
+3. **v0.17.0 — gix (local git) + LFS pointer resolve**: локальные репо без
+   git-CLI, удалённые LFS-blob'ы без full fetch.
+4. **v0.18.0 — Hugging Face Hub**: model cards + datasets API → влитие в
+   web-index.db как `hf://` URL-схема.
+5. **v0.19.0 — DVC + Oxen**: data-versioning pointer files, remote storage
+   resolve.
+6. **v0.20.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
+   монореп и AI-model versioning.
+
+### 6.4. Архитектурное правило для v0.16+
+
+**Ноль новых зависимостей в `web-index.db` схеме** — VCS-страницы используют
+те же `WebDoc` + `links` + `content_hash` + `positions` + PageRank, что
+веб и NLM. URL-схема — единственное отличие (`gh://` вместо `https://`,
+`hf://` вместо `nlm://`). Все адаптеры — source-генераторы страниц, ядро
+поиска не трогается.
+
+Это сохраняет invariant v0.14.0: один `--web-search` пробивает ВСЕ юниверсы
+(NLM + веб + локальный код + GitHub + HuggingFace + …) с единой PageRank
+топологией.

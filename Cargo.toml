@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -35,6 +35,10 @@ ctrlc = "3.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # SIMD-поиск байтов: literal prefilter в стиле ripgrep / kwset GNU grep
 memchr = "2"
+# v0.15.0: poler-shell — TUI Dashboard + REPL
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+rustyline = "14"
 
 [dev-dependencies]
 tempfile = "3.10"
