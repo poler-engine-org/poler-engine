@@ -53,6 +53,7 @@ pub mod psi;
 pub mod resonance;
 pub mod streaming;
 pub mod tokenizer;
+pub mod web;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

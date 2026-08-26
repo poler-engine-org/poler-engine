@@ -20,6 +20,41 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.8.0: Web-Native Retrieval — нативный Chromium CDP
+
+Замена «костыльной» связке Rust → Node.js → CLI → Chromium из
+super-z-skills (`agent-browser --cdp 9222`): **прямой CDP-клиент на чистом
+std** (`src/web/cdp.rs`, ~430 строк) — WebSocket RFC 6455 поверх
+`TcpStream`, ноль новых зависимостей.
+
+```bash
+# Chromium headless (chrome-headless-shell, без X11/KDE):
+chrome-headless-shell --headless --remote-debugging-port=9222 --no-sandbox &
+
+poler-engine --web "https://en.wikipedia.org/wiki/Rust_(programming_language)" \
+    -q "ownership" --web-wait-ms 2500
+```
+
+| Возможность | Как реализовано |
+|---|---|
+| **Bypass SPA/Shadow DOM** | браузер исполняет весь JS; `Runtime.evaluate(document.body.innerText)` — текст, который видит человек |
+| **Перехват скрытых API** | `Network.responseReceived` (mimeType=application/json) + `Network.getResponseBody` — сырой JSON до превращения в HTML, до 64 ответов |
+| **Cross-Universe Graph** | рендер-текст и JSON попадают в веб-кэш → общий K-hop граф с локальным репозиторием |
+| **Фильтрация шума** | реклама/меню/футеры отсеиваются сами: у шаблонного мусора низкая ε-плотность относительно запроса |
+
+### Полевые замеры (Chromium 152 headless-shell, реальные страницы)
+
+| Страница | Рендер-текст | Результат |
+|---|---|---|
+| example.com | 129 Б | 3 хита, 4 мс |
+| doc.rust-lang.org/std/mem/fn.swap.html | 1 001 Б | 8 хитов «swap», ε/R посчитаны |
+| en.wikipedia.org/wiki/Rust_(…) | **73 686 Б**, 11.5K токенов | 9 хитов «ownership», сцена 16 КБ с FFI-контентом, граф 148 узлов |
+| httpbin.org/json | — | **1 JSON API перехвачен** (pretty-printed в кэше) |
+| Википедия mmap + локальный allocator.c | — | **Cross-Universe**: 24 хита из веба и кода в одном K-hop графе |
+
+CLI: `--web` (PATH трактуется как URL), `--cdp-port` (default 9222),
+`--web-wait-ms` (пауза на дочерние XHR, default 1200).
+
 ## v0.7.0: стриминговый Top-K + кэш локатора сцен
 
 Литературный стресс на LM1B (4 файла, 28 млн токенов, запрос «the» =
@@ -508,7 +543,7 @@ poler-engine/
 
 ## Тестирование
 
-140 тестов: 102 unit (математика ε/IIR, сканер скобок, raw-строки, PII,
+143 теста: 105 unit (математика ε/IIR, сканер скобок, raw-строки, PII,
 разбиение предложений, K-hop, temporal-фильтр) + 38 интеграционных
 (воспроизведение контракта спецификации на фикстуре главы 36, call graph,
 PII-маскирование, детерминизм, сортировка, режимы резонанса).

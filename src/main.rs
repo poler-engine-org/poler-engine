@@ -63,7 +63,21 @@ enum ResonanceArg {
 )]
 struct Cli {
     /// Путь к файлу или корню репозитория.
+    /// С --web: трактуется как URL (https://...) — рендер через Chromium CDP.
     path: PathBuf,
+
+    /// Рендер веб-страницы через Chromium CDP перед поиском
+    /// (патч интерпретирует PATH как URL).
+    #[arg(long)]
+    web: bool,
+
+    /// Порт Chromium DevTools (с --web) [default: 9222].
+    #[arg(long = "cdp-port", default_value_t = 9222)]
+    cdp_port: u16,
+
+    /// Пауза после load на дочерние XHR, мс (с --web) [default: 1200].
+    #[arg(long = "web-wait-ms", default_value_t = 1200)]
+    web_wait_ms: u64,
 
     /// Поисковый запрос: слово или фраза (в кавычках).
     #[arg(short, long)]
@@ -233,8 +247,37 @@ fn main() -> ExitCode {
         }
     }
 
-    if !cli.path.exists() {
-        eprintln!("poler-engine: путь не найден: {}", cli.path.display());
+    // ---------- Web-Native режим: рендер через Chromium CDP ----------
+    let scan_target: PathBuf = if cli.web {
+        let url = cli.path.to_string_lossy().to_string();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            eprintln!("poler-engine: --web ожидает URL (http(s)://...), получено: {url}");
+            return ExitCode::from(2);
+        }
+        match poler_engine::web::ingest_url(&url, cli.cdp_port, cli.web_wait_ms) {
+            Ok(res) => {
+                if cli.verbose {
+                    eprintln!(
+                        "poler-engine web: «{}» — {} байт текста, {} JSON API перехвачено",
+                        res.title,
+                        res.text_len,
+                        res.json_files.len()
+                    );
+                }
+                // директория кэша: сканируем текст страницы + все JSON
+                poler_engine::web::web_cache_dir()
+            }
+            Err(e) => {
+                eprintln!("poler-engine web: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        cli.path.clone()
+    };
+
+    if !cli.web && !scan_target.exists() {
+        eprintln!("poler-engine: путь не найден: {}", scan_target.display());
         return ExitCode::from(2);
     }
 
@@ -289,7 +332,7 @@ fn main() -> ExitCode {
             eprintln!("poler-engine: --impact и --query взаимоисключающие");
             return ExitCode::from(2);
         }
-        let files: Vec<PathBuf> = collect_files(&cli.path, &config)
+        let files: Vec<PathBuf> = collect_files(&scan_target, &config)
             .into_iter()
             .filter(|p| poler_engine::detect_lang(p) != CodeLang::Plain)
             .collect();
@@ -384,11 +427,11 @@ fn main() -> ExitCode {
         }
 
         if cli.watch {
-            return watch_mode(cli, config, query);
+            return watch_mode(cli, config, query, scan_target);
         }
 
         let mut engine = Engine::new(config, false);
-        let (result, stats) = engine.scan(&cli.path, &query);
+        let (result, stats) = engine.scan(&scan_target, &query);
         if cli.verbose {
             eprintln!(
                 "poler-engine: файлов просканировано={}, с совпадениями={}, токенов={}, \
@@ -413,7 +456,7 @@ fn main() -> ExitCode {
 
 /// Watcher-режим: первичный полный скан, затем инкрементальные rescans
 /// по mtime/size; выход по Ctrl-C (SIGINT).
-fn watch_mode(cli: Cli, config: EngineConfig, query: String) -> ExitCode {
+fn watch_mode(cli: Cli, config: EngineConfig, query: String, scan_target: PathBuf) -> ExitCode {
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -421,7 +464,7 @@ fn watch_mode(cli: Cli, config: EngineConfig, query: String) -> ExitCode {
     }
 
     let mut engine = Engine::new(config, true).with_diff(cli.diff);
-    let (result, stats) = engine.scan(&cli.path, &query);
+    let (result, stats) = engine.scan(&scan_target, &query);
     if cli.verbose {
         eprintln!(
             "poler-engine watch: начальный скан — файлов={}, хитов={}, время={}мс",
@@ -436,7 +479,7 @@ fn watch_mode(cli: Cli, config: EngineConfig, query: String) -> ExitCode {
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let (event, result, stats) = engine.rescan(&cli.path, &query);
+        let (event, result, stats) = engine.rescan(&scan_target, &query);
         if event.is_empty() {
             continue;
         }
