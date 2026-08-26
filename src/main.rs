@@ -1071,7 +1071,11 @@ fn main() -> ExitCode {
     }
 
     let Some(path_arg) = cli.path.clone() else {
-        eprintln!("poler-engine: укажите PATH, --web-search <QUERY> или --crawl с seed URL");
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+            return poler_engine::shell::run_tui(db_path);
+        }
+        eprintln!("poler-engine: укажите PATH, --tui, --web-search <QUERY> или --crawl с seed URL");
         return ExitCode::from(2);
     };
 
