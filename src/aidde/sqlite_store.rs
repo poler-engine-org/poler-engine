@@ -28,6 +28,17 @@ pub struct SymbolStore {
 }
 
 impl SymbolStore {
+    /// Открывает базу без сброса (reuse-режим): если таблицы уже
+    /// заполнены — возвращает Ok(false) и построение пропускается.
+    pub fn open_existing(db_path: &Path) -> rusqlite::Result<(Self, bool)> {
+        let conn = Connection::open(db_path)?;
+        let calls: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calls", [], |r| r.get(0))
+            .unwrap_or(0);
+        let has_schema = calls > 0;
+        Ok((Self { conn }, has_schema))
+    }
+
     /// Открывает (создаёт) базу и схему. `:memory:` — ин-мемори режим
     /// (совместимость с тестами).
     pub fn open(db_path: &Path) -> rusqlite::Result<Self> {

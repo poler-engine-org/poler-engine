@@ -146,7 +146,9 @@ impl Engine {
         let mut stats = ScanStats::default();
         let query_tokens: Vec<String> = query
             .split_whitespace()
-            .map(|w| w.to_lowercase())
+            .flat_map(|w| w.split(|c: char| !c.is_alphanumeric() && c != '_'))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
             .collect();
         if query_tokens.is_empty() || !target.exists() {
             return (

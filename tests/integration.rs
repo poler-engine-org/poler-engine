@@ -808,3 +808,39 @@ fn poler_dissipator_distinguishes_sparse_and_dense_hits() {
         "диссипатор не различает плотность: dense={dense_max} sparse={sparse_max}"
     );
 }
+
+#[test]
+fn sqlite_impact_reuse_skips_rebuild() {
+    use poler_engine::aidde::{impact_analysis_sqlite, SymbolStore};
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("a.rs"),
+        "pub fn core_fn(x: i32) -> i32 {\n    x + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("b.rs"), "pub fn mid() {\n    core_fn(1);\n}\n").unwrap();
+    let files = vec![dir.path().join("a.rs"), dir.path().join("b.rs")];
+    let db = dir.path().join("sym.db");
+
+    // первая сборка
+    let mut s1 = SymbolStore::open(&db).unwrap();
+    s1.build(&files, 1024 * 1024).unwrap();
+    let (d1, c1) = s1.stats();
+    drop(s1);
+
+    // Изменим исходники: reuse обязан проигнорировать содержимое
+    fs::write(dir.path().join("b.rs"), "pub fn other() {\n    nothing();\n}\n").unwrap();
+
+    // reuse: схема заполнена -> перестройки нет, данные прежние
+    let (s2, has) = SymbolStore::open_existing(&db).unwrap();
+    assert!(has, "reuse должен увидеть заполненную схему");
+    let (d2, c2) = s2.stats();
+    assert_eq!((d1, c1), (d2, c2), "reuse не должен перестраивать");
+    // старые вызовы доступны
+    assert!(!s2.calls_of_callee("core_fn").is_empty());
+    drop(s2);
+
+    // impact по reuse-базе работает
+    let (s3, _) = SymbolStore::open_existing(&db).unwrap();
+    assert!(impact_analysis_sqlite(&s3, "core_fn", 2, 100).is_some());
+}

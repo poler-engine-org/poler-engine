@@ -78,6 +78,11 @@ struct Cli {
     #[arg(long = "impact-cache")]
     impact_cache: Option<PathBuf>,
 
+    /// Переиспользовать существующую --impact-cache базу без
+    /// перестройки (мгновенные повторные impact-запросы).
+    #[arg(long = "impact-reuse", default_value_t = false)]
+    impact_reuse: bool,
+
     /// Глубина BFS impact-анализа.
     #[arg(long = "impact-depth", default_value_t = 3)]
     impact_depth: usize,
@@ -294,17 +299,41 @@ fn main() -> ExitCode {
         // Два режима: ин-мемори (по умолчанию) или SQLite-хранилище
         // (--impact-cache path.db — для кодовых баз 65K+ файлов).
         if let Some(db_path) = &cli.impact_cache {
-            let mut store = match poler_engine::aidde::SymbolStore::open(db_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("poler-engine: не удалось открыть базу {db_path:?}: {e}");
-                    return ExitCode::from(2);
+            // reuse-режим: существующая база не перестраивается
+            let store = if cli.impact_reuse && db_path.exists() {
+                match poler_engine::aidde::SymbolStore::open_existing(db_path) {
+                    Ok((s, has_schema)) => {
+                        if has_schema {
+                            if cli.verbose {
+                                eprintln!("poler-engine AIDDE: reuse базы {db_path:?}");
+                            }
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let store = match store {
+                Some(s) => s,
+                None => {
+                    let mut s = match poler_engine::aidde::SymbolStore::open(db_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("poler-engine: не удалось открыть базу {db_path:?}: {e}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    if let Err(e) = s.build(&files, config.max_file_bytes) {
+                        eprintln!("poler-engine: ошибка построения таблицы: {e}");
+                        return ExitCode::from(2);
+                    }
+                    s
                 }
             };
-            if let Err(e) = store.build(&files, config.max_file_bytes) {
-                eprintln!("poler-engine: ошибка построения таблицы: {e}");
-                return ExitCode::from(2);
-            }
             if cli.verbose {
                 let (d, c) = store.stats();
                 eprintln!("poler-engine AIDDE(sqlite): defs={d}, calls={c}");
