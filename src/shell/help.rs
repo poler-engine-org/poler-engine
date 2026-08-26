@@ -1,4 +1,4 @@
-//! # Help 2.0 + ? palette (v0.17.0)
+//! # Help 2.0 + ? palette (v0.17.1 — Companion Bridge)
 //!
 //! Полная man-подобная справка по всем командам poler-shell + интерактивная
 //! палитра из 10 готовых сценариев (вызывается `?` в TUI или REPL).
@@ -53,7 +53,7 @@ pub struct HelpEntry {
     pub short: &'static str,
 }
 
-/// Все команды poler-shell v0.17.0 (полный реестр для `help`).
+/// Все команды poler-shell v0.17.1 (полный реестр для `help`).
 pub fn all_entries() -> Vec<HelpEntry> {
     vec![
         HelpEntry { group: HelpGroup::Search, cmd: "search \"<query>\" [--top N]", short: "Пошук по web-index.db (NLM+веб+локал)" },
@@ -128,7 +128,7 @@ pub fn help_overview() -> String {
         HelpGroup::Sources,
         HelpGroup::Meta,
     ];
-    let _ = writeln!(s, "poler-shell v0.17.0 — TUI Redesign (MiMo Code-style 4-pane + mouse + CRUD)");
+    let _ = writeln!(s, "poler-shell v0.17.1 — TUI Redesign + Companion Bridge (MiMo Code-style 4-pane + mouse + CRUD + оф. NotebookLM API I/O)");
     let _ = writeln!(s, "Доступні команди ({}):\n", entries.len());
     for g in groups {
         let g_entries: Vec<&HelpEntry> = entries.iter().filter(|e| e.group == g).collect();

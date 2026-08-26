@@ -20,6 +20,7 @@
 //! (это отдельный профиль для API-вызовов, не stealth-краулер).
 
 pub mod api;
+pub mod companion;
 pub mod nlm;
 pub mod nlm_ingest;
 pub mod oauth;

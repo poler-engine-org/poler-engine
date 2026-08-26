@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.17.0"
+version = "0.17.1"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -45,6 +45,7 @@ rustyline = "14"
 ureq = { version = "2.10", features = ["json"] }
 gix = { version = "0.66", default-features = false, features = ["blocking-http-transport-reqwest", "blocking-network-client", "worktree-mutation", "revision", "comfort"] }
 # v0.17.0: TUI Redesign (MiMo Code-style 4-pane + mouse + notes/sources CRUD)
+# v0.17.1: Companion Bridge — оф. NotebookLM Enterprise API как auxiliary I/O gateway
 # arboard — системный буфер обмена (drag-select → Ctrl+Y копирование)
 arboard = "3"
 # tui-textarea — встроенный редактор для Ctrl+N (новая заметка) прямо в TUI
