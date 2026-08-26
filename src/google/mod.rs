@@ -20,6 +20,7 @@
 //! (это отдельный профиль для API-вызовов, не stealth-краулер).
 
 pub mod api;
+pub mod nlm;
 pub mod oauth;
 
 use std::io::{Read, Write};

@@ -20,6 +20,64 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.13.0: NotebookLM без API — протокол batchexecute + медиа-канал
+
+NotebookLM не имеет публичного API, но расширение **NLMTools.com** («NotebookLM
+Tools for Gemini») работает внутри авторизованной страницы и говорит на его
+внутреннем RPC. Разведка: скачали их Firefox-XPI (это zip), извлекли `inject.js`
+и чанки — получили **полный протокол**: 57 RPC-методов `batchexecute`, аргументы,
+парсеры ответов, структуру `WIZ_global_data`. Протокол перенесён в Rust (ноль
+новых зависимостей) — движок теперь сам делает всё, что умеет NLMTools, **и то,
+чего их API не отдаёт** (медиа).
+
+| Донор (NLMTools / NotebookLM) | Что взято | Куда легло |
+|---|---|---|
+| `inject.js` расширения | карта RPC: `wXbhsf` (ноутбуки), `rLM1Ne` (паспорт), `hizoJc` (контент источника), `cFji9` (заметки), `gArtLc` (Studio), `ZwVcOc` (аккаунт) | `src/google/nlm.rs` |
+| `batchexecute` (внутренний RPC Google) | формат `f.req`/`at`/`rpcids`, анти-XSSI-префикс `)]}'`, конверты `wrb.fr`, коды ошибок (8 — квота, 7/16 — авторизация) | `NlmSession::rpc` |
+| `WIZ_global_data` | токен `SNlM0e`, app/bl/fsid, email сессии | `NlmSession::open` |
+| парсеры `On`/`R` из чанков | ноутбуки/источники/артефакты, enum-типы (YouTube=9, Docs=1…), даты `[сек, наносек]` → ISO-8601 | `parse_notebooks` / `parse_source_content` / `parse_artifacts` |
+| **медиа-канал (чего нет в API NLMTools)** | картинки слайдов `l[5][0]`, скачивание через профильный Chromium, скриншоты страниц | `fetch_media` / `screenshot` |
+
+**Два канала — суть комбинации**: текст/доки/чат идут по batchexecute (точно и
+структурированно, как «специальный API» NLMTools), а медиа — глазами профильного
+Chromium (тот самый `--google-browse`-профиль из v0.12.0: логин один раз, куки
+живут месяцами). Модель ноутбука отвечает **по его источникам** — это RAG
+владельца, а не общая модель.
+
+```bash
+# 0) один раз: залогиниться в профиль движка (те же куки, что для --google-fetch)
+poler-engine --google-browse https://notebook.google.com/
+
+poler-engine --nlm-notebooks                # все ноутбуки + источники (id, типы, YouTube-id)
+poler-engine --nlm-source <nb> <src>        # текст источника ИЛИ URL картинок слайдов
+poler-engine --nlm-notes <nb>               # сохранённые заметки
+poler-engine --nlm-artifacts <nb>           # Studio: аудио-обзоры, отчёты, квизы, миндмэпы
+poler-engine --nlm-account                  # email/настройки сессии
+poler-engine --nlm-chat <nb> "вопрос"       # ответ модели ПО ИСТОЧНИКАМ ноутбука (до 90 с)
+poler-engine --nlm-media <URL>              # скачать картинку слайда → ~/.cache/poler-engine/nlm/
+poler-engine --nlm-shot <URL>               # скриншот страницы (медиа-глазами юзера) → PNG
+```
+
+**MCP**: инструмент `poler_nlm` (итого 7) — LLM-агент получает action-модель:
+`notebooks | source | notes | artifacts | account | chat | media | shot`;
+ошибки валидации возвращаются `isError` с подсказкой, «не залогинен» — с
+инструкцией `--google-browse`.
+
+**Аттестация v0.13.0**:
+- 12 unit-тестов протокола: парсеры конвертов/ноутбуков/источников/артефактов,
+  varint-даты, анти-XSSI, коды ошибок (квота/авторизация), деградация форматов;
+- живой e2e с фейковым NotebookLM (`scripts/mcp_nlm_test.py`): настоящий
+  Chromium + MCP-конвейер — 7 инструментов в tools/list; `notebooks` → 2
+  ноутбука с источниками и YouTube-id; `source` → текст склеен из кусков **и
+  URL картинки слайда отдан**; `media` → байты PNG совпали до байта; `shot` →
+  настоящий PNG-скриншот; `chat` → полная UI-автоматизация (ввод вопроса →
+  Enter → клик Send → эвристика стабилизации стрима → извлечение ответа);
+  валидационные ошибки — `isError` с подсказками;
+- против реального notebook.google.com — честная граница: без логина в профиль
+  движок отдаёт инструкцию `--google-browse` (сессию не подделываем).
+
+227 unit + 38 integration тестов зелёные, clippy 0.
+
 ## v0.12.0: Google-сервисы без пароля — OAuth 2.0 + персистентный профиль
 
 Интеграция с Gmail / Google Drive / NotebookLM **без передачи пароля движку** —
@@ -654,6 +712,14 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
     --google-fetch <URL>    прочитать URL через персистентный профиль (headless)
     --google-scopes <S>     доп. скоупы OAuth для --google-auth (через пробел)
     --google-max <N>        лимит Gmail/Drive-результатов [default: 10]
+    --nlm-notebooks         NotebookLM: все ноутбуки с источниками (batchexecute)
+    --nlm-source <NB> <SRC> контент источника: текст ИЛИ URL картинок слайдов
+    --nlm-notes <NB>        сохранённые заметки ноутбука
+    --nlm-artifacts <NB>    Studio-объекты: аудио-обзоры, отчёты, квизы, миндмэпы
+    --nlm-account           email/настройки сессии NotebookLM
+    --nlm-chat <NB> <Q>     вопрос к модели ноутбука ПО ЕГО ИСТОЧНИКАМ
+    --nlm-media <URL>       скачать медиа профильным Chromium → ~/.cache/poler-engine/nlm/
+    --nlm-shot <URL>        скриншот страницы NotebookLM → PNG
 -v, --verbose               статистика прогона в stderr
 ```
 
@@ -723,6 +789,11 @@ poler-engine/
     │   ├── phrase.rs           # v0.11: позиционный кодек (delta-varint) + фразовый поиск
     │   ├── stem.rs             # кириллический стеммер (uk/рос)
     │   └── …                   # robots, simhash, urlnorm, extract
+    ├── google/                  # v0.12–v0.13: сервисы Google без пароля
+    │   ├── mod.rs              # google-браузер (порт 9223) + персистентный профиль + GoogleHttp
+    │   ├── oauth.rs            # OAuth 2.0 loopback (RFC 8252), refresh, хранилище 0600
+    │   ├── api.rs              # Gmail/Drive readonly-API + форматтеры
+    │   └── nlm.rs              # v0.13: NotebookLM batchexecute-протокол + медиа-канал
     ├── tokenizer/
     │   ├── pii.rs              # zero-copy (Cow) маскирование PII
     │   └── inverted_index.rs   # индекс всех токенов, включая отрицания

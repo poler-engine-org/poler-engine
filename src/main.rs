@@ -154,6 +154,44 @@ struct Cli {
     #[arg(long = "google-scopes", value_name = "SCOPES")]
     google_scopes: Option<String>,
 
+    // ---------- NotebookLM через RPC-протокол NLMTools (v0.13.0) ----------
+
+    /// Все ноутбуки NotebookLM с источниками (RPC wXbhsf из протокола
+    /// NLMTools.com, сессия персистентного профиля — без пароля).
+    #[arg(long = "nlm-notebooks", conflicts_with_all = ["nlm_source", "nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    nlm_notebooks: bool,
+
+    /// Контент источника: текст и/или URL картинок слайдов (RPC hizoJc).
+    /// NOTEBOOK SRC — id из --nlm-notebooks.
+    #[arg(long = "nlm-source", value_names = ["NOTEBOOK", "SOURCE"], num_args = 2, conflicts_with_all = ["nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    nlm_source: Option<Vec<String>>,
+
+    /// Заметки ноутбука (RPC cFji9, raw-JSON).
+    #[arg(long = "nlm-notes", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    nlm_notes: Option<String>,
+
+    /// Studio-объекты: аудио-обзоры, отчёты, квизы, миндмэпы (RPC gArtLc).
+    #[arg(long = "nlm-artifacts", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_account", "nlm_chat", "nlm_media", "nlm_shot"])]
+    nlm_artifacts: Option<String>,
+
+    /// Аккаунт сессии NotebookLM (RPC ZwVcOc) — проверка логина профиля.
+    #[arg(long = "nlm-account", conflicts_with_all = ["nlm_chat", "nlm_media", "nlm_shot"])]
+    nlm_account: bool,
+
+    /// Спросить ноутбук: вопрос печатается в чат страницы, ответ
+    /// читается после стабилизации (UI-автоматизация, без пароля).
+    #[arg(long = "nlm-chat", value_names = ["NOTEBOOK", "QUESTION"], num_args = 2, conflicts_with_all = ["nlm_media", "nlm_shot"])]
+    nlm_chat: Option<Vec<String>>,
+
+    /// Скачать медиа-файл (картинка слайда и т.п.) авторизованным
+    /// профилем: poler-engine --nlm-media URL → poler-media-N.<ext>.
+    #[arg(long = "nlm-media", value_name = "URL", conflicts_with_all = ["nlm_shot"])]
+    nlm_media: Option<String>,
+
+    /// Скриншот страницы в профиле (PNG): медиа глазами юзера.
+    #[arg(long = "nlm-shot", value_name = "URL")]
+    nlm_shot: Option<String>,
+
     /// Максимум результатов Gmail/Drive [default: 10].
     #[arg(long = "google-max", default_value_t = 10)]
     google_max: usize,
@@ -434,6 +472,203 @@ fn print_drive_hits(hits: &[poler_engine::google::api::DriveHit], query: &str, f
     let _ = std::io::stdout().flush();
 }
 
+/// NotebookLM-режимы (v0.13.0): RPC-протокол NLMTools поверх
+/// персистентного профиля. Сессия открывается один раз на вызов.
+fn run_nlm(cli: &Cli) -> ExitCode {
+    use poler_engine::google::nlm::{self, NlmSession};
+
+    let fail = |e: String| {
+        eprintln!("poler-engine nlm: {e}");
+        ExitCode::from(2)
+    };
+
+    // ---- медиа и скриншот не требуют полноценной RPC-сессии ноутбука ----
+    if let Some(url) = cli.nlm_shot.clone() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return fail(format!("--nlm-shot ожидает URL, получено: {url}"));
+        }
+        let mut s = match NlmSession::open() {
+            Ok(s) => s,
+            Err(e) => return fail(e),
+        };
+        if let Err(e) = s.load_page_raw(&url) {
+            return fail(e);
+        }
+        return match s.screenshot() {
+            Ok(png) => match save_unique("poler-shot", "png", &png) {
+                Ok(path) => {
+                    println!("скриншот: {} ({} КБ)", path.display(), png.len() / 1024);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e),
+            },
+            Err(e) => fail(e),
+        };
+    }
+
+    if let Some(url) = cli.nlm_media.clone() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return fail(format!("--nlm-media ожидает URL, получено: {url}"));
+        }
+        let mut s = match NlmSession::open() {
+            Ok(s) => s,
+            Err(e) => return fail(e),
+        };
+        return match s.fetch_media(&url) {
+            Ok((bytes, ct)) => {
+                let ext = nlm::mime_ext(&ct);
+                match save_unique("poler-media", ext, &bytes) {
+                    Ok(path) => {
+                        println!("медиа: {} ({} КБ, {})", path.display(), bytes.len() / 1024, ct);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    // ---- RPC-режимы ----
+    let mut s = match NlmSession::open() {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    if cli.verbose {
+        if let Some(email) = &s.email {
+            eprintln!("poler-engine nlm: сессия {email}");
+        }
+    }
+
+    if cli.nlm_notebooks {
+        return match s.list_notebooks() {
+            Ok(nbs) => {
+                if cli.format == Format::AiJson {
+                    let out = serde_json::json!({
+                        "engine": "poler-engine",
+                        "mode": "nlm-notebooks",
+                        "auth": "persistent profile (no password)",
+                        "protocol": "batchexecute (NLMTools)",
+                        "total": nbs.len(),
+                        "results": nbs,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                } else {
+                    println!("{}", nlm::format_notebooks(&nbs));
+                }
+                if nbs.is_empty() {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    if let Some(args) = cli.nlm_source.clone() {
+        let (nb, src) = (args[0].clone(), args[1].clone());
+        return match s.load_source(&nb, &src) {
+            Ok(sc) => {
+                if cli.format == Format::AiJson {
+                    let out = serde_json::json!({
+                        "engine": "poler-engine",
+                        "mode": "nlm-source",
+                        "notebook": nb,
+                        "source": sc,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                } else {
+                    println!("{}", nlm::format_source_content(&sc, &nb));
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    if let Some(nb) = cli.nlm_notes.clone() {
+        return match s.notes(&nb) {
+            Ok(v) => {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    if let Some(nb) = cli.nlm_artifacts.clone() {
+        return match s.artifacts(&nb) {
+            Ok(arts) => {
+                if cli.format == Format::AiJson {
+                    let out = serde_json::json!({
+                        "engine": "poler-engine",
+                        "mode": "nlm-artifacts",
+                        "notebook": nb,
+                        "total": arts.len(),
+                        "results": arts,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                } else {
+                    println!("{}", nlm::format_artifacts(&arts));
+                }
+                if arts.is_empty() {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    if cli.nlm_account {
+        return match s.account() {
+            Ok(v) => {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    if let Some(args) = cli.nlm_chat.clone() {
+        let (nb, q) = (args[0].clone(), args[1].clone());
+        return match s.chat(&nb, &q) {
+            Ok(answer) => {
+                if cli.format == Format::AiJson {
+                    let out = serde_json::json!({
+                        "engine": "poler-engine",
+                        "mode": "nlm-chat",
+                        "notebook": nb,
+                        "question": q,
+                        "answer": answer,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                } else {
+                    println!("{answer}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        };
+    }
+
+    fail("nlm: не выбран режим (см. --help)".to_string())
+}
+
+/// Сохранить байты в неиспользуемый файл poler-<prefix>-N.<ext> в CWD.
+fn save_unique(prefix: &str, ext: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    for n in 1..10_000 {
+        let p = std::path::PathBuf::from(format!("{prefix}-{n:02}.{ext}"));
+        if !p.exists() {
+            std::fs::write(&p, bytes).map_err(|e| format!("запись {}: {e}", p.display()))?;
+            return Ok(p);
+        }
+    }
+    Err("не найдено свободного имени для файла".to_string())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -593,6 +828,19 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         };
+    }
+
+    // ---------- NotebookLM: RPC-протокол NLMTools без пароля (v0.13.0) ----------
+    if cli.nlm_notebooks
+        || cli.nlm_source.is_some()
+        || cli.nlm_notes.is_some()
+        || cli.nlm_artifacts.is_some()
+        || cli.nlm_account
+        || cli.nlm_chat.is_some()
+        || cli.nlm_media.is_some()
+        || cli.nlm_shot.is_some()
+    {
+        return run_nlm(&cli);
     }
 
     // ---------- Веб-индекс: статистика ----------

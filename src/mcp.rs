@@ -17,7 +17,12 @@
 //! * `poler_search`     — локальный резонансный POLER-поиск (ε/R/сцены);
 //! * `poler_gmail`      — поиск в Gmail владельца через OAuth-токен
 //!   (readonly, одноразовый `--google-auth`, пароль не проходит через движок);
-//! * `poler_drive`      — файлы Google Drive через тот же OAuth-токен.
+//! * `poler_drive`      — файлы Google Drive через тот же OAuth-токен;
+//! * `poler_nlm`        — ноутбуки NotebookLM владельца через персистентный
+//!   профиль (протокол batchexecute, разведан из расширения NLMTools):
+//!   ноутбуки/источники/заметки/Studio, чат с моделью ноутбука и
+//!   медиа-канал (то, что API NLMTools не отдаёт — скачивает профильный
+//!   Chromium: картинки слайдов, скриншоты страниц).
 //!
 //! Chromium поднимается автоматически при первом poler_crawl/poler_fetch
 //! (см. `web::ensure_chromium`).
@@ -33,6 +38,18 @@ use crate::{Engine, EngineConfig};
 /// Cap рендер-текста в ответе poler_fetch: больше — бессмысленно для
 /// контекстного окна агента (полный текст лежит в кэш-файле).
 const FETCH_TEXT_CAP: usize = 24 * 1024;
+
+/// Cap raw-JSON (заметки/аккаунт NotebookLM) в ответе poler_nlm.
+const NLM_JSON_CAP: usize = 16 * 1024;
+
+/// Безопасно усечь строку по границе символов.
+fn cap_chars(s: &str, max: usize) -> (String, bool) {
+    if s.chars().count() <= max {
+        (s.to_string(), false)
+    } else {
+        (s.chars().take(max).collect(), true)
+    }
+}
 
 pub struct McpServer {
     cdp_port: u16,
@@ -146,6 +163,7 @@ impl McpServer {
             "poler_search" => self.tool_local_search(&args),
             "poler_gmail" => self.tool_gmail(&args),
             "poler_drive" => self.tool_drive(&args),
+            "poler_nlm" => self.tool_nlm(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -401,6 +419,136 @@ impl McpServer {
         }
         Ok(crate::google::api::format_drive_hits(&hits, query))
     }
+
+    // -----------------------------------------------------------------
+    // poler_nlm: NotebookLM владельца (персистентный профиль, без пароля)
+    // -----------------------------------------------------------------
+    fn tool_nlm(&self, args: &Value) -> Result<String, String> {
+        use crate::google::nlm::{self, NlmSession};
+
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент action обязателен: notebooks | source | notes | artifacts | account | chat | media | shot")?
+            .to_string();
+        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+        let notebook_id = get("notebook_id");
+        let source_id = get("source_id");
+        let question = get("question");
+        let url = get("url");
+
+        match action.as_str() {
+            // ---- медиа-канал: профильный Chromium видит то, чего нет в API ----
+            "media" | "shot" => {
+                let url = url.ok_or_else(|| format!("action {action} требует аргумент url"))?;
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(format!("url должен быть http(s)://…, получено: {url}"));
+                }
+                let mut s = NlmSession::open()?;
+                if action == "media" {
+                    let (bytes, ct) = s.fetch_media(&url)?;
+                    let path = nlm::save_media("poler-media", nlm::mime_ext(&ct), &bytes)?;
+                    Ok(format!(
+                        "медиа скачано профильным Chromium: {} ({} КБ, {})\nисточник: {url}\n\n\
+                         URL картинок слайдов приходит в action source (у контента с images).",
+                        path.display(),
+                        bytes.len() / 1024,
+                        ct
+                    ))
+                } else {
+                    s.load_page_raw(&url)?;
+                    let png = s.screenshot()?;
+                    let path = nlm::save_media("poler-shot", "png", &png)?;
+                    Ok(format!(
+                        "скриншот страницы: {} ({} КБ)\nстраница: {url}\n\n\
+                         PNG можно открыть или приложить к ответу владельцу — это канал \
+                         для контента, который текстовый batchexecute не отдаёт.",
+                        path.display(),
+                        png.len() / 1024
+                    ))
+                }
+            }
+
+            "notebooks" => {
+                let mut s = NlmSession::open()?;
+                let nbs = s.list_notebooks()?;
+                if nbs.is_empty() {
+                    return Ok(
+                        "0 ноутбуков у этого Google-аккаунта (создай на notebook.google.com)".to_string()
+                    );
+                }
+                Ok(format!(
+                    "NotebookLM: {} ноутбуков (аккаунт {}).\n\n{}\n\n\
+                     notebook_id нужен для action source/notes/artifacts/chat; source_id \
+                     и URL картинок — в списках источников выше.",
+                    nbs.len(),
+                    s.email.as_deref().unwrap_or("?"),
+                    nlm::format_notebooks(&nbs)
+                ))
+            }
+
+            "source" => {
+                let nb = notebook_id
+                    .ok_or("action source требует notebook_id (см. action notebooks)")?;
+                let src = source_id
+                    .ok_or("action source требует source_id (см. источники в action notebooks)")?;
+                let mut s = NlmSession::open()?;
+                let sc = s.load_source(&nb, &src)?;
+                Ok(nlm::format_source_content(&sc, &nb))
+            }
+
+            "notes" => {
+                let nb = notebook_id.ok_or("action notes требует notebook_id")?;
+                let mut s = NlmSession::open()?;
+                let v = s.notes(&nb)?;
+                let pretty = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+                let (out, truncated) = cap_chars(&pretty, NLM_JSON_CAP);
+                Ok(format!(
+                    "Заметки ноутбука {nb} (raw-JSON):\n\n{out}{}",
+                    if truncated { "\n…(обрезано для контекстного окна)" } else { "" }
+                ))
+            }
+
+            "artifacts" => {
+                let nb = notebook_id.ok_or("action artifacts требует notebook_id")?;
+                let mut s = NlmSession::open()?;
+                let arts = s.artifacts(&nb)?;
+                if arts.is_empty() {
+                    return Ok(
+                        "Studio пусто: у ноутбука нет аудио-обзоров/отчётов/квизов/миндмэпов".to_string()
+                    );
+                }
+                Ok(format!(
+                    "Studio-объекты ноутбука {nb}:\n\n{}",
+                    nlm::format_artifacts(&arts)
+                ))
+            }
+
+            "account" => {
+                let mut s = NlmSession::open()?;
+                let v = s.account()?;
+                let pretty = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+                let (out, truncated) = cap_chars(&pretty, NLM_JSON_CAP);
+                Ok(format!(
+                    "Аккаунт NotebookLM (raw-JSON):\n\n{out}{}",
+                    if truncated { "\n…(обрезано)" } else { "" }
+                ))
+            }
+
+            "chat" => {
+                let nb = notebook_id.ok_or("action chat требует notebook_id")?;
+                let q = question.ok_or("action chat требует question")?;
+                eprintln!("poler-mcp: nlm chat notebook={nb} q={q:?} (до 90 с)");
+                let mut s = NlmSession::open()?;
+                let answer = s.chat(&nb, &q)?;
+                Ok(format!("NotebookLM-ответ по источникам ноутбука {nb}:\n\n{answer}"))
+            }
+
+            other => Err(format!(
+                "неизвестный action: {other} (доступны notebooks | source | notes | artifacts | account | chat | media | shot)"
+            )),
+        }
+    }
 }
 
 fn tools_manifest() -> Vec<Value> {
@@ -498,6 +646,35 @@ has:attachment, newer_than:7d, is:unread, слова И-комбинируютс
                     "max": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50}
                 },
                 "required": []
+            }
+        }),
+        json!({
+            "name": "poler_nlm",
+            "description": "Ноутбуки NotebookLM владельца — БЕЗ пароля: движок говорит \
+на внутреннем протоколе NotebookLM (batchexecute, разведан из расширения \
+NLMTools) через персистентный профиль Chromium (одноразовый ручной логин: \
+poler-engine --google-browse https://notebook.google.com/). Действия (action): \
+notebooks — все ноутбуки с источниками (id, заголовки, типы, URL); source — \
+текст источника или URL картинок слайдов (медиа!); notes — сохранённые \
+заметки; artifacts — Studio-объекты (аудио-обзоры, отчёты, квизы, миндмэпы); \
+account — профиль аккаунта; chat — вопрос к модели ноутбука ПО ЕГО \
+ИСТОЧНИКАМ (RAG владельца, не общая модель); media — скачать медиа-URL \
+(картинки из source) в файл; shot — скриншот любой страницы NotebookLM \
+(медиа-канал: то, что текстовый API не отдаёт).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["notebooks", "source", "notes", "artifacts", "account", "chat", "media", "shot"],
+                        "description": "Режим работы"
+                    },
+                    "notebook_id": {"type": "string", "description": "id ноутбука — из action notebooks"},
+                    "source_id": {"type": "string", "description": "id источника — из списка источников ноутбука"},
+                    "question": {"type": "string", "description": "Вопрос для action chat (по источникам ноутбука)"},
+                    "url": {"type": "string", "description": "http(s)://… — медиа-URL (action media) или страница (action shot)"}
+                },
+                "required": ["action"]
             }
         }),
     ]

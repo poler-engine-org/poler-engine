@@ -22,7 +22,7 @@ use std::time::Duration;
 const MAX_WS_MESSAGE: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// base64 (только для Sec-WebSocket-Key — 16 байт)
+// base64: encode для Sec-WebSocket-Key, decode для скриншотов и медиа
 // ---------------------------------------------------------------------------
 
 fn base64_encode(data: &[u8]) -> String {
@@ -49,6 +49,37 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+/// Стандартный base64-декодер (без паддинга и с мусором вокруг — терпит).
+/// Нужен для `Page.captureScreenshot` и загрузки медиа NotebookLM.
+pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Result<u32, String> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' | b'-' => Ok(62),
+            b'/' | b'_' => Ok(63),
+            _ => Err(format!("не-base64 символ {:?}", c as char)),
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' || c == b' ' {
+            continue; // паддинг и перевод строк игнорируем
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
 }
 
 /// 16 случайных байт из /dev/urandom (или fallback на время).
@@ -430,6 +461,19 @@ impl CdpSession {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string())
+    }
+
+    /// Скриншот текущей страницы: PNG-байты через `Page.captureScreenshot`.
+    /// Медиа-канал для сервисов без API: видим страницу ровно как юзер
+    /// (фото, слайды, графики — всё, что не отдаётся текстом).
+    pub fn capture_screenshot(&mut self) -> Result<Vec<u8>, String> {
+        let params = r#"{"format":"png","captureBeyondViewport":true}"#;
+        let res = self.command("Page.captureScreenshot", params)?;
+        let b64 = res
+            .get("data")
+            .and_then(|d| d.as_str())
+            .ok_or("Page.captureScreenshot не вернул data")?;
+        crate::web::cdp::base64_decode(b64)
     }
 
     /// Runtime.evaluate → строка (returnByValue).
