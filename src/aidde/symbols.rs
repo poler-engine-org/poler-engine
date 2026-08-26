@@ -5,6 +5,7 @@
 //! скоуп вызова определяется лексическим сканером [`crate::parser::ast_code`]
 //! (строки/raw-строки/комментарии корректно пропускаются).
 
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -100,125 +101,36 @@ pub struct SymbolTable {
 
 impl SymbolTable {
     /// Сканирует кодовые файлы (Rust/Python/C/JS/…) и строит таблицу.
+    ///
+    /// v0.6: параллельная сборка (rayon par_iter) — файлы независимы,
+    /// результаты сливаются в порядке исходного списка (детерминизм).
     pub fn build(files: &[PathBuf], max_file_bytes: u64) -> Self {
+        let per_file: Vec<(Vec<Definition>, Vec<CallSite>, Vec<ImportStmt>)> = files
+            .par_iter()
+            .map(|path| scan_one_file(path, max_file_bytes))
+            .collect();
+
         let mut defs: Vec<Definition> = Vec::new();
         let mut calls: Vec<CallSite> = Vec::new();
         let mut imports: Vec<ImportStmt> = Vec::new();
-
-        for path in files {
-            if detect_lang(path) == CodeLang::Plain {
-                continue;
-            }
-            let Ok(meta) = std::fs::metadata(path) else {
-                continue;
-            };
-            if meta.len() > max_file_bytes {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let lang = detect_lang(path);
-            let stem = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let file_s = path.to_string_lossy().to_string();
-
-            // --- определения + импорты (построчно) ---
-            let mut off = 0usize;
-            for line in text.lines() {
-                if let Some((kind, name)) = ast_code::signature_of(line) {
-                    defs.push(Definition {
-                        symbol: name,
-                        kind,
-                        file: file_s.clone(),
-                        line: line_of_byte(&text, off),
-                        byte: off,
-                    });
-                }
-                if let Some(module) = import_of(line) {
-                    imports.push(ImportStmt {
-                        file: file_s.clone(),
-                        module,
-                    });
-                }
-                off += line.len() + 1;
-            }
-
-            // --- вызовы (call graph) ---
-            let noise_spans = ast_code::string_comment_spans(&text);
-            let in_noise = |off: usize| -> bool {
-                noise_spans.iter().any(|(s, e)| off >= *s && off < *e)
-            };
-
-            for caps in CALL_RE.captures_iter(&text) {
-                let callee = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
-                if callee.is_empty() || CALL_KEYWORDS.contains(&callee.as_str()) {
-                    continue;
-                }
-                let call_off = caps.get(0).map(|m| m.start()).unwrap_or(0);
-
-                // вызовы внутри строковых литералов и комментариев — шум
-                if in_noise(call_off) {
-                    continue;
-                }
-
-                let scope = ast_code::locate_scope(&text, call_off, lang);
-
-                // Определение вне любого блока (например, `fn inner() {}`
-                // на верхнем уровне): сигнатура строки совпадает с callee.
-                if scope.is_none() {
-                    let line_sig = ast_code::light_signature(&text, call_off);
-                    if line_sig.as_deref() == Some(callee.as_str()) {
-                        continue;
-                    }
-                }
-
-                let (scope_b, scope_name) = match scope {
-                    Some((b, _)) => (b, ast_code::light_signature(&text, b)),
-                    None => (0, None),
-                };
-                let caller = match &scope_name {
-                    Some(n) => format!("{stem}::{n}"),
-                    None => stem.clone(),
-                };
-
-                // Совпадение в строке сигнатуры — это определение, не вызов:
-                // пропуск, если имя совпадает со скоупом и смещение до '{'
-                // (brace-языки) / в пределах строки заголовка (Python).
-                if let Some(name) = &scope_name {
-                    if *name == callee {
-                        let header_end = match lang {
-                            CodeLang::Brace => text[scope_b..]
-                                .find('{')
-                                .map(|i| scope_b + i)
-                                .unwrap_or(scope_b),
-                            _ => text[scope_b..]
-                                .find('\n')
-                                .map(|i| scope_b + i)
-                                .unwrap_or(text.len()),
-                        };
-                        if call_off <= header_end {
-                            continue;
-                        }
-                    }
-                }
-
-                calls.push(CallSite {
-                    caller,
-                    callee,
-                    file: file_s.clone(),
-                    line: line_of_byte(&text, call_off),
-                });
-            }
+        for (d, c, i) in per_file {
+            defs.extend(d);
+            calls.extend(c);
+            imports.extend(i);
         }
+        Self::from_parts(defs, calls, imports)
+    }
 
+    /// Сборка таблицы из готовых частей (используется SQLite-бэкендом).
+    pub fn from_parts(
+        defs: Vec<Definition>,
+        calls: Vec<CallSite>,
+        imports: Vec<ImportStmt>,
+    ) -> Self {
         let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, d) in defs.iter().enumerate() {
             by_name.entry(d.symbol.clone()).or_default().push(i);
         }
-
         Self {
             defs,
             calls,
@@ -226,7 +138,152 @@ impl SymbolTable {
             by_name,
         }
     }
+}
 
+/// Разбор одного файла в (defs, calls, imports).
+pub(crate) fn scan_one_file(
+    path: &PathBuf,
+    max_file_bytes: u64,
+) -> (Vec<Definition>, Vec<CallSite>, Vec<ImportStmt>) {
+    let mut defs: Vec<Definition> = Vec::new();
+    let mut calls: Vec<CallSite> = Vec::new();
+    let mut imports: Vec<ImportStmt> = Vec::new();
+
+    if detect_lang(path) == CodeLang::Plain {
+        return (defs, calls, imports);
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (defs, calls, imports);
+    };
+    if meta.len() > max_file_bytes {
+        return (defs, calls, imports);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (defs, calls, imports);
+    };
+    let lang = detect_lang(path);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    #[allow(unused_variables)]
+    let file_s = path.to_string_lossy().to_string();
+
+let file_s = path.to_string_lossy().to_string();
+
+    // --- определения + импорты (построчно) ---
+    let mut off = 0usize;
+    for line in text.lines() {
+        if let Some((kind, name)) = ast_code::signature_of(line) {
+            defs.push(Definition {
+                symbol: name,
+                kind,
+                file: file_s.clone(),
+                line: line_of_byte(&text, off),
+                byte: off,
+            });
+        }
+        if let Some(module) = import_of(line) {
+            imports.push(ImportStmt {
+                file: file_s.clone(),
+                module,
+            });
+        }
+        off += line.len() + 1;
+    }
+
+    // --- вызовы (call graph) ---
+    // Спаны генерируются последовательно => уже отсортированы по
+    // началу. Бинарный поиск: O(log K) на вызов вместо O(K).
+    // (v0.6: на Wireshark-файлах с 5000+ спанов убирает O(M×N).)
+    let noise_spans = ast_code::string_comment_spans(&text);
+    let in_noise = |off: usize| -> bool {
+        match noise_spans.binary_search_by(|(s, e)| {
+            if off < *s {
+                std::cmp::Ordering::Greater
+            } else if off >= *e {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
+            Ok(_) => true,
+            // Err(insert_pos): спан слева от insert_pos может
+            // накрывать off (перекрывающихся спанов нет — они
+            // дизъюнктны по построению)
+            Err(0) => false,
+            Err(ip) => {
+                let (s, e) = noise_spans[ip - 1];
+                off >= s && off < e
+            }
+        }
+    };
+
+    for caps in CALL_RE.captures_iter(&text) {
+        let callee = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+        if callee.is_empty() || CALL_KEYWORDS.contains(&callee.as_str()) {
+            continue;
+        }
+        let call_off = caps.get(0).map(|m| m.start()).unwrap_or(0);
+
+        // вызовы внутри строковых литералов и комментариев — шум
+        if in_noise(call_off) {
+            continue;
+        }
+
+        let scope = ast_code::locate_scope(&text, call_off, lang);
+
+        // Определение вне любого блока (например, `fn inner() {}`
+        // на верхнем уровне): сигнатура строки совпадает с callee.
+        if scope.is_none() {
+            let line_sig = ast_code::light_signature(&text, call_off);
+            if line_sig.as_deref() == Some(callee.as_str()) {
+                continue;
+            }
+        }
+
+        let (scope_b, scope_name) = match scope {
+            Some((b, _)) => (b, ast_code::light_signature(&text, b)),
+            None => (0, None),
+        };
+        let caller = match &scope_name {
+            Some(n) => format!("{stem}::{n}"),
+            None => stem.clone(),
+        };
+
+        // Совпадение в строке сигнатуры — это определение, не вызов:
+        // пропуск, если имя совпадает со скоупом и смещение до '{'
+        // (brace-языки) / в пределах строки заголовка (Python).
+        if let Some(name) = &scope_name {
+            if *name == callee {
+                let header_end = match lang {
+                    CodeLang::Brace => text[scope_b..]
+                        .find('{')
+                        .map(|i| scope_b + i)
+                        .unwrap_or(scope_b),
+                    _ => text[scope_b..]
+                        .find('\n')
+                        .map(|i| scope_b + i)
+                        .unwrap_or(text.len()),
+                };
+                if call_off <= header_end {
+                    continue;
+                }
+            }
+        }
+
+        calls.push(CallSite {
+            caller,
+            callee,
+            file: file_s.clone(),
+            line: line_of_byte(&text, call_off),
+        });
+    }
+
+    (defs, calls, imports)
+}
+
+impl SymbolTable {
     /// Разрешает имя символа (с поддержкой qualified `a::b::c`).
     pub fn resolve(&self, name: &str) -> Vec<&Definition> {
         let key = last_segment(name);

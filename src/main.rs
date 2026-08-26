@@ -73,6 +73,11 @@ struct Cli {
     #[arg(long)]
     impact: Option<String>,
 
+    /// Disk-backed таблица символов (SQLite) для AIDDE на гигантских
+    /// кодовых базах: RAM ограничен пачками записи, BFS — индексами.
+    #[arg(long = "impact-cache")]
+    impact_cache: Option<PathBuf>,
+
     /// Глубина BFS impact-анализа.
     #[arg(long = "impact-depth", default_value_t = 3)]
     impact_depth: usize,
@@ -286,18 +291,56 @@ fn main() -> ExitCode {
         if cli.verbose {
             eprintln!("poler-engine AIDDE: кодовых файлов: {}", files.len());
         }
-        let table = SymbolTable::build(&files, config.max_file_bytes);
-        match impact_analysis(&table, symbol, cli.impact_depth, 200) {
-            Some(report) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).unwrap_or_default()
-                );
-                ExitCode::SUCCESS
+        // Два режима: ин-мемори (по умолчанию) или SQLite-хранилище
+        // (--impact-cache path.db — для кодовых баз 65K+ файлов).
+        if let Some(db_path) = &cli.impact_cache {
+            let mut store = match poler_engine::aidde::SymbolStore::open(db_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("poler-engine: не удалось открыть базу {db_path:?}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            if let Err(e) = store.build(&files, config.max_file_bytes) {
+                eprintln!("poler-engine: ошибка построения таблицы: {e}");
+                return ExitCode::from(2);
             }
-            None => {
-                eprintln!("poler-engine: символ не найден: {symbol}");
-                ExitCode::from(1)
+            if cli.verbose {
+                let (d, c) = store.stats();
+                eprintln!("poler-engine AIDDE(sqlite): defs={d}, calls={c}");
+            }
+            match poler_engine::aidde::impact_analysis_sqlite(
+                &store,
+                symbol,
+                cli.impact_depth,
+                200,
+            ) {
+                Some(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("poler-engine: символ не найден: {symbol}");
+                    ExitCode::from(1)
+                }
+            }
+        } else {
+            let table = SymbolTable::build(&files, config.max_file_bytes);
+            match impact_analysis(&table, symbol, cli.impact_depth, 200) {
+                Some(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("poler-engine: символ не найден: {symbol}");
+                    ExitCode::from(1)
+                }
             }
         }
     } else {

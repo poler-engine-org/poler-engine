@@ -13,7 +13,9 @@
 //!   обратным рёбрам) + эвристики сайд-эффектов + danger level.
 
 pub mod impact;
+pub mod sqlite_store;
 pub mod symbols;
 
 pub use impact::{impact_analysis, Dependency, Dependent, ImpactReport};
+pub use sqlite_store::{impact_analysis_sqlite, last_seg, SymbolStore};
 pub use symbols::{CallSite, Definition, ImportStmt, SymbolTable};

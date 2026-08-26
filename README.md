@@ -20,6 +20,27 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.6.0: пять багфиксов полевой аттестации + SQLite AIDDE
+
+### Исправления по отчёту полевых стресс-тестов (Wireshark/PYCCLE)
+
+| # | Баг | Исправление | Эффект |
+|---|---|---|---|
+| 1 | Квадратичный поиск по noise_spans в AIDDE (O(M×N) на файл) | Бинарный поиск по отсортированным спанам O(log K) | убраны десятки миллионов итераций на файл Wireshark |
+| 2 | Однопоточный SymbolTable::build | rayon par_iter + слияние в порядке файлов (детерминизм) | оба ядра, ~2× |
+| 3 | Память на многофайловых корпусах с частым словом (PYCCLE «king»: 500K+ HitRecord → 1.4 ГБ) | **Early Top-K Pruning**: per-file только top_n якорей + компактные hit_keys (8 байт/хит) + hits_temporal для честного total_hits; осиротевшие сцены удаляются | Eteryya: 168→138 МБ; корректность: глобальный top-N ⊆ ∪ per-file top-N |
+| 4 | Линейный скан table.calls на каждом шаге BFS в impact | Индексы HashMap по callee/caller, O(1) lookup на уровень | AIDDE без квадратичности |
+| 5 | OOM ин-мемори AIDDE на 65K файлах (~5 млн вызовов = 5–8 ГБ) | **SQLite SymbolStore** (`--impact-cache path.db`): потоковая запись чанками из rayon-воркеров (пик RAM = чанк), нормализация путей (files id/path — сжатие в ~2.5×), B-Tree индексы по callee/caller, BFS только по нужным строкам | **полное ядро Linux: 61 092 файла, 1.7 млн defs + 6.7 млн вызовов, RSS ~100 МБ** (было: OOM-kill при 4 ГБ) |
+
+### Результаты полного AIDDE на Linux Kernel через SQLite
+
+```bash
+poler-engine ~/linux-6.12.35 --impact printk --impact-cache /tmp/sym.db
+# 61 092 файла | defs=1 712 453 | calls=6 683 592
+# RSS ≈ 100 МБ (ин-мемори версия умирала от OOM)
+# printk → CRITICAL (44 файла), 200 upstream
+```
+
 ## v0.5.0: канонический POLER-цикл из P3_Engine + экзамен на Linux Kernel
 
 ### Канонический POLER-цикл (p3_poler.zig → poler-engine)
@@ -343,6 +364,7 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
     --max-scope <BYTES>     потолок enclosing_scope [default: 16384]
     --max-relations <N>     потолок K-hop связей на якорь [default: 64]
     --impact <SYMBOL>       AIDDE: impact-паспорт символа (upstream/downstream)
+    --impact-cache <DB>     disk-backed таблица символов (SQLite): для баз 65K+ файлов
     --impact-depth <N>      глубина BFS impact-анализа [default: 3]
     --watch                 watcher: инкрементальный рескан по mtime
     --diff                  дифф-режим watcher: только новые якоря
@@ -446,7 +468,7 @@ poler-engine/
 
 ## Тестирование
 
-137 тестов: 100 unit (математика ε/IIR, сканер скобок, raw-строки, PII,
+139 тестов: 102 unit (математика ε/IIR, сканер скобок, raw-строки, PII,
 разбиение предложений, K-hop, temporal-фильтр) + 37 интеграционных
 (воспроизведение контракта спецификации на фикстуре главы 36, call graph,
 PII-маскирование, детерминизм, сортировка, режимы резонанса).

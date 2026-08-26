@@ -44,6 +44,13 @@ impl WatchEvent {
 }
 
 /// Кэшированное состояние одного файла для watcher-режима.
+///
+/// v0.6 (bug: память на многофайловых корпусах с частым словом):
+/// `records` хранит только top_n лучших по резонансу якорей файла
+/// (Early Top-K Pruning), а полный список хитов — компактные
+/// `hit_keys` (байтовые позиции, 8 байт на хит) для diff-режима и
+/// честного total_hits. Сцены, на которые не ссылается ни один
+/// оставшийся якорь, удаляются.
 #[derive(Debug, Clone)]
 struct FileEntry {
     mtime: SystemTime,
@@ -51,8 +58,34 @@ struct FileEntry {
     counts: HashMap<String, usize>,
     total: u64,
     hits: Vec<u32>,
+    /// Все байтовые позиции хитов (компактно, для diff/статистики).
+    hit_keys: Vec<usize>,
+    /// Число хитов, прошедших temporal-фильтр (честный total_hits).
+    hits_temporal: usize,
+    /// Только top_n лучших якорей файла (по резонансу).
     records: Vec<HitRecord>,
     scenes: HashMap<(usize, usize), SceneInfo>,
+}
+
+/// Обрезает записи файла до top_n лучших по резонансу, чистит
+/// осиротевшие сцены. Математически корректно: глобальный top-N
+/// содержится в объединении per-file top-N.
+fn prune_file_entry(
+    records: &mut Vec<HitRecord>,
+    scenes: &mut HashMap<(usize, usize), SceneInfo>,
+    top_n: usize,
+) {
+    if records.len() > top_n {
+        records.sort_by(|a, b| {
+            b.resonance
+                .partial_cmp(&a.resonance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        records.truncate(top_n);
+        let alive: HashSet<(usize, usize)> =
+            records.iter().map(|r| r.scene_key).collect();
+        scenes.retain(|k, _| alive.contains(k));
+    }
 }
 
 /// Поисковый движок с опциональным инкрементальным состоянием.
@@ -205,6 +238,8 @@ impl Engine {
                         counts: entry_counts.unwrap_or_default(),
                         total: r.total,
                         hits: r.hits.clone(),
+                        hit_keys: Vec::new(),
+                        hits_temporal: 0,
                         records: Vec::new(),
                         scenes: HashMap::new(),
                     },
@@ -290,8 +325,22 @@ impl Engine {
             }
         }
         let results = results_mu.into_inner().unwrap();
-        for (p, (records, scenes)) in results {
+        for (p, (mut records, mut scenes)) in results {
+            // Early Top-K Pruning: держим только top_n якорей файла,
+            // полный список хитов — компактные hit_keys + счётчик
+            // temporal-прошедших (для честного total_hits).
+            let byte_keys: Vec<usize> = records.iter().map(|r| r.byte_pos).collect();
+            let hits_temporal = match &config.temporal_filter {
+                Some(filter) => records
+                    .iter()
+                    .filter(|r| r.metric_tag.as_deref().map_or(true, |m| m == filter))
+                    .count(),
+                None => records.len(),
+            };
+            prune_file_entry(&mut records, &mut scenes, config.top_n);
             if let Some(e) = fresh_entries.get_mut(&p) {
+                e.hit_keys = byte_keys;
+                e.hits_temporal = hits_temporal;
                 e.records = records;
                 e.scenes = scenes;
             }
@@ -337,10 +386,17 @@ impl Engine {
             .flat_map(|e| e.records.iter().cloned())
             .collect();
 
+        // Честный total_hits — по полному числу temporal-прошедших хитов,
+        // а не по обрезанным top-N записям.
+        let full_hits: usize = kept
+            .values()
+            .chain(fresh_entries.values())
+            .map(|e| e.hits_temporal)
+            .sum();
         if let Some(filter) = &config.temporal_filter {
             records.retain(|r| r.metric_tag.as_deref().map_or(true, |m| m == filter));
         }
-        stats.total_hits = records.len();
+        stats.total_hits = full_hits;
 
         // ---------- diff-режим: только новые якоря ----------
         if incremental && self.diff_mode {
@@ -355,7 +411,6 @@ impl Engine {
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| a.byte_pos.cmp(&b.byte_pos))
         });
-        let total_hits = records.len();
         records.truncate(config.top_n);
 
         // ---------- K-hop: одна корневая сущность на все якоря ----------
@@ -400,11 +455,11 @@ impl Engine {
                 .state
                 .as_ref()
                 .map(|m| {
-                    m.values()
-                        .flat_map(|e| {
-                            e.records
+                    m.iter()
+                        .flat_map(|(p, e)| {
+                            e.hit_keys
                                 .iter()
-                                .map(|r| (r.path.clone(), r.byte_pos))
+                                .map(|&b| (p.clone(), b))
                                 .collect::<Vec<_>>()
                         })
                         .collect()
@@ -416,7 +471,7 @@ impl Engine {
             event,
             SearchResult {
                 query: query.to_string(),
-                total_hits,
+                total_hits: full_hits,
                 anchors,
             },
             stats,

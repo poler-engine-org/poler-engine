@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -31,6 +31,8 @@ aho-corasick = "1.1"
 ignore = "0.4"
 # Обработка SIGINT для watcher-режима
 ctrlc = "3.4"
+# Disk-backed таблица символов AIDDE (лечит OOM на 65K+ файлов)
+rusqlite = { version = "0.31", features = ["bundled"] }
 # SIMD-поиск байтов: literal prefilter в стиле ripgrep / kwset GNU grep
 memchr = "2"
 

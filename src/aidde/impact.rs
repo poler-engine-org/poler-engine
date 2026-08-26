@@ -20,7 +20,7 @@
 //! ```
 
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::aidde::symbols::{last_segment_is, Definition, SymbolTable};
@@ -79,6 +79,11 @@ const SIDE_EFFECT_MARKERS: &[(&str, &str)] = &[
     ("panic!", "Паника"),
     ("process::exit", "Завершение процесса"),
 ];
+
+/// Публичная обёртка для SQLite-бэкенда.
+pub fn scan_side_effects_pub(body: &str) -> Vec<String> {
+    scan_side_effects(body)
+}
 
 fn scan_side_effects(body: &str) -> Vec<String> {
     let mut out: Vec<String> = SIDE_EFFECT_MARKERS
@@ -145,6 +150,16 @@ pub fn impact_analysis(
         )
     };
 
+    // ---------- Индексы вызовов (v0.6: O(1) lookup вместо O(N) скана) ----------
+    // По callee (для upstream): callee -> список вызовов.
+    let mut by_callee: HashMap<&str, Vec<&crate::aidde::symbols::CallSite>> = HashMap::new();
+    // По caller (для downstream): caller (last segment) -> список вызовов.
+    let mut by_caller: HashMap<&str, Vec<&crate::aidde::symbols::CallSite>> = HashMap::new();
+    for cs in &table.calls {
+        by_callee.entry(cs.callee.as_str()).or_default().push(cs);
+        by_caller.entry(last_segment_is(&cs.caller)).or_default().push(cs);
+    }
+
     // ---------- Upstream: кто зависит от меня (обратные рёбра) ----------
     let mut upstream: Vec<Dependent> = Vec::new();
     let mut seen_calls: HashSet<(String, String, usize)> = HashSet::new();
@@ -153,10 +168,13 @@ pub fn impact_analysis(
 
     for _ in 0..depth.max(1) {
         let mut next: HashSet<String> = HashSet::new();
-        for cs in &table.calls {
-            if !level.iter().any(|l| l == last_segment_is(&cs.callee)) {
-                continue;
-            }
+        // Кандидаты уровня: все вызовы, чей callee совпадает с одним из level.
+        for cs in level.iter().flat_map(|l| {
+            by_callee
+                .get(l.as_str())
+                .map(|v| v.iter().copied())
+                .unwrap_or_default()
+        }) {
             let key = (cs.caller.clone(), cs.file.clone(), cs.line);
             if seen_calls.insert(key) {
                 upstream.push(Dependent {
@@ -184,10 +202,12 @@ pub fn impact_analysis(
 
     for _ in 0..depth.max(1) {
         let mut next: HashSet<String> = HashSet::new();
-        for cs in &table.calls {
-            if !level.iter().any(|l| l == last_segment_is(&cs.caller)) {
-                continue;
-            }
+        for cs in level.iter().flat_map(|l| {
+            by_caller
+                .get(l.as_str())
+                .map(|v| v.iter().copied())
+                .unwrap_or_default()
+        }) {
             if seen_dep.insert(cs.callee.clone()) {
                 let file = table
                     .resolve(&cs.callee)
