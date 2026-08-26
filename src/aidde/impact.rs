@@ -23,7 +23,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::aidde::symbols::{last_segment_is, SymbolTable};
+use crate::aidde::symbols::{last_segment_is, Definition, SymbolTable};
 use crate::parser::{detect_lang, extract_enclosing_scope};
 
 /// Зависимый (upstream): кто вызывает цель.
@@ -107,13 +107,43 @@ pub fn impact_analysis(
     depth: usize,
     max_items: usize,
 ) -> Option<ImpactReport> {
-    let def = table.resolve(target).first().cloned()?;
+    // Fallback для макросов/extern-символов (printk → _printk в ядре Linux):
+    // определения нет, но сотни вызовов по имени — строим паспорт по ним.
+    let external_def;
+    let def: &Definition = match table.resolve(target).first() {
+        Some(d) => d,
+        None => {
+            let n_callers = table
+                .calls
+                .iter()
+                .filter(|c| c.callee == target)
+                .count();
+            if n_callers == 0 {
+                return None;
+            }
+            external_def = Definition {
+                symbol: target.to_string(),
+                kind: "extern/macro".to_string(),
+                file: String::new(),
+                line: 0,
+                byte: 0,
+            };
+            &external_def
+        }
+    };
 
     // Тело определения (enclosing scope) для строк и сайд-эффектов.
-    let text = std::fs::read_to_string(&def.file).ok()?;
-    let lang = detect_lang(Path::new(&def.file));
-    let scope = extract_enclosing_scope(&text, def.byte, lang);
-    let lines = format!("{}-{}", scope.start_line, scope.end_line);
+    let (lines, side_effects) = if def.file.is_empty() {
+        ("extern".to_string(), Vec::new())
+    } else {
+        let text = std::fs::read_to_string(&def.file).ok()?;
+        let lang = detect_lang(Path::new(&def.file));
+        let scope = extract_enclosing_scope(&text, def.byte, lang);
+        (
+            format!("{}-{}", scope.start_line, scope.end_line),
+            scan_side_effects(&scope.text),
+        )
+    };
 
     // ---------- Upstream: кто зависит от меня (обратные рёбра) ----------
     let mut upstream: Vec<Dependent> = Vec::new();
@@ -180,8 +210,7 @@ pub fn impact_analysis(
     }
     downstream.truncate(max_items);
 
-    // ---------- Сайд-эффекты и danger level ----------
-    let side_effects = scan_side_effects(&scope.text);
+    // ---------- Danger level ----------
     let files: HashSet<&String> = upstream.iter().map(|d| &d.file).collect();
     let n = files.len();
     let danger = match n {

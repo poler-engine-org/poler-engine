@@ -486,6 +486,36 @@ pub fn pass2_giant_parallel(
                             crate::psi::psi_resonances(&epsilons, &forbidden, config.psi_params);
                         epsilons.into_iter().zip(psi).collect()
                     }
+                    // Канонический POLER-цикл (P3_Engine)
+                    ResonanceMode::Poler => {
+                        let mut epsilons: Vec<f64> = Vec::with_capacity(sub_hits.len());
+                        for &h in &sub_hits {
+                            let c = h as usize;
+                            let s0 = c.saturating_sub(config.window_radius);
+                            let e0 = (c + config.window_radius + 1).min(sub_ft.toks_len());
+                            let (b, e) = sub_ft.window_byte_range(s0, e0.max(s0 + 1));
+                            let wtext = &sub_text[b.min(sub_text.len())..e.min(sub_text.len())];
+                            let bonus = semantic_bonus(wtext);
+                            let window: Vec<String> = (s0..e0)
+                                .map(|i| sub_ft.tok(i).to_string())
+                                .collect();
+                            epsilons.push(calculate_epsilon(
+                                &window,
+                                query_tokens,
+                                global_counts,
+                                n_total,
+                                config.kappa,
+                                bonus,
+                            ));
+                        }
+                        let forbidden = vec![false; sub_hits.len()];
+                        let poler = crate::poler::poler_resonances(
+                            &epsilons,
+                            &forbidden,
+                            config.poler_params,
+                        );
+                        epsilons.into_iter().zip(poler).collect()
+                    }
                     ResonanceMode::Hits => {
                         let mut epsilons: Vec<f64> = Vec::with_capacity(sub_hits.len());
                         for &h in &sub_hits {
@@ -819,6 +849,33 @@ pub fn pass2_file(
                 let forbidden = vec![false; hits.len()];
                 let psi = crate::psi::psi_resonances(&epsilons, &forbidden, config.psi_params);
                 epsilons.into_iter().zip(psi).collect()
+            }
+            // Канонический POLER-цикл (P3_Engine): p −= ηΠ_Λ(D·p + γJ·p + ∇F)
+            ResonanceMode::Poler => {
+                let mut epsilons: Vec<f64> = Vec::with_capacity(hits.len());
+                for &h in hits {
+                    let c = h as usize;
+                    let start = c.saturating_sub(config.window_radius);
+                    let end = (c + config.window_radius + 1).min(ft.toks_len());
+                    let (b, e) = ft.window_byte_range(start, end.max(start + 1));
+                    let wtext = &text[b.min(text.len())..e.min(text.len())];
+                    let bonus = semantic_bonus(wtext);
+                    let window: Vec<String> = (start..end)
+                        .map(|i| ft.tok(i).to_string())
+                        .collect();
+                    epsilons.push(calculate_epsilon(
+                        &window,
+                        query_tokens,
+                        gcounts,
+                        gtotal,
+                        config.kappa,
+                        bonus,
+                    ));
+                }
+                let forbidden = vec![false; hits.len()];
+                let poler =
+                    crate::poler::poler_resonances(&epsilons, &forbidden, config.poler_params);
+                epsilons.into_iter().zip(poler).collect()
             }
             ResonanceMode::Hits => {
                 let mut epsilons: Vec<f64> = Vec::with_capacity(hits.len());

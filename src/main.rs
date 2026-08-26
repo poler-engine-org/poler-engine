@@ -44,8 +44,11 @@ enum ResonanceArg {
     Hits,
     /// Поле резонанса по всему документу, строго O(N).
     Field,
-    /// POLER[Ψ]: каноническое уравнение внимания (η, γ, ρ) из POLER-Quantum.
+    /// POLER[Ψ]: уравнение внимания из POLER_Psi_v3.py.
     Psi,
+    /// Канонический POLER-цикл из P3_Engine (p3_poler.zig):
+    /// p −= η·Π_Λ(D·p + γ·J·p + ∇F), CORDIC-ренормализация.
+    Poler,
 }
 
 #[derive(Parser, Debug)]
@@ -138,6 +141,22 @@ struct Cli {
     #[arg(long = "psi-depth", default_value_t = 8)]
     psi_depth: usize,
 
+    /// POLER-цикл (P3_Engine): η — learning rate [default: 0.01].
+    #[arg(long = "poler-eta", default_value_t = 0.01)]
+    poler_eta: f64,
+
+    /// POLER-цикл: γ — резонансная связь [default: 0.1].
+    #[arg(long = "poler-gamma", default_value_t = 0.1)]
+    poler_gamma: f64,
+
+    /// POLER-цикл: mix — CORDIC-квантовая нормализация [default: 0.1].
+    #[arg(long = "poler-mix", default_value_t = 0.1)]
+    poler_mix: f64,
+
+    /// POLER-цикл: d — диссипатор D=LLᵀ (энтропийный горел) [default: 0.02].
+    #[arg(long = "poler-dissipator", default_value_t = 0.02)]
+    poler_dissipator: f64,
+
     /// ε по статистикам файла вместо корпуса.
     #[arg(long, default_value_t = false)]
     local_stats: bool,
@@ -223,6 +242,7 @@ fn main() -> ExitCode {
             ResonanceArg::Hits => ResonanceMode::Hits,
             ResonanceArg::Field => ResonanceMode::Field,
             ResonanceArg::Psi => ResonanceMode::Psi,
+            ResonanceArg::Poler => ResonanceMode::Poler,
         },
         temporal_filter: cli.metric.clone(),
         local_stats: cli.local_stats,
@@ -243,6 +263,13 @@ fn main() -> ExitCode {
             gamma: cli.psi_gamma,
             rho: cli.psi_rho,
             memory_depth: cli.psi_depth,
+        },
+        poler_params: poler_engine::poler::PolerParams {
+            eta: cli.poler_eta,
+            gamma: cli.poler_gamma,
+            mix: cli.poler_mix,
+            dissipator: cli.poler_dissipator,
+            ..poler_engine::poler::PolerParams::default()
         },
     };
 

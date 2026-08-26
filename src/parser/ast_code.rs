@@ -183,18 +183,54 @@ pub fn string_comment_spans(source: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+static C_SIGNATURE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // C-определение: [модификаторы] тип имя(аргументы) { — без ключевого
+    // слова (в отличие от fn/def/class). Управляющие конструкции и
+    // прототипы (оканчивающиеся на ';') отфильтрованы.
+    Regex::new(
+        r"^[\s]*((?:static|inline|extern|asmlinkage|__visible|__init|__exit|__always_inline|noinline|__weak|__noreturn|const|volatile|unsigned|signed|struct|enum|union|typedef)\s+)*[A-Za-z_][A-Za-z0-9_\s\*]*?[\s\*]([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{?\s*$",
+    )
+    .unwrap()
+});
+
+const C_CONTROL_KEYWORDS: &[&str] = &[
+    "if", "for", "while", "switch", "return", "sizeof", "else", "do", "case",
+];
+
+/// Сигнатура C-функции одной строки: имя. Возвращает None для прототипов,
+/// вызовов (с ';' на конце) и управляющих конструкций.
+pub(crate) fn c_signature_name(line: &str) -> Option<String> {
+    let t = line.trim_end();
+    if t.ends_with(';') || t.ends_with(',') || t.is_empty() {
+        return None;
+    }
+    let caps = C_SIGNATURE_RE.captures(line)?;
+    let name = caps
+        .get(caps.len() - 1)
+        .map(|m| m.as_str())?
+        .to_string();
+    if name.is_empty() || C_CONTROL_KEYWORDS.contains(&name.as_str()) {
+        return None;
+    }
+    Some(name)
+}
+
 /// Лёгкий lookup имени сигнатуры скоупа, начинающегося в `byte_begin`.
 pub fn light_signature(source: &str, byte_begin: usize) -> Option<String> {
     find_signature(source, byte_begin).1
 }
 
 /// Сигнатура одной строки: (вид, имя) — для таблицы символов AIDDE.
+/// Явные ключевo-языки (fn/def/class/…) — через SIGNATURE_RE;
+/// C-стиль (тип имя(args)) — через C_SIGNATURE_RE.
 pub(crate) fn signature_of(line: &str) -> Option<(String, String)> {
-    let caps = SIGNATURE_RE.captures(line)?;
-    Some((
-        caps.get(1)?.as_str().to_string(),
-        caps.get(2)?.as_str().to_string(),
-    ))
+    if let Some(caps) = SIGNATURE_RE.captures(line) {
+        return Some((
+            caps.get(1)?.as_str().to_string(),
+            caps.get(2)?.as_str().to_string(),
+        ));
+    }
+    c_signature_name(line).map(|n| ("fn".to_string(), n))
 }
 
 /// Точка входа: возвращает enclosing scope для байтового смещения.

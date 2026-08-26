@@ -745,3 +745,66 @@ fn psi_params_from_cli_defaults_match_poler_quantum() {
     assert_eq!(p.rho, 0.9);
     assert_eq!(p.memory_depth, 8);
 }
+
+// ---------------------------------------------------------------------------
+// Канонический POLER-цикл из P3_Engine (p3_poler.zig, Kotokvit)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn poler_mode_ranks_hits() {
+    // p_new = p − η·Π_Λ(D·p + γ·J·p + ∇F) с CORDIC-ренормализацией
+    let dir = write_fixture("chapter_36.md", CH36);
+    let mut cfg = EngineConfig::default();
+    cfg.resonance_mode = poler_engine::ResonanceMode::Poler;
+    let res = scan_path(dir.path(), "нокс", &cfg);
+    assert!(res.total_hits >= 3);
+    for a in &res.anchors {
+        // POLER-амплитуда ограничена CORDIC-нормализацией на S¹
+        assert!(a.resonance.is_finite() && a.resonance >= 0.0, "R={}", a.resonance);
+        assert!(a.epsilon > 0.0);
+    }
+    for w in res.anchors.windows(2) {
+        assert!(w[0].resonance >= w[1].resonance);
+    }
+}
+
+#[test]
+fn poler_dissipator_distinguishes_sparse_and_dense_hits() {
+    // Диссипатор D=LLᵀ — энтропийный горел: при серии наблюдений
+    // внимание накапливается, при паузе — сгорает. Плотная серия
+    // наблюдений даёт больший POLER-резонанс, чем разовая вспышка.
+    let dir = TempDir::new().unwrap();
+    let mut dense = String::from("# Плотная сцена\n\n");
+    for i in 0..12 {
+        dense.push_str(&format!("Абзац {i}: нокс упоминается здесь.\n\n"));
+    }
+    fs::write(dir.path().join("dense.md"), &dense).unwrap();
+
+    let mut sparse = String::from("# Разреженная сцена\n\n");
+    sparse.push_str("Долгое вступление без искомого слова. ");
+    sparse.push_str("Много других слов и предложений для объёма текста. ");
+    sparse.push_str("И только один раз — нокс.\n\n");
+    fs::write(dir.path().join("sparse.md"), &sparse).unwrap();
+
+    let mut cfg = EngineConfig::default();
+    cfg.resonance_mode = poler_engine::ResonanceMode::Poler;
+    cfg.top_n = 20;
+    let res = scan_path(dir.path(), "нокс", &cfg);
+
+    let dense_max = res
+        .anchors
+        .iter()
+        .filter(|a| a.file.contains("dense"))
+        .map(|a| a.resonance)
+        .fold(0.0, f64::max);
+    let sparse_max = res
+        .anchors
+        .iter()
+        .filter(|a| a.file.contains("sparse"))
+        .map(|a| a.resonance)
+        .fold(0.0, f64::max);
+    assert!(
+        dense_max > sparse_max,
+        "диссипатор не различает плотность: dense={dense_max} sparse={sparse_max}"
+    );
+}

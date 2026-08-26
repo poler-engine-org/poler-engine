@@ -48,6 +48,7 @@ pub mod engine;
 pub mod graph;
 pub mod output;
 pub mod parser;
+pub mod poler;
 pub mod psi;
 pub mod resonance;
 pub mod streaming;
@@ -67,6 +68,7 @@ pub use parser::{
     detect_lang, extract_code_triples, extract_enclosing_scope, extract_triples, CodeLang,
     CodeScope, SceneContext, Triple,
 };
+pub use poler::{cordic_inv_sqrt, poler_resonances, PolerCycle, PolerParams};
 pub use psi::{psi_resonances, PsiField, PsiParams};
 pub use resonance::{
     apply_iir_resonance, calculate_epsilon, semantic_bonus, IirFilter, SlidingEpsilon,
@@ -89,9 +91,13 @@ pub enum ResonanceMode {
     Hits,
     /// Поле резонанса по всему документу, строго O(N), семплы на хитах.
     Field,
-    /// POLER[Ψ]: каноническое уравнение внимания p_{t+1} = p_t + ηΠ(−∇F + γ∇ε)
-    /// из POLER-Quantum (Kotokvit) — полный ψ-поток с памятью резонанса.
+    /// POLER[Ψ]: уравнение внимания из POLER_Psi_v3.py (Kotokvit).
     Psi,
+    /// Канонический POLER-цикл из P3_Engine (p3_poler.zig, Kotokvit):
+    /// `p_new = p − η·Π_Λ(D·p + γ·J·p + ∇F)` — диссипатор D=LLᵀ,
+    /// кососимметричный резонанс J=A−Aᵀ, каузальный проектор Π_Λ,
+    /// CORDIC-ренормализация.
+    Poler,
 }
 
 /// Конфигурация движка.
@@ -131,6 +137,8 @@ pub struct EngineConfig {
     pub max_graph_triples: usize,
     /// Гиперпараметры POLER[Ψ] (η, γ, ρ, K) — режим резонанса Psi.
     pub psi_params: crate::psi::PsiParams,
+    /// Гиперпараметры канонического POLER-цикла (P3_Engine) — режим Poler.
+    pub poler_params: crate::poler::PolerParams,
 }
 
 impl Default for EngineConfig {
@@ -156,6 +164,7 @@ impl Default for EngineConfig {
             graph_export: None,
             max_graph_triples: 200_000,
             psi_params: crate::psi::PsiParams::default(),
+            poler_params: crate::poler::PolerParams::default(),
         }
     }
 }
