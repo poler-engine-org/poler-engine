@@ -570,3 +570,101 @@ fn hidden_files_skipped_by_default() {
     let (_, stats2) = scan_path_with_stats(dir.path(), "ВЕГА", &cfg);
     assert_eq!(stats2.files_scanned, 2, "--hidden включает скрытые");
 }
+
+// ---------------------------------------------------------------------------
+// Регрессия bug: гигантская строка-простыня с «Субъекты:» внутри (Eteryya)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn megabyte_line_with_subjects_marker_does_not_explode() {
+    // Реальный кейс Eteryya: строка 1.7 МБ содержит «- Персонажи:» в глубине
+    // текста с тысячами запятых. Прежний light_meta забирал остаток строки
+    // после двоеточия как значение → 9315 «субъектов» → OOM.
+    let dir = TempDir::new().unwrap();
+    let mut giant = String::with_capacity(1_200_000);
+    giant.push_str("# Дамп\n\n## Начало\n\n");
+    giant.push_str("Обычный текст начала сцены и нокс. ");
+    // мегабайтная простыня без переносов строк
+    for i in 0..15_000 {
+        giant.push_str(&format!("Сегмент {i} повествования, "),
+        );
+    }
+    giant.push_str(" Персонажи: а, б, в, г, д, е, ж, з, и, к, л, м, н, о, п, р, с, т, ");
+    for i in 0..20_000 {
+        giant.push_str(&format!("имя{i}, "));
+    }
+    giant.push_str("конец гигантской строки.\n");
+    giant.push_str("\nФинальный абзац с нокс.\n");
+    fs::write(dir.path().join("giant.md"), &giant).unwrap();
+
+    let (res, stats) = scan_path_with_stats(dir.path(), "нокс", &EngineConfig::default());
+    assert!(res.total_hits >= 1);
+    // граф не взорвался: разумное число рёбер (кап 256 троек на сцену)
+    assert!(stats.graph_edges < 300, "edges={}", stats.graph_edges);
+    // субъекты не распухли: карточка ищется только в первых 8 КБ сцены
+    let best = &res.anchors[0];
+    assert!(best.scene.subjects.len() <= 1);
+    if let Some(s) = best.scene.subjects.first() {
+        assert!(s.len() < 600, "subjects len={}", s.len());
+    }
+}
+
+#[test]
+fn subjects_value_capped_even_at_scene_start() {
+    // «Субъекты:» в ПЕРВОЙ строке сцены — значение обрезается до 256 байт
+    let dir = TempDir::new().unwrap();
+    let mut head = String::from("# Глава\n\n**Субъекты: ");
+    for i in 0..500 {
+        head.push_str(&format!("персонаж{i}, "));
+    }
+    head.push_str("**\n\nНокс действует.\n");
+    fs::write(dir.path().join("sub.md"), &head).unwrap();
+
+    let res = scan_path(dir.path(), "нокс", &EngineConfig::default());
+    assert!(res.total_hits >= 1);
+    let s = &res.anchors[0].scene.subjects;
+    assert!(!s.is_empty());
+    assert!(s[0].len() < 400, "len={}", s[0].len());
+}
+
+#[test]
+fn watcher_diff_mode_returns_only_new_anchors() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.md"), "# A\n\nНокс первый.\n").unwrap();
+    fs::write(dir.path().join("b.md"), "# B\n\nДругой текст.\n").unwrap();
+
+    let mut engine = poler_engine::Engine::new(EngineConfig::default(), true).with_diff(true);
+    let (res1, _) = engine.scan(dir.path(), "нокс");
+    assert_eq!(res1.total_hits, 1);
+    assert!(res1.anchors.iter().all(|a| a.file.contains("a.md")));
+
+    // без изменений — пустой дифф
+    let (_, res0, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(res0.anchors.len(), 0, "дифф без изменений должен быть пуст");
+
+    // b.md модифицируется: появляется Нокс
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::write(dir.path().join("b.md"), "# B\n\nТеперь и Нокс здесь.\n").unwrap();
+    let (_, res2, _) = engine.rescan(dir.path(), "нокс");
+    // только новый якорь b.md; a.md не повторяется
+    assert_eq!(res2.anchors.len(), 1, "{:?}", res2.anchors);
+    assert!(res2.anchors[0].file.contains("b.md"));
+
+    // повторный rescan без изменений — снова пусто (ключи запомнились)
+    let (_, res3, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(res3.anchors.len(), 0);
+}
+
+#[test]
+fn watcher_diff_mode_new_file() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.md"), "# A\n\nНокс.\n").unwrap();
+    let mut engine = poler_engine::Engine::new(EngineConfig::default(), true).with_diff(true);
+    let _ = engine.scan(dir.path(), "нокс");
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::write(dir.path().join("new.md"), "# N\n\nНокс новый.\n").unwrap();
+    let (_, res, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(res.anchors.len(), 1);
+    assert!(res.anchors[0].file.contains("new.md"));
+}

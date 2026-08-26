@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long = "interval-secs", default_value_t = 2)]
     interval: u64,
 
+    /// Дифф-режим watcher: печатать только новые/появившиеся якоря.
+    #[arg(long, default_value_t = false)]
+    diff: bool,
+
     /// Число топ-результатов.
     #[arg(short = 't', long, default_value_t = 10)]
     top: usize,
@@ -292,7 +296,7 @@ fn watch_mode(cli: Cli, config: EngineConfig, query: String) -> ExitCode {
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
     }
 
-    let mut engine = Engine::new(config, true);
+    let mut engine = Engine::new(config, true).with_diff(cli.diff);
     let (result, stats) = engine.scan(&cli.path, &query);
     if cli.verbose {
         eprintln!(

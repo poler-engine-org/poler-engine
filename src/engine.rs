@@ -58,10 +58,15 @@ struct FileEntry {
 ///
 /// `watching = true` включает кэш по mtime/size: повторные прогоны
 /// (`rescan`) не перечитывают и не ретокенизируют неизменённые файлы.
+/// `diff_mode = true` (только в watcher): `rescan` возвращает якоря,
+/// которых не было в предыдущем прогоне (новые file+byte_pos).
 pub struct Engine {
     config: EngineConfig,
     watching: bool,
+    diff_mode: bool,
     state: Option<HashMap<PathBuf, FileEntry>>,
+    /// Ключи (путь, байт) всех хитов предыдущего прогона — для diff.
+    last_hit_keys: HashSet<(PathBuf, usize)>,
 }
 
 fn round2(x: f64) -> f64 {
@@ -73,8 +78,16 @@ impl Engine {
         Self {
             config,
             watching,
+            diff_mode: false,
             state: None,
+            last_hit_keys: HashSet::new(),
         }
+    }
+
+    /// Включает дифф-режим (только для watcher-прогонов).
+    pub fn with_diff(mut self, on: bool) -> Self {
+        self.diff_mode = on;
+        self
     }
 
     /// Полный прогон: все файлы обрабатываются с нуля.
@@ -315,6 +328,12 @@ impl Engine {
         }
         stats.total_hits = records.len();
 
+        // ---------- diff-режим: только новые якоря ----------
+        if incremental && self.diff_mode {
+            let prev = &self.last_hit_keys;
+            records.retain(|r| !prev.contains(&(r.path.clone(), r.byte_pos)));
+        }
+
         records.sort_by(|a, b| {
             b.resonance
                 .partial_cmp(&a.resonance)
@@ -359,6 +378,25 @@ impl Engine {
         } else {
             None
         };
+
+        // Полный набор ключей хитов текущего прогона (для diff): в
+        // watcher-режиме собирается из состояния всех файлов.
+        if watching {
+            self.last_hit_keys = self
+                .state
+                .as_ref()
+                .map(|m| {
+                    m.values()
+                        .flat_map(|e| {
+                            e.records
+                                .iter()
+                                .map(|r| (r.path.clone(), r.byte_pos))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
 
         (
             event,

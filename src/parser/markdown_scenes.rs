@@ -62,6 +62,29 @@ fn file_stem(path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Потолки защиты от патологических «карточек» (bug: строка-мегабайт со
+/// «Субъекты:» внутри раздувала метаданные до гигабайт через каскад
+/// subject_names → тройки → co-occurrence).
+const META_VALUE_MAX: usize = 256;
+const META_LINE_MAX: usize = 512;
+const META_SCAN_MAX: usize = 8 * 1024;
+const SUBJECTS_MAX: usize = 16;
+const SUBJECT_NAME_MAX: usize = 80;
+/// Жёсткий потолок enclosing_scope при построении сцены (pass 3).
+const SCOPE_HARD_MAX: usize = 1024 * 1024;
+
+/// Обрезает строку до max байт по границе символа.
+fn clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Границы сцены (лёгкая структура — вычисляется на каждое совпадение).
 #[derive(Debug, Clone)]
 pub struct SceneBounds {
@@ -114,7 +137,10 @@ pub fn has_headings(text: &str) -> bool {
 pub fn light_meta(text: &str, bounds: &SceneBounds) -> LightSceneMeta {
     let start = bounds.start.min(text.len());
     let end = bounds.end.min(text.len()).max(start);
-    let scope_raw = &text[start..end];
+    // Карточка метаданных живёт в начале сцены: сканируем только
+    // META_SCAN_MAX байт, каждая строка обрезается до META_LINE_MAX —
+    // гигантские строки-простыни не участвуют в разборе.
+    let scan_zone = clip(&text[start..end], META_SCAN_MAX);
 
     let mut m = LightSceneMeta {
         chapter: bounds.chapter.clone(),
@@ -123,7 +149,8 @@ pub fn light_meta(text: &str, bounds: &SceneBounds) -> LightSceneMeta {
 
     if bounds.structured {
         // метаданные — карточка сцены: первые 60 строк от начала сцены
-        for line in scope_raw.lines().take(60) {
+        for raw_line in scan_zone.lines().take(60) {
+            let line = clip(raw_line, META_LINE_MAX);
             let lower = line.to_lowercase();
             let cleaned = strip_inline_md(line);
             if m.temporal_metric.is_none() && lower.contains("метрика:") {
@@ -161,7 +188,8 @@ pub fn light_meta(text: &str, bounds: &SceneBounds) -> LightSceneMeta {
         }
     } else {
         // txt-фолбэк: метаданные ищутся строками выше абзаца (макс. 50)
-        for line in text[..start].lines().rev().take(50) {
+        for raw_line in text[..start].lines().rev().take(50) {
+            let line = clip(raw_line, META_LINE_MAX);
             let lower = line.to_lowercase();
             let cleaned = strip_inline_md(line);
             if m.temporal_metric.is_none() && lower.contains("метрика:") {
@@ -268,7 +296,7 @@ impl SceneContext {
     pub fn build(text: &str, bounds: &SceneBounds, _file_path: &Path) -> SceneContext {
         let start = bounds.start.min(text.len());
         let end = bounds.end.min(text.len()).max(start);
-        let scope_raw = &text[start..end];
+        let scope_raw = clip(&text[start..end], SCOPE_HARD_MAX);
         let meta = light_meta(text, bounds);
 
         SceneContext {
@@ -325,7 +353,7 @@ impl SceneContext {
 
 fn after_colon(s: &str) -> String {
     match s.find(':') {
-        Some(i) => strip_inline_md(&s[i + 1..]),
+        Some(i) => strip_inline_md(clip(&s[i + 1..], META_VALUE_MAX)),
         None => String::new(),
     }
 }
@@ -356,7 +384,10 @@ fn parse_subjects(value: &str) -> (Vec<String>, Vec<(String, String)>) {
     let mut names = Vec::new();
     let mut pairs = Vec::new();
     for part in value.split(',') {
-        let p = part.trim();
+        if names.len() >= SUBJECTS_MAX {
+            break; // карточка не может перечислять тысячи субъектов
+        }
+        let p = clip(part.trim(), SUBJECT_NAME_MAX);
         if p.is_empty() {
             continue;
         }
