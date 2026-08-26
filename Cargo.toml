@@ -1,0 +1,43 @@
+[package]
+name = "poler-engine"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["POLER Engineering Core"]
+description = "AI-Native Topographical, Resonant and Graph Search Engine — successor to grep/ripgrep and blind vector RAG"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/poler-engine/poler-engine"
+keywords = ["search", "retrieval", "graph", "rag", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+
+[lib]
+name = "poler_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "poler-engine"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+petgraph = { version = "0.6", features = ["serde-1"] }
+regex = "1.10"
+aho-corasick = "1.1"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+# Максимальная оптимизация: LTO по всему крейту, один CGU, strip символов.
+# Тесты гоняются в debug-профиле (`cargo test`), поэтому panic="abort"
+# в release не мешает тестовому харнессу.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
