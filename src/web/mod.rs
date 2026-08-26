@@ -99,12 +99,12 @@ pub fn web_cache_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Жив ли CDP на порту (tcp-коннект достаточно: DevTools слушает только его).
-fn cdp_alive(port: u16) -> bool {
+pub fn cdp_alive(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
 
 /// Поиск бинаря браузера: $POLER_CHROME_BIN → PATH → известные абсолютные пути.
-fn find_browser() -> Option<PathBuf> {
+pub fn find_browser() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("POLER_CHROME_BIN") {
         let p = PathBuf::from(p);
         if p.is_file() {

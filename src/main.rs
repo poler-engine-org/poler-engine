@@ -113,9 +113,50 @@ struct Cli {
 
     /// MCP-СЕРВЕР (Model Context Protocol): poler-engine как нативный
     /// инструмент LLM-агентов поверх stdio JSON-RPC.
-    /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search.
+    /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search /
+    /// poler_gmail / poler_drive.
     #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact"])]
     mcp: bool,
+
+    // ---------- Google-интеграция без пароля (v0.12.0) ----------
+
+    /// OAuth 2.0 loopback: согласие Google в ТВОЁМ браузере (пароль не
+    /// попадает в poler-engine), движок получает только узкие readonly-токены.
+    /// Нужен client_secret.json своего GCP-проекта (README, раздел v0.12.0).
+    #[arg(long = "google-auth", conflicts_with_all = ["google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    google_auth: bool,
+
+    /// Gmail-поиск по своему ящику (нужен одноразовый --google-auth).
+    /// QUERY — синтаксис Gmail: from:vasya has:attachment newer_than:7d …
+    /// Без QUERY — недавняя почта.
+    #[arg(long = "google-gmail", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["google_drive", "google_status", "google_browse", "google_fetch"])]
+    google_gmail: Option<String>,
+
+    /// Google Drive: файлы по имени (пустой QUERY — недавние).
+    #[arg(long = "google-drive", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["google_status", "google_browse", "google_fetch"])]
+    google_drive: Option<String>,
+
+    /// Состояние Google-токенов: скоупы, срок действия, аккаунт.
+    #[arg(long = "google-status", conflicts_with_all = ["google_browse", "google_fetch"])]
+    google_status: bool,
+
+    /// Открыть URL в браузере с ПЕРСИСТЕНТНЫМ профилем poler-engine
+    /// (для сервисов без API — NotebookLM и т.п.: логин один раз своими руками).
+    #[arg(long = "google-browse", value_name = "URL", conflicts_with_all = ["google_fetch"])]
+    google_browse: Option<String>,
+
+    /// Прочитать URL через персистентный профиль headless-ом:
+    /// контент авторизованных сервисов после логина через --google-browse.
+    #[arg(long = "google-fetch", value_name = "URL")]
+    google_fetch: Option<String>,
+
+    /// Дополнительные скоупы OAuth (через пробел), кроме gmail/drive readonly.
+    #[arg(long = "google-scopes", value_name = "SCOPES")]
+    google_scopes: Option<String>,
+
+    /// Максимум результатов Gmail/Drive [default: 10].
+    #[arg(long = "google-max", default_value_t = 10)]
+    google_max: usize,
 
     /// Разрешить краулеру переход на другие хосты.
     #[arg(long = "cross-site", default_value_t = false)]
@@ -315,6 +356,84 @@ fn print_web_hits(hits: &[poler_engine::web::WebHit], query: &str, format: Forma
     let _ = std::io::stdout().flush();
 }
 
+/// Вывод Gmail-выдачи в трёх форматах.
+fn print_mail_hits(hits: &[poler_engine::google::api::MailHit], query: &str, format: Format) {
+    use std::io::Write;
+    match format {
+        Format::AiJson => {
+            let out = serde_json::json!({
+                "engine": "poler-engine",
+                "mode": "google-gmail",
+                "auth": "OAuth 2.0 (gmail.readonly)",
+                "query": query,
+                "total": hits.len(),
+                "results": hits,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        }
+        Format::Simple => {
+            for h in hits {
+                let subj: String = h.subject.chars().take(60).collect();
+                let from: String = h.from.chars().take(30).collect();
+                println!("{}  {}  {}", h.date, from, subj);
+            }
+        }
+        Format::Md => {
+            println!("# Gmail: «{query}»\n");
+            for (i, h) in hits.iter().enumerate() {
+                let subj = if h.subject.is_empty() { "(без темы)" } else { &h.subject };
+                println!("## {}. {}\n", i + 1, subj);
+                println!("- От: {}", h.from);
+                println!("- Дата: {}", h.date);
+                println!("- ID: {} (поток {})\n", h.id, h.thread_id);
+                let sn: String = h.snippet.chars().take(240).collect();
+                println!("> {sn}\n");
+            }
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// Вывод Drive-выдачи в трёх форматах.
+fn print_drive_hits(hits: &[poler_engine::google::api::DriveHit], query: &str, format: Format) {
+    use std::io::Write;
+    match format {
+        Format::AiJson => {
+            let out = serde_json::json!({
+                "engine": "poler-engine",
+                "mode": "google-drive",
+                "auth": "OAuth 2.0 (drive.readonly)",
+                "query": query,
+                "total": hits.len(),
+                "results": hits,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        }
+        Format::Simple => {
+            for h in hits {
+                let name: String = h.name.chars().take(70).collect();
+                println!("{}  {}  {}", h.modified_time, h.mime_type, name);
+            }
+        }
+        Format::Md => {
+            println!("# Google Drive: «{query}»\n");
+            for (i, h) in hits.iter().enumerate() {
+                println!("## {}. {}\n", i + 1, h.name);
+                println!("- Тип: {}", h.mime_type);
+                println!("- Изменён: {}", h.modified_time);
+                if let Some(b) = h.size_bytes {
+                    println!("- Размер: {:.1} КБ", b as f64 / 1024.0);
+                }
+                if let Some(l) = &h.web_view_link {
+                    println!("- Ссылка: {l}");
+                }
+                println!("- ID: {}\n", h.id);
+            }
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -333,6 +452,147 @@ fn main() -> ExitCode {
         let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
         let code = poler_engine::mcp::run(cli.cdp_port, cli.web_wait_ms, db);
         return ExitCode::from(code as u8);
+    }
+
+    // ---------- Google-сервисы: OAuth без пароля (v0.12.0) ----------
+    if cli.google_auth {
+        let extra: Vec<String> = cli
+            .google_scopes
+            .clone()
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
+        return match poler_engine::google::oauth::run_auth(&extra) {
+            Ok(t) => {
+                println!("\nГотово. Теперь доступны:");
+                println!("  poler-engine --google-gmail \"from:me newer_than:7d\"");
+                println!("  poler-engine --google-drive \"отчёт\"");
+                println!("  poler-engine --google-status");
+                let _ = t;
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("poler-engine google-auth: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if let Some(url) = cli.google_browse.clone() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            eprintln!("poler-engine: --google-browse ожидает URL, получено: {url}");
+            return ExitCode::from(2);
+        }
+        return match poler_engine::google::browse(&url) {
+            Ok(()) => {
+                println!("Браузер poler-engine открыт (персистентный профиль):");
+                println!("  {:?}", poler_engine::google::profile_dir());
+                println!("URL: {url}");
+                println!();
+                println!("Залогинься СВОИМИ руками — пароль остаётся между тобой и Google.");
+                println!("Сессия сохранится в профиль; дальше читай контент:");
+                println!("  poler-engine --google-fetch {url}");
+                println!("Окно браузера закрой сам, когда закончишь.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("poler-engine google-browse: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if let Some(url) = cli.google_fetch.clone() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            eprintln!("poler-engine: --google-fetch ожидает URL, получено: {url}");
+            return ExitCode::from(2);
+        }
+        return match poler_engine::google::fetch_profiled(&url, cli.web_wait_ms) {
+            Ok(page) => {
+                if page.text.trim().is_empty() {
+                    eprintln!(
+                        "poler-engine google-fetch: пустой рендер (нет логина для этого сервиса? \
+                         см. --google-browse <URL>): {url}"
+                    );
+                    ExitCode::from(1)
+                } else {
+                    let max_chars = 20_000;
+                    let text = page.text.trim();
+                    let shown: String = text.chars().take(max_chars).collect();
+                    println!("# {url}\n");
+                    println!("{shown}");
+                    if text.chars().count() > max_chars {
+                        eprintln!(
+                            "… (обрезано до {max_chars} символов из {})",
+                            text.chars().count()
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("poler-engine google-fetch: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if cli.google_status {
+        return match poler_engine::google::api::status() {
+            Ok(st) => {
+                println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("poler-engine google-status: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if let Some(query) = cli.google_gmail.clone() {
+        return match poler_engine::google::api::gmail_search(&query, cli.google_max.max(1)) {
+            Ok(hits) => {
+                if cli.verbose {
+                    eprintln!(
+                        "poler-engine gmail: «{query}» — {} писем",
+                        hits.len()
+                    );
+                }
+                print_mail_hits(&hits, &query, cli.format);
+                if hits.is_empty() {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("poler-engine gmail: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if let Some(query) = cli.google_drive.clone() {
+        return match poler_engine::google::api::drive_list(&query, cli.google_max.max(1)) {
+            Ok(hits) => {
+                if cli.verbose {
+                    eprintln!(
+                        "poler-engine drive: «{query}» — {} файлов",
+                        hits.len()
+                    );
+                }
+                print_drive_hits(&hits, &query, cli.format);
+                if hits.is_empty() {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("poler-engine drive: {e}");
+                ExitCode::from(2)
+            }
+        };
     }
 
     // ---------- Веб-индекс: статистика ----------

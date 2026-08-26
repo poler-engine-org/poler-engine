@@ -20,6 +20,63 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.12.0: Google-сервисы без пароля — OAuth 2.0 + персистентный профиль
+
+Интеграция с Gmail / Google Drive / NotebookLM **без передачи пароля движку** —
+двумя штатными механизмами (так работает «Войти через Google» у всех
+приложений):
+
+| Механизм | Сервисы | Как работает |
+|---|---|---|
+| **OAuth 2.0 loopback** (RFC 8252) | Gmail, Drive (+ любые API: Calendar, Docs…) | Consent-экран открывается в **браузере владельца** — пароль остаётся между человеком и Google. poler-engine получает только узкие readonly-токены (отзыв: myaccount.google.com/permissions) |
+| **Персистентный профиль Chromium** | NotebookLM и сервисы без публичного API | `--google-browse` открывает окно с профилем `~/.cache/poler-engine/google-profile` — владелец логинится **один раз своими руками**, куки живут месяцами; `--google-fetch` читает авторизованный контент headless-ом |
+
+**HTTPS-клиент — сам Chromium** (ноль TLS-зависимостей в Rust): `GoogleHttp`
+выполняет `fetch()` в контексте страницы через CDP `Runtime.evaluate` +
+`awaitPromise`; google-браузер живёт на отдельном порту 9223 с флагом
+`--disable-web-security` (это API-профиль, не stealth-краулер) и общим
+`--user-data-dir` для headless/headed режимов.
+
+```bash
+# 1) свой OAuth-клиент (5 минут, бесплатно — см. ниже) и одноразовое согласие
+poler-engine --google-auth                       # consent в твоём браузере
+
+# 2) почта и диск — нативный синтаксис Gmail
+poler-engine --google-gmail "from:me has:attachment newer_than:7d"
+poler-engine --google-gmail                      # недавняя почта
+poler-engine --google-drive "отчёт"              # файлы по имени
+poler-engine --google-status                     # скоупы/срок/email
+
+# 3) сервисы без API (NotebookLM): логин один раз своими руками
+poler-engine --google-browse https://notebook.google.com/
+poler-engine --google-fetch https://notebook.google.com/notebook/<id>
+```
+
+Своё OAuth-приложение (client_secret.json): console.cloud.google.com →
+проект → включить Gmail API + Drive API → OAuth consent screen (External,
+себя в Test users) → Credentials → OAuth client ID (Desktop app) → скачать
+JSON в `~/.config/poler-engine/client_secret.json`. Токены:
+`~/.config/poler-engine/google_tokens.json` (права 0600), refresh — тихо и
+автоматически; access-токен живёт ~1 час.
+
+**MCP**: инструменты `poler_gmail` и `poler_drive` (итого 6) — любой
+LLM-агент читает почту/диск владельца через те же readonly-токены.
+
+**Аттестация v0.12.0** (живые тесты):
+- мост CDP→HTTPS против **реального Google**: token endpoint отклоняет
+  мусорный обмен (401 `invalid_client`), Gmail/Drive API отклоняют фейковый
+  Bearer (401) — TLS/POST/заголовки/статусы проходят честно;
+- полный E2E на фейковых эндпоинтах (6 шагов): consent-URL → 302 →
+  loopback-ловушка (state проверен, чужой state отбрасывается) → обмен кода
+  через браузер → токены 0600 → **протухание → тихий refresh → Gmail-запрос
+  идёт с обновлённым токеном** (фейк-API принимает только его) → Drive →
+  status с email → `--google-fetch` → `--google-browse` честно требует
+  оконный Chromium;
+- MCP: tools/list отдаёт 6 инструментов, poler_gmail/poler_drive отвечают
+  живыми данными через refresh-токен.
+
+215 unit + 38 integration тестов зелёные, clippy 0.
+
 ## v0.11.0: Фразовый поиск — позиционный индекс в веб-поиске
 
 Виток «доработки хренового»: веб-индекс был «мешком слов» — запрос
@@ -589,6 +646,14 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
     --graph-export <PATH>   дамп графа сущностей в SQL (схема super-z memory_graph)
     --max-graph-triples <N> бюджет рёбер графа [default: 200000]
     --threads <N>           потоки rayon [default: все ядра]
+    --google-auth           OAuth 2.0 loopback: согласие Google в твоём браузере
+    --google-gmail [Q]      поиск в своём Gmail (синтаксис Gmail; пусто — недавние)
+    --google-drive [Q]      файлы Google Drive по имени (пусто — недавние)
+    --google-status         состояние токенов: скоупы, срок, email
+    --google-browse <URL>   открыть URL в оконном браузере с профилем poler
+    --google-fetch <URL>    прочитать URL через персистентный профиль (headless)
+    --google-scopes <S>     доп. скоупы OAuth для --google-auth (через пробел)
+    --google-max <N>        лимит Gmail/Drive-результатов [default: 10]
 -v, --verbose               статистика прогона в stderr
 ```
 

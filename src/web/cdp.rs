@@ -52,7 +52,7 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// 16 случайных байт из /dev/urandom (или fallback на время).
-fn random_key_16() -> [u8; 16] {
+pub fn random_key_16() -> [u8; 16] {
     let mut buf = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let _ = f.read_exact(&mut buf);
@@ -234,7 +234,7 @@ impl WsClient {
 /// HTTP GET к DevTools HTTP-эндпоинту (например, `/json`).
 /// Читает тело по Content-Length (read_to_end ломается на keep-alive
 /// соединениях Chromium с EAGAIN).
-fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
+pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect((host, port)).map_err(|e| format!("tcp: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -404,6 +404,34 @@ impl CdpSession {
         self.command_collect(method, params, &mut ev)
     }
 
+    /// Runtime.evaluate с awaitPromise: асинхронные выражения (fetch)
+    /// из контекста страницы. Браузер выступает HTTPS-клиентом движка —
+    /// TLS отдаём Chromium, ноль TLS-зависимостей в Rust.
+    pub fn eval_async_string(&mut self, expr: &str) -> Result<String, String> {
+        let params = serde_json::json!({
+            "expression": expr,
+            "returnByValue": true,
+            "awaitPromise": true,
+        })
+        .to_string();
+        let res = self.command("Runtime.evaluate", &params)?;
+        if let Some(exc) = res.get("exceptionDetails") {
+            let desc = exc
+                .get("exception")
+                .and_then(|e| e.get("description"))
+                .and_then(|d| d.as_str())
+                .or_else(|| exc.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("неизвестное исключение");
+            return Err(format!("js: {desc}"));
+        }
+        Ok(res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
     /// Runtime.evaluate → строка (returnByValue).
     fn eval_string(&mut self, expr: &str) -> Result<String, String> {
         let params = serde_json::json!({"expression": expr, "returnByValue": true}).to_string();
@@ -503,6 +531,12 @@ impl CdpSession {
             }
         }
         intercepted
+    }
+
+    /// Graceful-остановка браузера (CDP `Browser.close`).
+    /// Используется --google-browse: headless-инстанс уступает место оконному.
+    pub fn close_browser(&mut self) -> Result<(), String> {
+        self.command("Browser.close", "{}").map(|_| ())
     }
 
     /// Загрузка страницы и извлечение рендер-текста.

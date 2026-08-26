@@ -45,6 +45,7 @@
 
 pub mod aidde;
 pub mod engine;
+pub mod google;
 pub mod graph;
 pub mod mcp;
 pub mod output;

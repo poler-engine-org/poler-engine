@@ -14,7 +14,10 @@
 //!   индекс (robots.txt, sitemap, SimHash-дедуп, PageRank, инкрементально);
 //! * `poler_fetch`      — открыть любой URL в реальном Chromium (CDP):
 //!   JS/SPA/Shadow DOM рендерятся, скрытые JSON API перехватываются;
-//! * `poler_search`     — локальный резонансный POLER-поиск (ε/R/сцены).
+//! * `poler_search`     — локальный резонансный POLER-поиск (ε/R/сцены);
+//! * `poler_gmail`      — поиск в Gmail владельца через OAuth-токен
+//!   (readonly, одноразовый `--google-auth`, пароль не проходит через движок);
+//! * `poler_drive`      — файлы Google Drive через тот же OAuth-токен.
 //!
 //! Chromium поднимается автоматически при первом poler_crawl/poler_fetch
 //! (см. `web::ensure_chromium`).
@@ -141,6 +144,8 @@ impl McpServer {
             "poler_crawl" => self.tool_crawl(&args),
             "poler_fetch" => self.tool_fetch(&args),
             "poler_search" => self.tool_local_search(&args),
+            "poler_gmail" => self.tool_gmail(&args),
+            "poler_drive" => self.tool_drive(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -357,6 +362,45 @@ impl McpServer {
         out.push_str("\n(полные сцены/K-hop граф — CLI: poler-engine <path> -q «…» --format ai-json)");
         Ok(out)
     }
+
+    // -----------------------------------------------------------------
+    // poler_gmail: Gmail владельца (OAuth readonly-токен)
+    // -----------------------------------------------------------------
+    fn tool_gmail(&self, args: &Value) -> Result<String, String> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let max = max.clamp(1, 50);
+        let hits = crate::google::api::gmail_search(query, max)?;
+        if hits.is_empty() {
+            return Ok(format!(
+                "0 писем по «{query}». Синтаксис Gmail: from:, subject:, \
+                 has:attachment, newer_than:7d, is:unread…"
+            ));
+        }
+        Ok(crate::google::api::format_mail_hits(&hits, query))
+    }
+
+    // -----------------------------------------------------------------
+    // poler_drive: файлы Google Drive (OAuth readonly-токен)
+    // -----------------------------------------------------------------
+    fn tool_drive(&self, args: &Value) -> Result<String, String> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let max = max.clamp(1, 50);
+        let hits = crate::google::api::drive_list(query, max)?;
+        if hits.is_empty() {
+            return Ok(format!(
+                "0 файлов по «{query}» (пустой запрос — недавние файлы)"
+            ));
+        }
+        Ok(crate::google::api::format_drive_hits(&hits, query))
+    }
 }
 
 fn tools_manifest() -> Vec<Value> {
@@ -423,6 +467,37 @@ K-hop связи сущностей. Работает и по веб-кэшу po
                     "top": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20}
                 },
                 "required": ["path", "query"]
+            }
+        }),
+        json!({
+            "name": "poler_gmail",
+            "description": "Поиск в Gmail владельца (OAuth 2.0, скоуп gmail.readonly — \
+только чтение). Запрос — нативный синтаксис Gmail: from:vasya, subject:отчёт, \
+has:attachment, newer_than:7d, is:unread, слова И-комбинируются. \
+Требует одноразовой авторизации владельца: poler-engine --google-auth \
+(пароль остаётся в браузере владельца, движок видит только токен).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Gmail-запрос; пусто — недавняя почта"},
+                    "max": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50}
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "poler_drive",
+            "description": "Файлы Google Drive владельца (OAuth 2.0, drive.readonly): \
+поиск по имени (пустой запрос — недавние). Возвращает имя, тип, размер, \
+дату изменения, прямую ссылку и file-id. Требует одноразовой авторизации \
+владельца: poler-engine --google-auth.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Часть имени файла; пусто — недавние"},
+                    "max": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50}
+                },
+                "required": []
             }
         }),
     ]
