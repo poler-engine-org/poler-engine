@@ -304,6 +304,21 @@ pub fn parse_notebooks(data: &Value) -> Vec<Notebook> {
         .unwrap_or_default()
 }
 
+/// Распарсить паспорт одного ноутбука (из `GET_PROJECT` / `rLM1Ne`).
+pub fn parse_single_notebook(data: &Value) -> Option<Notebook> {
+    if let Some(nb) = parse_notebook(data) {
+        return Some(nb);
+    }
+    if let Some(arr) = data.as_array() {
+        for elem in arr {
+            if let Some(nb) = parse_notebook(elem) {
+                return Some(nb);
+            }
+        }
+    }
+    None
+}
+
 /// Артефакт из строки `[id, title, type, sourceIds, status, …]`.
 fn parse_artifact(row: &Value) -> Option<Artifact> {
     let id = at(row, 0).as_str()?.to_string();
@@ -618,6 +633,12 @@ impl NlmSession {
     /// Паспорт ноутбука (raw-JSON — схема богаче, чем в парсере).
     pub fn get_project(&mut self, notebook_id: &str) -> Result<Value, String> {
         self.rpc(RPC_GET_PROJECT, &serde_json::json!([notebook_id, null, [2]]), Some(notebook_id))
+    }
+
+    /// Загрузить структурированный паспорт ноутбука со всеми источниками (RPC GET_PROJECT / rLM1Ne).
+    pub fn get_notebook(&mut self, notebook_id: &str) -> Result<Notebook, String> {
+        let data = self.get_project(notebook_id)?;
+        parse_single_notebook(&data).ok_or_else(|| format!("Не удалось распарсить паспорт ноутбука {notebook_id}"))
     }
 
     /// Контент источника: текст и/или URL картинок слайдов.

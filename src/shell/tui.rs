@@ -108,6 +108,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     // Список ноутбуков (левая панель)
     let mut notebooks: Vec<String> = vec!["(нажмите 'r' для nlm list)".into()];
     let mut notebook_ids: Vec<String> = Vec::new();
+    let mut cached_notebooks: Vec<CachedNotebook> = Vec::new();
     let mut nb_state = ListState::default();
     nb_state.select(Some(0));
 
@@ -123,6 +124,27 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
 
     let mut focus = Focus::Input;
     let mut should_quit = false;
+
+    // Авто-загрузка списка блокнотов и первого блокнота при старте
+    refresh_notebooks_list(&mut state, &mut notebooks, &mut notebook_ids, &mut cached_notebooks);
+    if !notebook_ids.is_empty() {
+        nb_state.select(Some(0));
+        activate_notebook(
+            0,
+            &mut state,
+            &notebooks,
+            &notebook_ids,
+            &cached_notebooks,
+            &mut sources_items,
+            &mut notes_items,
+            &mut output_lines,
+            &mut output_scroll,
+            false,
+        );
+    } else {
+        refresh_notes_list(&mut state, &mut notes_items);
+        refresh_sources_list(&mut state, &mut sources_items);
+    }
 
     // Drag-select
     let mut selection = SelectionRect::new();
@@ -289,6 +311,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut output_scroll,
                     &mut notebooks,
                     &mut notebook_ids,
+                    &mut cached_notebooks,
                     &mut nb_state,
                     &mut notes_items,
                     &mut notes_state,
@@ -312,6 +335,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut output_scroll,
                     &mut notebooks,
                     &mut notebook_ids,
+                    &mut cached_notebooks,
                     &mut nb_state,
                     &mut notes_items,
                     &mut notes_state,
@@ -739,6 +763,7 @@ fn handle_key_event(
     output_scroll: &mut usize,
     notebooks: &mut Vec<String>,
     notebook_ids: &mut Vec<String>,
+    cached_notebooks: &mut Vec<CachedNotebook>,
     nb_state: &mut ListState,
     notes_items: &mut Vec<String>,
     notes_state: &mut ListState,
@@ -949,30 +974,38 @@ fn handle_key_event(
             // ? palette
             *mode = Mode::Palette;
         }
+        (KeyCode::Enter, _) if matches!(focus, Focus::Notebooks) => {
+            let idx = nb_state.selected().unwrap_or(0);
+            activate_notebook(
+                idx,
+                state,
+                notebooks,
+                notebook_ids,
+                cached_notebooks,
+                sources_items,
+                notes_items,
+                output_lines,
+                output_scroll,
+                true,
+            );
+        }
         (KeyCode::Char('r'), _) if matches!(focus, Focus::Notebooks) => {
             // Обновить список ноутбуков
-            output_lines.push("poler> nlm list".into());
-            let r = dispatch(state, "nlm list");
-            if let CmdResult::Done(out) = r {
-                let mut new_list = Vec::new();
-                notebook_ids.clear();
-                for l in out.lines() {
-                    if l.contains("704f") || l.contains('-') && l.len() > 30 {
-                        // Похоже на notebook UUID
-                        let id = l.split_whitespace().next().unwrap_or("").to_string();
-                        if id.len() >= 8 {
-                            notebook_ids.push(id.clone());
-                            new_list.push(l.to_string());
-                            continue;
-                        }
-                    }
-                    new_list.push(l.to_string());
-                }
-                if new_list.is_empty() {
-                    new_list = vec!["(пусто)".into()];
-                }
-                *notebooks = new_list;
-            }
+            output_lines.push("poler> nlm list (обновление...)".into());
+            refresh_notebooks_list(state, notebooks, notebook_ids, cached_notebooks);
+            let idx = nb_state.selected().unwrap_or(0);
+            activate_notebook(
+                idx,
+                state,
+                notebooks,
+                notebook_ids,
+                cached_notebooks,
+                sources_items,
+                notes_items,
+                output_lines,
+                output_scroll,
+                true,
+            );
             *output_scroll = usize::MAX; // прилипить к низу
         }
         (KeyCode::PageUp, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
@@ -1009,12 +1042,38 @@ fn handle_key_event(
         }
         (KeyCode::Up, _) if matches!(focus, Focus::Notebooks) => {
             let idx = nb_state.selected().unwrap_or(0);
-            nb_state.select(Some(idx.saturating_sub(1)));
+            let new_idx = idx.saturating_sub(1);
+            nb_state.select(Some(new_idx));
+            activate_notebook(
+                new_idx,
+                state,
+                notebooks,
+                notebook_ids,
+                cached_notebooks,
+                sources_items,
+                notes_items,
+                output_lines,
+                output_scroll,
+                false,
+            );
         }
         (KeyCode::Down, _) if matches!(focus, Focus::Notebooks) => {
             let idx = nb_state.selected().unwrap_or(0);
             let max = notebooks.len().saturating_sub(1);
-            nb_state.select(Some((idx + 1).min(max)));
+            let new_idx = (idx + 1).min(max);
+            nb_state.select(Some(new_idx));
+            activate_notebook(
+                new_idx,
+                state,
+                notebooks,
+                notebook_ids,
+                cached_notebooks,
+                sources_items,
+                notes_items,
+                output_lines,
+                output_scroll,
+                false,
+            );
         }
         (KeyCode::Up, _) if matches!(focus, Focus::Notes) => {
             let idx = notes_state.selected().unwrap_or(0);
@@ -1170,6 +1229,7 @@ fn handle_mouse_event(
     output_scroll: &mut usize,
     notebooks: &mut Vec<String>,
     notebook_ids: &mut Vec<String>,
+    cached_notebooks: &mut Vec<CachedNotebook>,
     nb_state: &mut ListState,
     notes_items: &mut Vec<String>,
     notes_state: &mut ListState,
@@ -1222,7 +1282,7 @@ fn handle_mouse_event(
                         handle_single_click(
                             col, row, layout, state, input_buf, input_history,
                             input_history_idx, output_lines, output_scroll,
-                            notebooks, notebook_ids, nb_state, notes_items, notes_state,
+                            notebooks, notebook_ids, cached_notebooks, nb_state, notes_items, notes_state,
                             sources_items, sources_state, focus, last_click_time, last_click_pos,
                         );
                     }
@@ -1232,7 +1292,7 @@ fn handle_mouse_event(
                 handle_single_click(
                     col, row, layout, state, input_buf, input_history,
                     input_history_idx, output_lines, output_scroll,
-                    notebooks, notebook_ids, nb_state, notes_items, notes_state,
+                    notebooks, notebook_ids, cached_notebooks, nb_state, notes_items, notes_state,
                     sources_items, sources_state, focus, last_click_time, last_click_pos,
                 );
             }
@@ -1245,7 +1305,20 @@ fn handle_mouse_event(
                 *output_scroll = output_scroll.saturating_sub(3);
             } else if mouse::hit(&layout.nb_area, me.column, me.row) {
                 let idx = nb_state.selected().unwrap_or(0);
-                nb_state.select(Some(idx.saturating_sub(1)));
+                let new_idx = idx.saturating_sub(1);
+                nb_state.select(Some(new_idx));
+                activate_notebook(
+                    new_idx,
+                    state,
+                    notebooks,
+                    notebook_ids,
+                    cached_notebooks,
+                    sources_items,
+                    notes_items,
+                    output_lines,
+                    output_scroll,
+                    false,
+                );
             } else if mouse::hit(&layout.notes_area, me.column, me.row) {
                 let idx = notes_state.selected().unwrap_or(0);
                 notes_state.select(Some(idx.saturating_sub(1)));
@@ -1261,7 +1334,20 @@ fn handle_mouse_event(
             } else if mouse::hit(&layout.nb_area, me.column, me.row) {
                 let idx = nb_state.selected().unwrap_or(0);
                 let max = notebooks.len().saturating_sub(1);
-                nb_state.select(Some((idx + 1).min(max)));
+                let new_idx = (idx + 1).min(max);
+                nb_state.select(Some(new_idx));
+                activate_notebook(
+                    new_idx,
+                    state,
+                    notebooks,
+                    notebook_ids,
+                    cached_notebooks,
+                    sources_items,
+                    notes_items,
+                    output_lines,
+                    output_scroll,
+                    false,
+                );
             } else if mouse::hit(&layout.notes_area, me.column, me.row) {
                 let idx = notes_state.selected().unwrap_or(0);
                 let max = notes_items.len().saturating_sub(1);
@@ -1311,10 +1397,11 @@ fn handle_single_click(
     output_scroll: &mut usize,
     notebooks: &[String],
     notebook_ids: &mut Vec<String>,
+    cached_notebooks: &[CachedNotebook],
     nb_state: &mut ListState,
-    _notes_items: &[String],
+    notes_items: &mut Vec<String>,
     notes_state: &mut ListState,
-    _sources_items: &[String],
+    sources_items: &mut Vec<String>,
     sources_state: &mut ListState,
     focus: &mut Focus,
     last_click_time: &mut Option<Instant>,
@@ -1331,9 +1418,18 @@ fn handle_single_click(
             // Если есть notebook_ids для этого индекса → активируем
             if local_row < notebook_ids.len() {
                 let id = notebook_ids[local_row].clone();
-                state.set_active_notebook(Some(id.clone()));
-                output_lines.push(format!("✓ Активирован ноутбук {} ({})", local_row + 1, &id[..id.len().min(8)]));
-                *output_scroll = usize::MAX; // прилипить к низу
+                activate_notebook(
+                    local_row,
+                    state,
+                    notebooks,
+                    notebook_ids,
+                    cached_notebooks,
+                    sources_items,
+                    notes_items,
+                    output_lines,
+                    output_scroll,
+                    true,
+                );
                 // Двойной клик → nlm sync <id>
                 let now = Instant::now();
                 let is_double = last_click_time
@@ -1418,6 +1514,140 @@ fn handle_note_editor_event(ev: Event, state: &mut NoteEditorState) -> NoteEdito
         }
     }
     NoteEditorResult::Continue
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct CachedNotebook {
+    id: String,
+    title: String,
+    emoji: String,
+    sources: Vec<crate::google::nlm::SourceMeta>,
+}
+
+fn refresh_notebooks_list(
+    state: &mut ShellState,
+    notebooks: &mut Vec<String>,
+    notebook_ids: &mut Vec<String>,
+    cached_notebooks: &mut Vec<CachedNotebook>,
+) {
+    if let Ok(nlm_sess) = state.ensure_nlm() {
+        if let Ok(nbs) = nlm_sess.list_notebooks() {
+            notebooks.clear();
+            notebook_ids.clear();
+            cached_notebooks.clear();
+            for (i, nb) in nbs.iter().enumerate() {
+                let emoji = if nb.emoji.is_empty() { "📓 " } else { &nb.emoji };
+                let line = format!("{}. {}{} [{} ист.]", i + 1, emoji, nb.title, nb.sources.len());
+                notebooks.push(line);
+                notebook_ids.push(nb.id.clone());
+                cached_notebooks.push(CachedNotebook {
+                    id: nb.id.clone(),
+                    title: nb.title.clone(),
+                    emoji: nb.emoji.clone(),
+                    sources: nb.sources.clone(),
+                });
+            }
+            if notebooks.is_empty() {
+                *notebooks = vec!["(нет блокнотов)".into()];
+            }
+            return;
+        }
+    }
+    if notebooks.is_empty() {
+        *notebooks = vec!["(нажмите 'r' для nlm list)".into()];
+    }
+}
+
+fn activate_notebook(
+    idx: usize,
+    state: &mut ShellState,
+    _notebooks: &[String],
+    notebook_ids: &[String],
+    cached_notebooks: &[CachedNotebook],
+    sources_items: &mut Vec<String>,
+    notes_items: &mut Vec<String>,
+    output_lines: &mut Vec<String>,
+    output_scroll: &mut usize,
+    announce: bool,
+) {
+    if idx >= notebook_ids.len() {
+        return;
+    }
+    let id = notebook_ids[idx].clone();
+    state.set_active_notebook(Some(id.clone()));
+
+    // 1. Источники блокнота: загрузка из NotebookLM (RPC GET_PROJECT / rLM1Ne)
+    sources_items.clear();
+    let mut fetched_sources: Vec<crate::google::nlm::SourceMeta> = Vec::new();
+    if let Ok(nlm_sess) = state.ensure_nlm() {
+        if let Ok(full_nb) = nlm_sess.get_notebook(&id) {
+            fetched_sources = full_nb.sources;
+        }
+    }
+    if fetched_sources.is_empty() {
+        if let Some(cnb) = cached_notebooks.get(idx) {
+            fetched_sources = cnb.sources.clone();
+        }
+    }
+    for (si, src) in fetched_sources.iter().enumerate() {
+        let icon = match src.kind.as_str() {
+            "Google Docs" => "📄",
+            "YouTube" => "🎬",
+            "Web" | "URL" => "🔗",
+            "Слайды" => "🖼️",
+            "PDF" => "📑",
+            _ => "📦",
+        };
+        let info = src.url.as_deref().unwrap_or(src.kind.as_str());
+        sources_items.push(format!("{}. {} [{}] {} — {}", si + 1, icon, src.kind, src.title, info));
+    }
+    if sources_items.is_empty() {
+        if let Ok(conn) = state.ensure_sources_conn() {
+            let local_srcs = crate::sources::list_sources(conn, 50).unwrap_or_default();
+            for s in local_srcs {
+                sources_items.push(format!("#{} [{}] {}", s.id, s.kind.as_str(), s.value));
+            }
+        }
+    }
+    if sources_items.is_empty() {
+        *sources_items = vec!["(в блокноте нет источников — sources add)".into()];
+    }
+
+    // 2. Синхронизация заметок (локальные + облачные NLM)
+    notes_items.clear();
+    // 2a. Локальные заметки для этого блокнота
+    if let Ok(conn) = state.ensure_notes_conn() {
+        let all = crate::notes::list_notes(conn, 100).unwrap_or_default();
+        for n in all {
+            if n.notebook_id.as_deref() == Some(&id) || n.notebook_id.is_none() {
+                let preview = n.body.lines().next().unwrap_or("").chars().take(30).collect::<String>();
+                notes_items.push(format!("#{} {} — {}", n.id, n.title, preview));
+            }
+        }
+    }
+    // 2b. Облачные заметки из NotebookLM
+    if let Ok(nlm_sess) = state.ensure_nlm() {
+        if let Ok(notes_raw) = nlm_sess.notes(&id) {
+            let parsed_notes = crate::google::nlm_ingest::parse_notes(&notes_raw);
+            for pn in parsed_notes {
+                let title = pn.title.unwrap_or_else(|| "Заметка NLM".into());
+                let preview = pn.text.lines().next().unwrap_or("").chars().take(35).collect::<String>();
+                notes_items.push(format!("📝 [NLM] {} — {}", title, preview));
+            }
+        }
+    }
+    if notes_items.is_empty() {
+        *notes_items = vec!["(нет заметок — Ctrl+N)".into()];
+    }
+
+    if announce {
+        let title = cached_notebooks.get(idx).map(|c| c.title.as_str()).unwrap_or("Ноутбук");
+        output_lines.push(format!("✓ Активирован блокнот: «{}» (ID: {})", title, &id[..id.len().min(8)]));
+        output_lines.push(format!("  Загружено источников: {}, заметок: {}", sources_items.len(), notes_items.len()));
+        output_lines.push(String::new());
+        *output_scroll = usize::MAX;
+    }
 }
 
 fn refresh_notes_list(state: &mut ShellState, notes_items: &mut Vec<String>) {
