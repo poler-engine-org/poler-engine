@@ -20,6 +20,55 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.9.0: Web Search for AI — краулер + BM25/PageRank-индекс + `--web-search`
+
+Полноценный веб-поиск: v0.8.0 умел **рендерить** страницу, v0.9.0 умеет
+**обходить сайты, строить индекс и отвечать на запросы**. Архитектура собрана
+из проверенных боевых технологий (Google → open source → POLER-модель:
+те же математические инварианты, вертикальный масштаб вместо 10 000 серверов):
+
+| Технология-донор | Откуда | Реализация в POLER |
+|---|---|---|
+| Googlebot (миллион headless Chromium) | Google | `cdp.rs` — один Chromium через CDP (v0.8.0) |
+| robots.txt + Sitemap | стандарт вежливости Googlebot | `robots.rs` — парсер групп UA, `Crawl-delay`, `Sitemap:`, `Allow`/`Disallow` |
+| URL Frontier + Politeness | Mercator/Heritrix (краулер, выкормивший Google-конкурентов) | `crawl.rs` — BFS-граница, доменная задержка, cap на хост |
+| SimHash-дедупликация | статья Google «Detecting Near-Duplicates for Web Crawling» (Manku et al., 2007) | `simhash.rs` — 64-битные отпечатки, расстояние Хэмминга ≤ 3 |
+| Инвертированный индекс | Tantivy/Lucene (открытые наследники Google Index) | `index.rs` — SQLite: `pages/terms/links/hosts/meta` |
+| BM25 (Okapi) | до-нейронный Google | классический BM25 (k1=1.2, b=0.75) + idf-фильтр стоп-слов |
+| PageRank | статья Brin & Page 1998 | итеративный по `links`-таблице, ε-телепорт |
+| Percolator (инкрементальный индекс) | Google (Colossus-стек) | content-hash skip: повторный краул переиндексирует ТОЛЬКО изменившееся |
+| Scatter-Gather Top-K | Google Serving | postings scatter → аккумулятор gather → нормированный WebRank |
+
+**Ранжирование — POLER WebRank v1**:
+`0.55·BM25 + 0.15·PageRank + 0.20·title-match + 0.10·ε-плотность` —
+лексическая точность BM25, ссылочная авторитетность, точность в заголовке
+и POLER-мера информационной плотности в одной формуле.
+
+```bash
+# 1. Краулинг сайта (Chromium рендерит каждую страницу, robots/sitemap соблюдаются):
+poler-engine "https://nginx.org/en/docs/" --crawl --crawl-depth 2 --crawl-max 50
+
+# 2. Поиск по собранному индексу (AI-ready JSON со сниппетами):
+poler-engine --web-search "gzip static" --top 5
+
+# Индекс: $POLER_WEB_DB или ~/.local/share/poler-engine/web-index.db
+```
+
+### Полевые замеры (Chromium 152, реальные сайты)
+
+| Сайт | Загружено | Проиндексировано | Особенности |
+|---|---|---|---|
+| doc.rust-lang.org/std/mem | 10 стр, 16 с | 10 | frontier нашёл ещё 230 URL |
+| en.wikipedia.org/wiki/Rust | 8 стр, 43 с | 8 | кросс-доменный поиск «ownership borrow checker»: Википедия #1 |
+| nginx.org/en/docs | 8 стр, 17 с | 5 | **3 SimHash-дубля поймано** (зеркала www/http), **200 URL из sitemap** |
+| повторный краул Википедии | 5 стр, 27 с | **0** (5 unchanged) | Percolator-lite: content-hash skip работает |
+
+Найден и закрыт живой баг релевантности: на **моно-тематическом корпусе**
+(весь сайт про nginx) предметный терм запроса встречается на каждой странице
+→ idf-фильтр стоп-слов убивал его → «gzip» давал 0 результатов. Теперь при
+пустом после фильтра запросе термы откатываются к полному набору (регрессионный
+тест `monothematic_corpus_subject_term_not_stopped_out`).
+
 ## v0.8.0: Web-Native Retrieval — нативный Chromium CDP
 
 Замена «костыльной» связке Rust → Node.js → CLI → Chromium из

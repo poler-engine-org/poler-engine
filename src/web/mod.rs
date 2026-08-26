@@ -1,5 +1,7 @@
 //! Web-Native Ingestion: рендер страницы через Chromium CDP → полный
-//! POLER-пайплайн (ε / R / сцены / тройки / K-hop граф).
+//! POLER-пайплайн (ε / R / сцены / тройки / K-hop граф) + ВЕБ-ПОИСК
+//! для AI: краулер (robots/sitemap/SimHash) → SQLite-индекс (BM25 +
+//! PageRank + WebRank) → `--web-search`.
 //!
 //! Поток (веб-версия потокового конвейера движка):
 //!
@@ -20,10 +22,61 @@
 //! частотный шаблонный мусор).
 
 pub mod cdp;
+pub mod crawl;
+pub mod extract;
+pub mod index;
+pub mod robots;
+pub mod simhash;
+pub mod urlnorm;
 
 use std::path::PathBuf;
 
 pub use cdp::{CdpSession, WebPage};
+pub use crawl::{CrawlConfig, CrawlStats, PageFetcher};
+pub use index::{WebHit, WebIndex};
+
+/// Реальный PageFetcher поверх Chromium CDP (одна живая сессия).
+pub struct CdpFetcher {
+    session: CdpSession,
+    wait_ms: u64,
+}
+
+impl CdpFetcher {
+    pub fn new(cdp_port: u16, wait_ms: u64) -> Result<Self, String> {
+        Ok(Self {
+            session: CdpSession::connect(cdp_port)?,
+            wait_ms,
+        })
+    }
+}
+
+impl PageFetcher for CdpFetcher {
+    fn fetch(&mut self, url: &str) -> Result<crawl::FetchedPage, String> {
+        let p = self.session.load_page_full(url, self.wait_ms)?;
+        Ok(crawl::FetchedPage {
+            final_url: p.final_url,
+            title: p.title,
+            meta_description: p.meta_description,
+            lang: p.lang,
+            text: p.text,
+            links: p.links,
+        })
+    }
+
+    fn fetch_raw(&mut self, url: &str) -> Result<(u16, String), String> {
+        self.session.fetch_raw(url)
+    }
+}
+
+/// Путь к базе веб-индекса по умолчанию:
+/// `$POLER_WEB_DB` → иначе `~/.local/share/poler-engine/web-index.db`.
+pub fn default_db_path() -> PathBuf {
+    if let Ok(p) = std::env::var("POLER_WEB_DB") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".local/share/poler-engine/web-index.db")
+}
 
 /// Директория веб-кэша (текст страниц + перехваченный JSON).
 pub fn web_cache_dir() -> PathBuf {
@@ -34,7 +87,7 @@ pub fn web_cache_dir() -> PathBuf {
 
 /// Детерминированное имя файла для URL (fnv-подобный хеш).
 fn url_slug(url: &str) -> String {
-    // простой стабильный хех (FNV-1a 64)
+    // простой стабильный хеш (FNV-1a 64)
     let mut h: u64 = 0xcbf29ce484222325;
     for b in url.bytes() {
         h ^= b as u64;
@@ -65,7 +118,7 @@ pub struct IngestResult {
 /// Загрузка URL через CDP и материализация в веб-кэш.
 ///
 /// * `cdp_port` — порт Chromium с --remote-debugging-port;
-/// * `wait_ms` — пауза на дочерние XHR после load.
+/// * `wait_ms` — пауза на дочерние fetch/XHR после load.
 pub fn ingest_url(url: &str, cdp_port: u16, wait_ms: u64) -> Result<IngestResult, String> {
     let mut session = CdpSession::connect(cdp_port)?;
     let page = session.load_page(url, wait_ms)?;
@@ -134,5 +187,12 @@ mod tests {
     fn cache_dir_creates() {
         let d = web_cache_dir();
         assert!(d.exists());
+    }
+
+    #[test]
+    fn default_db_path_env_override() {
+        // не мутируем env параллельных тестов — только проверка формы
+        let p = default_db_path();
+        assert!(p.to_string_lossy().contains("poler-engine"));
     }
 }

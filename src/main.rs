@@ -3,6 +3,8 @@
 //! Режимы:
 //! * поиск: `poler-engine <PATH> -q <QUERY> [--watch]`
 //! * impact-анализ (AIDDE): `poler-engine <PATH> --impact <SYMBOL>`
+//! * веб-поиск для AI: `poler-engine --web-search <QUERY>` (по веб-индексу)
+//! * краулинг: `poler-engine <URL> --crawl [--crawl-depth N --crawl-max M]`
 //!
 //! Коды выхода (grep-совместимые): 0 — есть совпадения, 1 — совпадений нет,
 //! 2 — ошибка.
@@ -64,7 +66,8 @@ enum ResonanceArg {
 struct Cli {
     /// Путь к файлу или корню репозитория.
     /// С --web: трактуется как URL (https://...) — рендер через Chromium CDP.
-    path: PathBuf,
+    /// С --crawl: seed-URL для обхода.
+    path: Option<PathBuf>,
 
     /// Рендер веб-страницы через Chromium CDP перед поиском
     /// (патч интерпретирует PATH как URL).
@@ -78,6 +81,39 @@ struct Cli {
     /// Пауза после load на дочерние XHR, мс (с --web) [default: 1200].
     #[arg(long = "web-wait-ms", default_value_t = 1200)]
     web_wait_ms: u64,
+
+    /// ВЕБ-ПОИСК: поиск по локальному веб-индексу (краулер --crawl).
+    #[arg(long = "web-search", conflicts_with_all = ["web", "crawl"])]
+    web_search: Option<String>,
+
+    /// Краулинг: PATH трактуется как seed-URL, страницы индексируются
+    /// в веб-индекс (robots.txt, sitemap, SimHash-дедуп, PageRank).
+    #[arg(long, requires = "path")]
+    crawl: bool,
+
+    /// Путь к базе веб-индекса [default: ~/.local/share/poler-engine/web-index.db].
+    #[arg(long = "web-db")]
+    web_db: Option<PathBuf>,
+
+    /// Статистика веб-индекса (JSON в stdout).
+    #[arg(long = "web-stats")]
+    web_stats: bool,
+
+    /// Глубина краулинга от seed [default: 2].
+    #[arg(long = "crawl-depth", default_value_t = 2)]
+    crawl_depth: usize,
+
+    /// Максимум страниц за один обход [default: 25].
+    #[arg(long = "crawl-max", default_value_t = 25)]
+    crawl_max: usize,
+
+    /// Минимальная пауза между запросами к одному хосту, мс [default: 1000].
+    #[arg(long = "crawl-delay-ms", default_value_t = 1000)]
+    crawl_delay_ms: u64,
+
+    /// Разрешить краулеру переход на другие хосты.
+    #[arg(long = "cross-site", default_value_t = false)]
+    cross_site: bool,
 
     /// Поисковый запрос: слово или фраза (в кавычках).
     #[arg(short, long)]
@@ -234,6 +270,40 @@ fn print_result(res: &SearchResult, format: Format) {
     let _ = std::io::stdout().flush();
 }
 
+/// Вывод результатов веб-поиска в трёх форматах.
+fn print_web_hits(hits: &[poler_engine::web::WebHit], query: &str, format: Format) {
+    use std::io::Write;
+    match format {
+        Format::AiJson => {
+            let out = serde_json::json!({
+                "engine": "poler-engine",
+                "mode": "web-search",
+                "rank": "POLER WebRank v1 (0.55·BM25 + 0.15·PageRank + 0.20·title + 0.10·ε-density)",
+                "query": query,
+                "total": hits.len(),
+                "results": hits,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        }
+        Format::Simple => {
+            for h in hits {
+                println!("{:.4}  {}  {}", h.score, h.url, h.title);
+            }
+        }
+        Format::Md => {
+            println!("# Веб-поиск: «{query}»\n");
+            for (i, h) in hits.iter().enumerate() {
+                println!("## {}. {}\n", i + 1, if h.title.is_empty() { &h.url } else { &h.title });
+                println!("- URL: {}", h.url);
+                println!("- Score: {:.4} (bm25={:.3}, pagerank={:.5}, title={:.2}, ε={:.5})", h.score, h.bm25, h.pagerank, h.title_frac, h.density);
+                println!("- Язык: {}, токенов: {}\n", if h.lang.is_empty() { "-" } else { &h.lang }, h.doclen);
+                println!("> {}\n", h.snippet);
+            }
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -247,9 +317,123 @@ fn main() -> ExitCode {
         }
     }
 
+    // ---------- Веб-индекс: статистика ----------
+    if cli.web_stats {
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        return match poler_engine::web::WebIndex::open(&db) {
+            Ok(ix) => {
+                let mut st = match ix.stats() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("poler-engine: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                st.db_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+                println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("poler-engine: web-индекс {db:?}: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    // ---------- Веб-поиск: по локальному веб-индексу ----------
+    if let Some(query) = cli.web_search.clone() {
+        if query.trim().is_empty() {
+            eprintln!("poler-engine: пустой --web-search");
+            return ExitCode::from(2);
+        }
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let mut ix = match poler_engine::web::WebIndex::open(&db) {
+            Ok(ix) => ix,
+            Err(e) => {
+                eprintln!("poler-engine: web-индекс {db:?}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let hits = match ix.search(&query, cli.top.max(1)) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("poler-engine: web-search: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        if cli.verbose {
+            eprintln!(
+                "poler-engine web-search: «{query}» — {} результатов из {} страниц",
+                hits.len(),
+                ix.page_count()
+            );
+        }
+        print_web_hits(&hits, &query, cli.format);
+        return if hits.is_empty() {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+
+    // ---------- Краулинг: seed URL → веб-индекс ----------
+    if cli.crawl {
+        let Some(seed_path) = cli.path.clone() else {
+            eprintln!("poler-engine: --crawl требует seed URL как PATH");
+            return ExitCode::from(2);
+        };
+        let seed = seed_path.to_string_lossy().to_string();
+        if !seed.starts_with("http://") && !seed.starts_with("https://") {
+            eprintln!("poler-engine: --crawl ожидает URL (http(s)://...), получено: {seed}");
+            return ExitCode::from(2);
+        }
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let mut ix = match poler_engine::web::WebIndex::open(&db) {
+            Ok(ix) => ix,
+            Err(e) => {
+                eprintln!("poler-engine: web-индекс {db:?}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut fetcher = match poler_engine::web::CdpFetcher::new(cli.cdp_port, cli.web_wait_ms) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-engine: Chromium CDP (порт {}): {e}", cli.cdp_port);
+                eprintln!("  запустите: chrome --headless --remote-debugging-port={} --no-sandbox", cli.cdp_port);
+                return ExitCode::from(2);
+            }
+        };
+        let cfg = poler_engine::web::CrawlConfig {
+            max_pages: cli.crawl_max.max(1),
+            max_depth: cli.crawl_depth,
+            delay_ms: cli.crawl_delay_ms,
+            cross_site: cli.cross_site,
+            wait_ms: cli.web_wait_ms,
+        };
+        eprintln!("poler-crawl: seed {seed}, глубина ≤ {}, до {} страниц, база {db:?}", cfg.max_depth, cfg.max_pages);
+        let stats = match poler_engine::web::crawl::crawl(&mut ix, &mut fetcher, &seed, &cfg, cli.verbose) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("poler-crawl: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+        eprintln!(
+            "poler-crawl: готово — {} загружено, {} проиндексировано, {} дубликатов, {} мс",
+            stats.fetched, stats.indexed, stats.duplicates, stats.elapsed_ms
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(path_arg) = cli.path.clone() else {
+        eprintln!("poler-engine: укажите PATH, --web-search <QUERY> или --crawl с seed URL");
+        return ExitCode::from(2);
+    };
+
     // ---------- Web-Native режим: рендер через Chromium CDP ----------
     let scan_target: PathBuf = if cli.web {
-        let url = cli.path.to_string_lossy().to_string();
+        let url = path_arg.to_string_lossy().to_string();
         if !url.starts_with("http://") && !url.starts_with("https://") {
             eprintln!("poler-engine: --web ожидает URL (http(s)://...), получено: {url}");
             return ExitCode::from(2);
@@ -273,7 +457,7 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        cli.path.clone()
+        path_arg
     };
 
     if !cli.web && !scan_target.exists() {

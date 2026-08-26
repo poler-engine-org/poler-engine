@@ -27,7 +27,7 @@ const MAX_WS_MESSAGE: usize = 64 * 1024 * 1024;
 
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
             chunk[0],
@@ -296,6 +296,19 @@ pub struct WebPage {
     pub json_responses: Vec<(String, String)>, // (url, body)
 }
 
+/// Полная выгрузка страницы для краулера (load_page_full).
+pub struct WebPageFull {
+    /// Финальный URL после редиректов (location.href).
+    pub final_url: String,
+    pub title: String,
+    pub meta_description: String,
+    pub lang: String,
+    pub text: String,
+    /// Абсолютные ссылки со страницы (уже резолвлены браузером).
+    pub links: Vec<String>,
+    pub json_responses: Vec<(String, String)>,
+}
+
 impl CdpSession {
     /// Подключение к первому page-таргету Chromium на порту CDP.
     pub fn connect(port: u16) -> Result<Self, String> {
@@ -337,6 +350,11 @@ impl CdpSession {
         self.next_id += 1;
         let msg = format!(r#"{{"id":{id},"method":"{method}","params":{params}}}"#);
         self.ws.send_text(&msg)?;
+        // сброс таймаута: фаза ожидания load могла оставить 100-250 мс
+        self.ws
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
         loop {
             let text = self.ws.recv_text()?;
             let v: serde_json::Value =
@@ -358,19 +376,32 @@ impl CdpSession {
         self.command_collect(method, params, &mut ev)
     }
 
-    /// Загрузка страницы и извлечение рендер-текста.
-    ///
-    /// * `wait_ms` — пауза после load на дочерние fetch/XHR
-    ///   (React/Vue догружают контент после onload).
-    pub fn load_page(&mut self, url: &str, wait_ms: u64) -> Result<WebPage, String> {
+    /// Runtime.evaluate → строка (returnByValue).
+    fn eval_string(&mut self, expr: &str) -> Result<String, String> {
+        let params = serde_json::json!({"expression": expr, "returnByValue": true}).to_string();
+        let res = self.command("Runtime.evaluate", &params)?;
+        Ok(res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Навигация + ожидание load + дренирование событий сети.
+    /// Возвращает собранные CDP-события (перехват JSON, статусы ответов).
+    fn navigate_and_collect(
+        &mut self,
+        url: &str,
+        wait_ms: u64,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let mut events: Vec<serde_json::Value> = Vec::new();
         self.command_collect(
             "Page.navigate",
-            &format!(r#"{{"url":"{url}"}}"#),
+            &serde_json::json!({"url": url}).to_string(),
             &mut events,
         )?;
 
-        // ждать Page.loadEventFired до 20 с (неблокирующе, собирая события)
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             self.ws
@@ -391,10 +422,9 @@ impl CdpSession {
                         }
                     }
                 }
-                Err(_) => continue, // read timeout — ждём дальше
+                Err(_) => continue,
             }
         }
-        // пауза на дочерние XHR + дренирование событий
         if wait_ms > 0 {
             std::thread::sleep(Duration::from_millis(wait_ms));
             self.ws
@@ -409,8 +439,14 @@ impl CdpSession {
                 }
             }
         }
+        Ok(events)
+    }
 
-        // сетевой перехват: JSON-ответы скрытых API
+    /// Перехват JSON-ответов скрытых API из накопленных событий.
+    fn intercept_json(
+        &mut self,
+        events: &[serde_json::Value],
+    ) -> Vec<(String, String)> {
         let json_requests: Vec<(String, String)> = events
             .iter()
             .filter_map(|e| {
@@ -438,24 +474,105 @@ impl CdpSession {
                 }
             }
         }
+        intercepted
+    }
 
-        // рендер-текст: innerText (браузер уже исполнил весь JS/Shadow DOM)
-        let text = self
-            .command(
-                "Runtime.evaluate",
-                r#"{"expression":"document.body ? document.body.innerText : ''","returnByValue":true}"#,
-            )?
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+    /// Загрузка страницы и извлечение рендер-текста.
+    ///
+    /// * `wait_ms` — пауза после load на дочерние fetch/XHR
+    ///   (React/Vue догружают контент после onload).
+    pub fn load_page(&mut self, url: &str, wait_ms: u64) -> Result<WebPage, String> {
+        let events = self.navigate_and_collect(url, wait_ms)?;
+        let intercepted = self.intercept_json(&events);
+        let text = self.eval_string(
+            "document.body ? document.body.innerText : ''",
+        )?;
 
         Ok(WebPage {
             url: url.to_string(),
             text,
             json_responses: intercepted,
         })
+    }
+
+    /// Полная выгрузка страницы для веб-краулера: финальный URL после
+    /// редиректов, заголовок, meta description, язык, рендер-текст и
+    /// абсолютные ссылки (`a.href` — браузер сам резолвит относительные).
+    pub fn load_page_full(&mut self, url: &str, wait_ms: u64) -> Result<WebPageFull, String> {
+        let events = self.navigate_and_collect(url, wait_ms)?;
+        let intercepted = self.intercept_json(&events);
+        let text = self
+            .eval_string("document.body ? document.body.innerText : ''")?;
+
+        // один вызов: title + meta + lang + ссылки (JSON — экранирование честное)
+        let meta_json = self.eval_string(
+            "JSON.stringify({\
+              u: location.href,\
+              t: document.title || '',\
+              d: (document.querySelector('meta[name=\"description\"]') || {content: ''}).content || '',\
+              l: document.documentElement.lang || '',\
+              a: Array.from(document.querySelectorAll('a[href]'))\
+                   .map(function(a){ return a.href; })\
+                   .filter(function(h){ return h.indexOf('http') === 0; })\
+                   .slice(0, 800)\
+            })",
+        )?;
+        let meta: serde_json::Value = serde_json::from_str(&meta_json)
+            .unwrap_or(serde_json::Value::Null);
+        let g = |k: &str| {
+            meta.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let links = meta
+            .get("a")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(WebPageFull {
+            final_url: if g("u").is_empty() {
+                url.to_string()
+            } else {
+                g("u")
+            },
+            title: g("t"),
+            meta_description: g("d"),
+            lang: g("l"),
+            text,
+            links,
+            json_responses: intercepted,
+        })
+    }
+
+    /// Загрузка «сырого» ресурса (robots.txt, sitemap.xml):
+    /// (HTTP-статус, текст). Статус — последнего Document-ответа.
+    pub fn fetch_raw(&mut self, url: &str) -> Result<(u16, String), String> {
+        let events = self.navigate_and_collect(url, 0)?;
+        // статус последнего Document-ответа (учитывает редиректы)
+        let status = events
+            .iter()
+            .rev()
+            .filter(|e| {
+                e.get("method").and_then(|m| m.as_str()) == Some("Network.responseReceived")
+            })
+            .find_map(|e| {
+                let p = e.get("params")?;
+                if p.get("type").and_then(|t| t.as_str()) != Some("Document") {
+                    return None;
+                }
+                p.get("response")?.get("status")?.as_u64().map(|s| s as u16)
+            })
+            .unwrap_or(200);
+        let text = self.eval_string(
+            "document.documentElement ? document.documentElement.textContent : ''",
+        )?;
+        Ok((status, text))
     }
 }
 
