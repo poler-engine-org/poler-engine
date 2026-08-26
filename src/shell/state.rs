@@ -87,6 +87,8 @@ impl ShellState {
                 "nlm", "sync",
                 "crawl", "impact",
                 "set", "version",
+                // v0.16.0: Unified VCS & Data Mesh
+                "gh", "gl", "gt", "gix",
             ]
         })
     }
@@ -94,6 +96,21 @@ impl ShellState {
     /// Подкоманды `nlm ...` для Tab-completion.
     pub fn nlm_subcommands() -> &'static [&'static str] {
         &["list", "notes", "artifacts", "source", "account", "ask", "sync", "shot", "media"]
+    }
+
+    /// v0.16.0: Подкоманды `gh`/`gl`/`gt` (одинаковые для всех REST-адаптеров).
+    pub fn vcs_subcommands() -> &'static [&'static str] {
+        &["search", "repos", "commits", "issues"]
+    }
+
+    /// v0.16.0: Подкоманды `gix` (Pure-Rust git).
+    pub fn gix_subcommands() -> &'static [&'static str] {
+        &["log", "clone"]
+    }
+
+    /// v0.16.0: Схемы VCS для `sync vcs <scheme>` completion.
+    pub fn vcs_schemes() -> &'static [&'static str] {
+        &["gh", "gl", "gt", "gix", "all"]
     }
 
     /// Именованные параметры `set ...` для Tab-completion.

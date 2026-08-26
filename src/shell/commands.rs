@@ -22,6 +22,7 @@ use std::process::ExitCode;
 
 use crate::google::nlm;
 use crate::google::nlm_ingest;
+use crate::vcs::VcsAdapter;
 
 use super::state::ShellState;
 
@@ -78,17 +79,23 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "quit" | "exit" | "q" => CmdResult::Quit,
         "help" | "?" => CmdResult::Done(help_text(args)),
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.15.1)",
+            "poler-engine {} (poler-shell v0.16.0 — Unified VCS & Data Mesh)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
         "stats" => cmd_stats(state),
         "nlm" => cmd_nlm(state, args),
-        "sync" => cmd_nlm(state, &["sync".into()]),
+        // v0.16.0: alias для subкоманд vcs-sync: `sync vcs github owner`
+        "sync" => cmd_sync(state, args),
         "set" => cmd_set(state, args),
         // v0.15.1: нативные команды crawl/impact внутри шелла
         "crawl" => cmd_crawl(state, args),
         "impact" => cmd_impact(state, args),
+        // v0.16.0: Unified VCS & Data Mesh — нативные адаптеры GitHub/GitLab/Gitea/gix
+        "gh" => cmd_gh(state, args),
+        "gl" => cmd_gl(state, args),
+        "gt" => cmd_gt(state, args),
+        "gix" => cmd_gix(state, args),
         other => CmdResult::Done(format!(
             "неизвестная команда: {other} (введите `help` для списка)"
         )),
@@ -118,6 +125,20 @@ fn help_text(_args: &[String]) -> String {
     s.push('\n');
     s.push_str("  set format md|json|simple     — переключить формат вывода\n");
     s.push_str("  set top N                     — топ-K по умолчанию для search\n");
+    s.push('\n');
+    // v0.16.0: Unified VCS & Data Mesh — нативные адаптеры
+    s.push_str("  gh search <Q> [--top N]      — поиск по коду GitHub (требует $GITHUB_TOKEN)\n");
+    s.push_str("  gh repos <USER>               — список репозиториев пользователя GitHub\n");
+    s.push_str("  gh commits <OWNER/REPO>       — последние 20 коммитов репо\n");
+    s.push_str("  gh issues <OWNER/REPO>        — issues+PR репозитория\n");
+    s.push_str("  gl search <Q>                 — поиск по GitLab (REST v4)\n");
+    s.push_str("  gl commits <GROUP/PROJ>       — коммиты GitLab проекта\n");
+    s.push_str("  gl issues <GROUP/PROJ>        — issues+MR GitLab\n");
+    s.push_str("  gt search <Q>                 — поиск по Gitea/Forgejo ($GITEA_HOST)\n");
+    s.push_str("  gt commits <OWNER/REPO>       — коммиты Gitea\n");
+    s.push_str("  gix log <PATH> [--top N]      — git log локального репо через Pure-Rust gix\n");
+    s.push_str("  gix clone <URL> <PATH>        — (заглушка v0.16: используйте git clone)\n");
+    s.push_str("  sync vcs [gh|gl|gt] <OWNER>  — синк VCS-страниц в web-index.db\n");
     s.push('\n');
     s.push_str("  version | v                    — версия poler-engine + poler-shell\n");
     s.push_str("  quit | exit | q                — выйти из шелла\n");
@@ -791,7 +812,290 @@ fn cmd_impact(state: &mut ShellState, args: &[String]) -> CmdResult {
 }
 
 // ---------------------------------------------------------------------------
-// REPL entry point (используется main.rs)
+// v0.16.0: VCS-команды — gh / gl / gt / gix / sync vcs
+// ---------------------------------------------------------------------------
+
+/// `poler> gh <subcommand> [args]` — GitHub REST API.
+/// Субкоманды: `search <Q>`, `repos <USER>`, `commits <OWNER/REPO>`, `issues <OWNER/REPO>`.
+fn cmd_gh(state: &mut ShellState, args: &[String]) -> CmdResult {
+    let adapter = match crate::vcs::github_adapter() {
+        Ok(a) => a,
+        Err(e) => return CmdResult::Done(format!("❌ gh: {e}")),
+    };
+    cmd_vcs_adapter(state, "gh", adapter, args)
+}
+
+/// `poler> gl <subcommand>` — GitLab REST v4.
+fn cmd_gl(state: &mut ShellState, args: &[String]) -> CmdResult {
+    let adapter = match crate::vcs::gitlab_adapter() {
+        Ok(a) => a,
+        Err(e) => return CmdResult::Done(format!("❌ gl: {e}")),
+    };
+    cmd_vcs_adapter(state, "gl", adapter, args)
+}
+
+/// `poler> gt <subcommand>` — Gitea/Forgejo REST.
+fn cmd_gt(state: &mut ShellState, args: &[String]) -> CmdResult {
+    let adapter = match crate::vcs::gitea_adapter() {
+        Ok(a) => a,
+        Err(e) => return CmdResult::Done(format!("❌ gt: {e}")),
+    };
+    cmd_vcs_adapter(state, "gt", adapter, args)
+}
+
+/// `poler> gix <log|clone> ...` — локальный git через Pure-Rust gix.
+fn cmd_gix(state: &mut ShellState, args: &[String]) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(
+            "gix <subcommand> — доступные:\n  gix log <PATH> [--top N]\n  gix clone <URL> <PATH>".into(),
+        );
+    }
+    let sub = args[0].as_str();
+    match sub {
+        "log" => {
+            let path = match args.get(1) {
+                Some(p) => p,
+                None => return CmdResult::Done("gix log <PATH> — укажите путь к репозиторию".into()),
+            };
+            let mut top = 20usize;
+            let mut i = 2;
+            while i < args.len() {
+                if (args[i] == "--top" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(n) = args[i + 1].parse::<usize>() {
+                        top = n.max(1);
+                    }
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            match crate::vcs::local::GixAdapter::list_commits_at_path(
+                std::path::Path::new(path),
+                top,
+            ) {
+                Ok(commits) => {
+                    if commits.is_empty() {
+                        return CmdResult::Done(format!("gix log: 0 коммитов в {path}"));
+                    }
+                    let mut out = String::new();
+                    out.push_str(&format!("gix log {path} — {} коммитов (top {})\n\n", commits.len(), top));
+                    let adapter = crate::vcs::local::GixAdapter::default();
+                    let repo = crate::vcs::RepoId::from_path(std::path::Path::new(path));
+                    // Заодно вливаем в web-index.db — коммиты как gix:// страницы
+                    if let Ok(ix) = state.ensure_index() {
+                        let docs = crate::vcs::ingest::commits_to_docs(adapter.scheme(), &repo, &commits);
+                        let mut new_count = 0;
+                        let mut unc_count = 0;
+                        for doc in &docs {
+                            if let Ok((_, was_new)) = ix.upsert_page(doc) {
+                                if was_new {
+                                    new_count += 1;
+                                } else {
+                                    unc_count += 1;
+                                }
+                            }
+                        }
+                        let _ = ix.recompute_pagerank(20);
+                        out.push_str(&format!(
+                            "✓ индексировано: {new_count} новых, {unc_count} без изменений (gix://)\n\n"
+                        ));
+                    }
+                    for c in &commits {
+                        let short = crate::vcs::ingest::short_sha(&c.sha);
+                        let subject = c.message.lines().next().unwrap_or("");
+                        out.push_str(&format!(
+                            "{}  {}  <{}>  [{}]\n    {}\n",
+                            short,
+                            crate::vcs::ingest::iso_time(c.authored_at),
+                            c.author,
+                            c.author_email,
+                            subject,
+                        ));
+                    }
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ gix log: {e}")),
+            }
+        }
+        "clone" => {
+            let url = match args.get(1) {
+                Some(u) => u,
+                None => return CmdResult::Done("gix clone <URL> <PATH> — укажите URL".into()),
+            };
+            let dest = match args.get(2) {
+                Some(p) => p,
+                None => return CmdResult::Done("gix clone <URL> <PATH> — укажите путь назначения".into()),
+            };
+            let res = crate::vcs::local::GixAdapter::clone_repo(url, std::path::Path::new(dest));
+            match res {
+                Ok(p) => CmdResult::Done(format!("✓ gix clone: {} → {}", url, p.display())),
+                Err(e) => CmdResult::Done(format!("⚠ gix clone: {e}")),
+            }
+        }
+        other => CmdResult::Done(format!("gix: неизвестная подкоманда {other} (log|clone)")),
+    }
+}
+
+/// Общий обработчик для `gh`/`gl`/`gt` — все имеют REST-adapter.
+fn cmd_vcs_adapter(
+    state: &mut ShellState,
+    label: &str,
+    adapter: impl crate::vcs::VcsAdapter,
+    args: &[String],
+) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(format!(
+            "{label} <subcommand> — доступные:\n  search <Q>\n  repos <USER>\n  commits <OWNER/REPO>\n  issues <OWNER/REPO>"
+        ));
+    }
+    let sub = args[0].as_str();
+    let rest = &args[1..];
+    match sub {
+        "search" => {
+            let query = match rest.first() {
+                Some(q) => q,
+                None => return CmdResult::Done(format!("{label} search <QUERY> — укажите запрос")),
+            };
+            match adapter.search_code(query, 20) {
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        return CmdResult::Done(format!("{label} search «{query}»: 0 хитов"));
+                    }
+                    let mut out = String::new();
+                    out.push_str(&format!("🔍 {label} «{query}» — {} хитов\n\n", hits.len()));
+                    for (i, h) in hits.iter().enumerate() {
+                        out.push_str(&format!("{}. {}\n", i + 1, h.repo));
+                        out.push_str(&format!("   {}/{}\n", h.path, h.sha));
+                        if !h.web_url.is_empty() {
+                            out.push_str(&format!("   {}\n", h.web_url));
+                        }
+                        if !h.snippet.is_empty() {
+                            out.push_str(&format!("   {}\n", h.snippet));
+                        }
+                    }
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ {label} search: {e}")),
+            }
+        }
+        "repos" => {
+            let owner = match rest.first() {
+                Some(o) => o,
+                None => return CmdResult::Done(format!("{label} repos <USER> — укажите owner")),
+            };
+            match adapter.list_repos(owner) {
+                Ok(repos) => {
+                    if repos.is_empty() {
+                        return CmdResult::Done(format!("{label} repos {owner}: 0 репозиториев"));
+                    }
+                    let mut out = String::new();
+                    out.push_str(&format!("📂 {label} {owner} — {} репозиториев\n\n", repos.len()));
+                    for (i, r) in repos.iter().enumerate() {
+                        out.push_str(&format!("{}. {}\n", i + 1, r.display));
+                    }
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ {label} repos: {e}")),
+            }
+        }
+        "commits" => {
+            let repo_str = match rest.first() {
+                Some(r) => r,
+                None => return CmdResult::Done(format!("{label} commits <OWNER/REPO> — укажите")),
+            };
+            let repo = crate::vcs::RepoId::new(repo_str.clone(), repo_str.clone());
+            match adapter.list_commits(&repo, 20) {
+                Ok(commits) => {
+                    if commits.is_empty() {
+                        return CmdResult::Done(format!("{label} commits {repo_str}: 0 коммитов"));
+                    }
+                    let mut out = String::new();
+                    out.push_str(&format!("📜 {label} {repo_str} — {} коммитов\n\n", commits.len()));
+                    for c in &commits {
+                        let short = crate::vcs::ingest::short_sha(&c.sha);
+                        let subject = c.message.lines().next().unwrap_or("");
+                        out.push_str(&format!(
+                            "{}  {}  <{}>\n    {}\n",
+                            short,
+                            crate::vcs::ingest::iso_time(c.authored_at),
+                            c.author,
+                            subject,
+                        ));
+                    }
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ {label} commits: {e}")),
+            }
+        }
+        "issues" => {
+            let repo_str = match rest.first() {
+                Some(r) => r,
+                None => return CmdResult::Done(format!("{label} issues <OWNER/REPO> — укажите")),
+            };
+            let repo = crate::vcs::RepoId::new(repo_str.clone(), repo_str.clone());
+            match adapter.list_issues(&repo, 50) {
+                Ok(issues) => {
+                    if issues.is_empty() {
+                        return CmdResult::Done(format!("{label} issues {repo_str}: 0 issues/MR"));
+                    }
+                    let mut out = String::new();
+                    out.push_str(&format!("🐛 {label} {repo_str} — {} issues/MR\n\n", issues.len()));
+                    for i in &issues {
+                        let kind = if i.is_merge_request { "MR" } else { "IS" };
+                        out.push_str(&format!("[{}] #{} {} ({})\n", kind, i.number, i.title, i.state));
+                        out.push_str(&format!("    by {} at {}\n", i.author, crate::vcs::ingest::iso_time(i.created_at)));
+                    }
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ {label} issues: {e}")),
+            }
+        }
+        "--help" | "-h" => CmdResult::Done(format!(
+            "{label} <search|repos|commits|issues> ... — REST API {label}"
+        )),
+        other => CmdResult::Done(format!("{label}: неизвестная подкоманда {other}")),
+    }
+}
+
+/// `poler> sync vcs [gh|gl|gt|all] <OWNER>` — синк всех VCS-страниц в web-index.db.
+/// `poler> sync` без args — синоним для `nlm sync` (обратная совместимость v0.14).
+fn cmd_sync(state: &mut ShellState, args: &[String]) -> CmdResult {
+    // Если первый аргумент — `vcs`, делегируем в vcs::sync_vcs; иначе — NLM sync.
+    if !args.is_empty() && args[0] == "vcs" {
+        let scheme = args.get(1).and_then(|s| crate::vcs::VcsScheme::parse(s).ok());
+        let owner = args.get(2).map(|s| s.as_str());
+        let limit = 20usize; // последний 20 коммитов/issue на репо
+        let ix = match state.ensure_index() {
+            Ok(ix) => ix,
+            Err(e) => return CmdResult::Done(format!("❌ sync vcs: {e}")),
+        };
+        let stats = crate::vcs::sync_vcs(ix, scheme, owner, limit);
+        let mut out = String::new();
+        out.push_str(&format!("🔄 sync vcs: {} схем(а) обработано\n\n", stats.len()));
+        for st in &stats {
+            out.push_str(&format!(
+                "  {}: {} репо, {} коммитов, {} issues, {} skip, {} errors ({:?}ms)\n",
+                st.scheme,
+                st.repos_synced,
+                st.commits_indexed,
+                st.issues_indexed,
+                st.unchanged,
+                st.errors,
+                st.elapsed_ms,
+            ));
+        }
+        state.set_output(out.clone());
+        return CmdResult::Done(out);
+    }
+    // fallback: `sync` без vcs → NLM sync (как в v0.14)
+    cmd_nlm(state, &["sync".into()])
+}
+
 // ---------------------------------------------------------------------------
 
 /// Запустить интерактивный REPL (`poler-engine --shell`).
@@ -1099,10 +1403,203 @@ mod tests {
 
     #[test]
     fn cmd_version_string_updated_for_v0151() {
+        // v0.16.0: полека обновила бейдж poler-shell — теперь содержит v0.16.0.
+        // Тест оставлен для обратной совместимости, проверяет что версия движка в выводе.
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("v0.15.1")),
+            CmdResult::Done(out) => {
+                assert!(out.contains("0.16.0"));
+                assert!(out.contains("poler-shell"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ---- v0.16.0: VCS-команды (gh/gl/gt/gix/sync vcs) ----
+
+    #[test]
+    fn cmd_version_string_updated_for_v016() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "version");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("0.16.0")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gh_no_subcommand_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gh");
+        match r {
+            CmdResult::Done(out) => {
+                assert!(out.contains("search"));
+                assert!(out.contains("repos"));
+                assert!(out.contains("commits"));
+                assert!(out.contains("issues"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gl_no_subcommand_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gl");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("search")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gt_no_subcommand_returns_help_or_init_error() {
+        // gitea_adapter() требует GITEA_HOST; если не задан — ошибка инициализации.
+        std::env::remove_var("GITEA_HOST");
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gt");
+        match r {
+            CmdResult::Done(out) => {
+                // либо help (если хост задан), либо ошибка GITEA_HOST
+                assert!(
+                    out.contains("search") || out.contains("GITEA_HOST"),
+                    "got: {out}"
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gh_search_no_query_gives_help() {
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gh search");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите запрос")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gh_repos_no_owner_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gh repos");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите owner")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gh_commits_no_repo_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gh commits");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gh_issues_no_repo_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gh issues");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gh_unknown_subcommand_rejected() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gh bogus");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("неизвестная подкоманда")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gix_no_args_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gix");
+        match r {
+            CmdResult::Done(out) => {
+                assert!(out.contains("log"));
+                assert!(out.contains("clone"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gix_log_no_path_gives_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gix log");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите путь")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gix_log_nonexistent_path_errors() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gix log /nonexistent/path");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("gix log") || out.contains("❌")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gix_clone_missing_args() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gix clone");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("укажите URL")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_gix_clone_with_url_only_gives_dest_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "gix clone https://github.com/x/y.git");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("путь назначения")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_sync_vcs_no_scheme_gives_nlm_fallback_or_help() {
+        // `sync vcs` без scheme → пробуем все 4 адаптера. gitea без GITEA_HOST
+        // даст ошибку, но не должен паниковать. Тест проверяет только что
+        // dispatch возвращает Done (не падает).
+        std::env::remove_var("GITEA_HOST");
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GITLAB_TOKEN");
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "sync vcs");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("sync vcs") || out.contains("❌")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_sync_alone_falls_back_to_nlm() {
+        // `sync` без vcs — это синоним для `nlm sync` (обратная совместимость)
+        // без Chromium это даст ошибку, но в CmdResult::Done.
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "sync");
+        match r {
+            CmdResult::Done(_) => {} // OK — упало с ошибкой в Done
             _ => panic!(),
         }
     }

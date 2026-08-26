@@ -20,9 +20,13 @@ static CMD_HINTS: &[(&str, &str)] = &[
     ("web", "web \"<query>\" [--top N]"),
     ("stats", "stats"),
     ("nlm", "nlm list|notes|artifacts|source|account|ask|sync"),
-    ("sync", "sync (синк NLM в web-index)"),
+    ("sync", "sync (синк NLM) | sync vcs [gh|gl|gt] <OWNER>"),
     ("crawl", "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]"),
     ("impact", "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]"),
+    ("gh", "gh search|repos|commits|issues ... (GitHub REST)"),
+    ("gl", "gl search|repos|commits|issues ... (GitLab REST v4)"),
+    ("gt", "gt search|repos|commits|issues ... (Gitea REST)"),
+    ("gix", "gix log <PATH> [--top N] | gix clone <URL> <PATH>"),
     ("set", "set format|top <value>"),
     ("help", "help"),
     ("quit", "quit"),
@@ -82,6 +86,76 @@ pub fn complete_prefix(prefix: &str) -> (usize, Vec<String>) {
             .map(|s| (*s).to_string())
             .collect();
         let replace_from = prefix.find("set ").map(|i| i + 4).unwrap_or(prefix.len());
+        return (replace_from, cands);
+    }
+
+    // v0.16.0: gh/gl/gt — завершаем подкоманду (search/repos/commits/issues)
+    if matches!(first, "gh" | "gl" | "gt") {
+        let sub_prefix = if tokens.len() >= 2 && in_first_token {
+            tokens[1]
+        } else {
+            ""
+        };
+        let cands: Vec<String> = ShellState::vcs_subcommands()
+            .iter()
+            .filter(|s| s.starts_with(sub_prefix))
+            .map(|s| (*s).to_string())
+            .collect();
+        let replace_from = prefix
+            .find(&format!("{first} "))
+            .map(|i| i + first.len() + 1)
+            .unwrap_or(prefix.len());
+        return (replace_from, cands);
+    }
+
+    // v0.16.0: gix — завершаем подкоманду (log/clone)
+    if first == "gix" {
+        let sub_prefix = if tokens.len() >= 2 && in_first_token {
+            tokens[1]
+        } else {
+            ""
+        };
+        let cands: Vec<String> = ShellState::gix_subcommands()
+            .iter()
+            .filter(|s| s.starts_with(sub_prefix))
+            .map(|s| (*s).to_string())
+            .collect();
+        let replace_from = prefix.find("gix ").map(|i| i + 4).unwrap_or(prefix.len());
+        return (replace_from, cands);
+    }
+
+    // v0.16.0: `sync vcs <scheme>` — завершаем scheme после "sync vcs "
+    if first == "sync" {
+        if tokens.len() >= 2 && tokens[1] == "vcs" {
+            // ожидаем scheme как 3-й токен
+            let sub_prefix = if tokens.len() >= 3 && in_first_token {
+                tokens[2]
+            } else {
+                ""
+            };
+            let cands: Vec<String> = ShellState::vcs_schemes()
+                .iter()
+                .filter(|s| s.starts_with(sub_prefix))
+                .map(|s| (*s).to_string())
+                .collect();
+            let replace_from = prefix
+                .find("sync vcs ")
+                .map(|i| i + "sync vcs ".len())
+                .unwrap_or(prefix.len());
+            return (replace_from, cands);
+        }
+        // `sync ` без vcs — подсказываем vcs как первую подкоманду
+        let sub_prefix = if tokens.len() >= 2 && in_first_token {
+            tokens[1]
+        } else {
+            ""
+        };
+        let cands: Vec<String> = ["vcs", "all"]
+            .iter()
+            .filter(|s| s.starts_with(sub_prefix))
+            .map(|s| (*s).to_string())
+            .collect();
+        let replace_from = prefix.find("sync ").map(|i| i + 5).unwrap_or(prefix.len());
         return (replace_from, cands);
     }
 
@@ -397,5 +471,138 @@ mod tests {
         let h = hint_for_line("impact ");
         assert!(h.is_some());
         assert!(h.unwrap().contains("PATH"));
+    }
+
+    // ---- v0.16.0: VCS-команды (gh/gl/gt/gix/sync vcs) ----
+
+    #[test]
+    fn complete_gh_first_token() {
+        let (_, cands) = complete_prefix("g");
+        assert!(cands.iter().any(|c| c == "gh"));
+        assert!(cands.iter().any(|c| c == "gix"));
+    }
+
+    #[test]
+    fn complete_gh_subcommands() {
+        let (_, cands) = complete_prefix("gh ");
+        assert!(cands.iter().any(|c| c == "search"));
+        assert!(cands.iter().any(|c| c == "repos"));
+        assert!(cands.iter().any(|c| c == "commits"));
+        assert!(cands.iter().any(|c| c == "issues"));
+    }
+
+    #[test]
+    fn complete_gh_prefix_filters() {
+        let (_, cands) = complete_prefix("gh sea");
+        assert!(cands.iter().any(|c| c == "search"));
+        assert!(!cands.iter().any(|c| c == "repos"));
+    }
+
+    #[test]
+    fn complete_gl_subcommands() {
+        let (_, cands) = complete_prefix("gl ");
+        assert!(cands.iter().any(|c| c == "search"));
+        assert!(cands.iter().any(|c| c == "commits"));
+    }
+
+    #[test]
+    fn complete_gt_subcommands() {
+        let (_, cands) = complete_prefix("gt ");
+        assert!(cands.iter().any(|c| c == "issues"));
+    }
+
+    #[test]
+    fn complete_gix_subcommands() {
+        let (_, cands) = complete_prefix("gix ");
+        assert!(cands.iter().any(|c| c == "log"));
+        assert!(cands.iter().any(|c| c == "clone"));
+    }
+
+    #[test]
+    fn complete_gix_prefix_filters() {
+        let (_, cands) = complete_prefix("gix lo");
+        assert!(cands.iter().any(|c| c == "log"));
+        assert!(!cands.iter().any(|c| c == "clone"));
+    }
+
+    #[test]
+    fn complete_sync_suggests_vcs() {
+        let (_, cands) = complete_prefix("sync ");
+        assert!(cands.iter().any(|c| c == "vcs"));
+    }
+
+    #[test]
+    fn complete_sync_vcs_suggests_schemes() {
+        let (_, cands) = complete_prefix("sync vcs ");
+        assert!(cands.iter().any(|c| c == "gh"));
+        assert!(cands.iter().any(|c| c == "gl"));
+        assert!(cands.iter().any(|c| c == "gt"));
+        assert!(cands.iter().any(|c| c == "gix"));
+        assert!(cands.iter().any(|c| c == "all"));
+    }
+
+    #[test]
+    fn complete_sync_vcs_prefix_filters() {
+        // "sync vcs g" должно дать gh, gl, gt, gix (все начинаются на 'g')
+        // — это валидная фильтрация по префиксу.
+        let (_, cands) = complete_prefix("sync vcs g");
+        assert!(cands.iter().any(|c| c == "gh"));
+        assert!(cands.iter().any(|c| c == "gl"));
+        assert!(cands.iter().any(|c| c == "gt"));
+        assert!(cands.iter().any(|c| c == "gix"));
+        assert!(!cands.iter().any(|c| c == "all"));
+    }
+
+    #[test]
+    fn complete_sync_vcs_gi_filters_only_gix() {
+        // "sync vcs gi" — только gix
+        let (_, cands) = complete_prefix("sync vcs gi");
+        assert_eq!(cands, vec!["gix"]);
+    }
+
+    #[test]
+    fn hint_for_gh_command() {
+        let h = hint_for_line("gh");
+        assert!(h.is_some());
+        let h = h.unwrap();
+        assert!(h.contains("search"));
+        assert!(h.contains("GitHub"));
+    }
+
+    #[test]
+    fn hint_for_gl_command() {
+        let h = hint_for_line("gl");
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("GitLab"));
+    }
+
+    #[test]
+    fn hint_for_gt_command() {
+        let h = hint_for_line("gt");
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("Gitea"));
+    }
+
+    #[test]
+    fn hint_for_gix_command() {
+        let h = hint_for_line("gix");
+        assert!(h.is_some());
+        let h = h.unwrap();
+        assert!(h.contains("log"));
+        assert!(h.contains("clone"));
+    }
+
+    #[test]
+    fn hint_for_sync_command_has_vcs_hint() {
+        let h = hint_for_line("sync");
+        assert!(h.is_some());
+        assert!(h.unwrap().contains("vcs"));
+    }
+
+    #[test]
+    fn hint_for_unknown_vcs_command_is_none() {
+        // если ввести что-то непонятное — hint должен вернуть None
+        let h = hint_for_line("bogus_vcs_cmd");
+        assert!(h.is_none());
     }
 }

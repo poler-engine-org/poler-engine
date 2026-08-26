@@ -56,6 +56,7 @@ pub mod resonance;
 pub mod shell;
 pub mod streaming;
 pub mod tokenizer;
+pub mod vcs;
 pub mod web;
 
 use std::fs::File;

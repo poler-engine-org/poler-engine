@@ -20,6 +20,124 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.16.0: Unified VCS & Data Mesh — нативные адаптеры GitHub/GitLab/Gitea + Pure-Rust git (gix)
+
+Превращение poler-engine из локального инструмента в **Универсальную Сеть Кода и
+Данных** — единый пульт, нативно работающий с любыми репозиториями. Каждый VCS
+(GitHub, GitLab, Gitea/Forgejo, локальный git через gix) становится
+source-адаптером, вливающим коммиты/issues/PR в `web-index.db` как страницы по
+своим URL-схемам (`gh://`, `gl://`, `gt://`, `gix://`).
+
+### Архитектурные инварианты v0.16.0 (см. FUTURE_ROADMAP.md §6.4)
+
+**Ноль новых зависимостей в схеме `web-index.db`** — VCS-страницы используют те
+же `WebDoc` + `links` + `content_hash` + `positions` + PageRank, что веб и NLM.
+URL-схема — единственное отличие. Это сохраняет инвариант v0.14.0: один
+`--web-search` пробивает ВСЕ юниверсы (NLM + веб + локальный код + GitHub +
+GitLab + Gitea + gix-local) с единой PageRank топологией.
+
+### Структура нового модуля `src/vcs/`
+
+| Файл | Назначение | LOC |
+|---|---|---|
+| `mod.rs` | VcsAdapter trait, VcsScheme enum, RepoId/VcsCommit/VcsIssue типы, sync_vcs() | ~370 |
+| `github.rs` | REST API GitHub v3 (search/repos/commits/issues/PRs) через ureq | ~470 |
+| `gitlab.rs` | REST API GitLab v4 (search/projects/commits/issues/MRs) | ~420 |
+| `gitea.rs` | REST API Gitea/Forgejo (commits/issues/PRs) | ~370 |
+| `local.rs` | Pure-Rust git через `gix` crate: discover/rev_walk/decode | ~440 |
+| `ingest.rs` | Helper: VcsCommit/VcsIssue → WebDoc (URL-схема + content_hash + links) | ~220 |
+
+### Новые команды poler-shell
+
+```
+poler> gh search <Q>                # GitHub code search (требует $GITHUB_TOKEN)
+poler> gh repos <USER>              # список репозиториев пользователя
+poler> gh commits <OWNER/REPO>      # последние 20 коммитов
+poler> gh issues <OWNER/REPO>       # issues + PRs (REST, не GraphQL)
+poler> gl search <Q>                # GitLab REST v4 search
+poler> gl commits <GROUP/PROJ>      # коммиты GitLab проекта
+poler> gl issues <GROUP/PROJ>        # issues + MR (два endpoint'а слиты)
+poler> gt search <Q>                 # Gitea/Forgejo (требует $GITEA_HOST)
+poler> gt commits <OWNER/REPO>       # коммиты Gitea
+poler> gix log <PATH> [--top N]      # Pure-Rust git log локального репо
+poler> gix clone <URL> <PATH>        # заглушка v0.16 (используйте git clone)
+poler> sync vcs [gh|gl|gt] <OWNER>   # синк VCS в web-index.db + recompute_pagerank
+poler> sync vcs all <OWNER>           # все 4 адаптера сразу
+```
+
+Tab-completion для всех новых команд: `gh<Tab>` → search/repos/commits/issues;
+`sync vcs <Tab>` → gh/gl/gt/gix/all; `gix <Tab>` → log/clone.
+
+### Переменные окружения
+
+- `$GITHUB_TOKEN` или `$GH_TOKEN` — для `gh search` (анонимно нельзя).
+  Опционально для list_repos/commits/issues (rate-limit 60 req/h без токена).
+- `$GITLAB_TOKEN` или `$GL_TOKEN` — для GitLab.
+- `$GITEA_TOKEN` / `$GT_TOKEN` — для Gitea. `$GITEA_HOST` — обязательный
+  (например `gitea.com`, `codeberg.org`, `git.example.com`).
+- `$GITHUB_API_HOST` — для GitHub Enterprise (например `github.corp.com/api/v3`).
+- `$GITLAB_HOST` — для self-hosted GitLab (`gitlab.corp.org`).
+- `$POLER_USER_AGENT` — User-Agent для HTTP-запросов (по умолчанию `poler-engine/0.16`).
+
+### Донорские технологии
+
+| Донор | Что берём | Куда легло |
+|---|---|---|
+| `gh` CLI (GitHub) | REST+GraphQL API, commits/issues/PR/codeowners | `src/vcs/github.rs` |
+| `glab` CLI (GitLab) | REST API v4, merge_requests/pipelines | `src/vcs/gitlab.rs` |
+| `tea` CLI (Gitea/Forgejo) | REST API (forgejo-compatible) | `src/vcs/gitea.rs` |
+| `gix` crate (gitoxide) | Pure-Rust git: discover/rev_walk/commit decode | `src/vcs/local.rs` |
+| `ureq` crate | Синхронный HTTP без tokio-runtime (минимум deps) | `src/vcs/{github,gitlab,gitea}.rs` |
+
+### Аттестация
+
+- 413 unit-тестов зелёные (+119 к v0.15.1: 6 vcs::mod, 21 github, 13 gitlab,
+  11 gitea, 22 ingest, 16 local, 15 completer, 15 commands).
+- clippy — 0 warning'ов.
+- Бинарник `poler-engine` — 8.4 МБ stripped (рост с 5.9 МБ за счёт gix+ureq).
+- Smoke-тест: `poler> gix log /home/z/my-project --top 3` → 3 коммита
+  прочитаны через Pure-Rust gix (без `git` CLI), индексированы в web-index.db
+  как `gix://` страницы, PageRank переcчитан.
+- Smoke-тест: `poler> gh search rust` без токена → корректная подсказка
+  `$GITHUB_TOKEN`. `poler> sync vcs` без owner → graceful fallback к NLM sync.
+
+### Архитектурный итог
+
+VCS-страницы в `web-index.db` — это обычные `WebDoc` со своим URL-space:
+`gh://user/repo/commit/<sha>`, `gl://group/proj/issues/<iid>`,
+`gt://owner/repo/pulls/<n>`, `gix:///path/to/repo/commit/<sha>`.
+Каждая страница получает `content_hash` (Percolator-lite идемпотентность),
+индексируется BM25, ссылается через `links` на свой `web_url`
+(`https://github.com/...`), и участвует в общем PageRank графе вместе с
+вебом, NLM и локальным кодом. `poler> search "Планковська геодезична"`
+пробивает всё сразу.
+
+### Известные ограничения (перенесены в v0.17.0)
+
+- `gix clone` — заглушка v0.16.0; для синхронного clone требуются
+  feature-флаги `blocking-network-client` (добавлены в v0.17.0).
+  Пока: `git clone URL path` в соседнем окне, затем `poler> gix log path`.
+- Git LFS pointer-resolve (`.gitattributes` + `version https://git-lfs/...`)
+  — v0.17.0 (см. FUTURE_ROADMAP.md §6.3, шаг 3).
+- Hugging Face Hub (model cards + datasets) — v0.18.0 (`hf://` URL-схема).
+- DVC + Oxen.ai (data-versioning pointer files) — v0.19.0.
+- HugeSCM/Lit/ParamLake — v0.20.0+.
+
+### Артефакты
+
+- `src/vcs/{mod,github,gitlab,gitea,local,ingest}.rs` — 6 файлов, ~2290 строк
+  (+119 unit-тестов, ~370 строк тестового кода).
+- `src/shell/commands.rs` — +290 строк cmd_gh/cmd_gl/cmd_gt/cmd_gix/cmd_sync +
+  16 unit-тестов.
+- `src/shell/completer.rs` — +60 строк complete_gh/gl/gt/gix/sync_vcs + 14 тестов.
+- `src/shell/state.rs` — +20 строк vcs_subcommands()/gix_subcommands()/vcs_schemes().
+- `Cargo.toml` — `ureq 2.10` + `gix 0.66` (default-features=false, features
+  `blocking-http-transport-reqwest` + `worktree-mutation` + `revision` + `comfort`).
+- `README.md` — секция v0.16.0 (~150 строк).
+- `FUTURE_ROADMAP.md` — §6.2 обновлён (v0.16.0 = shipped, v0.17.0 → gix-clone + LFS).
+
+---
+
 ## v0.15.1: poler-shell финализация — Tab-completion + нативные crawl/impact в REPL
 
 **Шлифовка полиринга полер-шелла** — подключены Tab-completion, подсказки Hinter

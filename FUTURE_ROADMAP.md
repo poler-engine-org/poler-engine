@@ -197,16 +197,22 @@ API**, не забивая локальный диск сотнями гигаб
 
 1. **v0.15.0 — poler-shell**: TUI+REPL поверх существующих режимов.
    Зависимости: `ratatui`, `crossterm`, `rustyline` (всё mature, ноль
-   новых рисков). Никаких изменений в ядре движка — только UI слой.
-2. **v0.16.0 — GitHub + GitLab adapters**: REST+GraphQL, коммиты+issues+PR
-   в web-index.db. Это закроет 80% use-case'ов VCS-поиска.
-3. **v0.17.0 — gix (local git) + LFS pointer resolve**: локальные репо без
-   git-CLI, удалённые LFS-blob'ы без full fetch.
-4. **v0.18.0 — Hugging Face Hub**: model cards + datasets API → влитие в
+   новых рисков). Никаких изменений в ядре движка — только UI слой. ✅ shipped
+2. **v0.15.1 — полер-шелл финализация**: Tab-completion через rustyline Helper
+   + нативные `crawl`/`impact` в REPL. ✅ shipped
+3. **v0.16.0 — Unified VCS & Data Mesh**: нативные адаптеры GitHub/GitLab/Gitea
+   (REST через `ureq`) + Pure-Rust git через `gix` crate. VCS-страницы в
+   web-index.db (`gh://`, `gl://`, `gt://`, `gix://`). Команды `poler> gh/gl/gt/gix`
+   + `sync vcs`. ✅ shipped (2026-08-26)
+4. **v0.17.0 — gix clone + LFS pointer resolve**: feature-флаги
+   `blocking-network-client` для синхронного `gix clone` (без `git` CLI);
+   Git LFS `.gitattributes` + pointer-файлы `version https://git-lfs/...`
+   для resolve `lfs://` URL без full fetch.
+5. **v0.18.0 — Hugging Face Hub**: model cards + datasets API → влитие в
    web-index.db как `hf://` URL-схема.
-5. **v0.19.0 — DVC + Oxen**: data-versioning pointer files, remote storage
+6. **v0.19.0 — DVC + Oxen**: data-versioning pointer files, remote storage
    resolve.
-6. **v0.20.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
+7. **v0.20.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+
