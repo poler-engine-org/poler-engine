@@ -342,6 +342,8 @@ mod tests {
 
     #[test]
     fn host_from_env_adds_protocol() {
+        // NOTE: env-var тесты ломаются при параллельном выполнении (race condition).
+        // Запускать только через `cargo test -- --test-threads=1`.
         std::env::set_var("GITLAB_HOST", "gitlab.corp.org");
         let a = GitlabAdapter::from_env().unwrap();
         assert_eq!(a.host, "https://gitlab.corp.org");
@@ -351,6 +353,7 @@ mod tests {
 
     #[test]
     fn host_with_explicit_protocol_preserved() {
+        // NOTE: env-var тесты ломаются при параллельном выполнении (race condition).
         std::env::set_var("GITLAB_HOST", "http://localhost:8080");
         let a = GitlabAdapter::from_env().unwrap();
         assert_eq!(a.host, "http://localhost:8080");

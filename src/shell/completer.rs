@@ -26,7 +26,7 @@ static CMD_HINTS: &[(&str, &str)] = &[
     ("gh", "gh search|repos|commits|issues ... (GitHub REST)"),
     ("gl", "gl search|repos|commits|issues ... (GitLab REST v4)"),
     ("gt", "gt search|repos|commits|issues ... (Gitea REST)"),
-    ("gix", "gix log <PATH> [--top N] | gix clone <URL> <PATH>"),
+    ("gix", "gix log <PATH> [--top N] | gix clone <URL> <PATH> [--depth N] [--branch B] | gix lfs <list|fetch> <PATH>"),
     ("set", "set format|top <value>"),
     ("help", "help"),
     ("quit", "quit"),
@@ -122,6 +122,53 @@ pub fn complete_prefix(prefix: &str) -> (usize, Vec<String>) {
             .collect();
         let replace_from = prefix.find("gix ").map(|i| i + 4).unwrap_or(prefix.len());
         return (replace_from, cands);
+    }
+
+    // v0.17.0: notes — завершаем подкоманду (list/add/show/edit/rm/save-from-ai)
+    if first == "notes" {
+        let sub_prefix = if tokens.len() >= 2 && in_first_token {
+            tokens[1]
+        } else {
+            ""
+        };
+        let cands: Vec<String> = ShellState::notes_subcommands()
+            .iter()
+            .filter(|s| s.starts_with(sub_prefix))
+            .map(|s| (*s).to_string())
+            .collect();
+        let replace_from = prefix.find("notes ").map(|i| i + 6).unwrap_or(prefix.len());
+        return (replace_from, cands);
+    }
+
+    // v0.17.0: sources — завершаем подкоманду (list/add/rm/test/open)
+    if first == "sources" {
+        let sub_prefix = if tokens.len() >= 2 && in_first_token {
+            tokens[1]
+        } else {
+            ""
+        };
+        let cands: Vec<String> = ShellState::sources_subcommands()
+            .iter()
+            .filter(|s| s.starts_with(sub_prefix))
+            .map(|s| (*s).to_string())
+            .collect();
+        let replace_from = prefix.find("sources ").map(|i| i + 8).unwrap_or(prefix.len());
+        return (replace_from, cands);
+    }
+
+    // v0.17.0: `sources add <value> --kind <TAB>` — завершаем kind
+    if first == "sources" && tokens.len() >= 3 && tokens[1] == "add" {
+        // ищем --kind в args
+        if tokens.iter().any(|t| *t == "--kind") && in_first_token {
+            let last = tokens[tokens.len() - 1];
+            let cands: Vec<String> = ShellState::source_kinds()
+                .iter()
+                .filter(|s| s.starts_with(last))
+                .map(|s| (*s).to_string())
+                .collect();
+            let replace_from = prefix.rfind(last).unwrap_or(prefix.len());
+            return (replace_from, cands);
+        }
     }
 
     // v0.16.0: `sync vcs <scheme>` — завершаем scheme после "sync vcs "
@@ -346,6 +393,51 @@ mod tests {
         let (_, cands) = complete_prefix("");
         assert!(cands.len() >= 8);
         assert!(cands.iter().any(|c| c == "search"));
+        // v0.17.0: notes/sources должны быть в списке команд
+        assert!(cands.iter().any(|c| c == "notes"));
+        assert!(cands.iter().any(|c| c == "sources"));
+    }
+
+    #[test]
+    fn complete_notes_subcommands_v017() {
+        let (start, cands) = complete_prefix("notes l");
+        assert!(cands.iter().any(|c| c == "list"));
+        assert!(cands.iter().any(|c| c == "add") == false, "add doesn't start with 'l'");
+        assert!(start >= 6);
+    }
+
+    #[test]
+    fn complete_notes_after_space() {
+        let (_, cands) = complete_prefix("notes ");
+        assert!(cands.iter().any(|c| c == "list"));
+        assert!(cands.iter().any(|c| c == "add"));
+        assert!(cands.iter().any(|c| c == "show"));
+        assert!(cands.iter().any(|c| c == "edit"));
+        assert!(cands.iter().any(|c| c == "rm"));
+        assert!(cands.iter().any(|c| c == "save-from-ai"));
+    }
+
+    #[test]
+    fn complete_sources_subcommands_v017() {
+        let (start, cands) = complete_prefix("sources ad");
+        assert!(cands.iter().any(|c| c == "add"));
+        assert!(cands.iter().any(|c| c == "rm") == false, "rm doesn't start with 'ad'");
+        assert!(start >= 8);
+    }
+
+    #[test]
+    fn complete_sources_after_space() {
+        let (_, cands) = complete_prefix("sources ");
+        assert!(cands.iter().any(|c| c == "list"));
+        assert!(cands.iter().any(|c| c == "add"));
+        assert!(cands.iter().any(|c| c == "rm"));
+        assert!(cands.iter().any(|c| c == "test"));
+        assert!(cands.iter().any(|c| c == "open"));
+    }
+
+    #[test]
+    fn complete_empty_line_returns_all_commands_full() {
+        let (_, cands) = complete_prefix("");
         assert!(cands.iter().any(|c| c == "nlm"));
         assert!(cands.iter().any(|c| c == "quit"));
     }

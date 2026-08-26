@@ -115,26 +115,21 @@ impl GixAdapter {
     /// URL — `https://github.com/...`, `git@github.com:...`, или локальный путь.
     /// Возвращает путь к склонированному репозиторию.
     ///
-    /// **Ограничение v0.16.0:** для синхронного clone требуются feature-флаги
-    /// `blocking-network-client` (добавлены в v0.17.0). В этой версии функция
-    /// возвращает `Err` с подсказкой использовать системный `git clone` или
-    /// дождаться v0.17.0.
+    /// **v0.17.0:** реализован настоящий pure-Rust clone через
+    /// `gix::clone::PrepareFetch` (feature `blocking-network-client` включён).
+    /// Делегирует в [`crate::vcs::clone::clone_repo`]. Для LFS-объектов
+    /// используйте `gix lfs fetch <PATH>` после clone.
     pub fn clone_repo(url: &str, dest: &Path) -> Result<PathBuf, String> {
-        // Проверяем, что URL валиден (не идём в сеть без необходимости).
+        // Валидация на раннем этапе (без сети).
         if parse_clone_url(url).is_none() && !Path::new(url).exists() {
             return Err(format!(
                 "clone_repo: невалидный URL или путь: {url}\n\
-                 подсказка: используйте `git clone {url} {}` в соседнем окне,\n\
-                 или дождитесь v0.17.0 — там включён blocking-network-client для gix",
-                dest.display()
+                 подсказка: HTTPS-URL должен быть вида https://github.com/USER/REPO[.git];\n\
+                 локальный путь должен существовать"
             ));
         }
-        Err(format!(
-            "clone_repo в v0.16.0 требует blocking-network-client (включается в v0.17.0).\n\
-             Пока: `git clone {url} {}` в соседнем окне, затем `poler> gix log {}`",
-            dest.display(),
-            dest.display(),
-        ))
+        let opts = crate::vcs::clone::CloneOpts::new(url, dest);
+        crate::vcs::clone::clone_repo(&opts).map_err(|e| e.to_user_string())
     }
 
     /// Листинг коммитов пути (аналог `git log -n N` в поданном репо).

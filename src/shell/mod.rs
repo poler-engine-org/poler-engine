@@ -33,6 +33,8 @@
 
 pub mod commands;
 pub mod completer;
+pub mod help;
+pub mod mouse;
 pub mod state;
 pub mod tui;
 

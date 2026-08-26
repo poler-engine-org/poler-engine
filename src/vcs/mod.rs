@@ -26,6 +26,8 @@ pub mod github;
 pub mod gitlab;
 pub mod ingest;
 pub mod local;
+pub mod clone;
+pub mod lfs;
 
 use crate::web::WebIndex;
 

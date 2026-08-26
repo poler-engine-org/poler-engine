@@ -1,38 +1,62 @@
-//! TUI Dashboard poler-shell (ratatui + crossterm). Минимальная реализация
-//! v0.15.0: 3-панельный layout с переключением фокуса Tab.
+//! # poler-shell TUI v0.17.0 — MiMo Code-style 4-pane Dashboard
 //!
-//! Layout (когда terminal >= 100×30):
+//! Полная переработка TUI: 4-панельный layout с поддержкой мыши,
+//! drag-select, встроенным редактором заметок (tui-textarea) и
+//! палитрой `?` с 10 готовыми сценариями.
+//!
 //! ```text
-//! ┌──────────────────┬──────────────────────────────────────────┐
-//! │ Butkи/Репозитории │ Поле ввода (rustyline-семантика)           │
-//! │ (1/4 ширины)      │ (правая верхняя, 1/3 высоты)               │
-//! │                   ├──────────────────────────────────────────┤
-//! │                   │ Результаты (правая нижняя, 2/3 высоты)    │
-//! │                   │ скроллятся PgUp/PgDn                       │
-//! └──────────────────┴──────────────────────────────────────────┘
-//! │status: poler 0.15.0  db:/path/to/web-index.db  fmt:md  top:10│
+//! ┌──────────────┬──────────────────────────────────┬──────────────┐
+//! │ REPO / NB    │ CHAT & RESPONSES  (50% height)    │ NOTES (CRUD) │
+//! │ (25% width)  │ • Чистый ответ без мусора         │ (25% width)  │
+//! │              │ • Drag-select мышью → Ctrl+Y      │ • Ctrl+N     │
+//! │ nlm list     │ • Клик по ноутбуку → активация    │ • Ctrl+S     │
+//! │ gh repos     ├──────────────────────────────────┤ │ (save AI)   │
+//! │ gix log      │ INPUT BOX (25% height)            ├──────────────┤
+//! │              │ • ↑/↓ history • Tab completion     │ SOURCES CRUD │
+//! │              │ • Enter — выполнить              │ • list/add/rm│
+//! ├──────────────┴──────────────────────────────────┴──────────────┤
+//! │ poler-shell 0.17.0  db:web-index.db  fmt:md  top:10  F2:Chat   │
 //! └────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Фокус: Tab переключает left|input|output; Esc — выход; Enter в input —
-//! выполнить команду; PgUp/PgDn в output — скроллинг.
+//! Управление:
+//! - **Tab/BackTab** — смена фокуса между панелями
+//! - **↑/↓** — навигация в списках / история ввода
+//! - **PgUp/PgDn** — прокрутка Chat panel
+//! - **Enter** — выполнить команду
+//! - **Ctrl+N** — новая заметка (встроенный tui-textarea редактор)
+//! - **Ctrl+S** — сохранить последний AI-ответ как заметку
+//! - **Ctrl+Y** — копировать текущее выделение в буфер
+//! - **?** — палитра 10 сценариев
+//! - **Ctrl+E** — редактировать выделенную заметку
+//! - **Ctrl+D** — удалить выделенную заметку/источник (с подтверждением)
+//! - **Esc / Ctrl+C** — выход
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Terminal;
+use tui_textarea::TextArea;
 
 use super::commands::{dispatch, CmdResult};
+use super::help;
+use super::mouse::{self, MouseAction, SelectionRect};
 use super::state::ShellState;
 
 /// Запустить TUI-режим (`poler-engine --tui`).
@@ -45,7 +69,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, EnterAlternateScreen);
+    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(t) => t,
@@ -56,119 +80,86 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         }
     };
 
-    // Начальное состояние
+    // Состояние TUI
     let mut input_buf = String::new();
     let mut input_history: Vec<String> = Vec::new();
     let mut input_history_idx: Option<usize> = None;
     let mut output_lines: Vec<String> = vec![
-        "poler-shell TUI Dashboard v0.15.0".into(),
+        "poler-shell TUI Dashboard v0.17.0 — MiMo Code-style".into(),
         "  ↑↓ — история ввода; Enter — выполнить; Tab — сменить фокус; Esc — выход".into(),
-        "  PgUp/PgDn — прокрутка результата; команды как в REPL (`help`).".into(),
+        "  Ctrl+N — новая заметка; Ctrl+S — сохранить AI-ответ; ? — палитра".into(),
+        "  Drag мышью по Chat panel → Ctrl+Y → буфер обмена".into(),
         String::new(),
     ];
-    let mut notebooks: Vec<String> = vec!["(нажмите 'r' для списка 87 ноутбуков)".into()];
-    let mut nb_state = ListState::default();
-    nb_state.select(Some(0));
+    let mut output_scroll: usize = 0;
     let mut output_state = ListState::default();
     output_state.select(None);
+
+    // Список ноутбуков (левая панель)
+    let mut notebooks: Vec<String> = vec!["(нажмите 'r' для nlm list)".into()];
+    let mut notebook_ids: Vec<String> = Vec::new();
+    let mut nb_state = ListState::default();
+    nb_state.select(Some(0));
+
+    // Список заметок (правая верхняя)
+    let mut notes_items: Vec<String> = vec!["(нет заметок — Ctrl+N)".into()];
+    let mut notes_state = ListState::default();
+    notes_state.select(Some(0));
+
+    // Список источников (правая нижняя)
+    let mut sources_items: Vec<String> = vec!["(нет источников — sources add)".into()];
+    let mut sources_state = ListState::default();
+    sources_state.select(Some(0));
+
     let mut focus = Focus::Input;
     let mut should_quit = false;
 
+    // Drag-select
+    let mut selection = SelectionRect::new();
+    let mut last_click_time: Option<Instant> = None;
+    let mut last_click_pos: Option<(u16, u16)> = None;
+
+    // Режим: Normal / Palette / NoteEditor
+    let mut mode: Mode = Mode::Normal;
+    let mut palette_state = ListState::default();
+    palette_state.select(Some(0));
+
     // Стартовый приветственный вывод
-    state.set_output(help_text());
+    state.set_output(help::help_overview());
+    // Поместить help в output для немедленного отображения
+    for l in help::help_overview().lines() {
+        output_lines.push(l.to_string());
+    }
+    output_lines.push(String::new());
+    output_scroll = output_lines.len().saturating_sub(1);
 
+    // Главная петля событий
     while !should_quit {
-        // Получить снапшот layout
+        // Снапшот layout — нужен для hit-testing мыши
+        let term_size = terminal.size().unwrap_or_default();
+        let layout_snapshot = compute_layout(Rect::new(0, 0, term_size.width, term_size.height));
         let _ = terminal.draw(|f| {
-            let area = f.area();
-            // Layout: правая часть делится по высоте на 1/3 input + 2/3 output
-            // левая занимает 1/4 ширины; status-bar 1 строка снизу
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(1)])
-                .split(area);
-            let main_area = chunks[0];
-            let status_area = chunks[1];
-
-            let main_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
-                .split(main_area);
-            let nb_area = main_cols[0];
-            let right_area = main_cols[1];
-
-            let right_rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(5)])
-                .split(right_area);
-            let input_area = right_rows[0];
-            let output_area = right_rows[1];
-
-            // Левая панель — ноутбуки
-            let nb_items: Vec<ListItem> = notebooks.iter().map(|s| ListItem::new(Line::from(s.clone()))).collect();
-            let nb_block = Block::default()
-                .borders(Borders::ALL)
-                .title("Notebooks (r=refresh)")
-                .border_style(if matches!(focus, Focus::Notebooks) {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                });
-            let nb_widget = List::new(nb_items)
-                .block(nb_block)
-                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
-            f.render_stateful_widget(nb_widget, nb_area, &mut nb_state.clone());
-
-            // Правая верхняя — ввод
-            let input_block = Block::default()
-                .borders(Borders::ALL)
-                .title("Input (Enter=run, ↑↓=history)")
-                .border_style(if matches!(focus, Focus::Input) {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                });
-            let input_para = Paragraph::new(format!("poler> {}", input_buf))
-                .block(input_block)
-                .style(Style::default().fg(Color::White));
-            f.render_widget(input_para, input_area);
-
-            // Правая нижняя — вывод
-            let out_items: Vec<ListItem> = output_lines
-                .iter()
-                .map(|s| ListItem::new(Line::from(s.clone())))
-                .collect();
-            let out_block = Block::default()
-                .borders(Borders::ALL)
-                .title("Output (PgUp/PgDn=scroll)")
-                .border_style(if matches!(focus, Focus::Output) {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                });
-            let out_widget = List::new(out_items)
-                .block(out_block)
-                .highlight_style(Style::default().fg(Color::Black).bg(Color::Green));
-            f.render_stateful_widget(out_widget, output_area, &mut output_state.clone());
-
-            // Status bar (1 строка)
-            let status_text = format!(
-                " poler-shell {}  │  db: {:?}  │  fmt: {:?}  │  top: {}  │  focus: {}  ",
-                env!("CARGO_PKG_VERSION"),
-                state.db_path(),
-                state.format,
-                state.top,
-                focus.as_str(),
+            render_ui(
+                f,
+                &layout_snapshot,
+                &input_buf,
+                &output_lines,
+                &output_state,
+                &notebooks,
+                &nb_state,
+                &notes_items,
+                &notes_state,
+                &sources_items,
+                &sources_state,
+                focus,
+                &selection,
+                &state,
+                &mode,
+                &palette_state,
             );
-            let status_line = Line::from(Span::styled(
-                status_text,
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ));
-            let status_para = Paragraph::new(status_line).wrap(Wrap { trim: false });
-            f.render_widget(status_para, status_area);
         });
 
-        // События клавиатуры
+        // События
         let ev = match event::read() {
             Ok(e) => e,
             Err(e) => {
@@ -176,124 +167,155 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                 break;
             }
         };
-        if let Event::Key(k) = ev {
-            match (k.code, k.modifiers) {
-                (KeyCode::Esc, _) => {
-                    should_quit = true;
-                }
-                (KeyCode::Tab, _) => {
-                    focus = focus.next();
-                }
-                (KeyCode::BackTab, _) => {
-                    focus = focus.prev();
-                }
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    should_quit = true;
-                }
-                (KeyCode::Char('r'), _) if matches!(focus, Focus::Notebooks) => {
-                    // Обновить список ноутбуков
-                    output_lines.push("poler> nlm list ...".into());
-                    let r = dispatch(&mut state, "nlm list");
-                    if let CmdResult::Done(out) = r {
-                        notebooks = out.lines().map(String::from).take(200).collect();
-                        if notebooks.is_empty() {
-                            notebooks = vec!["(пусто)".into()];
-                        }
-                    }
-                }
-                (KeyCode::PageUp, _) if matches!(focus, Focus::Output) => {
-                    let idx = output_state.selected().unwrap_or(0);
-                    output_state.select(Some(idx.saturating_sub(5)));
-                }
-                (KeyCode::PageDown, _) if matches!(focus, Focus::Output) => {
-                    let idx = output_state.selected().unwrap_or(0);
-                    let max = output_lines.len().saturating_sub(1);
-                    output_state.select(Some((idx + 5).min(max)));
-                }
-                (KeyCode::Up, _) if matches!(focus, Focus::Input) => {
-                    if !input_history.is_empty() {
-                        input_history_idx = Some(match input_history_idx {
-                            None => input_history.len() - 1,
-                            Some(i) if i > 0 => i - 1,
-                            Some(i) => i,
-                        });
-                        if let Some(i) = input_history_idx {
-                            input_buf = input_history[i].clone();
-                        }
-                    }
-                }
-                (KeyCode::Down, _) if matches!(focus, Focus::Input) => {
-                    if !input_history.is_empty() {
-                        input_history_idx = match input_history_idx {
-                            None => None,
-                            Some(i) if i + 1 < input_history.len() => Some(i + 1),
-                            _ => None,
-                        };
-                        input_buf = match input_history_idx {
-                            Some(i) => input_history[i].clone(),
-                            None => String::new(),
-                        };
-                    }
-                }
-                (KeyCode::Up, _) if matches!(focus, Focus::Notebooks) => {
-                    let idx = nb_state.selected().unwrap_or(0);
-                    nb_state.select(Some(idx.saturating_sub(1)));
-                }
-                (KeyCode::Down, _) if matches!(focus, Focus::Notebooks) => {
-                    let idx = nb_state.selected().unwrap_or(0);
-                    let max = notebooks.len().saturating_sub(1);
-                    nb_state.select(Some((idx + 1).min(max)));
-                }
-                (KeyCode::Char(c), _) if matches!(focus, Focus::Input) => {
-                    input_buf.push(c);
-                }
-                (KeyCode::Backspace, _) if matches!(focus, Focus::Input) => {
-                    input_buf.pop();
-                }
-                (KeyCode::Enter, _) if matches!(focus, Focus::Input) => {
-                    let line = input_buf.clone();
-                    output_lines.push(format!("poler> {}", line));
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    input_history.push(trimmed.to_string());
-                    input_history_idx = None;
-                    input_buf.clear();
 
-                    // Спец-выход TUI
-                    if matches!(trimmed, "quit" | "exit" | "q") {
-                        should_quit = true;
-                        continue;
-                    }
-                    let r = dispatch(&mut state, &line);
-                    match r {
-                        CmdResult::Quit => {
-                            should_quit = true;
-                        }
-                        CmdResult::Empty => {}
-                        CmdResult::Done(out) => {
-                            // Каждый абзац — отдельная строка для скроллинга
-                            for l in out.lines() {
-                                output_lines.push(l.to_string());
+        // Сначала режимные обработчики
+        let new_mode = match &mut mode {
+            Mode::NoteEditor(editor_state) => {
+                match handle_note_editor_event(ev.clone(), editor_state) {
+                    NoteEditorResult::Continue => continue,
+                    NoteEditorResult::Save(title, body) => {
+                        // Сохранить как новую заметку
+                        let nb_id = state.active_notebook().map(String::from);
+                        match state.ensure_notes_conn() {
+                            Ok(conn) => {
+                                match crate::notes::add_note(
+                                    conn,
+                                    &title,
+                                    &body,
+                                    &[],
+                                    crate::notes::NoteSource::Manual,
+                                    nb_id.as_deref(),
+                                ) {
+                                    Ok(id) => {
+                                        output_lines.push(format!("✓ Сохранена заметка #{id} «{title}»"));
+                                        refresh_notes_list(&mut state, &mut notes_items);
+                                    }
+                                    Err(e) => output_lines.push(format!("❌ {e}")),
+                                }
                             }
-                            // Доп. пустая строка как разделитель
-                            output_lines.push(String::new());
-                            // Скролл вниз
-                            let max = output_lines.len().saturating_sub(1);
-                            output_state.select(Some(max));
+                            Err(e) => output_lines.push(format!("❌ {e}")),
+                        }
+                        output_scroll = output_lines.len().saturating_sub(1);
+                        Mode::Normal
+                    }
+                    NoteEditorResult::Cancel => Mode::Normal,
+                }
+            }
+            Mode::Palette => {
+                let mut keep_palette = true;
+                if let Event::Key(k) = ev {
+                    match (k.code, k.modifiers) {
+                        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            keep_palette = false;
+                        }
+                        (KeyCode::Up, _) => {
+                            let i = palette_state.selected().unwrap_or(0);
+                            palette_state.select(Some(i.saturating_sub(1)));
+                        }
+                        (KeyCode::Down, _) => {
+                            let i = palette_state.selected().unwrap_or(0);
+                            let max = help::palette_scenarios().len().saturating_sub(1);
+                            palette_state.select(Some((i + 1).min(max)));
+                        }
+                        (KeyCode::Enter, _) => {
+                            let sc = &help::palette_scenarios()[palette_state.selected().unwrap_or(0)];
+                            input_buf.clear();
+                            input_buf.push_str(sc.cmd);
+                            focus = Focus::Input;
+                            keep_palette = false;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Event::Mouse(me) = ev {
+                    if let MouseAction::DragEnd { col, row } = mouse::parse_event(me) {
+                        if let Some(area) = layout_snapshot.palette_area() {
+                            if mouse::hit(&area, col, row) {
+                                let local_row = row.saturating_sub(area.y) as usize;
+                                let scenarios = help::palette_scenarios();
+                                if local_row < scenarios.len() {
+                                    palette_state.select(Some(local_row));
+                                }
+                            }
                         }
                     }
                 }
-                _ => {}
+                if keep_palette {
+                    continue;
+                } else {
+                    Mode::Normal
+                }
             }
+            Mode::Normal => {
+                // Не меняем режим, переходим к обычной обработке событий
+                Mode::Normal
+            }
+        };
+        if std::mem::discriminant(&new_mode) != std::mem::discriminant(&mode) {
+            mode = new_mode;
+            continue;
+        }
+
+        // Mode::Normal — обычная обработка событий
+        match ev {
+            Event::Key(k) => {
+                handle_key_event(
+                    k,
+                    &mut state,
+                    &mut input_buf,
+                    &mut input_history,
+                    &mut input_history_idx,
+                    &mut output_lines,
+                    &mut output_scroll,
+                    &mut output_state,
+                    &mut notebooks,
+                    &mut notebook_ids,
+                    &mut nb_state,
+                    &mut notes_items,
+                    &mut notes_state,
+                    &mut sources_items,
+                    &mut sources_state,
+                    &mut focus,
+                    &mut should_quit,
+                    &mut mode,
+                    &mut selection,
+                );
+            }
+            Event::Mouse(me) => {
+                handle_mouse_event(
+                    me,
+                    &layout_snapshot,
+                    &mut state,
+                    &mut input_buf,
+                    &mut input_history,
+                    &mut input_history_idx,
+                    &mut output_lines,
+                    &mut output_scroll,
+                    &mut output_state,
+                    &mut notebooks,
+                    &mut notebook_ids,
+                    &mut nb_state,
+                    &mut notes_items,
+                    &mut notes_state,
+                    &mut sources_items,
+                    &mut sources_state,
+                    &mut focus,
+                    &mut selection,
+                    &mut last_click_time,
+                    &mut last_click_pos,
+                );
+            }
+            Event::Resize(_, _) => {
+                // ratatui автоматически перерисует на следующей итерации
+            }
+            _ => {}
         }
     }
 
     // Восстановление терминала
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
     let _ = stdout.flush();
 
     std::process::ExitCode::SUCCESS
@@ -304,6 +326,8 @@ enum Focus {
     Notebooks,
     Input,
     Output,
+    Notes,
+    Sources,
 }
 
 impl Focus {
@@ -311,41 +335,972 @@ impl Focus {
         match self {
             Focus::Notebooks => Focus::Input,
             Focus::Input => Focus::Output,
-            Focus::Output => Focus::Notebooks,
+            Focus::Output => Focus::Notes,
+            Focus::Notes => Focus::Sources,
+            Focus::Sources => Focus::Notebooks,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Focus::Notebooks => Focus::Output,
+            Focus::Notebooks => Focus::Sources,
             Focus::Input => Focus::Notebooks,
             Focus::Output => Focus::Input,
+            Focus::Notes => Focus::Output,
+            Focus::Sources => Focus::Notes,
         }
     }
     fn as_str(self) -> &'static str {
         match self {
             Focus::Notebooks => "notebooks",
             Focus::Input => "input",
-            Focus::Output => "output",
+            Focus::Output => "chat",
+            Focus::Notes => "notes",
+            Focus::Sources => "sources",
         }
     }
 }
 
-fn help_text() -> String {
-    let mut s = String::new();
-    s.push_str("poler-shell TUI Dashboard v0.15.0\n\n");
-    s.push_str("Команды (как в REPL):\n");
-    s.push_str("  search \"<query>\" --top 5\n");
-    s.push_str("  nlm list | nlm sync [<NB_ID>] | nlm ask <NB_ID> \"вопрос\"\n");
-    s.push_str("  stats | set format md|json | set top 20\n");
-    s.push('\n');
-    s.push_str("Управление:\n");
-    s.push_str("  Tab/BackTab — сменить фокус\n");
-    s.push_str("  ↑/↓ в input — история команд\n");
-    s.push_str("  ↑/↓ в notebooks — навигация\n");
-    s.push_str("  'r' в notebooks — обновить список (nlm list)\n");
-    s.push_str("  PgUp/PgDn в output — скроллинг\n");
-    s.push_str("  Esc или Ctrl+C — выход\n");
-    s
+#[derive(Debug)]
+enum Mode {
+    Normal,
+    Palette,
+    NoteEditor(NoteEditorState),
+}
+
+#[derive(Debug)]
+struct NoteEditorState {
+    title_input: String,
+    title_active: bool, // true = редактируем title, false = редактируем body
+    body: TextArea<'static>,
+}
+
+#[derive(Debug)]
+enum NoteEditorResult {
+    Continue,
+    Save(String, String),
+    Cancel,
+}
+
+/// Снапшот вычисленных прямоугольников layout для hit-testing мыши.
+#[derive(Debug, Clone, Default)]
+struct LayoutSnapshot {
+    nb_area: Rect,
+    chat_area: Rect,
+    input_area: Rect,
+    notes_area: Rect,
+    sources_area: Rect,
+    status_area: Rect,
+    palette_area: Option<Rect>,
+}
+
+impl LayoutSnapshot {
+    fn palette_area(&self) -> Option<Rect> {
+        self.palette_area
+    }
+}
+
+fn compute_layout(area: Rect) -> LayoutSnapshot {
+    // Layout:
+    // ┌──────┬─────────────────┬──────┐
+    // │ NB   │ Chat (50% h)     │ Notes│
+    // │      ├─────────────────┼──────┤
+    // │      │ Input (25% h)    │Src   │
+    // ├──────┴─────────────────┴──────┤
+    // │ status bar                    │
+    // └───────────────────────────────┘
+    // Ширина: 25% / 50% / 25%
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+    let main = outer[0];
+    let status = outer[1];
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+        ])
+        .split(main);
+    let nb_area = cols[0];
+    let center = cols[1];
+    let right = cols[2];
+
+    let center_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Min(3)])
+        .split(center);
+    let chat_area = center_rows[0];
+    let input_area = center_rows[1];
+
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(right);
+    let notes_area = right_rows[0];
+    let sources_area = right_rows[1];
+
+    LayoutSnapshot {
+        nb_area,
+        chat_area,
+        input_area,
+        notes_area,
+        sources_area,
+        status_area: status,
+        palette_area: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_ui(
+    f: &mut ratatui::Frame,
+    layout: &LayoutSnapshot,
+    input_buf: &str,
+    output_lines: &[String],
+    output_state: &ListState,
+    notebooks: &[String],
+    nb_state: &ListState,
+    notes_items: &[String],
+    notes_state: &ListState,
+    sources_items: &[String],
+    sources_state: &ListState,
+    focus: Focus,
+    selection: &SelectionRect,
+    state: &ShellState,
+    mode: &Mode,
+    palette_state: &ListState,
+) {
+    // Левая панель — репозитории/ноутбуки
+    let nb_items: Vec<ListItem> = notebooks
+        .iter()
+        .map(|s| ListItem::new(Line::from(s.clone())))
+        .collect();
+    let nb_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Repo / Notebooks (r=refresh)")
+        .border_style(if matches!(focus, Focus::Notebooks) {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let nb_widget = List::new(nb_items)
+        .block(nb_block)
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    f.render_stateful_widget(nb_widget, layout.nb_area, &mut nb_state.clone());
+
+    // Центр верх — Chat / Output (с drag-select overlay)
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Chat & Responses (drag-select → Ctrl+Y)")
+        .border_style(if matches!(focus, Focus::Output) {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let chat_inner = chat_block.inner(layout.chat_area);
+    // Рендерим текст как один Paragraph (с Wrap)
+    let chat_text = output_lines.join("\n");
+    let chat_para = Paragraph::new(chat_text).wrap(Wrap { trim: false });
+    f.render_widget(chat_para, chat_inner);
+
+    // Drag-select overlay — рамка выделения
+    if let Some((min_col, min_row, max_col, max_row)) = selection.bbox() {
+        let sel_area = Rect::new(min_col, min_row, max_col - min_col + 1, max_row - min_row + 1);
+        let sel_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        f.render_widget(sel_block, sel_area);
+    }
+
+    // Border Chat panel — рисуем ПОВЕРХ overlay
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Chat & Responses (drag-select → Ctrl+Y)")
+            .border_style(if matches!(focus, Focus::Output) {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            }),
+        layout.chat_area,
+    );
+
+    // Центр низ — Input
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Input (Enter=run, ↑↓=history, ?=palette)")
+        .border_style(if matches!(focus, Focus::Input) {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let input_para = Paragraph::new(format!("poler> {}", input_buf))
+        .block(input_block)
+        .style(Style::default().fg(Color::White));
+    f.render_widget(input_para, layout.input_area);
+
+    // Правая верх — Notes
+    let notes_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Notes (Ctrl+N=new, Ctrl+S=save AI)")
+        .border_style(if matches!(focus, Focus::Notes) {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let notes_list_items: Vec<ListItem> = notes_items
+        .iter()
+        .map(|s| ListItem::new(Line::from(s.clone())))
+        .collect();
+    let notes_widget = List::new(notes_list_items)
+        .block(notes_block)
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Magenta));
+    f.render_stateful_widget(notes_widget, layout.notes_area, &mut notes_state.clone());
+
+    // Правая низ — Sources
+    let sources_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Sources (click=open, Ctrl+T=test)")
+        .border_style(if matches!(focus, Focus::Sources) {
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let sources_list_items: Vec<ListItem> = sources_items
+        .iter()
+        .map(|s| ListItem::new(Line::from(s.clone())))
+        .collect();
+    let sources_widget = List::new(sources_list_items)
+        .block(sources_block)
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Blue));
+    f.render_stateful_widget(sources_widget, layout.sources_area, &mut sources_state.clone());
+
+    // Status bar
+    let status_text = format!(
+        " poler-shell {}  │  db: {:?}  │  fmt: {:?}  │  top: {}  │  focus: {}  │  F2=Chat  ?=palette  Ctrl+N=note  Ctrl+S=save AI",
+        env!("CARGO_PKG_VERSION"),
+        state.db_path(),
+        state.format,
+        state.top,
+        focus.as_str(),
+    );
+    let status_line = Line::from(Span::styled(
+        status_text,
+        Style::default().fg(Color::Black).bg(Color::DarkGray),
+    ));
+    let status_para = Paragraph::new(status_line).wrap(Wrap { trim: false });
+    f.render_widget(status_para, layout.status_area);
+
+    // Mode overlays
+    match mode {
+        Mode::Palette => {
+            render_palette_overlay(f, palette_state);
+        }
+        Mode::NoteEditor(editor_state) => {
+            render_note_editor_overlay(f, editor_state);
+        }
+        Mode::Normal => {}
+    }
+}
+
+fn render_palette_overlay(f: &mut ratatui::Frame, palette_state: &ListState) {
+    let area = centered_rect(80, 70, f.area());
+    let scenarios = help::palette_scenarios();
+    let items: Vec<ListItem> = scenarios
+        .iter()
+        .map(|sc| ListItem::new(Line::from(format!("{}. {}", sc.title, sc.cmd))))
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("? palette — 10 сценариев (↑↓=select, Enter=use, Esc=cancel)")
+        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let widget = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(widget, area, &mut palette_state.clone());
+}
+
+fn render_note_editor_overlay(f: &mut ratatui::Frame, editor: &NoteEditorState) {
+    let area = centered_rect(80, 70, f.area());
+    f.render_widget(Clear, area);
+
+    // Title input
+    let title_area = Rect::new(area.x, area.y, area.width, 3);
+    let title_block = Block::default()
+        .borders(Borders::ALL)
+        .title(if editor.title_active {
+            "Title (TAB → body)"
+        } else {
+            "Title (TAB → body)"
+        })
+        .border_style(if editor.title_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let title_para = Paragraph::new(editor.title_input.as_str())
+        .block(title_block)
+        .style(Style::default().fg(Color::White));
+    f.render_widget(title_para, title_area);
+
+    // Body textarea
+    let body_area = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(3));
+    let body_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Body (Ctrl+S=save, Esc=cancel)")
+        .border_style(if !editor.title_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    f.render_widget(&editor.body, body_area);
+    f.render_widget(body_block, body_area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let popup = popup_layout[1];
+    let popup_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup);
+    popup_layout[1]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_event(
+    k: KeyEvent,
+    state: &mut ShellState,
+    input_buf: &mut String,
+    input_history: &mut Vec<String>,
+    input_history_idx: &mut Option<usize>,
+    output_lines: &mut Vec<String>,
+    output_scroll: &mut usize,
+    output_state: &mut ListState,
+    notebooks: &mut Vec<String>,
+    notebook_ids: &mut Vec<String>,
+    nb_state: &mut ListState,
+    notes_items: &mut Vec<String>,
+    notes_state: &mut ListState,
+    sources_items: &mut Vec<String>,
+    sources_state: &mut ListState,
+    focus: &mut Focus,
+    should_quit: &mut bool,
+    mode: &mut Mode,
+    selection: &mut SelectionRect,
+) {
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => {
+            if selection.active {
+                selection.clear();
+            } else {
+                *should_quit = true;
+            }
+        }
+        (KeyCode::Tab, _) => {
+            *focus = focus.next();
+        }
+        (KeyCode::BackTab, _) => {
+            *focus = focus.prev();
+        }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            *should_quit = true;
+        }
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+            // Ctrl+Y: скопировать выделение (если активно) или весь последний вывод
+            if selection.active {
+                if let Some((min_col, min_row, max_col, max_row)) = selection.bbox() {
+                    let text = mouse::extract_text(output_lines, &Rect::new(0, 0, 200, 1000), min_col, min_row, max_col, max_row);
+                    match mouse::copy_to_clipboard(&text) {
+                        Ok(()) => output_lines.push(format!("✓ Скопировано {} символов в буфер", text.chars().count())),
+                        Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
+                    }
+                    selection.clear();
+                }
+            } else if !state.last_output.is_empty() {
+                match mouse::copy_to_clipboard(&state.last_output) {
+                    Ok(()) => output_lines.push(format!("✓ Скопирован весь вывод ({} символов)", state.last_output.chars().count())),
+                    Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
+                }
+            } else {
+                output_lines.push("ℹ Нет выделения и нет последнего вывода".into());
+            }
+            *output_scroll = output_lines.len().saturating_sub(1);
+        }
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            // Ctrl+N: новая заметка (встроенный редактор)
+            let mut body = TextArea::default();
+            body.set_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Note body (Ctrl+S=save, Esc=cancel)")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+            *mode = Mode::NoteEditor(NoteEditorState {
+                title_input: String::new(),
+                title_active: true,
+                body,
+            });
+        }
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            // Ctrl+S: сохранить последний AI-ответ как заметку
+            let title = format!(
+                "AI reply @{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            match state.save_last_ai_reply_as_note(&title) {
+                Ok(id) => {
+                    output_lines.push(format!("✓ Сохранён AI-ответ как заметка #{id} «{title}»"));
+                    refresh_notes_list(state, notes_items);
+                }
+                Err(e) => output_lines.push(format!("❌ {e}")),
+            }
+            *output_scroll = output_lines.len().saturating_sub(1);
+        }
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            // Ctrl+E: редактировать выбранную заметку → открыть редактор
+            if let Some(idx) = notes_state.selected() {
+                if let Ok(conn) = state.ensure_notes_conn() {
+                    let all = crate::notes::list_notes(conn, 500).unwrap_or_default();
+                    if idx < all.len() {
+                        let n = &all[idx];
+                        let mut body = TextArea::default();
+                        body.set_block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(format!("Edit #{} (Ctrl+S=save, Esc=cancel)", n.id))
+                                .border_style(Style::default().fg(Color::Yellow)),
+                        );
+                        // Вставить существующий текст
+                        for line in n.body.lines() {
+                            body.insert_str(line);
+                            body.insert_newline();
+                        }
+                        *mode = Mode::NoteEditor(NoteEditorState {
+                            title_input: n.title.clone(),
+                            title_active: true,
+                            body,
+                        });
+                    }
+                }
+            }
+        }
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            // Ctrl+D: удалить выбранную заметку
+            if matches!(focus, Focus::Notes) {
+                if let Some(idx) = notes_state.selected() {
+                    if let Ok(conn) = state.ensure_notes_conn() {
+                        let all = crate::notes::list_notes(conn, 500).unwrap_or_default();
+                        if idx < all.len() {
+                            let id = all[idx].id;
+                            match crate::notes::delete_note(conn, id) {
+                                Ok(()) => {
+                                    output_lines.push(format!("✓ Заметка #{id} удалена"));
+                                    refresh_notes_list(state, notes_items);
+                                }
+                                Err(e) => output_lines.push(format!("❌ {e}")),
+                            }
+                            *output_scroll = output_lines.len().saturating_sub(1);
+                        }
+                    }
+                }
+            } else if matches!(focus, Focus::Sources) {
+                if let Some(idx) = sources_state.selected() {
+                    if let Ok(conn) = state.ensure_sources_conn() {
+                        let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
+                        if idx < all.len() {
+                            let id = all[idx].id;
+                            match crate::sources::delete_source(conn, id) {
+                                Ok(()) => {
+                                    output_lines.push(format!("✓ Источник #{id} удалён"));
+                                    refresh_sources_list(state, sources_items);
+                                }
+                                Err(e) => output_lines.push(format!("❌ {e}")),
+                            }
+                            *output_scroll = output_lines.len().saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            // Ctrl+T: тестировать источник
+            if matches!(focus, Focus::Sources) {
+                if let Some(idx) = sources_state.selected() {
+                    if let Ok(conn) = state.ensure_sources_conn() {
+                        let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
+                        if idx < all.len() {
+                            let id = all[idx].id;
+                            match crate::sources::test_source(conn, id) {
+                                Ok(crate::sources::TestStatus::Ok) => {
+                                    output_lines.push(format!("✓ #{id}: доступен"));
+                                }
+                                Ok(crate::sources::TestStatus::Fail) => {
+                                    output_lines.push(format!("✗ #{id}: недоступен"));
+                                }
+                                Err(e) => output_lines.push(format!("❌ {e}")),
+                            }
+                            refresh_sources_list(state, sources_items);
+                            *output_scroll = output_lines.len().saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+        (KeyCode::Char('?'), _) => {
+            // ? palette
+            *mode = Mode::Palette;
+        }
+        (KeyCode::Char('r'), _) if matches!(focus, Focus::Notebooks) => {
+            // Обновить список ноутбуков
+            output_lines.push("poler> nlm list".into());
+            let r = dispatch(state, "nlm list");
+            if let CmdResult::Done(out) = r {
+                let mut new_list = Vec::new();
+                notebook_ids.clear();
+                for l in out.lines() {
+                    if l.contains("704f") || l.contains('-') && l.len() > 30 {
+                        // Похоже на notebook UUID
+                        let id = l.split_whitespace().next().unwrap_or("").to_string();
+                        if id.len() >= 8 {
+                            notebook_ids.push(id.clone());
+                            new_list.push(l.to_string());
+                            continue;
+                        }
+                    }
+                    new_list.push(l.to_string());
+                }
+                if new_list.is_empty() {
+                    new_list = vec!["(пусто)".into()];
+                }
+                *notebooks = new_list;
+            }
+            *output_scroll = output_lines.len().saturating_sub(1);
+        }
+        (KeyCode::PageUp, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
+            *output_scroll = output_scroll.saturating_sub(5);
+        }
+        (KeyCode::PageDown, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
+            let max = output_lines.len().saturating_sub(1);
+            *output_scroll = (*output_scroll + 5).min(max);
+        }
+        (KeyCode::Up, _) if matches!(focus, Focus::Input) => {
+            if !input_history.is_empty() {
+                *input_history_idx = Some(match *input_history_idx {
+                    None => input_history.len() - 1,
+                    Some(i) if i > 0 => i - 1,
+                    Some(i) => i,
+                });
+                if let Some(i) = *input_history_idx {
+                    *input_buf = input_history[i].clone();
+                }
+            }
+        }
+        (KeyCode::Down, _) if matches!(focus, Focus::Input) => {
+            if !input_history.is_empty() {
+                *input_history_idx = match *input_history_idx {
+                    None => None,
+                    Some(i) if i + 1 < input_history.len() => Some(i + 1),
+                    _ => None,
+                };
+                *input_buf = match *input_history_idx {
+                    Some(i) => input_history[i].clone(),
+                    None => String::new(),
+                };
+            }
+        }
+        (KeyCode::Up, _) if matches!(focus, Focus::Notebooks) => {
+            let idx = nb_state.selected().unwrap_or(0);
+            nb_state.select(Some(idx.saturating_sub(1)));
+        }
+        (KeyCode::Down, _) if matches!(focus, Focus::Notebooks) => {
+            let idx = nb_state.selected().unwrap_or(0);
+            let max = notebooks.len().saturating_sub(1);
+            nb_state.select(Some((idx + 1).min(max)));
+        }
+        (KeyCode::Up, _) if matches!(focus, Focus::Notes) => {
+            let idx = notes_state.selected().unwrap_or(0);
+            notes_state.select(Some(idx.saturating_sub(1)));
+        }
+        (KeyCode::Down, _) if matches!(focus, Focus::Notes) => {
+            let idx = notes_state.selected().unwrap_or(0);
+            let max = notes_items.len().saturating_sub(1);
+            notes_state.select(Some((idx + 1).min(max)));
+        }
+        (KeyCode::Up, _) if matches!(focus, Focus::Sources) => {
+            let idx = sources_state.selected().unwrap_or(0);
+            sources_state.select(Some(idx.saturating_sub(1)));
+        }
+        (KeyCode::Down, _) if matches!(focus, Focus::Sources) => {
+            let idx = sources_state.selected().unwrap_or(0);
+            let max = sources_items.len().saturating_sub(1);
+            sources_state.select(Some((idx + 1).min(max)));
+        }
+        (KeyCode::Char(c), _) if matches!(focus, Focus::Input) => {
+            input_buf.push(c);
+        }
+        (KeyCode::Backspace, _) if matches!(focus, Focus::Input) => {
+            input_buf.pop();
+        }
+        (KeyCode::Enter, _) if matches!(focus, Focus::Input) => {
+            let line = input_buf.clone();
+            output_lines.push(format!("poler> {}", line));
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            input_history.push(trimmed.to_string());
+            *input_history_idx = None;
+            input_buf.clear();
+
+            // Спец-выход TUI
+            if matches!(trimmed, "quit" | "exit" | "q") {
+                *should_quit = true;
+                return;
+            }
+            let r = dispatch(state, trimmed);
+            match r {
+                CmdResult::Quit => {
+                    *should_quit = true;
+                }
+                CmdResult::Empty => {}
+                CmdResult::Done(out) => {
+                    // После выполнения команды обновим notes/sources если это была CRUD
+                    if trimmed.starts_with("notes") {
+                        refresh_notes_list(state, notes_items);
+                    }
+                    if trimmed.starts_with("sources") {
+                        refresh_sources_list(state, sources_items);
+                    }
+                    for l in out.lines() {
+                        output_lines.push(l.to_string());
+                    }
+                    output_lines.push(String::new());
+                    *output_scroll = output_lines.len().saturating_sub(1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_event(
+    me: MouseEvent,
+    layout: &LayoutSnapshot,
+    state: &mut ShellState,
+    input_buf: &mut String,
+    input_history: &mut Vec<String>,
+    input_history_idx: &mut Option<usize>,
+    output_lines: &mut Vec<String>,
+    output_scroll: &mut usize,
+    _output_state: &mut ListState,
+    notebooks: &mut Vec<String>,
+    notebook_ids: &mut Vec<String>,
+    nb_state: &mut ListState,
+    notes_items: &mut Vec<String>,
+    notes_state: &mut ListState,
+    sources_items: &mut Vec<String>,
+    sources_state: &mut ListState,
+    focus: &mut Focus,
+    selection: &mut SelectionRect,
+    last_click_time: &mut Option<Instant>,
+    last_click_pos: &mut Option<(u16, u16)>,
+) {
+    let action = mouse::parse_event(me);
+    match action {
+        MouseAction::Ignore => {}
+        MouseAction::DragStart { col, row } => {
+            // Drag начинается только если клик в Chat panel
+            if mouse::hit(&layout.chat_area, col, row) {
+                selection.start(col, row);
+                *focus = Focus::Output;
+            }
+        }
+        MouseAction::DragMove { col, row } => {
+            selection.extend(col, row);
+        }
+        MouseAction::DragEnd { col, row } => {
+            // Если это был drag с активным выделением — финализируем и копируем
+            if selection.active {
+                if let Some((min_col, min_row, max_col, max_row)) = selection.finish() {
+                    // Проверим что был реальный drag (не клик)
+                    let was_drag = (min_col != max_col) || (min_row != max_row);
+                    if was_drag {
+                        // Копируем выделение в буфер автоматически
+                        let text = mouse::extract_text(
+                            output_lines,
+                            &Rect::new(0, 0, 200, 1000),
+                            min_col,
+                            min_row,
+                            max_col,
+                            max_row,
+                        );
+                        match mouse::copy_to_clipboard(&text) {
+                            Ok(()) => output_lines.push(format!(
+                                "✓ Скопировано {} символов (drag-select)",
+                                text.chars().count()
+                            )),
+                            Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
+                        }
+                        *output_scroll = output_lines.len().saturating_sub(1);
+                    } else {
+                        // Это был одиночный клик — обрабатываем как клик
+                        handle_single_click(
+                            col, row, layout, state, input_buf, input_history,
+                            input_history_idx, output_lines, output_scroll,
+                            notebooks, notebook_ids, nb_state, notes_items, notes_state,
+                            sources_items, sources_state, focus, last_click_time, last_click_pos,
+                        );
+                    }
+                }
+            } else {
+                // Событие Up без активного drag — обрабатываем как одиночный клик
+                handle_single_click(
+                    col, row, layout, state, input_buf, input_history,
+                    input_history_idx, output_lines, output_scroll,
+                    notebooks, notebook_ids, nb_state, notes_items, notes_state,
+                    sources_items, sources_state, focus, last_click_time, last_click_pos,
+                );
+            }
+        }
+        MouseAction::Click { .. } | MouseAction::DoubleClick { .. } => {
+            // Используется только в handle_single_click через timing
+        }
+        MouseAction::ScrollUp => {
+            if mouse::hit(&layout.chat_area, me.column, me.row) {
+                *output_scroll = output_scroll.saturating_sub(3);
+            } else if mouse::hit(&layout.nb_area, me.column, me.row) {
+                let idx = nb_state.selected().unwrap_or(0);
+                nb_state.select(Some(idx.saturating_sub(1)));
+            } else if mouse::hit(&layout.notes_area, me.column, me.row) {
+                let idx = notes_state.selected().unwrap_or(0);
+                notes_state.select(Some(idx.saturating_sub(1)));
+            } else if mouse::hit(&layout.sources_area, me.column, me.row) {
+                let idx = sources_state.selected().unwrap_or(0);
+                sources_state.select(Some(idx.saturating_sub(1)));
+            }
+        }
+        MouseAction::ScrollDown => {
+            if mouse::hit(&layout.chat_area, me.column, me.row) {
+                let max = output_lines.len().saturating_sub(1);
+                *output_scroll = (*output_scroll + 3).min(max);
+            } else if mouse::hit(&layout.nb_area, me.column, me.row) {
+                let idx = nb_state.selected().unwrap_or(0);
+                let max = notebooks.len().saturating_sub(1);
+                nb_state.select(Some((idx + 1).min(max)));
+            } else if mouse::hit(&layout.notes_area, me.column, me.row) {
+                let idx = notes_state.selected().unwrap_or(0);
+                let max = notes_items.len().saturating_sub(1);
+                notes_state.select(Some((idx + 1).min(max)));
+            } else if mouse::hit(&layout.sources_area, me.column, me.row) {
+                let idx = sources_state.selected().unwrap_or(0);
+                let max = sources_items.len().saturating_sub(1);
+                sources_state.select(Some((idx + 1).min(max)));
+            }
+        }
+        MouseAction::RightClick { col, row } => {
+            // Правый клик по источнику → открыть в xdg-open
+            if mouse::hit(&layout.sources_area, col, row) {
+                if let Some(idx) = sources_state.selected() {
+                    if let Ok(conn) = state.ensure_sources_conn() {
+                        let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
+                        if idx < all.len() {
+                            let id = all[idx].id;
+                            match crate::sources::open_source(conn, id) {
+                                Ok(()) => {
+                                    output_lines.push(format!("✓ #{id}: отправлено в xdg-open"));
+                                    *output_scroll = output_lines.len().saturating_sub(1);
+                                }
+                                Err(e) => {
+                                    output_lines.push(format!("❌ {e}"));
+                                    *output_scroll = output_lines.len().saturating_sub(1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_single_click(
+    col: u16,
+    row: u16,
+    layout: &LayoutSnapshot,
+    state: &mut ShellState,
+    _input_buf: &mut String,
+    _input_history: &mut Vec<String>,
+    _input_history_idx: &mut Option<usize>,
+    output_lines: &mut Vec<String>,
+    output_scroll: &mut usize,
+    notebooks: &[String],
+    notebook_ids: &mut Vec<String>,
+    nb_state: &mut ListState,
+    _notes_items: &[String],
+    notes_state: &mut ListState,
+    _sources_items: &[String],
+    sources_state: &mut ListState,
+    focus: &mut Focus,
+    last_click_time: &mut Option<Instant>,
+    _last_click_pos: &mut Option<(u16, u16)>,
+) {
+    // Клик по левой панели → выбор ноутбука
+    if mouse::hit(&layout.nb_area, col, row) {
+        *focus = Focus::Notebooks;
+        let local_row = row.saturating_sub(layout.nb_area.y) as usize;
+        // Пропускаем рамку → строка 1 = индекс 0
+        let local_row = local_row.saturating_sub(1);
+        if local_row < notebooks.len() {
+            nb_state.select(Some(local_row));
+            // Если есть notebook_ids для этого индекса → активируем
+            if local_row < notebook_ids.len() {
+                let id = notebook_ids[local_row].clone();
+                state.set_active_notebook(Some(id.clone()));
+                output_lines.push(format!("✓ Активирован ноутбук {} ({})", local_row + 1, &id[..id.len().min(8)]));
+                *output_scroll = output_lines.len().saturating_sub(1);
+                // Двойной клик → nlm sync <id>
+                let now = Instant::now();
+                let is_double = last_click_time
+                    .map(|t| now.duration_since(t).as_millis() < 400)
+                    .unwrap_or(false);
+                if is_double {
+                    output_lines.push(format!("poler> nlm sync {}", id));
+                    let r = dispatch(state, &format!("nlm sync {}", id));
+                    if let CmdResult::Done(out) = r {
+                        for l in out.lines() {
+                            output_lines.push(l.to_string());
+                        }
+                        output_lines.push(String::new());
+                        *output_scroll = output_lines.len().saturating_sub(1);
+                    }
+                }
+                *last_click_time = Some(now);
+            }
+        }
+        return;
+    }
+
+    // Клик по Notes → выбор + переход фокуса
+    if mouse::hit(&layout.notes_area, col, row) {
+        *focus = Focus::Notes;
+        let local_row = row.saturating_sub(layout.notes_area.y).saturating_sub(1) as usize;
+        notes_state.select(Some(local_row));
+        return;
+    }
+
+    // Клик по Sources → выбор
+    if mouse::hit(&layout.sources_area, col, row) {
+        *focus = Focus::Sources;
+        let local_row = row.saturating_sub(layout.sources_area.y).saturating_sub(1) as usize;
+        sources_state.select(Some(local_row));
+        return;
+    }
+
+    // Клик по Chat panel → фокус + клир выделения
+    if mouse::hit(&layout.chat_area, col, row) {
+        *focus = Focus::Output;
+        return;
+    }
+
+    // Клик по Input panel → фокус
+    if mouse::hit(&layout.input_area, col, row) {
+        *focus = Focus::Input;
+        return;
+    }
+}
+
+fn handle_note_editor_event(ev: Event, state: &mut NoteEditorState) -> NoteEditorResult {
+    if let Event::Key(k) = ev {
+        match (k.code, k.modifiers) {
+            (KeyCode::Esc, _) => return NoteEditorResult::Cancel,
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                let body = state.body.lines().join("\n");
+                return NoteEditorResult::Save(state.title_input.clone(), body);
+            }
+            (KeyCode::Tab, _) => {
+                state.title_active = !state.title_active;
+                return NoteEditorResult::Continue;
+            }
+            (KeyCode::BackTab, _) => {
+                state.title_active = !state.title_active;
+                return NoteEditorResult::Continue;
+            }
+            (KeyCode::Char(c), _) if state.title_active => {
+                state.title_input.push(c);
+                return NoteEditorResult::Continue;
+            }
+            (KeyCode::Backspace, _) if state.title_active => {
+                state.title_input.pop();
+                return NoteEditorResult::Continue;
+            }
+            // Все остальные клавиши идут в body (если title не активен)
+            _ if !state.title_active => {
+                state.body.input(tui_textarea::Input::from(k));
+                return NoteEditorResult::Continue;
+            }
+            _ => {}
+        }
+    }
+    NoteEditorResult::Continue
+}
+
+fn refresh_notes_list(state: &mut ShellState, notes_items: &mut Vec<String>) {
+    if let Ok(conn) = state.ensure_notes_conn() {
+        let all = crate::notes::list_notes(conn, 500).unwrap_or_default();
+        if all.is_empty() {
+            *notes_items = vec!["(нет заметок — Ctrl+N)".into()];
+        } else {
+            *notes_items = all
+                .iter()
+                .map(|n| {
+                    let preview = n.body.lines().next().unwrap_or("").chars().take(40).collect::<String>();
+                    format!("#{} {} {}", n.id, n.title, if preview.is_empty() { String::new() } else { format!("— {}", preview) })
+                })
+                .collect();
+        }
+    }
+}
+
+fn refresh_sources_list(state: &mut ShellState, sources_items: &mut Vec<String>) {
+    if let Ok(conn) = state.ensure_sources_conn() {
+        let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
+        if all.is_empty() {
+            *sources_items = vec!["(нет источников — sources add)".into()];
+        } else {
+            *sources_items = all
+                .iter()
+                .map(|s| {
+                    let lbl = s.label.as_ref().map(|l| format!(" ({})", l)).unwrap_or_default();
+                    let st = match s.last_status.as_str() {
+                        "ok" => "✓",
+                        "fail" => "✗",
+                        _ => "?",
+                    };
+                    format!("#{} [{}] {} {}{}", s.id, st, s.kind.as_str(), s.value, lbl)
+                })
+                .collect();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -356,12 +1311,16 @@ mod tests {
     fn focus_cycle_next() {
         assert_eq!(Focus::Notebooks.next(), Focus::Input);
         assert_eq!(Focus::Input.next(), Focus::Output);
-        assert_eq!(Focus::Output.next(), Focus::Notebooks);
+        assert_eq!(Focus::Output.next(), Focus::Notes);
+        assert_eq!(Focus::Notes.next(), Focus::Sources);
+        assert_eq!(Focus::Sources.next(), Focus::Notebooks);
     }
 
     #[test]
     fn focus_cycle_prev() {
-        assert_eq!(Focus::Notebooks.prev(), Focus::Output);
+        assert_eq!(Focus::Notebooks.prev(), Focus::Sources);
+        assert_eq!(Focus::Sources.prev(), Focus::Notes);
+        assert_eq!(Focus::Notes.prev(), Focus::Output);
         assert_eq!(Focus::Output.prev(), Focus::Input);
         assert_eq!(Focus::Input.prev(), Focus::Notebooks);
     }
@@ -370,6 +1329,15 @@ mod tests {
     fn focus_as_str_correct() {
         assert_eq!(Focus::Notebooks.as_str(), "notebooks");
         assert_eq!(Focus::Input.as_str(), "input");
-        assert_eq!(Focus::Output.as_str(), "output");
+        assert_eq!(Focus::Output.as_str(), "chat");
+        assert_eq!(Focus::Notes.as_str(), "notes");
+        assert_eq!(Focus::Sources.as_str(), "sources");
+    }
+
+    #[test]
+    fn layout_snapshot_default_is_empty() {
+        let ls = LayoutSnapshot::default();
+        assert_eq!(ls.nb_area, Rect::default());
+        assert_eq!(ls.palette_area, None);
     }
 }

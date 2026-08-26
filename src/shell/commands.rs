@@ -22,8 +22,11 @@ use std::process::ExitCode;
 
 use crate::google::nlm;
 use crate::google::nlm_ingest;
+use crate::notes;
+use crate::sources;
 use crate::vcs::VcsAdapter;
 
+use super::help;
 use super::state::ShellState;
 
 
@@ -77,9 +80,17 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
     match cmd {
         "" => CmdResult::Empty,
         "quit" | "exit" | "q" => CmdResult::Quit,
-        "help" | "?" => CmdResult::Done(help_text(args)),
+        "help" | "?" => {
+            // v0.17.0: `help` без аргументов → overview; `help nlm ask` → детальная справка
+            if args.is_empty() {
+                CmdResult::Done(help::help_overview())
+            } else {
+                let topic = args.join(" ");
+                CmdResult::Done(help::help_topic(&topic))
+            }
+        }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.16.0 — Unified VCS & Data Mesh)",
+            "poler-engine {} (poler-shell v0.17.0 — TUI Redesign: MiMo Code-style 4-pane + mouse + CRUD)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -96,6 +107,9 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "gl" => cmd_gl(state, args),
         "gt" => cmd_gt(state, args),
         "gix" => cmd_gix(state, args),
+        // v0.17.0: Notes & Sources CRUD
+        "notes" => cmd_notes(state, args),
+        "sources" => cmd_sources(state, args),
         other => CmdResult::Done(format!(
             "неизвестная команда: {other} (введите `help` для списка)"
         )),
@@ -351,6 +365,8 @@ fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
             };
             match s.chat(&nb, &q) {
                 Ok(answer) => {
+                    // v0.17.0: Запомнить ответ для Ctrl+S (save_last_ai_reply_as_note)
+                    state.remember_ai_reply(answer.clone(), Some(nb.clone()));
                     let out = format!("💬 вопрос: {q}\n→ {answer}");
                     state.set_output(out.clone());
                     CmdResult::Done(out)
@@ -843,11 +859,12 @@ fn cmd_gt(state: &mut ShellState, args: &[String]) -> CmdResult {
     cmd_vcs_adapter(state, "gt", adapter, args)
 }
 
-/// `poler> gix <log|clone> ...` — локальный git через Pure-Rust gix.
+/// `poler> gix <log|clone|lfs> ...` — локальный git через Pure-Rust gix.
+/// v0.17.0: добавлен настоящий `clone` (через gix::clone::PrepareFetch) и `lfs`.
 fn cmd_gix(state: &mut ShellState, args: &[String]) -> CmdResult {
     if args.is_empty() {
         return CmdResult::Done(
-            "gix <subcommand> — доступные:\n  gix log <PATH> [--top N]\n  gix clone <URL> <PATH>".into(),
+            "gix <subcommand> — доступные:\n  gix log <PATH> [--top N]    — листинг коммитов\n  gix clone <URL> <PATH> [--depth N] [--branch B]  — Pure-Rust clone\n  gix lfs list <PATH>           — найти LFS pointer-файлы\n  gix lfs fetch <PATH>          — скачать LFS-объекты через batch API".into(),
         );
     }
     let sub = args[0].as_str();
@@ -921,19 +938,80 @@ fn cmd_gix(state: &mut ShellState, args: &[String]) -> CmdResult {
         "clone" => {
             let url = match args.get(1) {
                 Some(u) => u,
-                None => return CmdResult::Done("gix clone <URL> <PATH> — укажите URL".into()),
+                None => return CmdResult::Done("gix clone <URL> <PATH> [--depth N] [--branch B] — укажите URL".into()),
             };
             let dest = match args.get(2) {
                 Some(p) => p,
-                None => return CmdResult::Done("gix clone <URL> <PATH> — укажите путь назначения".into()),
+                None => return CmdResult::Done("gix clone <URL> <PATH> [--depth N] [--branch B] — укажите путь назначения".into()),
             };
-            let res = crate::vcs::local::GixAdapter::clone_repo(url, std::path::Path::new(dest));
-            match res {
-                Ok(p) => CmdResult::Done(format!("✓ gix clone: {} → {}", url, p.display())),
-                Err(e) => CmdResult::Done(format!("⚠ gix clone: {e}")),
+            // Парсинг опциональных флагов --depth N и --branch B
+            let mut opts = crate::vcs::clone::CloneOpts::new(url, std::path::Path::new(dest));
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--depth" | "-d" if i + 1 < args.len() => {
+                        if let Ok(n) = args[i + 1].parse::<usize>() {
+                            opts = opts.with_depth(n);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    "--branch" | "-b" if i + 1 < args.len() => {
+                        opts = opts.with_branch(args[i + 1].clone());
+                        i += 2;
+                        continue;
+                    }
+                    _ => i += 1,
+                }
+            }
+            match crate::vcs::clone::clone_repo(&opts) {
+                Ok(p) => CmdResult::Done(format!("✓ gix clone: {url} → {}", p.display())),
+                Err(e) => CmdResult::Done(format!("❌ gix clone: {}", e.to_user_string())),
             }
         }
-        other => CmdResult::Done(format!("gix: неизвестная подкоманда {other} (log|clone)")),
+        "lfs" => cmd_gix_lfs(state, &args[1..]),
+        other => CmdResult::Done(format!("gix: неизвестная подкоманда {other} (log|clone|lfs)")),
+    }
+}
+
+/// `poler> gix lfs <list|fetch> <PATH>` — LFS pointer detection + batch fetch.
+fn cmd_gix_lfs(state: &mut ShellState, args: &[String]) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(
+            "gix lfs <subcommand> — доступные:\n  gix lfs list <PATH>   — найти LFS pointer-файлы в worktree\n  gix lfs fetch <PATH>  — скачать LFS-объекты (batch API)".into(),
+        );
+    }
+    let sub = args[0].as_str();
+    match sub {
+        "list" => {
+            let path = match args.get(1) {
+                Some(p) => p,
+                None => return CmdResult::Done("gix lfs list <PATH> — укажите путь к репозиторию".into()),
+            };
+            let pointers = crate::vcs::lfs::detect_pointers(std::path::Path::new(path));
+            let out = crate::vcs::lfs::format_pointers(&pointers);
+            state.set_output(out.clone());
+            CmdResult::Done(out)
+        }
+        "fetch" => {
+            let path = match args.get(1) {
+                Some(p) => p,
+                None => return CmdResult::Done("gix lfs fetch <PATH> — укажите путь к репозиторию".into()),
+            };
+            let pointers = crate::vcs::lfs::detect_pointers(std::path::Path::new(path));
+            if pointers.is_empty() {
+                return CmdResult::Done("LFS pointer-файлов не обнаружено — нечего скачивать".into());
+            }
+            match crate::vcs::lfs::fetch_objects(std::path::Path::new(path), &pointers) {
+                Ok(results) => {
+                    let out = crate::vcs::lfs::format_fetch_results(&results);
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ gix lfs fetch: {e}")),
+            }
+        }
+        other => CmdResult::Done(format!("gix lfs: неизвестная подкоманда {other} (list|fetch)")),
     }
 }
 
@@ -1185,6 +1263,270 @@ pub fn run_shell(db_path: PathBuf) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// v0.17.0: notes CRUD — list/add/show/edit/rm/save-from-ai
+// ---------------------------------------------------------------------------
+
+fn cmd_notes(state: &mut ShellState, args: &[String]) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(
+            "notes: укажите подкоманду (list | add | show | edit | rm | save-from-ai)".into(),
+        );
+    }
+    let sub = args[0].as_str();
+    let rest = &args[1..];
+    match sub {
+        "list" => {
+            let conn = match state.ensure_notes_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            let notes_list = match notes::list_notes(conn, 200) {
+                Ok(n) => n,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            let out = notes::format_list(&notes_list);
+            state.set_output(out.clone());
+            CmdResult::Done(out)
+        }
+        "show" => {
+            if rest.is_empty() {
+                return CmdResult::Done("notes show <id>".into());
+            }
+            let id: i64 = match rest[0].parse() {
+                Ok(n) => n,
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+            };
+            let conn = match state.ensure_notes_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match notes::get_note(conn, id) {
+                Ok(Some(n)) => {
+                    let mut s = String::new();
+                    s.push_str(&format!("📝 note #{}\n", n.id));
+                    s.push_str(&format!("title: {}\n", n.title));
+                    if !n.tags.is_empty() {
+                        s.push_str(&format!("tags:   {}\n", n.tags.join(", ")));
+                    }
+                    s.push_str(&format!("source: {}\n", n.source));
+                    if let Some(nb) = &n.notebook_id {
+                        s.push_str(&format!("notebook: {}\n", nb));
+                    }
+                    s.push_str("\n");
+                    s.push_str(&n.body);
+                    state.set_output(s.clone());
+                    CmdResult::Done(s)
+                }
+                Ok(None) => CmdResult::Done(format!("note id {id} не найдена")),
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        "add" => {
+            if rest.is_empty() {
+                return CmdResult::Done(
+                    "notes add <title> — укажите заголовок (тело введёте в TUI редакторе через Ctrl+N)".into(),
+                );
+            }
+            let title = rest.join(" ");
+            let conn = match state.ensure_notes_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match notes::add_note(conn, &title, "", &[], notes::NoteSource::Manual, None) {
+                Ok(id) => {
+                    let msg = format!("✓ Создана пустая заметка #{id} «{title}». Используйте `notes edit {id}` в TUI для ввода тела.");
+                    CmdResult::Done(msg)
+                }
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        "edit" => {
+            // В REPL-режиме мы не открываем TUI редактор (нет raw-mode). Просто
+            // покажем тело и подскажем открыть TUI.
+            if rest.is_empty() {
+                return CmdResult::Done("notes edit <id>".into());
+            }
+            let id: i64 = match rest[0].parse() {
+                Ok(n) => n,
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+            };
+            CmdResult::Done(format!(
+                "📝 В REPL-режиме редактирование не поддерживается. Запустите `poler-engine --tui` и используйте Ctrl+N / Ctrl+E для встроенного редактора. (note #{id})"
+            ))
+        }
+        "rm" => {
+            if rest.is_empty() {
+                return CmdResult::Done("notes rm <id>".into());
+            }
+            let id: i64 = match rest[0].parse() {
+                Ok(n) => n,
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+            };
+            let conn = match state.ensure_notes_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match notes::delete_note(conn, id) {
+                Ok(()) => CmdResult::Done(format!("✓ Заметка #{id} удалена")),
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        "save-from-ai" => {
+            let title = if rest.is_empty() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| format!("AI reply @{}", d.as_secs()))
+                    .unwrap_or_else(|_| "AI reply".into());
+                now
+            } else {
+                rest.join(" ")
+            };
+            match state.save_last_ai_reply_as_note(&title) {
+                Ok(id) => CmdResult::Done(format!("✓ Сохранён AI-ответ как заметка #{id} «{title}»")),
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        other => CmdResult::Done(format!(
+            "notes: неизвестная подкоманда {other} (list|add|show|edit|rm|save-from-ai)"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.17.0: sources CRUD — list/add/rm/test/open
+// ---------------------------------------------------------------------------
+
+fn cmd_sources(state: &mut ShellState, args: &[String]) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(
+            "sources: укажите подкоманду (list | add | rm | test | open)".into(),
+        );
+    }
+    let sub = args[0].as_str();
+    let rest = &args[1..];
+    match sub {
+        "list" => {
+            let conn = match state.ensure_sources_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            let srcs = match sources::list_sources(conn, 500) {
+                Ok(s) => s,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            let out = sources::format_list(&srcs);
+            state.set_output(out.clone());
+            CmdResult::Done(out)
+        }
+        "add" => {
+            if rest.is_empty() {
+                return CmdResult::Done(
+                    "sources add <value> [--kind file|url|repo] [--label \"текст\"]".into(),
+                );
+            }
+            let mut value = String::new();
+            let mut kind: Option<sources::SourceKind> = None;
+            let mut label: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--kind" if i + 1 < rest.len() => {
+                        kind = sources::SourceKind::from_str(&rest[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    "--label" if i + 1 < rest.len() => {
+                        label = Some(rest[i + 1].clone());
+                        i += 2;
+                        continue;
+                    }
+                    other => {
+                        if !value.is_empty() {
+                            value.push(' ');
+                        }
+                        value.push_str(other);
+                        i += 1;
+                    }
+                }
+            }
+            if value.trim().is_empty() {
+                return CmdResult::Done("❌ пустое значение источника".into());
+            }
+            let conn = match state.ensure_sources_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match sources::add_source(conn, kind, &value, label.as_deref()) {
+                Ok(id) => {
+                    let detected = kind.unwrap_or_else(|| sources::detect_kind(&value));
+                    CmdResult::Done(format!(
+                        "✓ Добавлен источник #{id} [{}] {}",
+                        detected.as_str(),
+                        value
+                    ))
+                }
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        "rm" => {
+            if rest.is_empty() {
+                return CmdResult::Done("sources rm <id>".into());
+            }
+            let id: i64 = match rest[0].parse() {
+                Ok(n) => n,
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+            };
+            let conn = match state.ensure_sources_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match sources::delete_source(conn, id) {
+                Ok(()) => CmdResult::Done(format!("✓ Источник #{id} удалён")),
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        "test" => {
+            if rest.is_empty() {
+                return CmdResult::Done("sources test <id>".into());
+            }
+            let id: i64 = match rest[0].parse() {
+                Ok(n) => n,
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+            };
+            let conn = match state.ensure_sources_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match sources::test_source(conn, id) {
+                Ok(sources::TestStatus::Ok) => CmdResult::Done(format!("✓ #{id}: доступен")),
+                Ok(sources::TestStatus::Fail) => CmdResult::Done(format!("✗ #{id}: недоступен")),
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        "open" => {
+            if rest.is_empty() {
+                return CmdResult::Done("sources open <id>".into());
+            }
+            let id: i64 = match rest[0].parse() {
+                Ok(n) => n,
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+            };
+            let conn = match state.ensure_sources_conn() {
+                Ok(c) => c,
+                Err(e) => return CmdResult::Done(format!("❌ {e}")),
+            };
+            match sources::open_source(conn, id) {
+                Ok(()) => CmdResult::Done(format!("✓ #{id}: отправлено в xdg-open")),
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+        other => CmdResult::Done(format!(
+            "sources: неизвестная подкоманда {other} (list|add|rm|test|open)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,14 +1744,14 @@ mod tests {
     }
 
     #[test]
-    fn cmd_version_string_updated_for_v0151() {
-        // v0.16.0: полека обновила бейдж poler-shell — теперь содержит v0.16.0.
-        // Тест оставлен для обратной совместимости, проверяет что версия движка в выводе.
+    fn cmd_version_string_updated_for_v0170() {
+        // shadow test marker — used by other tests via name
+        // v0.17.0: TUI Redesign — бейдж poler-shell обновлён.
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("0.16.0"));
+                assert!(out.contains("0.17.0"));
                 assert!(out.contains("poler-shell"));
             }
             _ => panic!(),
@@ -1419,11 +1761,11 @@ mod tests {
     // ---- v0.16.0: VCS-команды (gh/gl/gt/gix/sync vcs) ----
 
     #[test]
-    fn cmd_version_string_updated_for_v016() {
+    fn cmd_version_string_updated_for_v017() {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("0.16.0")),
+            CmdResult::Done(out) => assert!(out.contains("0.17.0")),
             _ => panic!(),
         }
     }
