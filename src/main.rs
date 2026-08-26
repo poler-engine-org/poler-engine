@@ -112,6 +112,19 @@ struct Cli {
     #[arg(long = "max-relations", default_value_t = 64)]
     max_relations: usize,
 
+    /// Литеральный SIMD-предфильтр: файлы без ASCII-литерала запроса не
+    /// токенизируются (техника GNU grep kwset / ripgrep prefilter).
+    #[arg(long, default_value_t = false)]
+    fast: bool,
+
+    /// Показывать скрытые файлы/директории (аналог rg --hidden).
+    #[arg(long, default_value_t = false)]
+    hidden: bool,
+
+    /// Экспорт графа сущностей в SQL-файл (схема super-z memory_graph).
+    #[arg(long = "graph-export")]
+    graph_export: Option<PathBuf>,
+
     /// Число потоков rayon (по умолчанию — все ядра).
     #[arg(long)]
     threads: Option<usize>,
@@ -168,6 +181,9 @@ fn main() -> ExitCode {
         max_file_bytes: cli.max_file_mb.saturating_mul(1024 * 1024),
         max_scope_bytes: cli.max_scope,
         max_relations: cli.max_relations,
+        prefilter: cli.fast,
+        include_hidden: cli.hidden,
+        graph_export: cli.graph_export.clone(),
     };
 
     let (result, stats) = scan_path_with_stats(&cli.path, &cli.query, &config);

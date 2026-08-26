@@ -190,6 +190,61 @@ impl EntityGraph {
         }
         out
     }
+
+    /// Экспорт графа в SQL (схема memory_graph из super-z-skills:
+    /// entities/relations с UNIQUE-констрейнтами и temporal-слоем).
+    ///
+    /// Результат можно загрузить в SQLite: `sqlite3 graph.db < dump.sql`.
+    pub fn export_sql(&self, out: &mut String) {
+        fn esc(s: &str) -> String {
+            s.replace('\'', "''")
+        }
+        out.push_str("-- POLER-Engine entity graph export\n");
+        out.push_str("-- Схема заимствована из super-z-skills memory_graph.py\n");
+        out.push_str(
+            "CREATE TABLE IF NOT EXISTS entities (\n\
+             \x20 id INTEGER PRIMARY KEY,\n\
+             \x20 name TEXT NOT NULL,\n\
+             \x20 type TEXT DEFAULT 'entity',\n\
+             \x20 temporal_layer TEXT,\n\
+             \x20 UNIQUE(name)\n);\n\n",
+        );
+        out.push_str(
+            "CREATE TABLE IF NOT EXISTS relations (\n\
+             \x20 id INTEGER PRIMARY KEY,\n\
+             \x20 subject TEXT NOT NULL,\n\
+             \x20 predicate TEXT NOT NULL,\n\
+             \x20 object TEXT NOT NULL,\n\
+             \x20 UNIQUE(subject, predicate, object)\n);\n\n",
+        );
+
+        for idx in self.graph.node_indices() {
+            let n = &self.graph[idx];
+            let tl = n
+                .temporal_layer
+                .as_deref()
+                .map(|t| format!("'{}'", esc(t)))
+                .unwrap_or_else(|| "NULL".to_string());
+            out.push_str(&format!(
+                "INSERT OR IGNORE INTO entities (name, type, temporal_layer) VALUES ('{}', '{}', {});\n",
+                esc(&n.name),
+                esc(&n.node_type),
+                tl
+            ));
+        }
+        out.push('\n');
+        for e in self.graph.edge_references() {
+            let s = &self.graph[e.source()].name;
+            let o = &self.graph[e.target()].name;
+            let p = &e.weight().predicate;
+            out.push_str(&format!(
+                "INSERT OR IGNORE INTO relations (subject, predicate, object) VALUES ('{}', '{}', '{}');\n",
+                esc(s),
+                esc(p),
+                esc(o)
+            ));
+        }
+    }
 }
 
 impl Default for EntityGraph {

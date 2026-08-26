@@ -305,3 +305,118 @@ fn local_stats_mode_works() {
     assert!(res.total_hits >= 3);
     assert!(res.anchors[0].epsilon > 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// Техники из исходников: ripgrep (ignore-обход), GNU grep (предфильтр),
+// super-z-skills (SQL-схема memory_graph)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gitignore_is_respected() {
+    // WalkBuilder из крейта ignore (ripgrep): .gitignore работает даже
+    // вне git-репозитория при require_git(false)
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("keep.md"),
+        "# Глава 1\n\nЗдесь есть искомое слово ВЕГА.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("skipme.md"),
+        "# Глава 2\n\nА тут тоже ВЕГА, но файл в .gitignore.\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join(".gitignore"), "skipme.md\n").unwrap();
+
+    let (_, stats) = scan_path_with_stats(dir.path(), "ВЕГА", &EngineConfig::default());
+    assert_eq!(stats.files_scanned, 1, "файл из .gitignore должен быть пропущен");
+    assert_eq!(stats.files_with_hits, 1);
+}
+
+#[test]
+fn fast_prefilter_skips_files_without_literal() {
+    // GNU grep kwset-техника: ASCII-запрос -> SIMD-предфильтр до токенизации
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("hit.md"),
+        "# Глава\n\nФункция process_data обрабатывает поток.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("miss.md"),
+        "# Другая глава\n\nЗдесь нет искомого литерала совсем.\n",
+    )
+    .unwrap();
+
+    let mut cfg = EngineConfig::default();
+    cfg.prefilter = true;
+    let (_, stats) = scan_path_with_stats(dir.path(), "process_data", &cfg);
+    assert_eq!(stats.files_scanned, 2);
+    // miss.md не индексировался вовсе: его токены не попали в total_tokens
+    assert!(stats.total_tokens < 15, "total_tokens={}", stats.total_tokens);
+}
+
+#[test]
+fn fast_prefilter_ascii_case_insensitive() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("code.rs"),
+        "fn ALPHA_FUNC() {\n    let x = 1;\n}\n",
+    )
+    .unwrap();
+    let mut cfg = EngineConfig::default();
+    cfg.prefilter = true;
+    let res = scan_path(dir.path(), "alpha_func", &cfg);
+    assert!(res.total_hits >= 1, "CI-предфильтр не нашёл вхождение");
+}
+
+#[test]
+fn fast_prefilter_non_ascii_falls_back_to_full() {
+    // кириллица: предфильтр не применим (регистр меняет байты) -> полный путь
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("ch.md"),
+        "# Глава\n\nНокс действует решительно.\n",
+    )
+    .unwrap();
+    let mut cfg = EngineConfig::default();
+    cfg.prefilter = true;
+    let res = scan_path(dir.path(), "нокс", &cfg);
+    assert!(res.total_hits >= 1);
+}
+
+#[test]
+fn graph_export_sql_follows_superz_schema() {
+    // Схема super-z-skills memory_graph: entities/relations + UNIQUE
+    let dir = write_fixture("chapter_36.md", CH36);
+    let sql_path = dir.path().join("graph.sql");
+    let mut cfg = EngineConfig::default();
+    cfg.graph_export = Some(sql_path.clone());
+    let _ = scan_path(dir.path(), "нокс", &cfg);
+
+    let sql = fs::read_to_string(&sql_path).expect("SQL-дамп создан");
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS entities"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS relations"));
+    assert!(sql.contains("UNIQUE(name)"));
+    assert!(sql.contains("UNIQUE(subject, predicate, object)"));
+    assert!(sql.contains("INSERT OR IGNORE INTO entities"));
+    assert!(sql.contains("'Нокс'"));
+    assert!(sql.contains("вонзила_когти"));
+    assert!(sql.contains("1300°C"));
+}
+
+#[test]
+fn hidden_files_skipped_by_default() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("visible.md"), "# Глава\n\nВЕГА видима.\n").unwrap();
+    fs::create_dir(dir.path().join(".secret")).unwrap();
+    fs::write(dir.path().join(".secret/hidden.md"), "# Глава\n\nВЕГА скрыта.\n").unwrap();
+
+    let (_, stats) = scan_path_with_stats(dir.path(), "ВЕГА", &EngineConfig::default());
+    assert_eq!(stats.files_scanned, 1, "скрытые файлы пропускаются по умолчанию");
+
+    let mut cfg = EngineConfig::default();
+    cfg.include_hidden = true;
+    let (_, stats2) = scan_path_with_stats(dir.path(), "ВЕГА", &cfg);
+    assert_eq!(stats2.files_scanned, 2, "--hidden включает скрытые");
+}

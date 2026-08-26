@@ -48,9 +48,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
 
 pub use graph::EntityGraph;
 pub use output::{render_markdown, render_simple, ContextAnchor, SearchResult};
@@ -108,6 +109,14 @@ pub struct EngineConfig {
     pub max_scope_bytes: usize,
     /// Максимум K-hop отношений на якорь.
     pub max_relations: usize,
+    /// Литеральный SIMD-предфильтр (GNU grep/ripgrep техника): файлы без
+    /// ASCII-литерала запроса не токенизируются вовсе. Статистика ε тогда
+    /// считается по matched-подмножеству, а не по всему корпусу.
+    pub prefilter: bool,
+    /// Обход скрытых файлов (аналог rg --hidden).
+    pub include_hidden: bool,
+    /// Дамп графа сущностей в SQL-файл (схема super-z memory_graph).
+    pub graph_export: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -129,6 +138,9 @@ impl Default for EngineConfig {
             max_file_bytes: 32 * 1024 * 1024,
             max_scope_bytes: 16 * 1024,
             max_relations: 64,
+            prefilter: false,
+            include_hidden: false,
+            graph_export: None,
         }
     }
 }
@@ -185,19 +197,38 @@ fn effective_text<'a>(raw: &'a str, config: &EngineConfig, cleaner: &PiiCleaner)
 // Сбор файлов
 // ---------------------------------------------------------------------------
 
+/// Литеральный SIMD-предфильтр (техника GNU grep kwset / ripgrep prefilter):
+/// aho-corasick по байтам до токенизации. Применим к ASCII-запросам;
+/// не-ASCII запросы проходят полный путь (регистр кириллицы меняет байты).
+fn literal_ac(query_tokens: &[String]) -> Option<AhoCorasick> {
+    if query_tokens.is_empty() || !query_tokens.iter().all(|t| t.is_ascii()) {
+        return None;
+    }
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(query_tokens)
+        .ok()
+}
+
 fn collect_files(target: &Path, config: &EngineConfig) -> Vec<PathBuf> {
     if target.is_file() {
         return vec![target.to_path_buf()];
     }
     let exts: Vec<String> = config.extensions.clone();
-    WalkDir::new(target)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| {
-            !e.file_type().is_dir() || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
+    // WalkBuilder из крейта `ignore` (BurntSushi, ripgrep): уважение
+    // .gitignore/.ignore, пропуск скрытых файлов, фильтр нежелательных директорий.
+    WalkBuilder::new(target)
+        .hidden(!config.include_hidden)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .filter_entry(move |e| {
+            e.file_type().map_or(true, |t| !t.is_dir()) || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
         })
+        .build()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .filter(|e| {
             e.path()
                 .extension()
@@ -243,9 +274,19 @@ fn scan_file_stats(
     query_tokens: &[String],
     config: &EngineConfig,
     cleaner: &PiiCleaner,
+    literal: &Option<AhoCorasick>,
 ) -> FileScan {
     let size = path.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
     with_text(path, config.max_file_bytes, |raw| {
+        // Литеральный SIMD-предфильтр (Commentz-Walter идея из GNU grep kwset):
+        // байтовый автомат Ахо-Корасик отбраковывает файл до токенизации.
+        if config.prefilter {
+            if let Some(ac) = literal {
+                if !ac.find_iter(raw).next().is_some() {
+                    return FileScan::empty();
+                }
+            }
+        }
         let eff = effective_text(raw, config, cleaner);
         let mut index = InvertedIndex::build(&eff);
         let hits = index.find_phrase(query_tokens);
@@ -415,9 +456,10 @@ pub fn scan_path_with_stats(
     let cleaner = PiiCleaner::new();
 
     // ---------- Проход A ----------
+    let literal = literal_ac(&query_tokens);
     let scans: Vec<FileScan> = files
         .par_iter()
-        .map(|p| scan_file_stats(p, &query_tokens, config, &cleaner))
+        .map(|p| scan_file_stats(p, &query_tokens, config, &cleaner, &literal))
         .collect();
 
     let mut global_counts: HashMap<String, usize> = HashMap::new();
@@ -635,6 +677,13 @@ pub fn scan_path_with_stats(
     }
     stats.graph_nodes = graph.node_count();
     stats.graph_edges = graph.edge_count();
+
+    // ---------- SQL-дамп графа (схема super-z memory_graph) ----------
+    if let Some(sql_path) = &config.graph_export {
+        let mut sql = String::new();
+        graph.export_sql(&mut sql);
+        let _ = std::fs::write(sql_path, sql);
+    }
 
     // ---------- сортировка и усечение ----------
     records.sort_by(|a, b| {

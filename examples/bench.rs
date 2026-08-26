@@ -77,4 +77,58 @@ fn main() {
         stats2.total_hits,
         res2.anchors.len()
     );
+
+    // --- Разреженный корпус: техника GNU grep kwset (литеральный
+    // SIMD-предфильтр до токенизации) ---
+    let sparse_files = 400usize;
+    let sdir = TempDir::new().expect("tempdir");
+    for f in 0..sparse_files {
+        // только каждый 20-й файл содержит искомый литерал
+        let has_hit = f % 20 == 0;
+        let mut text = format!("# Документ {f}\n\nТехническая записка номер {f}.\n\n");
+        if has_hit {
+            text.push_str(
+                "Нокс проводит калибровку сенсоров. Система не должна превышать лимит.\n\n",
+            );
+        }
+        text.push_str("Стандартный параграф с описанием регламента обслуживания узлов.\n\n");
+        fs::write(sdir.path().join(format!("doc_{f:04}.md")), &text).unwrap();
+    }
+    let _ = scan_path_with_stats(sdir.path(), "нокс", &EngineConfig::default());
+
+    let t = Instant::now();
+    let (res_full, stats_full) = scan_path_with_stats(sdir.path(), "нокс", &EngineConfig::default());
+    let full = t.elapsed();
+
+    let mut cfg_fast = EngineConfig::default();
+    cfg_fast.prefilter = true;
+    let t = Instant::now();
+    let (res_fast, stats_fast) = scan_path_with_stats(sdir.path(), "нокс", &cfg_fast);
+    let fast = t.elapsed();
+
+    println!(
+        "Разреженный корпус: полный проход {:.0} мс (токенов {}), --fast {:.0} мс (токенов {}), хитов {} == {}",
+        full.as_secs_f64() * 1000.0,
+        stats_full.total_tokens,
+        fast.as_secs_f64() * 1000.0,
+        stats_fast.total_tokens,
+        res_full.total_hits,
+        res_fast.total_hits
+    );
+
+    // --- ASCII-запрос: предфильтр применим ---
+    let t = Instant::now();
+    let (_, _) = scan_path_with_stats(sdir.path(), "doc_0100", &EngineConfig::default());
+    let ascii_full = t.elapsed();
+    let mut cfg_fast2 = EngineConfig::default();
+    cfg_fast2.prefilter = true;
+    let t = Instant::now();
+    let (_, _) = scan_path_with_stats(sdir.path(), "doc_0100", &cfg_fast2);
+    let ascii_fast = t.elapsed();
+    println!(
+        "ASCII-запрос по тому же корпусу: полный {:.0} мс vs --fast {:.0} мс (ускорение {:.1}x)",
+        ascii_full.as_secs_f64() * 1000.0,
+        ascii_fast.as_secs_f64() * 1000.0,
+        ascii_full.as_secs_f64() / ascii_fast.as_secs_f64().max(1e-9)
+    );
 }

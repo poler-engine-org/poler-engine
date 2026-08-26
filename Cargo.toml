@@ -27,7 +27,10 @@ serde_json = "1.0"
 petgraph = { version = "0.6", features = ["serde-1"] }
 regex = "1.10"
 aho-corasick = "1.1"
-walkdir = "2.5"
+# Крейт из состава ripgrep (BurntSushi): параллельный обход дерева с .gitignore
+ignore = "0.4"
+# SIMD-поиск байтов: literal prefilter в стиле ripgrep / kwset GNU grep
+memchr = "2"
 
 [dev-dependencies]
 tempfile = "3.10"

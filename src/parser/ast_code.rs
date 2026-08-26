@@ -337,7 +337,20 @@ fn brace_bounds(source: &str, off: usize) -> Option<(usize, usize)> {
     let mut stack: Vec<usize> = Vec::new();
     lex_scan(source, 0, Some(off), &mut stack, false);
 
-    let open_pos = *stack.last()?;
+    // Совпадение в строке сигнатуры (до '{'): если открывающая скобка
+    // блока находится на той же строке — совпадение принадлежит этому блоку.
+    let open_pos = match stack.last() {
+        Some(&p) => p,
+        None => {
+            let line_end = source[off..]
+                .find('\n')
+                .map(|i| off + i)
+                .unwrap_or(source.len());
+            let mut probe: Vec<usize> = Vec::new();
+            lex_scan(source, off, Some(line_end), &mut probe, false);
+            *probe.last()?
+        }
+    };
 
     // Фаза 2: парная закрывающая скобка от open_pos.
     let mut close_stack: Vec<usize> = Vec::new();

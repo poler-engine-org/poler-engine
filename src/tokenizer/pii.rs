@@ -22,7 +22,18 @@ pub enum PiiMode {
     Mask,
 }
 
-type Pattern = (Regex, &'static str);
+/// Класс литерального якоря паттерна (техника ripgrep literal prefilter:
+/// regex не запускается, если якорного байта в тексте нет вовсе).
+enum Anchor {
+    /// Требуется байт `@`.
+    At,
+    /// Требуется хотя бы одна ASCII-цифра.
+    Digit,
+    /// Якоря нет — проверяется всегда.
+    None,
+}
+
+type Pattern = (Regex, &'static str, Anchor);
 
 static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
@@ -34,22 +45,27 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             )
             .unwrap(),
             "[SECRET]",
+            Anchor::None,
         ),
         (
             Regex::new(r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}").unwrap(),
             "[EMAIL]",
+            Anchor::At,
         ),
         (
             Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap(),
             "[IP]",
+            Anchor::Digit,
         ),
         (
             Regex::new(r"\+?\d[\d\s().\u{2010}-]{7,16}\d").unwrap(),
             "[PHONE]",
+            Anchor::Digit,
         ),
         (
             Regex::new(r"\b\d{13,19}\b").unwrap(),
             "[CARD]",
+            Anchor::Digit,
         ),
     ]
 });
@@ -76,8 +92,19 @@ impl PiiCleaner {
     /// в пользу начавшегося раньше (и более длинного) — сортировка spans
     /// по `(start, Reverse(end))`.
     pub fn clean<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        // literal prefilter (ripgrep/kwset-техника): наличие якорных байтов
+        // проверяется SIMD-поиском memchr до запуска любого regex
+        let bytes = text.as_bytes();
+        let has_at = memchr::memchr(b'@', bytes).is_some();
+        let has_digit = bytes.iter().any(|b| b.is_ascii_digit());
+
         let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
-        for (re, label) in PATTERNS.iter() {
+        for (re, label, anchor) in PATTERNS.iter() {
+            match anchor {
+                Anchor::At if !has_at => continue,
+                Anchor::Digit if !has_digit => continue,
+                _ => {}
+            }
             for m in re.find_iter(text) {
                 if *label == "[PHONE]" && digit_count(m.as_str()) < 9 {
                     continue; // защита от ложных срабатываний на числах/версиях
