@@ -106,7 +106,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     ];
     let mut output_scroll: usize = usize::MAX; // row-offset для Paragraph::scroll; usize::MAX = прилипить к низу
     // Список ноутбуков (левая панель)
-    let mut notebooks: Vec<String> = vec!["(нажмите 'r' для nlm list)".into()];
+    let mut notebooks: Vec<String> = vec!["(r — загрузить список из NotebookLM)".into()];
     let mut notebook_ids: Vec<String> = Vec::new();
     let mut cached_notebooks: Vec<CachedNotebook> = Vec::new();
     let mut nb_state = ListState::default();
@@ -125,26 +125,11 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     let mut focus = Focus::Input;
     let mut should_quit = false;
 
-    // Авто-загрузка списка блокнотов и первого блокнота при старте
-    refresh_notebooks_list(&mut state, &mut notebooks, &mut notebook_ids, &mut cached_notebooks);
-    if !notebook_ids.is_empty() {
-        nb_state.select(Some(0));
-        activate_notebook(
-            0,
-            &mut state,
-            &notebooks,
-            &notebook_ids,
-            &cached_notebooks,
-            &mut sources_items,
-            &mut notes_items,
-            &mut output_lines,
-            &mut output_scroll,
-            false,
-        );
-    } else {
-        refresh_notes_list(&mut state, &mut notes_items);
-        refresh_sources_list(&mut state, &mut sources_items);
-    }
+    // Старт мгновенный: сеть не трогаем — только локальные заметки/источники.
+    // Список ноутбуков и их полное содержимое — по 'r' / Enter / клику
+    // (87 ноутбуков × 2 RPC на каждое нажатие стрелок заморозили бы TUI).
+    refresh_notes_list(&mut state, &mut notes_items);
+    refresh_sources_list(&mut state, &mut sources_items);
 
     // Drag-select
     let mut selection = SelectionRect::new();
@@ -230,6 +215,12 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                                 ) {
                                     Ok(id) => {
                                         output_lines.push(format!("✓ Сохранена заметка #{id} «{title}»"));
+                                        if let Some(nb) = &nb_id {
+                                            output_lines.push(format!(
+                                                "  ↺ в ноутбуке {} — уйдёт в NLM при синке (Enter на ноутбуке / r / nlm notes-sync)",
+                                                &nb[..nb.len().min(8)]
+                                            ));
+                                        }
                                         refresh_notes_list(&mut state, &mut notes_items);
                                     }
                                     Err(e) => output_lines.push(format!("❌ {e}")),
@@ -975,25 +966,37 @@ fn handle_key_event(
             *mode = Mode::Palette;
         }
         (KeyCode::Enter, _) if matches!(focus, Focus::Notebooks) => {
-            let idx = nb_state.selected().unwrap_or(0);
-            activate_notebook(
-                idx,
-                state,
-                notebooks,
-                notebook_ids,
-                cached_notebooks,
-                sources_items,
-                notes_items,
-                output_lines,
-                output_scroll,
-                true,
-            );
+            if notebook_ids.is_empty() {
+                output_lines.push("ℹ Список ноутбуков не загружен — нажмите r (NLM list)".into());
+                *output_scroll = usize::MAX; // прилипить к низу
+            } else {
+                let idx = nb_state.selected().unwrap_or(0);
+                activate_notebook(
+                    idx,
+                    state,
+                    notebooks,
+                    notebook_ids,
+                    cached_notebooks,
+                    sources_items,
+                    notes_items,
+                    output_lines,
+                    output_scroll,
+                    true,
+                );
+            }
         }
         (KeyCode::Char('r'), _) if matches!(focus, Focus::Notebooks) => {
-            // Обновить список ноутбуков
+            // Обновить список ноутбуков + загрузить выбранный (с синком заметок)
             output_lines.push("poler> nlm list (обновление...)".into());
-            refresh_notebooks_list(state, notebooks, notebook_ids, cached_notebooks);
-            let idx = nb_state.selected().unwrap_or(0);
+            match refresh_notebooks_list(state, notebooks, notebook_ids, cached_notebooks) {
+                Ok(n) => output_lines.push(format!("  ноутбуков в аккаунте: {n}")),
+                Err(e) => output_lines.push(format!("  ⚠ {e}")),
+            }
+            let idx = nb_state
+                .selected()
+                .unwrap_or(0)
+                .min(notebook_ids.len().saturating_sub(1));
+            nb_state.select(Some(idx));
             activate_notebook(
                 idx,
                 state,
@@ -1041,39 +1044,15 @@ fn handle_key_event(
             }
         }
         (KeyCode::Up, _) if matches!(focus, Focus::Notebooks) => {
+            // мгновенная навигация — без сети; загрузка по Enter/клику
             let idx = nb_state.selected().unwrap_or(0);
-            let new_idx = idx.saturating_sub(1);
-            nb_state.select(Some(new_idx));
-            activate_notebook(
-                new_idx,
-                state,
-                notebooks,
-                notebook_ids,
-                cached_notebooks,
-                sources_items,
-                notes_items,
-                output_lines,
-                output_scroll,
-                false,
-            );
+            nb_state.select(Some(idx.saturating_sub(1)));
         }
         (KeyCode::Down, _) if matches!(focus, Focus::Notebooks) => {
+            // мгновенная навигация — без сети; загрузка по Enter/клику
             let idx = nb_state.selected().unwrap_or(0);
             let max = notebooks.len().saturating_sub(1);
-            let new_idx = (idx + 1).min(max);
-            nb_state.select(Some(new_idx));
-            activate_notebook(
-                new_idx,
-                state,
-                notebooks,
-                notebook_ids,
-                cached_notebooks,
-                sources_items,
-                notes_items,
-                output_lines,
-                output_scroll,
-                false,
-            );
+            nb_state.select(Some((idx + 1).min(max)));
         }
         (KeyCode::Up, _) if matches!(focus, Focus::Notes) => {
             let idx = notes_state.selected().unwrap_or(0);
@@ -1304,21 +1283,9 @@ fn handle_mouse_event(
             if mouse::hit(&layout.chat_area, me.column, me.row) {
                 *output_scroll = output_scroll.saturating_sub(3);
             } else if mouse::hit(&layout.nb_area, me.column, me.row) {
+                // колесо — мгновенная навигация, без сети
                 let idx = nb_state.selected().unwrap_or(0);
-                let new_idx = idx.saturating_sub(1);
-                nb_state.select(Some(new_idx));
-                activate_notebook(
-                    new_idx,
-                    state,
-                    notebooks,
-                    notebook_ids,
-                    cached_notebooks,
-                    sources_items,
-                    notes_items,
-                    output_lines,
-                    output_scroll,
-                    false,
-                );
+                nb_state.select(Some(idx.saturating_sub(1)));
             } else if mouse::hit(&layout.notes_area, me.column, me.row) {
                 let idx = notes_state.selected().unwrap_or(0);
                 notes_state.select(Some(idx.saturating_sub(1)));
@@ -1332,22 +1299,10 @@ fn handle_mouse_event(
                 let max = output_lines.len().saturating_sub(1);
                 *output_scroll = (*output_scroll + 3).min(max);
             } else if mouse::hit(&layout.nb_area, me.column, me.row) {
+                // колесо — мгновенная навигация, без сети
                 let idx = nb_state.selected().unwrap_or(0);
                 let max = notebooks.len().saturating_sub(1);
-                let new_idx = (idx + 1).min(max);
-                nb_state.select(Some(new_idx));
-                activate_notebook(
-                    new_idx,
-                    state,
-                    notebooks,
-                    notebook_ids,
-                    cached_notebooks,
-                    sources_items,
-                    notes_items,
-                    output_lines,
-                    output_scroll,
-                    false,
-                );
+                nb_state.select(Some((idx + 1).min(max)));
             } else if mouse::hit(&layout.notes_area, me.column, me.row) {
                 let idx = notes_state.selected().unwrap_or(0);
                 let max = notes_items.len().saturating_sub(1);
@@ -1395,9 +1350,9 @@ fn handle_single_click(
     _input_history_idx: &mut Option<usize>,
     output_lines: &mut Vec<String>,
     output_scroll: &mut usize,
-    notebooks: &[String],
+    notebooks: &mut Vec<String>,
     notebook_ids: &mut Vec<String>,
-    cached_notebooks: &[CachedNotebook],
+    cached_notebooks: &mut Vec<CachedNotebook>,
     nb_state: &mut ListState,
     notes_items: &mut Vec<String>,
     notes_state: &mut ListState,
@@ -1516,155 +1471,240 @@ fn handle_note_editor_event(ev: Event, state: &mut NoteEditorState) -> NoteEdito
     NoteEditorResult::Continue
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
+/// Кэш ноутбука: метаданные из списка + (после полной загрузки) источники.
+///
+/// Полная загрузка происходит ОДИН раз — по Enter / клику / 'r';
+/// навигация стрелками и колесом кэш не трогает (мгновенная).
+#[derive(Clone, Debug, Default)]
 struct CachedNotebook {
     id: String,
     title: String,
     emoji: String,
-    sources: Vec<crate::google::nlm::SourceMeta>,
+    /// Источники после GET_PROJECT (rLM1Ne); None — ещё не загружали.
+    sources: Option<Vec<crate::google::nlm::SourceMeta>>,
+    /// Ошибка последней загрузки (протухшая сессия и т.п.) — видна юзеру.
+    load_error: Option<String>,
 }
 
+impl CachedNotebook {
+    fn loaded(&self) -> bool {
+        self.sources.is_some()
+    }
+}
+
+/// Строка левой панели: до загрузки `3. 🌌 Название`, после — `3. ✓ 🌌 Название [S ист.]`.
+fn nb_panel_line(idx: usize, cn: &CachedNotebook) -> String {
+    let emoji = if cn.emoji.is_empty() { "📓" } else { &cn.emoji };
+    let mark = if cn.loaded() { "✓ " } else { "" };
+    let counts = cn
+        .sources
+        .as_ref()
+        .map(|s| format!(" [{} ист.]", s.len()))
+        .unwrap_or_default();
+    format!("{}. {}{} {}{}", idx + 1, mark, emoji, cn.title, counts)
+}
+
+fn source_icon(kind: &str) -> &'static str {
+    match kind {
+        "Google Docs" => "📄",
+        "Google Slides" => "🖼️",
+        "Google Drive" => "🗄️",
+        "YouTube" => "🎬",
+        "Веб-страница" => "🔗",
+        "PDF" => "📑",
+        "Markdown" => "📝",
+        "DOCX" => "📃",
+        "Изображение" => "🏞️",
+        "Медиа-файл" => "🎞️",
+        "CSV" => "📊",
+        "Текст" => "🧾",
+        _ => "📦",
+    }
+}
+
+/// Загрузить список ноутбуков из NLM (один RPC wXbhsf).
+/// Возвращает количество ноутбуков; кэш сбрасывается.
 fn refresh_notebooks_list(
     state: &mut ShellState,
     notebooks: &mut Vec<String>,
     notebook_ids: &mut Vec<String>,
     cached_notebooks: &mut Vec<CachedNotebook>,
-) {
-    if let Ok(nlm_sess) = state.ensure_nlm() {
-        if let Ok(nbs) = nlm_sess.list_notebooks() {
-            notebooks.clear();
-            notebook_ids.clear();
-            cached_notebooks.clear();
-            for (i, nb) in nbs.iter().enumerate() {
-                let emoji = if nb.emoji.is_empty() { "📓 " } else { &nb.emoji };
-                let line = format!("{}. {}{} [{} ист.]", i + 1, emoji, nb.title, nb.sources.len());
-                notebooks.push(line);
-                notebook_ids.push(nb.id.clone());
-                cached_notebooks.push(CachedNotebook {
-                    id: nb.id.clone(),
-                    title: nb.title.clone(),
-                    emoji: nb.emoji.clone(),
-                    sources: nb.sources.clone(),
-                });
-            }
-            if notebooks.is_empty() {
-                *notebooks = vec!["(нет блокнотов)".into()];
-            }
-            return;
-        }
+) -> Result<usize, String> {
+    let nbs = state
+        .ensure_nlm()
+        .map_err(|e| format!("NLM-сессия: {e}"))?
+        .list_notebooks()
+        .map_err(|e| format!("nlm list: {e}"))?;
+    notebook_ids.clear();
+    cached_notebooks.clear();
+    notebooks.clear();
+    for nb in &nbs {
+        notebook_ids.push(nb.id.clone());
+        cached_notebooks.push(CachedNotebook {
+            id: nb.id.clone(),
+            title: nb.title.clone(),
+            emoji: nb.emoji.clone(),
+            sources: None,
+            load_error: None,
+        });
     }
+    *notebooks = cached_notebooks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| nb_panel_line(i, c))
+        .collect();
     if notebooks.is_empty() {
-        *notebooks = vec!["(нажмите 'r' для nlm list)".into()];
+        *notebooks = vec!["(в аккаунте нет ноутбуков)".into()];
     }
+    Ok(nbs.len())
 }
 
+/// Активировать ноутбук: полная загрузка (один раз) + синк заметок + панели.
+///
+/// `sources_items` ← источники NLM; `notes_items` ← единый список заметок
+/// ноутбука из SQLite (после двустороннего синка там лежат и облачные,
+/// и локальные — «везде одинаковые заметки»).
 fn activate_notebook(
     idx: usize,
     state: &mut ShellState,
-    _notebooks: &[String],
+    notebooks: &mut Vec<String>,
     notebook_ids: &[String],
-    cached_notebooks: &[CachedNotebook],
+    cached_notebooks: &mut [CachedNotebook],
     sources_items: &mut Vec<String>,
     notes_items: &mut Vec<String>,
     output_lines: &mut Vec<String>,
     output_scroll: &mut usize,
     announce: bool,
 ) {
-    if idx >= notebook_ids.len() {
+    if idx >= notebook_ids.len() || idx >= cached_notebooks.len() {
         return;
     }
-    let id = notebook_ids[idx].clone();
+    let id = cached_notebooks[idx].id.clone();
+    let title = cached_notebooks[idx].title.clone();
     state.set_active_notebook(Some(id.clone()));
 
-    // 1. Источники блокнота: загрузка из NotebookLM (RPC GET_PROJECT / rLM1Ne)
-    sources_items.clear();
-    let mut fetched_sources: Vec<crate::google::nlm::SourceMeta> = Vec::new();
-    if let Ok(nlm_sess) = state.ensure_nlm() {
-        if let Ok(full_nb) = nlm_sess.get_notebook(&id) {
-            fetched_sources = full_nb.sources;
-        }
-    }
-    if fetched_sources.is_empty() {
-        if let Some(cnb) = cached_notebooks.get(idx) {
-            fetched_sources = cnb.sources.clone();
-        }
-    }
-    for (si, src) in fetched_sources.iter().enumerate() {
-        let icon = match src.kind.as_str() {
-            "Google Docs" => "📄",
-            "YouTube" => "🎬",
-            "Web" | "URL" => "🔗",
-            "Слайды" => "🖼️",
-            "PDF" => "📑",
-            _ => "📦",
-        };
-        let info = src.url.as_deref().unwrap_or(src.kind.as_str());
-        sources_items.push(format!("{}. {} [{}] {} — {}", si + 1, icon, src.kind, src.title, info));
-    }
-    if sources_items.is_empty() {
-        if let Ok(conn) = state.ensure_sources_conn() {
-            let local_srcs = crate::sources::list_sources(conn, 50).unwrap_or_default();
-            for s in local_srcs {
-                sources_items.push(format!("#{} [{}] {}", s.id, s.kind.as_str(), s.value));
+    let mut sync_summary: Option<String> = None;
+
+    if !cached_notebooks[idx].loaded() {
+        // 1) Паспорт с источниками (GET_PROJECT / rLM1Ne)
+        match state.ensure_nlm().and_then(|s| s.get_notebook(&id)) {
+            Ok(full) => {
+                cached_notebooks[idx].sources = Some(full.sources);
+                cached_notebooks[idx].load_error = None;
             }
+            Err(e) => cached_notebooks[idx].load_error = Some(e),
         }
-    }
-    if sources_items.is_empty() {
-        *sources_items = vec!["(в блокноте нет источников — sources add)".into()];
+        // 2) Двусторонняя синхронизация заметок (облако ↔ SQLite)
+        match state.with_nlm_notes(|sess, conn| {
+            crate::google::nlm_notes_sync::sync_notebook_notes(sess, conn, &id)
+        }) {
+            Ok(rep) => sync_summary = Some(rep.summary()),
+            Err(e) => cached_notebooks[idx].load_error = Some(e),
+        }
+        // обновить строку в левой панели (счётчик источников + ✓)
+        if let Some(line) = notebooks.get_mut(idx) {
+            *line = nb_panel_line(idx, &cached_notebooks[idx]);
+        }
     }
 
-    // 2. Синхронизация заметок (локальные + облачные NLM)
-    notes_items.clear();
-    // 2a. Локальные заметки для этого блокнота
-    if let Ok(conn) = state.ensure_notes_conn() {
-        let all = crate::notes::list_notes(conn, 100).unwrap_or_default();
-        for n in all {
-            if n.notebook_id.as_deref() == Some(&id) || n.notebook_id.is_none() {
-                let preview = n.body.lines().next().unwrap_or("").chars().take(30).collect::<String>();
-                notes_items.push(format!("#{} {} — {}", n.id, n.title, preview));
+    // ---- Sources panel ----
+    sources_items.clear();
+    match &cached_notebooks[idx].sources {
+        Some(srcs) if !srcs.is_empty() => {
+            for (si, src) in srcs.iter().enumerate() {
+                let icon = source_icon(&src.kind);
+                let info = src
+                    .url
+                    .as_deref()
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or(src.kind.as_str());
+                sources_items.push(format!("{}. {} {} — {}", si + 1, icon, src.title, info));
             }
         }
-    }
-    // 2b. Облачные заметки из NotebookLM
-    if let Ok(nlm_sess) = state.ensure_nlm() {
-        if let Ok(notes_raw) = nlm_sess.notes(&id) {
-            let parsed_notes = crate::google::nlm_ingest::parse_notes(&notes_raw);
-            for pn in parsed_notes {
-                let title = pn.title.unwrap_or_else(|| "Заметка NLM".into());
-                let preview = pn.text.lines().next().unwrap_or("").chars().take(35).collect::<String>();
-                notes_items.push(format!("📝 [NLM] {} — {}", title, preview));
-            }
+        Some(_) => {
+            *sources_items = vec!["(в блокноте нет источников)".into()];
+        }
+        None => {
+            let err = cached_notebooks[idx]
+                .load_error
+                .clone()
+                .unwrap_or_else(|| "не загружено".into());
+            *sources_items = vec![format!("⚠ источники: {err}")];
         }
     }
-    if notes_items.is_empty() {
-        *notes_items = vec!["(нет заметок — Ctrl+N)".into()];
-    }
+
+    // ---- Notes panel: единый список ноутбука из SQLite ----
+    refresh_notes_list(state, notes_items);
 
     if announce {
-        let title = cached_notebooks.get(idx).map(|c| c.title.as_str()).unwrap_or("Ноутбук");
-        output_lines.push(format!("✓ Активирован блокнот: «{}» (ID: {})", title, &id[..id.len().min(8)]));
-        output_lines.push(format!("  Загружено источников: {}, заметок: {}", sources_items.len(), notes_items.len()));
+        let srcs = cached_notebooks[idx]
+            .sources
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        output_lines.push(format!(
+            "✓ Ноутбук «{}» ({}) — источников: {}, заметок: {}",
+            title,
+            &id[..id.len().min(8)],
+            srcs,
+            notes_items.len()
+        ));
+        if let Some(s) = sync_summary {
+            output_lines.push(format!("  синк заметок: {s}"));
+        }
+        if let Some(err) = &cached_notebooks[idx].load_error {
+            output_lines.push(format!("  ⚠ {err}"));
+        }
         output_lines.push(String::new());
-        *output_scroll = usize::MAX;
+        *output_scroll = usize::MAX; // прилипить к низу
     }
 }
 
+/// Notes panel: заметки активного ноутбука (если выбран) или все локальные.
+/// После синка облачные заметки лежат в той же SQLite — с меткой [nlm].
 fn refresh_notes_list(state: &mut ShellState, notes_items: &mut Vec<String>) {
-    if let Ok(conn) = state.ensure_notes_conn() {
-        let all = crate::notes::list_notes(conn, 500).unwrap_or_default();
-        if all.is_empty() {
-            *notes_items = vec!["(нет заметок — Ctrl+N)".into()];
+    let Some(conn) = state.ensure_notes_conn().ok() else {
+        return;
+    };
+    let all = crate::notes::list_notes(conn, 500).unwrap_or_default();
+    let nb = state.active_notebook_id.clone();
+    let filtered: Vec<_> = match nb.as_deref() {
+        Some(id) => all
+            .into_iter()
+            .filter(|n| n.notebook_id.as_deref() == Some(id))
+            .collect(),
+        None => all,
+    };
+    if filtered.is_empty() {
+        let hint = if nb.is_some() {
+            "(в этом блокноте нет заметок — Ctrl+N или синк по Enter)"
         } else {
-            *notes_items = all
-                .iter()
-                .map(|n| {
-                    let preview = n.body.lines().next().unwrap_or("").chars().take(40).collect::<String>();
-                    format!("#{} {} {}", n.id, n.title, if preview.is_empty() { String::new() } else { format!("— {}", preview) })
-                })
-                .collect();
-        }
+            "(нет заметок — Ctrl+N)"
+        };
+        *notes_items = vec![hint.into()];
+        return;
     }
+    *notes_items = filtered
+        .iter()
+        .map(|n| {
+            let origin = if n.source == "nlm" { "[nlm]" } else { "[лок]" };
+            let preview = n
+                .body
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(36)
+                .collect::<String>();
+            format!(
+                "#{} {} {}{}",
+                n.id,
+                origin,
+                n.title,
+                if preview.is_empty() { String::new() } else { format!(" — {preview}") }
+            )
+        })
+        .collect();
 }
 
 fn refresh_sources_list(state: &mut ShellState, sources_items: &mut Vec<String>) {

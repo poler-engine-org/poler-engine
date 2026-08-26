@@ -1071,7 +1071,11 @@ fn main() -> ExitCode {
     }
 
     let Some(path_arg) = cli.path.clone() else {
-        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        // Интерактивный терминал (и stdin, и stdout — TTY) → сразу TUI-дашборд.
+        // Если хоть один поток пайп/редирект — честная справка (скрипты, CI, docker).
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout());
+        if interactive {
             let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
             return poler_engine::shell::run_tui(db_path);
         }

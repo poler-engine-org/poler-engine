@@ -214,7 +214,7 @@ fn cmd_stats(state: &mut ShellState) -> CmdResult {
 fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
     if args.is_empty() {
         return CmdResult::Done(
-            "nlm: укажите подкоманду (list | notes | artifacts | source | account | ask | sync)".into(),
+            "nlm: укажите подкоманду (list | notes | notes-sync | artifacts | source | account | ask | sync)".into(),
         );
     }
     let sub = args[0].as_str();
@@ -245,13 +245,53 @@ fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
                 Ok(s) => s,
                 Err(e) => return CmdResult::Done(format!("❌ {e}")),
             };
-            match s.notes(nb) {
-                Ok(v) => {
-                    let out = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into());
+            match s.list_notes_structured(nb) {
+                Ok(notes) => {
+                    let mut out = format!("📝 {} заметок в {nb} (без mind maps):\n\n", notes.len());
+                    for (i, n) in notes.iter().enumerate() {
+                        let preview: String = n
+                            .text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect();
+                        out.push_str(&format!("{}. {} — {}\n", i + 1, n.title, preview));
+                    }
+                    if notes.is_empty() {
+                        out.push_str("(заметок нет — mind maps не считаются)\n");
+                    }
+                    out.push_str("\nсинхронизировать в poler_notes: `nlm notes-sync <NB_ID>`\n");
                     state.set_output(out.clone());
                     CmdResult::Done(out)
                 }
                 Err(e) => CmdResult::Done(format!("❌ nlm notes: {e}")),
+            }
+        }
+        // M5: двусторонняя синхронизация заметок облако ↔ локально
+        "notes-sync" | "nsync" => {
+            let nb = match rest.first().cloned().or_else(|| state.active_notebook_id.clone()) {
+                Some(id) => id,
+                None => {
+                    return CmdResult::Done(
+                        "nlm notes-sync <NB_ID> — не указан ID (или выберите ноутбук в TUI)".into(),
+                    )
+                }
+            };
+            match state.with_nlm_notes(|sess, conn| {
+                crate::google::nlm_notes_sync::sync_notebook_notes(sess, conn, &nb)
+            }) {
+                Ok(rep) => {
+                    let mut out = format!("🔄 Синк заметок ноутбука {nb}: {}\n", rep.summary());
+                    for e in &rep.errors {
+                        out.push_str(&format!("  ⚠ {e}\n"));
+                    }
+                    out.push_str("Заметки теперь одинаковы в TUI, poler_notes и NotebookLM.\n");
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ nlm notes-sync: {e}")),
             }
         }
         "artifacts" => {

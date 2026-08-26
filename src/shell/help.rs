@@ -61,7 +61,8 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Search, cmd: "stats", short: "Статистика web-index.db: сторінки, байти, PageRank" },
 
         HelpEntry { group: HelpGroup::Nlm, cmd: "nlm list", short: "Список 87 ноутбуків акаунту (notebooklm.google.com)" },
-        HelpEntry { group: HelpGroup::Nlm, cmd: "nlm notes <NB_ID>", short: "Замітки/чат ноутбука (JSON)" },
+        HelpEntry { group: HelpGroup::Nlm, cmd: "nlm notes <NB_ID>", short: "Замітки ноутбука (без mind maps)" },
+        HelpEntry { group: HelpGroup::Nlm, cmd: "nlm notes-sync [<NB_ID>]", short: "Синк заміток двобічний: хмара ↔ poler_notes" },
         HelpEntry { group: HelpGroup::Nlm, cmd: "nlm artifacts <NB_ID>", short: "Studio-артефакти: Audio/Slide/Report/Video/Quiz" },
         HelpEntry { group: HelpGroup::Nlm, cmd: "nlm source <NB_ID> <SRC_ID>", short: "Контент джерела + URL слайдів" },
         HelpEntry { group: HelpGroup::Nlm, cmd: "nlm account", short: "email/налаштування сесії NLM" },
@@ -468,6 +469,7 @@ mod tests {
         assert!(s.contains("nlm ask"));
         assert!(s.contains("nlm sync"));
         assert!(s.contains("nlm notes"));
+        assert!(s.contains("nlm notes-sync"));
         assert!(s.contains("nlm artifacts"));
         assert!(s.contains("nlm source"));
         assert!(s.contains("nlm account"));
