@@ -50,8 +50,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEvent,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -82,7 +82,12 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+    let _ = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(t) => t,
@@ -101,7 +106,8 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         "poler-shell TUI Dashboard v0.17.3 — MiMo Code-style + Companion Bridge (M2+M3+M4)".into(),
         "  ↑↓ — история ввода; Enter — выполнить; Tab — сменить фокус; Esc — выход".into(),
         "  Ctrl+N — новая заметка; Ctrl+S — сохранить AI-ответ; ? — палитра".into(),
-        "  Drag мышью по Chat panel → Ctrl+Y → буфер обмена".into(),
+        "  Drag мышью по Chat panel → Ctrl+Y → буфер (OSC 52 + системный)".into(),
+        "  Вставка из буфера — Ctrl+Shift+V / Ctrl+V (bracketed paste)".into(),
         String::new(),
     ];
     let mut output_scroll: usize = usize::MAX; // row-offset для Paragraph::scroll; usize::MAX = прилипить к низу
@@ -314,6 +320,13 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut selection,
                 );
             }
+            Event::Paste(text) => {
+                // bracketed paste: терминал прислал содержимое буфера обмена.
+                // В строку ввода — в одну строку (переводы строк → пробелы,
+                // иначе вставка выполнилась бы как команда).
+                let flat = text.replace(['\r', '\n'], " ");
+                input_buf.push_str(&flat);
+            }
             Event::Mouse(me) => {
                 handle_mouse_event(
                     me,
@@ -348,7 +361,12 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     // Восстановление терминала
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = stdout.flush();
 
     std::process::ExitCode::SUCCESS
@@ -788,14 +806,20 @@ fn handle_key_event(
                 if let Some((min_col, min_row, max_col, max_row)) = selection.bbox() {
                     let text = mouse::extract_text(output_lines, &Rect::new(0, 0, 200, 1000), min_col, min_row, max_col, max_row);
                     match mouse::copy_to_clipboard(&text) {
-                        Ok(()) => output_lines.push(format!("✓ Скопировано {} символов в буфер", text.chars().count())),
+                        Ok(via) => output_lines.push(format!(
+                            "✓ Скопировано {} символов в буфер ({via})",
+                            text.chars().count()
+                        )),
                         Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
                     }
                     selection.clear();
                 }
             } else if !state.last_output.is_empty() {
                 match mouse::copy_to_clipboard(&state.last_output) {
-                    Ok(()) => output_lines.push(format!("✓ Скопирован весь вывод ({} символов)", state.last_output.chars().count())),
+                    Ok(via) => output_lines.push(format!(
+                        "✓ Скопирован весь вывод ({} символов, {via})",
+                        state.last_output.chars().count()
+                    )),
                     Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
                 }
             } else {
@@ -1249,8 +1273,8 @@ fn handle_mouse_event(
                             max_row,
                         );
                         match mouse::copy_to_clipboard(&text) {
-                            Ok(()) => output_lines.push(format!(
-                                "✓ Скопировано {} символов (drag-select)",
+                            Ok(via) => output_lines.push(format!(
+                                "✓ Скопировано {} символов (drag-select, {via})",
                                 text.chars().count()
                             )),
                             Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
@@ -1466,6 +1490,15 @@ fn handle_note_editor_event(ev: Event, state: &mut NoteEditorState) -> NoteEdito
                 return NoteEditorResult::Continue;
             }
             _ => {}
+        }
+    }
+    // bracketed paste: в заголовок — в одну строку, в тело — как есть
+    // (TextArea сам раскладывает переводы строк)
+    if let Event::Paste(text) = ev {
+        if state.title_active {
+            state.title_input.push_str(&text.replace(['\r', '\n'], " "));
+        } else {
+            state.body.insert_str(&text);
         }
     }
     NoteEditorResult::Continue

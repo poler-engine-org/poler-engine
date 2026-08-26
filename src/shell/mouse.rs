@@ -19,6 +19,8 @@
 //! ловит только события БЕЗ модификаторов), поэтому гики получают привычное
 //! поведение.
 
+use std::sync::{Mutex, OnceLock};
+
 use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
 use ratatui::layout::Rect;
 
@@ -216,11 +218,131 @@ pub fn parse_event(ev: MouseEvent) -> MouseAction {
     }
 }
 
-/// Скопировать текст в системный буфер обмена через `arboard`.
-pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut cb| cb.set_text(text.to_string()))
-        .map_err(|e| format!("clipboard: {e}"))
+/// Скопировать текст в системный буфер обмена.
+///
+/// # Почему не только arboard
+///
+/// `arboard::Clipboard` во временной переменной — ловушка на X11: содержимое
+/// буфера живёт, пока жив владелец-процесс соединения. Старая реализация
+/// (`Clipboard::new().set_text(..)` в одну строку) роняла владение сразу
+/// после вызова — терминал отдавал пустой/протухший буфер, хотя статус
+/// был «✓ Скопировано».
+///
+/// # Стратегия (два независимых канала, пробуем оба)
+///
+/// 1. **OSC 52** — escape-последовательность `\x1b]52;c;<base64>\x07`:
+///    терминал САМ кладёт текст в системный буфер. Работает в SSH-сессиях,
+///    tmux (через DCS-passthrough), Wayland- и X11-терминалах — там, где
+///    arboard бессилен. Тихо игнорируется терминалами без поддержки.
+/// 2. **arboard** — прямой доступ к буферу (X11/Wayland/macOS/Windows),
+///    экземпляр держим на всё время процесса (см. [`ARBOARD`]).
+///
+/// Возвращает описание сработавших каналов, например `"OSC 52 + arboard"`.
+pub fn copy_to_clipboard(text: &str) -> Result<String, String> {
+    let mut via: Vec<&'static str> = Vec::new();
+    let mut errs: Vec<String> = Vec::new();
+    match osc52_copy(text) {
+        Ok(()) => via.push("OSC 52"),
+        Err(e) => errs.push(e),
+    }
+    match arboard_copy(text) {
+        Ok(()) => via.push("arboard"),
+        Err(e) => errs.push(e),
+    }
+    if via.is_empty() {
+        Err(errs.join("; "))
+    } else {
+        Ok(via.join(" + "))
+    }
+}
+
+/// arboard-Clipboard со временем жизни процесса.
+///
+/// На X11 буфер живёт, пока жив владелец: держим один экземпляр в static,
+/// при ошибке `set_text` пересоздаём (соединение могло протухнуть).
+static ARBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+
+fn arboard_copy(text: &str) -> Result<(), String> {
+    let cell = ARBOARD.get_or_init(|| Mutex::new(None));
+    let mut guard = cell
+        .lock()
+        .map_err(|e| format!("arboard: lock отравлен ({e})"))?;
+    if guard.is_none() {
+        *guard = Some(arboard::Clipboard::new().map_err(|e| format!("arboard: {e}"))?);
+    }
+    let cb = guard.as_mut().expect("инициализирован выше");
+    if let Err(e) = cb.set_text(text.to_string()) {
+        *guard = None; // сломанное соединение — пересоздадим при следующем копировании
+        return Err(format!("arboard: {e}"));
+    }
+    Ok(())
+}
+
+/// Отправить OSC 52 в терминал (текст → base64 → escape-последовательность).
+fn osc52_copy(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let payload = osc52_payload(
+        &base64_encode(text.as_bytes()),
+        std::env::var_os("TMUX").is_some(),
+    );
+    // /dev/tty — прямой канал к терминалу даже если stdout перенаправлен;
+    // в TUI-режиме stdout тоже терминал — годится как fallback.
+    let via_tty = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .and_then(|mut f| f.write_all(payload.as_bytes()).and_then(|_| f.flush()));
+    if via_tty.is_ok() {
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(payload.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| format!("osc52: {e}"))
+}
+
+/// OSC 52 payload: `\x1b]52;c;<base64>\x07`; в tmux — DCS-passthrough
+/// с удвоением ESC внутри (как в helix/neovim).
+fn osc52_payload(b64: &str, in_tmux: bool) -> String {
+    let seq = format!("\x1b]52;c;{b64}\x07");
+    if !in_tmux {
+        return seq;
+    }
+    let mut wrapped = String::from("\x1bPtmux;");
+    for c in seq.chars() {
+        if c == '\x1b' {
+            wrapped.push(c);
+        }
+        wrapped.push(c);
+    }
+    wrapped.push_str("\x1b\\");
+    wrapped
+}
+
+/// Алфавит base64 (RFC 4648, стандартный, с padding).
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// base64-кодирование без внешних зависимостей (для OSC 52).
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -381,5 +503,43 @@ mod tests {
         s.clear();
         assert!(!s.active);
         assert_eq!(s.bbox(), None);
+    }
+
+    #[test]
+    fn base64_rfc4648_vectors() {
+        // классические тест-векторы RFC 4648
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // кириллица (UTF-8 → 2× байтов)
+        assert_eq!(base64_encode("привет".as_bytes()), "0L/RgNC40LLQtdGC");
+    }
+
+    #[test]
+    fn osc52_payload_plain() {
+        let p = osc52_payload("Zm9v", false);
+        assert_eq!(p, "\x1b]52;c;Zm9v\x07");
+    }
+
+    #[test]
+    fn osc52_payload_tmux_passthrough() {
+        // в tmux: DCS-обёртка Ptmux; + ESC удвоен внутри + ST
+        let p = osc52_payload("Zm9v", true);
+        assert_eq!(p, "\x1bPtmux;\x1b\x1b]52;c;Zm9v\x07\x1b\\");
+    }
+
+    #[test]
+    fn copy_to_clipboard_reports_channel_or_error() {
+        // В headless-окружении (CI) оба канала могут упасть — тогда Err;
+        // на десктопе хотя бы один сработает — тогда Ok с именем канала.
+        // Проверяем только контракт: Ok — непустая строка, Err — непустая.
+        match copy_to_clipboard("poler-engine clipboard test") {
+            Ok(via) => assert!(!via.is_empty()),
+            Err(e) => assert!(!e.is_empty()),
+        }
     }
 }

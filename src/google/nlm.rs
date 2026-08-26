@@ -248,13 +248,28 @@ fn artifact_status(raw: Option<&Value>) -> String {
     .to_string()
 }
 
-/// Источник из строки `[key, title, metadata]`.
+/// Источник из строки `[[id], title, metadata, …]` — реальный формат NLM
+/// (одинаковый в `wXbhsf` и `rLM1Ne`; подтверждено gemini-notebook-mcp-cli:
+/// `src[0]` — список, id лежит в `src[0][0]`). Legacy-фикстуры с голым
+/// id в `row[0]` тоже принимаются.
+///
+/// ⚠ Раньше парсер ожидал `row[0]`-строку: `.as_str()` на вложенном списке
+/// возвращал `None` — и ВСЕ источники молча отбрасывались (sources: 0
+/// в sync, пустая панель Sources в TUI).
 fn parse_source_meta(row: &Value) -> Option<SourceMeta> {
-    let id = at(row, 0).as_str()?.to_string();
-    let title = at(row, 1).as_str()?.to_string();
-    if id.is_empty() || title.is_empty() {
+    // id: реальный формат — `[[id], …]`; legacy — голая строка.
+    let id = at(row, 0)
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| at(at(row, 0), 0).as_str().map(str::to_string))?;
+    if id.is_empty() {
         return None;
     }
+    let title = at(row, 1)
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Untitled")
+        .to_string();
     let m = at(row, 2);
     let type_raw = at(m, 4);
     Some(SourceMeta {
@@ -715,7 +730,12 @@ impl NlmSession {
 
     /// Паспорт ноутбука (raw-JSON — схема богаче, чем в парсере).
     pub fn get_project(&mut self, notebook_id: &str) -> Result<Value, String> {
-        self.rpc(RPC_GET_PROJECT, &serde_json::json!([notebook_id, null, [2]]), Some(notebook_id))
+        // Формат gemini-notebook-mcp-cli: [nb_id, null, [2], null, 0]
+        self.rpc(
+            RPC_GET_PROJECT,
+            &serde_json::json!([notebook_id, null, [2], null, 0]),
+            Some(notebook_id),
+        )
     }
 
     /// Загрузить структурированный паспорт ноутбука со всеми источниками (RPC GET_PROJECT / rLM1Ne).
@@ -1164,14 +1184,15 @@ mod tests {
     #[test]
     fn notebooks_parse_with_sources_and_dates() {
         // схема: [title, sources, id, emoji, _, meta[perm,_,_,_,_,updated,_,_,created]]
+        // источники — реальный формат NLM: [[id], title, metadata] (id вложен в список)
         let data = json!([[
             [
                 "Касіопея",
                 [
-                    ["s-1", "Роман повний текст", [
+                    [["s-1"], "Роман повний текст", [
                         null, null, [1735689600, 0], [null, [1700000000, 0]], 4
                     ]],
-                    ["s-2", "Відео розбір", [
+                    [["s-2"], "Відео розбір", [
                         null, null, null, null, 9,
                         ["https://youtu.be/abc", "abc", "Канал"]
                     ]]
@@ -1208,6 +1229,68 @@ mod tests {
         let nbs = parse_notebooks(&data);
         assert_eq!(nbs.len(), 1);
         assert_eq!(nbs[0].title, "T");
+    }
+
+    #[test]
+    fn source_meta_legacy_bare_id_still_parses() {
+        // старый формат фикстур: id голой строкой — не ломаем обратную совместимость
+        // (обёртка [[rows]] — как в реальном wXbhsf)
+        let data = json!([[[
+            "T",
+            [["s-legacy", "Старый формат", [null, null, null, null, 4]]],
+            "id-1", "", null, null
+        ]]]);
+        let nbs = parse_notebooks(&data);
+        assert_eq!(nbs[0].sources.len(), 1);
+        assert_eq!(nbs[0].sources[0].id, "s-legacy");
+        assert_eq!(nbs[0].sources[0].title, "Старый формат");
+    }
+
+    #[test]
+    fn source_meta_without_title_gets_untitled() {
+        // реальный NLM иногда присылает пустой title — не теряем источник
+        let data = json!([[[
+            "T",
+            [[["s-x"], "", [null, null, null, null, 3]]],
+            "id-1", "", null, null
+        ]]]);
+        let nbs = parse_notebooks(&data);
+        assert_eq!(nbs[0].sources.len(), 1);
+        assert_eq!(nbs[0].sources[0].title, "Untitled");
+        assert_eq!(nbs[0].sources[0].kind, "PDF");
+    }
+
+    #[test]
+    fn single_notebook_parse_rlm1ne_wrapper() {
+        // GET_PROJECT (rLM1Ne): данные обёрнуты внешним массивом,
+        // источники — вложенный id (gemini-notebook-mcp-cli:
+        // notebook_data[1], src[0][0] = id, src[2] = metadata, src[2][4] = тип)
+        let data = json!([
+            [
+                "Касиопея (Відлуння Глибокого Яру)",
+                [
+                    [["fce0e1bf-e499-481b-ba2f-f1e73f136ade"], "NotebookLM Help", [
+                        null, null, [1735689600, 0], null, 5,
+                        null, null, ["https://support.google.com/notebooklm"]
+                    ]],
+                    [["src-2"], "Роман", [null, null, null, null, 4]]
+                ],
+                "704f2610-c02b-4ec1-9fc7-a3b72dde2af1", "🌌", null,
+                [1, null, null, null, null, [1735689600, 0]]
+            ]
+        ]);
+        let nb = parse_single_notebook(&data).expect("паспорт должен парситься");
+        assert_eq!(nb.id, "704f2610-c02b-4ec1-9fc7-a3b72dde2af1");
+        assert_eq!(nb.title, "Касиопея (Відлуння Глибокого Яру)");
+        assert_eq!(nb.sources.len(), 2);
+        assert_eq!(nb.sources[0].id, "fce0e1bf-e499-481b-ba2f-f1e73f136ade");
+        assert_eq!(nb.sources[0].title, "NotebookLM Help");
+        assert_eq!(nb.sources[0].kind, "Веб-страница");
+        assert_eq!(
+            nb.sources[0].url.as_deref(),
+            Some("https://support.google.com/notebooklm")
+        );
+        assert_eq!(nb.sources[1].kind, "Текст");
     }
 
     #[test]

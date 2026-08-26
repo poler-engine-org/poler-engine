@@ -149,7 +149,8 @@ pub fn help_overview() -> String {
     s.push_str("  Enter — виконати команду\n");
     s.push_str("  Ctrl+N — нова замітка (вбудований редактор)\n");
     s.push_str("  Ctrl+S — зберегти відповідь AI як замітку\n");
-    s.push_str("  Ctrl+Y — копіювати виділення мишею в буфер\n");
+    s.push_str("  Ctrl+Y — копіювати виділення мишею в буфер (OSC 52 + системний)\n");
+    s.push_str("  Ctrl+Shift+V / Ctrl+V — вставка з буфера (bracketed paste)\n");
     s.push_str("  ? — палітра сценаріїв (11 пресетів)\n");
     s.push_str("  Esc / Ctrl+C — вихід\n");
     s.push('\n');
@@ -236,7 +237,8 @@ fn format_entry_detail(e: &HelpEntry) -> String {
             s.push_str("  nlm ask 704f2610-c02b-4ec1-9fc7-a3b72dde2af1 \"Що таке POLER cycle?\"\n\n");
             s.push_str("ВИВІД:\n");
             s.push_str("  Повний текст відповіді моделі (без more_horiz, без keep_pin,\n");
-            s.push_str("  без артефактів UI). Текст можна виділити мишею → Ctrl+Y → буфер.\n");
+            s.push_str("  без артефактів UI). Текст можна виділити мишею → Ctrl+Y → буфер\n");
+            s.push_str("  (OSC 52 — працює і через SSH/tmux). Вставка — Ctrl+Shift+V.\n");
             s.push_str("  Або Ctrl+S щоб зберегти як замітку (source=ai-reply).\n");
         }
         "sources add <value> [--kind file|url|repo] [--label \"...\"]" => {
