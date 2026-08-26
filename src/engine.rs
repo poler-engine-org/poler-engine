@@ -26,7 +26,8 @@ use crate::output::{ContextAnchor, SearchResult};
 use crate::parser::markdown_scenes::truncate_char_safe;
 use crate::parser::SceneContext;
 use crate::streaming::{self, HitRecord, Pass2Result, SceneInfo};
-use crate::{collect_files, effective_text, with_text, EngineConfig, PiiCleaner, ScanStats};
+
+use crate::{collect_files, with_text, EngineConfig, PiiCleaner, PiiMode, ScanStats};
 
 /// Событие инкрементального прогона (watcher).
 #[derive(Debug, Clone, Default, Serialize)]
@@ -270,8 +271,21 @@ impl Engine {
                 results_mu.lock().unwrap().push((p.clone(), (records, scenes)));
             }
         });
+        // Гиганты: параллельная чанковая обработка (границы сцен,
+        // глобальные байтовые позиции, память ограничена чанками).
         for p in &hg {
-            if let Some((records, scenes)) = pass2(p) {
+            let Some(hits) = sink.hit_files.get(p) else {
+                continue;
+            };
+            if let Some((records, scenes)) = streaming::pass2_giant_parallel(
+                p,
+                &query_tokens,
+                &config,
+                &cleaner,
+                global,
+                n_total,
+                hits,
+            ) {
                 results_mu.lock().unwrap().push((p.clone(), (records, scenes)));
             }
         }
@@ -412,20 +426,30 @@ impl Engine {
 
 /// Полная материализация сцены одного якоря (проход 3): перечитывает
 /// файл через mmap и строит SceneContext только для top-N записей.
+///
+/// PII-маскирование (v0.4) применяется ТОЛЬКО здесь — на тексте,
+/// получаемом AI-потребителем: enclosing_scope и метаданных сцены.
+/// Байтовые позиции внутри конвейера остаются raw-точными; маскирование
+/// не смещает индексы, потому что выполняется над готовой строкой.
 fn materialize_scene(r: &HitRecord, config: &EngineConfig, cleaner: &PiiCleaner) -> SceneContext {
     let res = with_text(&r.path, config.max_file_bytes, |raw| {
-        let eff = effective_text(raw, config, cleaner);
-        let text: &str = &eff;
-        if r.is_code {
+        let text: &str = raw;
+        let mut sc = if r.is_code {
             let scope =
                 crate::parser::ast_code::materialize_scope(text, r.scene_key.0, r.scene_key.1);
             SceneContext::from_code_scope(&scope, &r.path, config.max_scope_bytes)
         } else {
             let bounds = SceneContext::locate(text, r.byte_pos, &r.path);
-            let mut sc = SceneContext::build(text, &bounds, &r.path);
-            sc.enclosing_scope = truncate_char_safe(&sc.enclosing_scope, config.max_scope_bytes);
-            sc
+            SceneContext::build(text, &bounds, &r.path)
+        };
+        if config.pii_mode == PiiMode::Mask {
+            sc.enclosing_scope = cleaner.clean(&sc.enclosing_scope).into_owned();
+            for s in sc.subjects.iter_mut() {
+                *s = cleaner.clean(s).into_owned();
+            }
         }
+        sc.enclosing_scope = truncate_char_safe(&sc.enclosing_scope, config.max_scope_bytes);
+        sc
     });
     res.unwrap_or_else(|| SceneContext {
         chapter: r.path.to_string_lossy().to_string(),

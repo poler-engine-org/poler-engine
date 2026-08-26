@@ -40,10 +40,12 @@ enum PiiArg {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum ResonanceArg {
-    /// IIR-резонанс по последовательности совпадений.
+    /// IIR-резонанс по последовательности совпадений (R[n], K=1).
     Hits,
     /// Поле резонанса по всему документу, строго O(N).
     Field,
+    /// POLER[Ψ]: каноническое уравнение внимания (η, γ, ρ) из POLER-Quantum.
+    Psi,
 }
 
 #[derive(Parser, Debug)]
@@ -119,6 +121,22 @@ struct Cli {
     /// Режим накопления резонанса.
     #[arg(long = "resonance-mode", value_enum, default_value_t = ResonanceArg::Hits)]
     resonance: ResonanceArg,
+
+    /// POLER[Ψ]: η — скорость обучения внимания [default: 0.05].
+    #[arg(long = "psi-eta", default_value_t = 0.05)]
+    psi_eta: f64,
+
+    /// POLER[Ψ]: γ — вес резонансного члена ∇ε [default: 0.5].
+    #[arg(long = "psi-gamma", default_value_t = 0.5)]
+    psi_gamma: f64,
+
+    /// POLER[Ψ]: ρ — затухание резонансной памяти [default: 0.9].
+    #[arg(long = "psi-rho", default_value_t = 0.9)]
+    psi_rho: f64,
+
+    /// POLER[Ψ]: K — глубина резонансной памяти [default: 8].
+    #[arg(long = "psi-depth", default_value_t = 8)]
+    psi_depth: usize,
 
     /// ε по статистикам файла вместо корпуса.
     #[arg(long, default_value_t = false)]
@@ -204,6 +222,7 @@ fn main() -> ExitCode {
         resonance_mode: match cli.resonance {
             ResonanceArg::Hits => ResonanceMode::Hits,
             ResonanceArg::Field => ResonanceMode::Field,
+            ResonanceArg::Psi => ResonanceMode::Psi,
         },
         temporal_filter: cli.metric.clone(),
         local_stats: cli.local_stats,
@@ -219,6 +238,12 @@ fn main() -> ExitCode {
         include_hidden: cli.hidden,
         graph_export: cli.graph_export.clone(),
         max_graph_triples: cli.max_graph_triples,
+        psi_params: poler_engine::psi::PsiParams {
+            eta: cli.psi_eta,
+            gamma: cli.psi_gamma,
+            rho: cli.psi_rho,
+            memory_depth: cli.psi_depth,
+        },
     };
 
     // ---------- Режим AIDDE: Impact Passport ----------

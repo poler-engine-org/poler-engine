@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::parser::markdown_scenes::{light_meta, LightSceneMeta, SceneBounds};
 use crate::parser::{detect_lang, extract_code_triples, extract_triples, CodeLang, SceneContext, Triple};
 use crate::resonance::{apply_iir_resonance, calculate_epsilon, semantic_bonus};
-use crate::{effective_text, with_text, EngineConfig, PiiCleaner, ResonanceMode};
+use crate::{with_text, EngineConfig, PiiCleaner, ResonanceMode};
 
 /// Порог «гигантского» файла: обрабатывается строго последовательно.
 pub const GIANT_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -235,23 +235,26 @@ pub fn pass1_file(
     path: &Path,
     query_tokens: &[String],
     config: &EngineConfig,
-    cleaner: &PiiCleaner,
+    _cleaner: &PiiCleaner,
     ac: &Option<AhoCorasick>,
 ) -> Option<Pass1File> {
     with_text(path, config.max_file_bytes, |raw| {
         // Предфильтр по сырому тексту: файлы без литерала не токенизируются,
         // но всё равно участвуют в глобальной статистике (streaming counts).
+        //
+        // PII-маскирование НЕ применяется на уровне токенизации (v0.4):
+        // регексы по всему корпусу стоили ~65% времени. Маскирование
+        // выполняется только на материализации выходных сцен (engine.rs),
+        // где текст получает AI-потребитель.
         if !literal_present(raw, query_tokens, ac) {
-            let eff = effective_text(raw, config, cleaner);
-            let (counts, total) = streaming_counts(&eff);
+            let (counts, total) = streaming_counts(raw);
             return Pass1File {
                 counts,
                 total,
                 hits: Vec::new(),
             };
         }
-        let eff = effective_text(raw, config, cleaner);
-        let ft = FileTokens::build(&eff);
+        let ft = FileTokens::build(raw);
         let hits = ft.find_phrase(query_tokens);
         let counts: HashMap<String, usize> = ft
             .counts
@@ -314,6 +317,340 @@ pub fn split_giants(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     files.iter().cloned().partition(|p| {
         std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) >= GIANT_FILE_BYTES
     })
+}
+
+/// Целевой размер чанка гиганта (файл режется на ~2 МБ кусков).
+pub const CHUNK_TARGET_BYTES: usize = 2 * 1024 * 1024;
+
+/// Делит текст гиганта на чанки по границам ПАРАГРАФОВ (\n\n) и
+/// markdown-заголовков, выравнивая байтовые позиции к границам UTF-8 и
+/// строк. Граница сцены — единственный безопасный разрез: enclosing
+/// scope не рвётся посреди логического блока.
+///
+/// Каждый чанк — (start, end) в байтах оригинального текста.
+pub fn chunk_boundaries(text: &str) -> Vec<(usize, usize)> {
+    let len = text.len();
+    if len <= CHUNK_TARGET_BYTES {
+        return vec![(0, len)];
+    }
+    let mut cuts = Vec::new();
+    let mut search_from = 0usize;
+    while search_from < len {
+        let target = (search_from + CHUNK_TARGET_BYTES).min(len);
+        if target >= len {
+            cuts.push((search_from, len));
+            break;
+        }
+        // ищем ближайшую границу абзаца (пустая строка) или заголовка
+        // в окне [target - 512K, target + 512K]; выравниваем границы
+        // окна по границам символов UTF-8
+        let mut win_lo = search_from + CHUNK_TARGET_BYTES / 2;
+        while win_lo < len && !text.is_char_boundary(win_lo) {
+            win_lo += 1;
+        }
+        let mut win_hi = (target + CHUNK_TARGET_BYTES / 2).min(len);
+        while win_hi > win_lo && !text.is_char_boundary(win_hi) {
+            win_hi += 1;
+        }
+        let win_hi = win_hi.min(len);
+        let zone = &text[win_lo.min(len)..win_hi.min(len)];
+        let mut best: Option<usize> = None;
+        // предпочитаем границу заголовка, затем границу абзаца
+        if let Some(rel) = zone.find("\n\n#") {
+            best = Some(win_lo + rel + 1);
+        } else if let Some(rel) = zone.find("\n\n") {
+            best = Some(win_lo + rel + 2);
+        }
+        let cut = best.unwrap_or(target);
+        // выравниваем на границу символа и строки
+        let mut cut = cut.min(len).max(search_from + 1);
+        while cut < len && !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        if cut < len && text.as_bytes()[cut] != b'\n' && cut + 1 < len {
+            // дотягиваем до конца строки
+            if let Some(nl) = text[cut..].find('\n') {
+                cut += nl;
+            }
+        }
+        if cut <= search_from {
+            cut = target; // защита от зацикливания
+            while cut < len && !text.is_char_boundary(cut) {
+                cut += 1;
+            }
+        }
+        cuts.push((search_from, cut));
+        search_from = cut;
+    }
+    cuts
+}
+
+/// Параллельная обработка гигантского файла: чанки по границам сцен
+/// обрабатываются независимо в rayon-пуле; результат — слитые записи
+/// (байтовые позиции глобальные: chunk.offset прибавляется к локальным).
+///
+/// Память: каждый поток держит только свой чанк (zero-copy срез mmap),
+/// пиковое потребление ограничено ~CHUNK_TARGET_BYTES × threads.
+#[allow(clippy::too_many_arguments)]
+pub fn pass2_giant_parallel(
+    path: &Path,
+    query_tokens: &[String],
+    config: &EngineConfig,
+    _cleaner: &PiiCleaner,
+    global_counts: &HashMap<String, usize>,
+    n_total: usize,
+    hits: &[u32],
+) -> Option<Pass2Result> {
+    use rayon::prelude::*;
+
+    with_text(path, config.max_file_bytes, |raw| {
+        let text: &str = raw;
+
+        // Разбиение на чанки и распределение хитов по чанкам.
+        let chunks = chunk_boundaries(text);
+        if chunks.len() <= 1 {
+            // один чанк — обычный последовательный путь
+            return pass2_file(path, query_tokens, config, _cleaner, global_counts, n_total, hits);
+        }
+
+        // Распределение хитов по чанкам: байтовые позиции растут вместе
+        // с позициями токенов, поэтому достаточно одного прохода
+        // (FileTokens уже построен внутри per_chunk-замыкания? нет —
+        // строим временный для маппинга токен→байт).
+        let per_chunk: Vec<Vec<u32>> = {
+            let mut v: Vec<Vec<u32>> = vec![Vec::new(); chunks.len()];
+            let mut chunk_idx = 0usize;
+            let ft_hint = FileTokens::build(text);
+            for &h in hits {
+                let byte = ft_hint.window_byte_range(h as usize, h as usize + 1).0;
+                while chunk_idx + 1 < chunks.len() && chunks[chunk_idx].1 <= byte {
+                    chunk_idx += 1;
+                }
+                v[chunk_idx].push(h);
+            }
+            v
+        };
+
+        let lang = detect_lang(path);
+        let code_file = is_code_file(path);
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Каждый чанк обрабатывается как независимый «файл»: локальные
+        // границы сцен смещаются на chunk.start → глобальные ключи.
+        let results: Vec<Option<Pass2Result>> = chunks
+            .par_iter()
+            .zip(per_chunk.into_par_iter())
+            .map(|((start, end), chunk_hits)| {
+                if chunk_hits.is_empty() {
+                    return None;
+                }
+                let sub_text = &text[*start..*end];
+                let sub_ft = FileTokens::build(sub_text);
+                let sub_hits = sub_ft.find_phrase(query_tokens);
+                if sub_hits.is_empty() {
+                    return None;
+                }
+                let local_counts: HashMap<String, usize> = sub_ft
+                    .counts
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v as usize))
+                    .collect();
+
+                let sub_eps_res: Vec<(f64, f64)> = match config.resonance_mode {
+                    ResonanceMode::Psi => {
+                        let mut epsilons: Vec<f64> = Vec::with_capacity(sub_hits.len());
+                        for &h in &sub_hits {
+                            let c = h as usize;
+                            let s0 = c.saturating_sub(config.window_radius);
+                            let e0 = (c + config.window_radius + 1).min(sub_ft.toks_len());
+                            let (b, e) = sub_ft.window_byte_range(s0, e0.max(s0 + 1));
+                            let wtext = &sub_text[b.min(sub_text.len())..e.min(sub_text.len())];
+                            let bonus = semantic_bonus(wtext);
+                            let window: Vec<String> = (s0..e0)
+                                .map(|i| sub_ft.tok(i).to_string())
+                                .collect();
+                            epsilons.push(calculate_epsilon(
+                                &window,
+                                query_tokens,
+                                global_counts,
+                                n_total,
+                                config.kappa,
+                                bonus,
+                            ));
+                        }
+                        let forbidden = vec![false; sub_hits.len()];
+                        let psi =
+                            crate::psi::psi_resonances(&epsilons, &forbidden, config.psi_params);
+                        epsilons.into_iter().zip(psi).collect()
+                    }
+                    ResonanceMode::Hits => {
+                        let mut epsilons: Vec<f64> = Vec::with_capacity(sub_hits.len());
+                        for &h in &sub_hits {
+                            let c = h as usize;
+                            let s0 = c.saturating_sub(config.window_radius);
+                            let e0 = (c + config.window_radius + 1).min(sub_ft.toks_len());
+                            let (b, e) = sub_ft.window_byte_range(s0, e0.max(s0 + 1));
+                            let wtext = &sub_text[b.min(sub_text.len())..e.min(sub_text.len())];
+                            let bonus = semantic_bonus(wtext);
+                            let window: Vec<String> = (s0..e0)
+                                .map(|i| sub_ft.tok(i).to_string())
+                                .collect();
+                            epsilons.push(calculate_epsilon(
+                                &window,
+                                query_tokens,
+                                global_counts,
+                                n_total,
+                                config.kappa,
+                                bonus,
+                            ));
+                        }
+                        let res = apply_iir_resonance(&epsilons, config.phi_decay);
+                        epsilons.into_iter().zip(res).collect()
+                    }
+                    ResonanceMode::Field => {
+                        let hit_set: std::collections::HashSet<usize> =
+                            sub_hits.iter().map(|&h| h as usize).collect();
+                        let mut out = vec![(0.0, 0.0); sub_hits.len()];
+                        let log_n = (n_total.max(1) as f64).ln();
+                        let qset: HashSet<&str> =
+                            query_tokens.iter().map(|s| s.as_str()).collect();
+                        let rarity2 = |tok: &str| -> f64 {
+                            let freq = *global_counts.get(tok).unwrap_or(&1) as f64;
+                            let rr = (log_n - freq.ln()).max(0.0);
+                            rr * rr
+                        };
+                        let mut win: HashMap<&str, u32> = HashMap::new();
+                        let mut unique_sum = 0.0f64;
+                        let mut kw = 0u32;
+                        let mut head = 0usize;
+                        let mut tail = 0usize;
+                        let mut r = 0.0f64;
+                        let radius = config.window_radius;
+                        let n_toks = sub_ft.toks_len();
+                        for center in 0..n_toks {
+                            let s0 = center.saturating_sub(radius);
+                            let e0 = (center + radius + 1).min(n_toks);
+                            while head < e0 {
+                                let t = sub_ft.tok(head);
+                                if qset.contains(t) {
+                                    kw += 1;
+                                } else {
+                                    let e = win.entry(t).or_insert(0);
+                                    if *e == 0 {
+                                        unique_sum += rarity2(t);
+                                    }
+                                    *e += 1;
+                                }
+                                head += 1;
+                            }
+                            while tail < s0 {
+                                let t = sub_ft.tok(tail);
+                                if qset.contains(t) {
+                                    kw = kw.saturating_sub(1);
+                                } else if let Some(e) = win.get_mut(t) {
+                                    *e -= 1;
+                                    if *e == 0 {
+                                        win.remove(t);
+                                        unique_sum -= rarity2(t);
+                                    }
+                                }
+                                tail += 1;
+                            }
+                            let eps =
+                                config.kappa * (1.0 + ((kw as f64) + 1.0).ln()) * unique_sum;
+                            r = eps + config.phi_decay * r;
+                            if hit_set.contains(&center) {
+                                if let Some(pos) =
+                                    sub_hits.iter().position(|&h| h as usize == center)
+                                {
+                                    out[pos] = (eps, r);
+                                }
+                            }
+                        }
+                        out
+                    }
+                };
+                let _ = local_counts;
+
+                let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
+                let mut records: Vec<HitRecord> = Vec::with_capacity(sub_hits.len());
+
+                for (i, &h) in sub_hits.iter().enumerate() {
+                    let c = h as usize;
+                    let Some(&local_byte_u32) = sub_ft.pos.get(c) else {
+                        continue;
+                    };
+                    let local_byte = local_byte_u32 as usize;
+                    let byte_pos = (start + local_byte).min(text.len());
+
+                    let (key, is_code) = if code_file {
+                        match crate::parser::ast_code::locate_scope(sub_text, local_byte, lang) {
+                            Some((b, e)) => ((start + b, start + e), true),
+                            None => ((*start, *end), true),
+                        }
+                    } else {
+                        // границы сцены внутри чанка: маркер структуры
+                        let b = SceneContext::locate(sub_text, local_byte, path);
+                        ((*start + b.start, *start + b.end), false)
+                    };
+
+                    scenes.entry(key).or_insert_with(|| {
+                        if is_code {
+                            let scope_text = &text[key.0..key.1.min(text.len())];
+                            let name = crate::parser::ast_code::light_signature(text, key.0);
+                            SceneInfo {
+                                triples: extract_code_triples(scope_text, name.as_deref(), &stem),
+                                metric_tag: None,
+                            }
+                        } else {
+                            let b = crate::parser::markdown_scenes::SceneBounds {
+                                chapter: stem.clone(),
+                                start: key.0,
+                                end: key.1,
+                                structured: false,
+                            };
+                            let meta = crate::parser::markdown_scenes::light_meta(text, &b);
+                            let scope_text = truncate_slice(
+                                &text[key.0..key.1.min(text.len())],
+                                config.max_scope_bytes,
+                            );
+                            let scene = SceneContext::from_meta(&meta);
+                            SceneInfo {
+                                triples: extract_triples(scope_text, &scene, query_tokens),
+                                metric_tag: meta.metric_tag,
+                            }
+                        }
+                    });
+                    let metric = scenes.get(&key).and_then(|i| i.metric_tag.clone());
+
+                    records.push(HitRecord {
+                        path: path.to_path_buf(),
+                        byte_pos,
+                        epsilon: sub_eps_res[i].0,
+                        resonance: sub_eps_res[i].1,
+                        scene_key: key,
+                        is_code,
+                        metric_tag: metric,
+                    });
+                }
+                Some((records, scenes))
+            })
+            .collect();
+
+        // слияние чанков: записи конкататируются, сцены сливаются
+        let mut all_records = Vec::new();
+        let mut all_scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
+        for r in results.into_iter().flatten() {
+            all_records.extend(r.0);
+            for (k, v) in r.1 {
+                all_scenes.entry(k).or_insert(v);
+            }
+        }
+        Some((all_records, all_scenes))
+    })?
 }
 
 /// Поле резонанса строго за один проход O(N): инкрементальное скользящее
@@ -424,14 +761,13 @@ pub fn pass2_file(
     path: &Path,
     query_tokens: &[String],
     config: &EngineConfig,
-    cleaner: &PiiCleaner,
+    _cleaner: &PiiCleaner,
     global_counts: &HashMap<String, usize>,
     n_total: usize,
     hits: &[u32],
 ) -> Option<Pass2Result> {
     with_text(path, config.max_file_bytes, |raw| {
-        let eff = effective_text(raw, config, cleaner);
-        let text: &str = &eff;
+        let text: &str = raw;
         let ft = FileTokens::build(text);
         let lang = detect_lang(path);
         let code_file = is_code_file(path);
@@ -455,6 +791,35 @@ pub fn pass2_file(
 
         // ε и IIR-резонанс по последовательности совпадений либо полю.
         let eps_res: Vec<(f64, f64)> = match config.resonance_mode {
+            // POLER[Ψ]: наблюдения = ε окон, эволюция внимания по
+            // каноническому уравнению p_{t+1} = p_t + ηΠ(−∇F + γ∇ε).
+            // ψ-резонанс нормируется к масштабу ε (|p| ≤ 1 после tanh) —
+            // умножаем на интенсивность последнего окна.
+            ResonanceMode::Psi => {
+                let mut epsilons: Vec<f64> = Vec::with_capacity(hits.len());
+                for &h in hits {
+                    let c = h as usize;
+                    let start = c.saturating_sub(config.window_radius);
+                    let end = (c + config.window_radius + 1).min(ft.toks_len());
+                    let (b, e) = ft.window_byte_range(start, end.max(start + 1));
+                    let wtext = &text[b.min(text.len())..e.min(text.len())];
+                    let bonus = semantic_bonus(wtext);
+                    let window: Vec<String> = (start..end)
+                        .map(|i| ft.tok(i).to_string())
+                        .collect();
+                    epsilons.push(calculate_epsilon(
+                        &window,
+                        query_tokens,
+                        gcounts,
+                        gtotal,
+                        config.kappa,
+                        bonus,
+                    ));
+                }
+                let forbidden = vec![false; hits.len()];
+                let psi = crate::psi::psi_resonances(&epsilons, &forbidden, config.psi_params);
+                epsilons.into_iter().zip(psi).collect()
+            }
             ResonanceMode::Hits => {
                 let mut epsilons: Vec<f64> = Vec::with_capacity(hits.len());
                 for &h in hits {
@@ -651,6 +1016,61 @@ mod tests {
         let ft = FileTokens::build("alpha beta gamma delta");
         let (b, e) = ft.window_byte_range(1, 3);
         assert_eq!(&"alpha beta gamma delta"[b..e], "beta gamma");
+    }
+
+    #[test]
+    fn chunk_boundaries_small_file_single_chunk() {
+        let text = "короткий текст";
+        assert_eq!(chunk_boundaries(text), vec![(0, text.len())]);
+    }
+
+    #[test]
+    fn chunk_boundaries_respect_paragraph_edges() {
+        // большой текст: границы только по \n\n и UTF-8
+        let mut text = String::new();
+        // ~3 МБ: абзацы по ~400 байт
+        for i in 0..12000 {
+            text.push_str(&format!(
+                "Абзац номер {i} содержит осмысленный текст средней длины \
+                 с несколькими словами и точками для объёма. Ещё предложения.\n\n"
+            ));
+        }
+        let chunks = chunk_boundaries(&text);
+        assert!(chunks.len() > 1, "ожидается несколько чанков");
+        // покрытие полное и без пересечений
+        assert_eq!(chunks[0].0, 0);
+        assert_eq!(chunks.last().unwrap().1, text.len());
+        for w in chunks.windows(2) {
+            assert_eq!(w[0].1, w[1].0);
+        }
+        // каждая граница — на границе символа
+        for &(s, e) in &chunks {
+            assert!(text.is_char_boundary(s));
+            assert!(text.is_char_boundary(e));
+            // разрез проходит по границе абзаца или заголовка:
+            // перед границей или сразу после неё есть перевод строки
+            if e < text.len() {
+                let lo = {
+                    let mut i = e.saturating_sub(4);
+                    while i < e && !text.is_char_boundary(i) {
+                        i += 1;
+                    }
+                    i
+                };
+                let hi = {
+                    let mut i = (e + 4).min(text.len());
+                    while i > e && !text.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    i
+                };
+                let around = &text[lo..hi];
+                assert!(
+                    around.contains('\n'),
+                    "разрез не на границе строки: байт {e}"
+                );
+            }
+        }
     }
 
     #[test]

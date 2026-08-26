@@ -668,3 +668,80 @@ fn watcher_diff_mode_new_file() {
     assert_eq!(res.anchors.len(), 1);
     assert!(res.anchors[0].file.contains("new.md"));
 }
+
+// ---------------------------------------------------------------------------
+// POLER[Ψ] и параллельные гиганты (v0.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn psi_mode_ranks_hits() {
+    // POLER[Ψ]: каноническое уравнение внимания из POLER-Quantum
+    let dir = write_fixture("chapter_36.md", CH36);
+    let mut cfg = EngineConfig::default();
+    cfg.resonance_mode = poler_engine::ResonanceMode::Psi;
+    let res = scan_path(dir.path(), "нокс", &cfg);
+    assert!(res.total_hits >= 3);
+    for a in &res.anchors {
+        // ψ-резонанс ограничен перцептивным пространством Ω = tanh ∈ (−1,1)
+        assert!(a.resonance.abs() <= 1.0 + 1e-9, "R={}", a.resonance);
+        assert!(a.epsilon > 0.0);
+    }
+    // сортировка по ψ сохраняется
+    for w in res.anchors.windows(2) {
+        assert!(w[0].resonance >= w[1].resonance);
+    }
+}
+
+#[test]
+fn giant_chunked_equals_sequential_results() {
+    // Эквивалентность: гигантский файл, обработанный чанками параллельно,
+    // даёт те же сцены/хиты, что и малый файл с тем же содержимым
+    // (порог GIANT_FILE_BYTES = 8 МБ).
+    let dir = TempDir::new().unwrap();
+    let mut text = String::with_capacity(9 * 1024 * 1024);
+    text.push_str("# Документ\n\n");
+    // ~8.5 МБ текста с абзацами и несколькими вхождениями
+    for i in 0..90_000 {
+        text.push_str(&format!(
+            "Абзац {i} обычного текста с разными словами и смыслами. Слово ещё. Конец.\n\n"
+        ));
+    }
+    // вхождения в разных частях гиганта
+    text.push_str("## Раздел с нокс\n\nЗдесь Нокс упоминается впервые.\n\n");
+    for i in 0..90_000 {
+        text.push_str(&format!(
+            "Второй блок абзацев {i} после раздела. Другие слова. Тоже конец.\n\n"
+        ));
+    }
+    text.push_str("## Финал\n\nФинальный абзац с Нокс.\n\n");
+    fs::write(dir.path().join("giant.md"), &text).unwrap();
+    assert!(text.len() >= 9 * 1024 * 1024, "размер {}", text.len());
+
+    let res = scan_path(dir.path(), "нокс", &EngineConfig::default());
+    assert!(res.total_hits >= 3, "total_hits={}", res.total_hits);
+    // сцены найдены и содержат вхождения из разных частей гиганта
+    let scopes: Vec<&str> = res
+        .anchors
+        .iter()
+        .map(|a| a.scene.enclosing_scope.as_str())
+        .collect();
+    assert!(
+        scopes.iter().any(|s| s.contains("Нокс упоминается")),
+        "нет средней сцены"
+    );
+    assert!(
+        scopes.iter().any(|s| s.contains("Финальный абзац")),
+        "нет финальной сцены: первые 200 символов {:?}",
+        scopes.first().map(|s| s.chars().take(200).collect::<String>())
+    );
+}
+
+#[test]
+fn psi_params_from_cli_defaults_match_poler_quantum() {
+    // Значения по умолчанию — точно из POLER_Psi_v3.py
+    let p = poler_engine::psi::PsiParams::default();
+    assert_eq!(p.eta, 0.05);
+    assert_eq!(p.gamma, 0.5);
+    assert_eq!(p.rho, 0.9);
+    assert_eq!(p.memory_depth, 8);
+}

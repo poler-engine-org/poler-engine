@@ -48,11 +48,11 @@ pub mod engine;
 pub mod graph;
 pub mod output;
 pub mod parser;
+pub mod psi;
 pub mod resonance;
 pub mod streaming;
 pub mod tokenizer;
 
-use std::borrow::Cow;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +67,7 @@ pub use parser::{
     detect_lang, extract_code_triples, extract_enclosing_scope, extract_triples, CodeLang,
     CodeScope, SceneContext, Triple,
 };
+pub use psi::{psi_resonances, PsiField, PsiParams};
 pub use resonance::{
     apply_iir_resonance, calculate_epsilon, semantic_bonus, IirFilter, SlidingEpsilon,
 };
@@ -83,10 +84,14 @@ pub const DEFAULT_EXTENSIONS: &str =
 /// Режим накопления резонанса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResonanceMode {
-    /// IIR по последовательности совпадений (ε окна каждого хита).
+    /// IIR по последовательности совпадений (ε окна каждого хита):
+    /// вырожденный (K=1) случай резонанса памяти POLER R[n] = ρᵏ·s_{t−k}.
     Hits,
     /// Поле резонанса по всему документу, строго O(N), семплы на хитах.
     Field,
+    /// POLER[Ψ]: каноническое уравнение внимания p_{t+1} = p_t + ηΠ(−∇F + γ∇ε)
+    /// из POLER-Quantum (Kotokvit) — полный ψ-поток с памятью резонанса.
+    Psi,
 }
 
 /// Конфигурация движка.
@@ -124,6 +129,8 @@ pub struct EngineConfig {
     pub graph_export: Option<PathBuf>,
     /// Бюджет рёбер графа сущностей (защита от неограниченного роста).
     pub max_graph_triples: usize,
+    /// Гиперпараметры POLER[Ψ] (η, γ, ρ, K) — режим резонанса Psi.
+    pub psi_params: crate::psi::PsiParams,
 }
 
 impl Default for EngineConfig {
@@ -148,6 +155,7 @@ impl Default for EngineConfig {
             include_hidden: false,
             graph_export: None,
             max_graph_triples: 200_000,
+            psi_params: crate::psi::PsiParams::default(),
         }
     }
 }
@@ -190,18 +198,6 @@ pub(crate) fn with_text<T>(path: &Path, max_bytes: u64, f: impl FnOnce(&str) -> 
         }
     };
     Some(f(text))
-}
-
-/// Применяет PII-маскирование, возвращая эффективный текст.
-pub(crate) fn effective_text<'a>(
-    raw: &'a str,
-    config: &EngineConfig,
-    cleaner: &PiiCleaner,
-) -> Cow<'a, str> {
-    match config.pii_mode {
-        PiiMode::Off => Cow::Borrowed(raw),
-        PiiMode::Mask => cleaner.clean(raw),
-    }
 }
 
 /// Сбор файлов: WalkBuilder из крейта `ignore` (ripgrep) — .gitignore,
