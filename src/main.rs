@@ -301,7 +301,12 @@ fn print_web_hits(hits: &[poler_engine::web::WebHit], query: &str, format: Forma
             for (i, h) in hits.iter().enumerate() {
                 println!("## {}. {}\n", i + 1, if h.title.is_empty() { &h.url } else { &h.title });
                 println!("- URL: {}", h.url);
-                println!("- Score: {:.4} (bm25={:.3}, pagerank={:.5}, title={:.2}, ε={:.5})", h.score, h.bm25, h.pagerank, h.title_frac, h.density);
+                let phrase_note = if h.phrase_occ > 0 {
+                    format!(", фраз=·{}", h.phrase_occ)
+                } else {
+                    String::new()
+                };
+                println!("- Score: {:.4} (bm25={:.3}, pagerank={:.5}, title={:.2}, ε={:.5}{})", h.score, h.bm25, h.pagerank, h.title_frac, h.density, phrase_note);
                 println!("- Язык: {}, токенов: {}\n", if h.lang.is_empty() { "-" } else { &h.lang }, h.doclen);
                 println!("> {}\n", h.snippet);
             }

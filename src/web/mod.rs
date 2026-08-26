@@ -25,6 +25,7 @@ pub mod cdp;
 pub mod crawl;
 pub mod extract;
 pub mod index;
+pub mod phrase;
 pub mod robots;
 pub mod simhash;
 pub mod stem;

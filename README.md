@@ -20,6 +20,52 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.11.0: Фразовый поиск — позиционный индекс в веб-поиске
+
+Виток «доработки хренового»: веб-индекс был «мешком слов» — запрос
+`"Rust async runtime"` находил страницу, где `Rust` в первом абзаце, а
+`runtime` в футере через 5000 слов. Теперь порядок токенов сохраняется и
+проверяется по смежности позиций — семантика точных цитат Google.
+
+**Что внутри** (донорские технологии — Lucene `.prx` / Tantivy / Google
+exact-quotes):
+
+| Компонент | Откуда украдено | Что делает |
+|---|---|---|
+| `positions BLOB` в postings | Lucene `.prx` (positional index) | дельта-varint-позиции токенов рядом с `(term, page_id, tf)` — ~1–2 байта на вхождение |
+| `phrase_occurrences()` | Lucene `PhraseScorer` | вхождение фразы в позиции `p` ⇔ каждый терм в `p+i`; бинарный поиск по отсортированным спискам |
+| `parse_query()` | Google-синтаксис `"..."` | сегменты в кавычках `"..."` и `«...»` → фразы (стеммингуются!); однотокенная «фраза» деградирует до терма |
+| Proximity-бонус | Lucene `phraseFreq` | `0.5 · Σidf(термов) · min(occ, 8)` добавляется к BM25 за каждое вхождение |
+| TITLE_GAP=8 | — | фраза не сшивает последнее слово тела с первым словом заголовка |
+| Миграция v1→v2 | — | старые БД v0.9/v0.10 открываются: `ALTER TABLE` + пересчёт позиций из сохранённого text (content_hash не трогается — Percolator-lite не пострадает) |
+
+**Семантика**: документ обязан содержать КАЖДУЮ фразу запроса целиком
+(жёсткий фильтр, как точные цитаты Google); свободные термы за кавычками
+ранжируют как раньше. `phrase_occ` в JSON/Md-выдаче показывает число вхождений.
+
+```bash
+# фраза из живой страницы std::mem::swap (свежий краул v2):
+$ poler-engine --web-search '"swaps the values"' --format md
+## 1. swap in std::mem - Rust
+- Score: 0.8000 (bm25=1.402, pagerank=0.15000, title=0.00, ε=0.02484, фраз=·1)
+> …pub const fn swap<T>(x: &mut T, y: &mut T) Swaps the values at two mutable…
+
+# переставленные слова — честный ноль:
+$ poler-engine --web-search '"values the swaps"'; echo $?
+1
+
+# те же слова без кавычек — прежняя OR-семантика (3 хита вместо 1)
+$ poler-engine --web-search 'values swaps the'
+```
+
+**Живая аттестация**: старая БД эпохи v0.9 (8 страниц Rust std, 4532
+postings, БЕЗ колонки positions) мигрирована при открытии: все постинги
+получили позиции, `"list of all items"` → ровно 1 хит (страница «List of
+all items in this crate»), без кавычек — 3 хита. Кириллица: `«владения
+память»` находит «владение памятью» (стемминг + смежность).
+
+Тесты: **189 unit + 38 integration** (+23 к v0.10.0), clippy 0.
+
 ## v0.10.0: MCP-сервер — poler-engine как нативный инструмент LLM-агентов
 
 v0.9.0 дал движку веб-поиск; v0.10.0 отдаёт его **любому LLM-агенту напрямую**:
@@ -600,9 +646,18 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
 ```
 poler-engine/
 ├── Cargo.toml                  # clap, rayon, memmap2, petgraph, serde, regex, aho-corasick, walkdir
+├── FUTURE_ROADMAP.md           # «превзойти Google»: цель записана, срок не определён
 └── src/
     ├── main.rs                 # CLI: --format [ai-json|md|simple], grep-совместимые коды выхода
+    ├── mcp.rs                  # MCP-сервер (stdio JSON-RPC 2.0) для LLM-агентов
     ├── lib.rs                  # двухпроходный параллельный пайплайн, EngineConfig, ScanStats
+    ├── web/                    # v0.8–v0.11: веб-поиск
+    │   ├── cdp.rs              # нативный Chromium CDP-клиент (WebSocket RFC 6455)
+    │   ├── crawl.rs            # frontier BFS, robots.txt, sitemap, SimHash-дедуп
+    │   ├── index.rs            # SQLite-инвертированный индекс + BM25 + PageRank + WebRank
+    │   ├── phrase.rs           # v0.11: позиционный кодек (delta-varint) + фразовый поиск
+    │   ├── stem.rs             # кириллический стеммер (uk/рос)
+    │   └── …                   # robots, simhash, urlnorm, extract
     ├── tokenizer/
     │   ├── pii.rs              # zero-copy (Cow) маскирование PII
     │   └── inverted_index.rs   # индекс всех токенов, включая отрицания

@@ -2,8 +2,9 @@
 //!
 //! Украденные технологии в одном модуле:
 //! * инвертированный индекс (Tantivy/Lucene): словарь термов → postings
-//!   `(term, page_id, tf, title_tf)`, запрос — scatter по термам → gather
-//!   в аккумуляторы → Top-K;
+//!   `(term, page_id, tf, title_tf, positions)` с delta-varint-позициями
+//!   (Lucene .prx) — запрос — scatter по термам → gather в аккумуляторы
+//!   → Top-K; фразы «"..."» проверяются по смежности позиций;
 //! * BM25 (Robertson–Spärck Jones / Okapi) — tf×idf-ранжирование;
 //! * PageRank (Page & Brin 1998): итерации по таблице links, d=0.85;
 //! * Percolator-lite: повторный обход индексирует только изменившиеся
@@ -11,12 +12,13 @@
 //! * POLER WebRank v1 — гибрид: 0.55·BM25 + 0.15·PageRank + 0.20·заголовок
 //!   + 0.10·ε-плотность (hits/doclen — информационная плотность совпадений).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{params, Connection};
 
 use super::extract::{clean_text, snippet_for, title_from_text};
+use super::phrase::{decode_positions, encode_positions, parse_query, phrase_occurrences};
 use super::stem::tokenize_stem;
 use super::simhash::{near_duplicate, simhash};
 
@@ -31,6 +33,13 @@ const K1: f64 = 1.2;
 const B: f64 = 0.75;
 /// Дампинговый фактор PageRank.
 const DAMPING: f64 = 0.85;
+/// Proximity-бонус за фразовое вхождение: к BM25 добавляется
+/// `PHRASE_BONUS · Σidf(термов фразы) · min(occ, 8)` — фразовое совпадение
+/// весомее разрозненных слов (как phraseFreq в Lucene PhraseScorer).
+const PHRASE_BONUS: f64 = 0.5;
+/// Разрыв между концом тела и началом заголовка в позиционном потоке:
+/// фраза не должна сшивать последнее слово текста с первым словом title.
+const TITLE_GAP: u32 = 8;
 
 /// Документ на запись в индекс.
 pub struct WebDoc {
@@ -54,6 +63,8 @@ pub struct WebHit {
     pub pagerank: f64,
     pub title_frac: f64,
     pub density: f64,
+    /// Сколько вхождений фраз запроса (в кавычках) найдено по смежности.
+    pub phrase_occ: usize,
     pub snippet: String,
     pub doclen: usize,
     pub fetched_at: i64,
@@ -103,6 +114,7 @@ impl WebIndex {
                page_id INTEGER NOT NULL,
                tf INTEGER NOT NULL,
                title_tf INTEGER NOT NULL,
+               positions BLOB,
                PRIMARY KEY(term, page_id)
              ) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS links(
@@ -119,7 +131,9 @@ impl WebIndex {
              CREATE INDEX IF NOT EXISTS idx_terms_page ON terms(page_id);
              CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);",
         )?;
-        Ok(Self { conn })
+        let ix = Self { conn };
+        ix.migrate_positions_v1()?;
+        Ok(ix)
     }
 
     /// In-memory база (тесты).
@@ -138,6 +152,7 @@ impl WebIndex {
              CREATE TABLE IF NOT EXISTS terms(
                term TEXT NOT NULL, page_id INTEGER NOT NULL,
                tf INTEGER NOT NULL, title_tf INTEGER NOT NULL,
+               positions BLOB,
                PRIMARY KEY(term, page_id)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS links(
                src INTEGER NOT NULL, dst TEXT NOT NULL, PRIMARY KEY(src, dst)) WITHOUT ROWID;
@@ -152,6 +167,56 @@ impl WebIndex {
     }
 
     // ------------------------------------------------------------------
+    // Миграция v1 → v2: позиционный индекс (v0.11.0)
+    // ------------------------------------------------------------------
+
+    /// Старые БД (v0.9/v0.10) не имеют колонки `terms.positions`.
+    /// Миграция: ALTER TABLE + пересчёт позиций из сохранённого text/title
+    /// тем же токенизатором, что и upsert. content_hash не трогаем —
+    /// Percolator-lite продолжит пропускать неизменившиеся страницы.
+    /// Нюанс: у страниц с пустым исходным title в pages лежит title,
+    /// выведенный из text (title_from_text) — его позиции попадут в
+    /// title-зону потока и могут продублировать вхождения фразы
+    /// (без ложных срабатываний: выведенный title — префикс текста).
+    fn migrate_positions_v1(&self) -> rusqlite::Result<()> {
+        let has_positions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('terms') WHERE name = 'positions'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_positions > 0 {
+            return Ok(()); // уже v2
+        }
+        self.conn
+            .execute_batch("ALTER TABLE terms ADD COLUMN positions BLOB")?;
+        let pages: Vec<(i64, String, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, text, title FROM pages")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, rusqlite::Error>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE terms SET positions = ?1 WHERE page_id = ?2 AND term = ?3")?;
+            for (id, text, title) in pages {
+                let positions = position_map(&tokenize_stem(&text), &tokenize_stem(&title));
+                for (term, pos) in &positions {
+                    let blob = encode_positions(pos);
+                    stmt.execute(params![blob, id, term])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Запись
     // ------------------------------------------------------------------
 
@@ -163,6 +228,9 @@ impl WebIndex {
         let title_tokens = tokenize_stem(&doc.title);
         // ЗАГОЛОВОК — ЧАСТЬ ДОКУМЕНТА: его термы индексируются тоже
         // (иначе запрос по слову из title не находит страницу).
+        // Позиции: тело [0..len), затем разрыв TITLE_GAP и заголовок —
+        // фраза не сшивается через границу тело→title.
+        let positions = position_map(&body_tokens, &title_tokens);
         let mut tokens = body_tokens;
         tokens.extend(title_tokens.iter().cloned());
         let sim = simhash(&tokens) as i64;
@@ -235,11 +303,16 @@ impl WebIndex {
                 *title_tf.entry(t.as_str()).or_insert(0) += 1;
             }
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO terms(term, page_id, tf, title_tf) VALUES(?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO terms(term, page_id, tf, title_tf, positions)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
             )?;
             for (term, tf_v) in &tf {
                 let ttf_v = title_tf.get(term).copied().unwrap_or(0);
-                stmt.execute(params![term, id, tf_v, ttf_v])?;
+                let pos_blob = positions
+                    .get(*term)
+                    .map(|p| encode_positions(p))
+                    .unwrap_or_default();
+                stmt.execute(params![term, id, tf_v, ttf_v, pos_blob])?;
             }
         }
         {
@@ -361,8 +434,13 @@ impl WebIndex {
     // ------------------------------------------------------------------
 
     /// Поиск по веб-индексу. Возвращает Top-N отсортированных хитов.
+    ///
+    /// v0.11: сегменты запроса в кавычках (`"..."` / `«...»`) — ФРАЗЫ:
+    /// документ обязан содержать их по смежности позиций (семантика точных
+    /// цитат Google); вхождения дают proximity-бонус к BM25.
     pub fn search(&mut self, query: &str, top_n: usize) -> rusqlite::Result<Vec<WebHit>> {
-        let q_terms = tokenize_stem(query);
+        let qp = parse_query(query);
+        let q_terms = qp.all_terms();
         if q_terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -395,24 +473,72 @@ impl WebIndex {
         // убил ВСЕ термы запроса, нужен откат к полному набору (иначе на моно-
         // корпусе «про nginx» запрос «gzip» даёт 0 результатов: предметный терм
         // встречается на каждой странице сайта и выглядит стоп-словом).
+        // Для фразовых термов заодно тянем positions (delta-varint blob).
+        /// (page_id, tf, title_tf) — строка postings одного терма.
+        type RawPostings = Vec<(i64, i64, i64)>;
+        /// page_id → positions-blob (только фразовые термы).
+        type PosBlobs = HashMap<i64, Vec<u8>>;
         struct TermPostings {
+            term: String,
             postings: Vec<(i64, i64, i64)>,
+            /// позиции только у фразовых термов (память не тратим зря)
+            pos_blobs: HashMap<i64, Vec<u8>>,
             dfv: u64,
         }
+        let phrase_terms: HashSet<&str> = qp
+            .phrases
+            .iter()
+            .flatten()
+            .map(|s| s.as_str())
+            .collect();
         let mut all_terms: Vec<TermPostings> = Vec::with_capacity(q_terms.len());
         for term in &q_terms {
-            let postings: Vec<(i64, i64, i64)> = {
-                let mut stmt = self.conn.prepare(
-                    "SELECT page_id, tf, title_tf FROM terms WHERE term = ?1",
-                )?;
-                let rows = stmt.query_map(params![term], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-                })?;
-                rows.collect::<Result<Vec<_>, rusqlite::Error>>()?
-            };
+            let need_pos = phrase_terms.contains(term.as_str());
+            let (postings, pos_blobs): (RawPostings, PosBlobs) = if need_pos {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT page_id, tf, title_tf, positions FROM terms WHERE term = ?1",
+                    )?;
+                    let rows = stmt.query_map(params![term], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Option<Vec<u8>>>(3)?,
+                        ))
+                    })?;
+                    let mut postings = Vec::new();
+                    let mut pos_blobs = HashMap::new();
+                    for row in rows.flatten() {
+                        let (pid, tf, ttf, blob) = row;
+                        postings.push((pid, tf, ttf));
+                        if let Some(b) = blob {
+                            pos_blobs.insert(pid, b);
+                        }
+                    }
+                    (postings, pos_blobs)
+                } else {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT page_id, tf, title_tf FROM terms WHERE term = ?1",
+                    )?;
+                    let rows = stmt.query_map(params![term], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    let postings =
+                        rows.collect::<Result<Vec<(i64, i64, i64)>, rusqlite::Error>>()?;
+                    (postings, HashMap::new())
+                };
             let dfv = postings.len() as u64;
             if dfv > 0 {
-                all_terms.push(TermPostings { postings, dfv });
+                all_terms.push(TermPostings {
+                    term: term.clone(),
+                    postings,
+                    pos_blobs,
+                    dfv,
+                });
             }
         }
 
@@ -442,6 +568,65 @@ impl WebIndex {
             }
         }
 
+        // ---- фразовый фильтр: смежность позиций (v0.11) ----
+        // Документ обязан содержать КАЖДУЮ фразу запроса целиком; страницы,
+        // где слова фразы разбросаны по тексту, из выдачи исключаются —
+        // семантика точных цитат. Вхождения дают proximity-бонус к BM25.
+        let mut phrase_occ_total: HashMap<i64, usize> = HashMap::new();
+        if !qp.phrases.is_empty() {
+            let by_term: HashMap<&str, &TermPostings> = all_terms
+                .iter()
+                .map(|t| (t.term.as_str(), t))
+                .collect();
+            let mut drop_pids: Vec<i64> = Vec::new();
+            for (&pid, e) in &mut acc {
+                let mut total = 0usize;
+                let mut matched = true;
+                'phrases: for phrase in &qp.phrases {
+                    let mut lists: Vec<Vec<u32>> = Vec::with_capacity(phrase.len());
+                    let mut idf_sum = 0.0f64;
+                    for t in phrase {
+                        let Some(tp) = by_term.get(t.as_str()) else {
+                            // терма нет ни в одном документе → фразы нет нигде
+                            matched = false;
+                            break 'phrases;
+                        };
+                        let list = match tp.pos_blobs.get(&pid) {
+                            Some(blob) => decode_positions(blob),
+                            None => Vec::new(),
+                        };
+                        if list.is_empty() {
+                            matched = false; // в этом документе терма нет
+                            break 'phrases;
+                        }
+                        let idf = (n_pages.saturating_sub(tp.dfv) as f64 + 0.5)
+                            / (tp.dfv as f64 + 0.5);
+                        idf_sum += (1.0 + idf).ln();
+                        lists.push(list);
+                    }
+                    let refs: Vec<&[u32]> = lists.iter().map(|l| l.as_slice()).collect();
+                    let occ = phrase_occurrences(&refs);
+                    if occ == 0 {
+                        matched = false; // слова есть, но не рядом
+                        break 'phrases;
+                    }
+                    total += occ;
+                    e[0] += PHRASE_BONUS * idf_sum * occ.min(8) as f64;
+                }
+                if matched {
+                    phrase_occ_total.insert(pid, total);
+                } else {
+                    drop_pids.push(pid);
+                }
+            }
+            for pid in drop_pids {
+                acc.remove(&pid);
+            }
+            if acc.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+
         // ---- gather: метаданные кандидатов ----
         struct Cand {
             e: [f64; 3],
@@ -452,6 +637,7 @@ impl WebIndex {
             text: String,
             fetched_at: i64,
             doclen: usize,
+            phrase_occ: usize,
         }
         let mut candidates: Vec<Cand> = Vec::new();
         for (pid, e) in &acc {
@@ -486,6 +672,7 @@ impl WebIndex {
                 text,
                 fetched_at,
                 doclen: doclen as usize,
+                phrase_occ: phrase_occ_total.get(pid).copied().unwrap_or(0),
             });
         }
         if candidates.is_empty() {
@@ -522,6 +709,7 @@ impl WebIndex {
                     pagerank: c.rank,
                     title_frac,
                     density: eps,
+                    phrase_occ: c.phrase_occ,
                     snippet: snippet_for(&c.text, &q_terms, 240),
                     doclen: c.doclen,
                     fetched_at: c.fetched_at,
@@ -608,6 +796,21 @@ impl WebIndex {
             })
             .unwrap_or(0.0)
     }
+}
+
+/// Позиции термов в объединённом потоке `[тело | TITLE_GAP | заголовок]`.
+/// Одинаковая функция для upsert и миграции — позиции восстанавливаются
+/// байт-в-байт тем же путём.
+fn position_map(body: &[String], title: &[String]) -> HashMap<String, Vec<u32>> {
+    let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+    for (i, t) in body.iter().enumerate() {
+        map.entry(t.clone()).or_default().push(i as u32);
+    }
+    let start = body.len() as u32 + TITLE_GAP;
+    for (i, t) in title.iter().enumerate() {
+        map.entry(t.clone()).or_default().push(start + i as u32);
+    }
+    map
 }
 
 /// FNV-1a 128-бит (два независимых 64) — content_hash для Percolator-lite.
@@ -885,5 +1088,219 @@ mod tests {
         ix.upsert_page(&doc("https://a.io/yo", "Ё", "тёмная ёлка зимой", vec![])).unwrap();
         let hits = ix.search("темная елка", 5).unwrap();
         assert!(hits.iter().any(|h| h.url == "https://a.io/yo"));
+    }
+
+    // ==================================================================
+    // v0.11: фразовый поиск с позиционным индексом
+    // ==================================================================
+
+    #[test]
+    fn phrase_search_exact_match() {
+        let mut ix = ix();
+        ix.upsert_page(&doc(
+            "https://a.io/1",
+            "async rust guide",
+            "the rust async runtime is tokio; async io drives the reactor",
+            vec![],
+        ))
+        .unwrap();
+        ix.upsert_page(&doc(
+            "https://a.io/2",
+            "scattered",
+            "rust is a language; much later we discuss async patterns and runtime details",
+            vec![],
+        ))
+        .unwrap();
+        // точная фраза: только страница, где слова стоят РЯДОМ
+        let hits = ix.search("\"rust async\"", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://a.io/1");
+        assert!(hits[0].phrase_occ >= 1);
+        // без кавычек — обе (мешок слов, прежняя семантика)
+        let hits = ix.search("rust async", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn phrase_search_stemmed_cyrillic() {
+        let mut ix = ix();
+        ix.upsert_page(&doc(
+            "https://a.io/ru",
+            "Владение памятью",
+            "безопасное владение памятью без сборщика мусора",
+            vec![],
+        ))
+        .unwrap();
+        // падежи запроса отличаются от текста — стемминг унифицирует,
+        // а смежность позиций подтверждает фразу
+        let hits = ix.search("«владения память»", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://a.io/ru");
+        assert!(hits[0].phrase_occ >= 1);
+    }
+
+    #[test]
+    fn phrase_not_across_title_boundary() {
+        let mut ix = ix();
+        // тело кончается на «memory safety», заголовок начинается с «Rust» —
+        // фраза «safety rust» НЕ должна сшиваться через границу тело→title
+        ix.upsert_page(&doc(
+            "https://a.io/b",
+            "Rust ownership",
+            "lifetimes borrow checker memory safety",
+            vec![],
+        ))
+        .unwrap();
+        let hits = ix.search("\"safety rust\"", 10).unwrap();
+        assert!(hits.is_empty(), "фраза через границу тело→title — не фраза");
+        // а «memory safety» внутри тела — находится
+        let hits = ix.search("\"memory safety\"", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://a.io/b");
+    }
+
+    #[test]
+    fn phrase_bonus_ranks_multiple_occurrences() {
+        let mut ix = ix();
+        ix.upsert_page(&doc("https://a.io/one", "one", "error handling here", vec![]))
+            .unwrap();
+        ix.upsert_page(&doc(
+            "https://a.io/many",
+            "many",
+            "error handling again and again error handling everywhere",
+            vec![],
+        ))
+        .unwrap();
+        let hits = ix.search("\"error handling\"", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://a.io/many");
+        assert!(hits[0].phrase_occ > hits[1].phrase_occ);
+    }
+
+    #[test]
+    fn phrase_plus_free_terms() {
+        let mut ix = ix();
+        ix.upsert_page(&doc(
+            "https://a.io/a",
+            "a",
+            "rust async runtime basics intro",
+            vec![],
+        ))
+        .unwrap();
+        ix.upsert_page(&doc(
+            "https://a.io/b",
+            "b",
+            "rust async tokio scheduler deep dive",
+            vec![],
+        ))
+        .unwrap();
+        // обе содержат фразу; свободный терм «tokio» решает ранжирование
+        let hits = ix.search("\"rust async\" tokio", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://a.io/b");
+    }
+
+    #[test]
+    fn phrase_missing_everywhere_gives_zero() {
+        let mut ix = ix();
+        ix.upsert_page(&doc(
+            "https://a.io/1",
+            "t",
+            "alpha beta gamma delta epsilon",
+            vec![],
+        ))
+        .unwrap();
+        // оба слова есть в документе, но НЕ рядом → честный ноль
+        let hits = ix.search("\"gamma alpha\"", 10).unwrap();
+        assert!(hits.is_empty());
+        // и обратный порядок не матчится
+        let hits = ix.search("\"beta gamma\" alpha", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn positions_survive_reindex() {
+        let mut ix = ix();
+        let mut d = doc("https://a.io/x", "T", "hello world phrase here", vec![]);
+        ix.upsert_page(&d).unwrap();
+        d.text = "hello world phrase here updated tail".into();
+        d.content_hash = content_hash(&d.text);
+        ix.upsert_page(&d).unwrap();
+        let hits = ix.search("\"world phrase\"", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://a.io/x");
+    }
+
+    #[test]
+    fn migration_v1_db_gets_positions() {
+        // ручная v1-БД (v0.9/v0.10): terms БЕЗ колонки positions
+        let dir = std::env::temp_dir().join(format!("poler-mig-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("mig.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pages(id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL,
+                   title TEXT NOT NULL DEFAULT '', lang TEXT NOT NULL DEFAULT '',
+                   meta_desc TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '',
+                   content_hash TEXT NOT NULL, simhash INTEGER NOT NULL,
+                   doclen INTEGER NOT NULL, rank REAL NOT NULL DEFAULT 1.0,
+                   dup_of TEXT NOT NULL DEFAULT '', fetched_at INTEGER NOT NULL);
+                 CREATE TABLE terms(term TEXT NOT NULL, page_id INTEGER NOT NULL,
+                   tf INTEGER NOT NULL, title_tf INTEGER NOT NULL,
+                   PRIMARY KEY(term, page_id)) WITHOUT ROWID;
+                 CREATE TABLE links(src INTEGER NOT NULL, dst TEXT NOT NULL,
+                   PRIMARY KEY(src, dst)) WITHOUT ROWID;
+                 CREATE TABLE hosts(host TEXT PRIMARY KEY, robots TEXT NOT NULL DEFAULT '',
+                   robots_at INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO pages(url, title, lang, meta_desc, text, content_hash,
+                   simhash, doclen, fetched_at)
+                   VALUES('https://old.io/1', 'Old page', 'en', '',
+                          'tokio rust async runtime scheduler', 'deadbeef', 0, 5, 100);
+                 INSERT INTO terms(term, page_id, tf, title_tf) VALUES
+                   ('tokio', 1, 1, 0), ('rust', 1, 1, 0), ('async', 1, 1, 0),
+                   ('runtime', 1, 1, 0), ('scheduler', 1, 1, 0);",
+            )
+            .unwrap();
+        }
+        // открытие мигрирует: ALTER TABLE + пересчёт позиций из text
+        let mut ix = WebIndex::open(&db).unwrap();
+        let hits = ix.search("\"rust async\"", 10).unwrap();
+        assert_eq!(hits.len(), 1, "после миграции фразовый поиск обязан работать");
+        assert_eq!(hits[0].url, "https://old.io/1");
+        assert!(hits[0].phrase_occ >= 1);
+        // повторное открытие — колонка уже есть, миграция холостая
+        drop(ix);
+        let mut ix2 = WebIndex::open(&db).unwrap();
+        let hits = ix2.search("\"async runtime\"", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phrase_queries_via_plain_terms_unchanged() {
+        // регрессия: запросы БЕЗ кавычек ведут себя как раньше (OR-семантика)
+        let mut ix = ix();
+        ix.upsert_page(&doc(
+            "https://a.io/rust",
+            "Rust ownership",
+            "rust ownership borrowing lifetimes memory safety",
+            vec![],
+        ))
+        .unwrap();
+        ix.upsert_page(&doc(
+            "https://a.io/cooking",
+            "Cooking pasta",
+            "pasta recipe tomato sauce cheese delicious dinner",
+            vec![],
+        ))
+        .unwrap();
+        let hits = ix.search("rust ownership", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].phrase_occ, 0);
+        let none = ix.search("quantum entanglement", 10).unwrap();
+        assert!(none.is_empty());
     }
 }
