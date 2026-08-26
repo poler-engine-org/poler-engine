@@ -287,7 +287,12 @@ pub struct HitRecord {
 }
 
 /// Результат прохода 2 по одному файлу.
-pub type Pass2Result = (Vec<HitRecord>, HashMap<(usize, usize), SceneInfo>);
+/// Третий элемент — все байтовые позиции хитов файла (честный total_hits, diff).
+pub type Pass2Result = (
+    Vec<HitRecord>,
+    HashMap<(usize, usize), SceneInfo>,
+    Vec<usize>,
+);
 
 /// Информация уникальной сцены: только тройки (без клонов текста сцены).
 #[derive(Debug, Clone, Default)]
@@ -469,8 +474,8 @@ pub fn pass2_giant_parallel(
                             let (b, e) = sub_ft.window_byte_range(s0, e0.max(s0 + 1));
                             let wtext = &sub_text[b.min(sub_text.len())..e.min(sub_text.len())];
                             let bonus = semantic_bonus(wtext);
-                            let window: Vec<String> = (s0..e0)
-                                .map(|i| sub_ft.tok(i).to_string())
+                            let window: Vec<&str> = (s0..e0)
+                                .map(|i| sub_ft.tok(i))
                                 .collect();
                             epsilons.push(calculate_epsilon(
                                 &window,
@@ -496,8 +501,8 @@ pub fn pass2_giant_parallel(
                             let (b, e) = sub_ft.window_byte_range(s0, e0.max(s0 + 1));
                             let wtext = &sub_text[b.min(sub_text.len())..e.min(sub_text.len())];
                             let bonus = semantic_bonus(wtext);
-                            let window: Vec<String> = (s0..e0)
-                                .map(|i| sub_ft.tok(i).to_string())
+                            let window: Vec<&str> = (s0..e0)
+                                .map(|i| sub_ft.tok(i))
                                 .collect();
                             epsilons.push(calculate_epsilon(
                                 &window,
@@ -525,8 +530,8 @@ pub fn pass2_giant_parallel(
                             let (b, e) = sub_ft.window_byte_range(s0, e0.max(s0 + 1));
                             let wtext = &sub_text[b.min(sub_text.len())..e.min(sub_text.len())];
                             let bonus = semantic_bonus(wtext);
-                            let window: Vec<String> = (s0..e0)
-                                .map(|i| sub_ft.tok(i).to_string())
+                            let window: Vec<&str> = (s0..e0)
+                                .map(|i| sub_ft.tok(i))
                                 .collect();
                             epsilons.push(calculate_epsilon(
                                 &window,
@@ -605,8 +610,23 @@ pub fn pass2_giant_parallel(
                 };
                 let _ = local_counts;
 
-                let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
-                let mut records: Vec<HitRecord> = Vec::with_capacity(sub_hits.len());
+                // ── Стриминговый Top-K в чанке (bug PYCCLE) ──
+                use std::cmp::Reverse;
+                let chunk_locator =
+                    crate::parser::markdown_scenes::SceneLocator::new(sub_text, path);
+                let bit_key = |r: f64| -> u64 {
+                    let b = r.to_bits();
+                    if b >> 63 == 0 {
+                        b ^ 0x8000_0000_0000_0000
+                    } else {
+                        !b
+                    }
+                };
+                let mut heap: std::collections::BinaryHeap<Reverse<(u64, usize)>> =
+                    std::collections::BinaryHeap::new();
+                // (hit_idx, byte_pos, key, is_code) — лёгкие данные чанка
+                let mut light: Vec<(usize, usize, (usize, usize), bool)> =
+                    Vec::with_capacity(sub_hits.len().min(1 << 20));
 
                 for (i, &h) in sub_hits.iter().enumerate() {
                     let c = h as usize;
@@ -622,12 +642,31 @@ pub fn pass2_giant_parallel(
                             None => ((*start, *end), true),
                         }
                     } else {
-                        // границы сцены внутри чанка: маркер структуры
-                        let b = SceneContext::locate(sub_text, local_byte, path);
+                        // локатор ЧАНКА: заголовки один раз на чанк
+                        let b = chunk_locator.locate(sub_text, local_byte);
                         ((*start + b.start, *start + b.end), false)
                     };
 
-                    scenes.entry(key).or_insert_with(|| {
+                    light.push((i, byte_pos, key, is_code));
+                    heap.push(Reverse((bit_key(sub_eps_res[i].1), light.len() - 1)));
+                    if heap.len() > config.top_n {
+                        heap.pop();
+                    }
+                }
+                let chunk_hit_keys: Vec<usize> = light.iter().map(|(_, b, _, _)| *b).collect();
+                let survivors: Vec<usize> = {
+                    let mut v: Vec<usize> =
+                        heap.into_iter().map(|Reverse((_, li))| li).collect();
+                    v.sort_unstable();
+                    v
+                };
+
+                // Тяжёлые сцены — только для выживших чанка
+                let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
+                let mut records: Vec<HitRecord> = Vec::with_capacity(survivors.len());
+                for li in survivors {
+                    let (i, byte_pos, key, is_code) = light[li];
+                    let info = scenes.entry(key).or_insert_with(|| {
                         if is_code {
                             let scope_text = &text[key.0..key.1.min(text.len())];
                             let name = crate::parser::ast_code::light_signature(text, key.0);
@@ -654,8 +693,6 @@ pub fn pass2_giant_parallel(
                             }
                         }
                     });
-                    let metric = scenes.get(&key).and_then(|i| i.metric_tag.clone());
-
                     records.push(HitRecord {
                         path: path.to_path_buf(),
                         byte_pos,
@@ -663,23 +700,36 @@ pub fn pass2_giant_parallel(
                         resonance: sub_eps_res[i].1,
                         scene_key: key,
                         is_code,
-                        metric_tag: metric,
+                        metric_tag: info.metric_tag.clone(),
                     });
                 }
-                Some((records, scenes))
+                Some((records, scenes, chunk_hit_keys))
             })
             .collect();
 
-        // слияние чанков: записи конкататируются, сцены сливаются
-        let mut all_records = Vec::new();
+        // Слияние чанков: объединение per-chunk top-N ⊇ глобального top-N
+        // (IIR в чанках независим) -> финальная обрезка по резонансу.
+        let mut all_light: Vec<HitRecord> = Vec::new();
         let mut all_scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
-        for r in results.into_iter().flatten() {
-            all_records.extend(r.0);
-            for (k, v) in r.1 {
+        let mut all_hit_keys: Vec<usize> = Vec::new();
+        for (recs, scns, keys) in results.into_iter().flatten() {
+            all_hit_keys.extend(keys);
+            all_light.extend(recs);
+            for (k, v) in scns {
                 all_scenes.entry(k).or_insert(v);
             }
         }
-        Some((all_records, all_scenes))
+        all_light.sort_by(|a, b| {
+            b.resonance
+                .partial_cmp(&a.resonance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_light.truncate(config.top_n);
+        // осиротевшие сцены после финальной обрезки
+        let alive: std::collections::HashSet<(usize, usize)> =
+            all_light.iter().map(|r| r.scene_key).collect();
+        all_scenes.retain(|k, _| alive.contains(k));
+        Some((all_light, all_scenes, all_hit_keys))
     })?
 }
 
@@ -805,6 +855,8 @@ pub fn pass2_file(
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
+        // Кэш заголовков: один проход по файлу вместо O(файл) на каждый хит
+        let locator = crate::parser::markdown_scenes::SceneLocator::new(text, path);
 
         // Статистики для ε: глобальные по корпусу либо локальные по файлу.
         let local_counts: HashMap<String, usize>;
@@ -834,8 +886,8 @@ pub fn pass2_file(
                     let (b, e) = ft.window_byte_range(start, end.max(start + 1));
                     let wtext = &text[b.min(text.len())..e.min(text.len())];
                     let bonus = semantic_bonus(wtext);
-                    let window: Vec<String> = (start..end)
-                        .map(|i| ft.tok(i).to_string())
+                    let window: Vec<&str> = (start..end)
+                        .map(|i| ft.tok(i))
                         .collect();
                     epsilons.push(calculate_epsilon(
                         &window,
@@ -860,8 +912,8 @@ pub fn pass2_file(
                     let (b, e) = ft.window_byte_range(start, end.max(start + 1));
                     let wtext = &text[b.min(text.len())..e.min(text.len())];
                     let bonus = semantic_bonus(wtext);
-                    let window: Vec<String> = (start..end)
-                        .map(|i| ft.tok(i).to_string())
+                    let window: Vec<&str> = (start..end)
+                        .map(|i| ft.tok(i))
                         .collect();
                     epsilons.push(calculate_epsilon(
                         &window,
@@ -886,8 +938,8 @@ pub fn pass2_file(
                     let (b, e) = ft.window_byte_range(start, end.max(start + 1));
                     let wtext = &text[b.min(text.len())..e.min(text.len())];
                     let bonus = semantic_bonus(wtext);
-                    let window: Vec<String> = (start..end)
-                        .map(|i| ft.tok(i).to_string())
+                    let window: Vec<&str> = (start..end)
+                        .map(|i| ft.tok(i))
                         .collect();
                     epsilons.push(calculate_epsilon(
                         &window,
@@ -913,9 +965,30 @@ pub fn pass2_file(
             ),
         };
 
-        let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
+        // ── Стриминговый Top-K (bug PYCCLE: суперчастотные слова) ──
+        // SceneInfo (тройки — дорого) НЕ строится на лету для каждого хита:
+        // лёгкие записи собираются в ограниченную кучу top_n по резонансу,
+        // тяжёлые сцены строятся только для выживших. Математическая
+        // корректность: резонанс хита зависит только от предыдущих хитов
+        // (IIR), поэтому отсев по ходу не меняет значений выживших.
+        use std::cmp::Reverse;
+
+        // Куча top-N: ключ — монотонное отображение f64 в u64
+        // (каноничный total-order transform): не-/отрицательные ветки.
+        let bit_key = |r: f64| -> u64 {
+            let b = r.to_bits();
+            if b >> 63 == 0 {
+                b ^ 0x8000_0000_0000_0000
+            } else {
+                !b
+            }
+        };
+        let mut heap: std::collections::BinaryHeap<Reverse<(u64, usize)>> =
+            std::collections::BinaryHeap::new();
+        // Лёгкие данные хита: (hit_idx, byte_pos, key, is_code)
+        let mut light: Vec<(usize, usize, (usize, usize), bool)> =
+            Vec::with_capacity(hits.len().min(1 << 20));
         let mut bounds_cache: HashMap<(usize, usize), SceneBounds> = HashMap::new();
-        let mut records: Vec<HitRecord> = Vec::with_capacity(hits.len());
 
         for (i, &h) in hits.iter().enumerate() {
             let c = h as usize;
@@ -924,39 +997,61 @@ pub fn pass2_file(
             };
             let byte_pos = (byte_pos_u32 as usize).min(text.len());
 
-            let (key, is_code, bounds) = if code_file {
+            let (key, is_code) = if code_file {
                 match crate::parser::ast_code::locate_scope(text, byte_pos, lang) {
-                    Some((b, e)) => ((b, e), true, None),
-                    None => ((0, text.len()), true, None),
+                    Some((b, e)) => ((b, e), true),
+                    None => ((0, text.len()), true),
                 }
             } else {
-                let b = SceneContext::locate(text, byte_pos, path);
+                let b = locator.locate(text, byte_pos);
                 let key = (b.start, b.end);
-                bounds_cache.entry(key).or_insert_with(|| b.clone());
-                (key, false, Some(()))
+                bounds_cache.entry(key).or_insert_with(|| b);
+                (key, false)
             };
-            let _ = bounds;
 
-            let info = scenes
-                .entry(key)
-                .or_insert_with(|| match bounds_cache.get(&key) {
-                    Some(b) => build_scene_info(text, b, key, is_code, &stem, query_tokens, config),
-                    None => build_scene_info(
-                        text,
-                        &SceneBounds {
-                            chapter: stem.clone(),
-                            start: key.0,
-                            end: key.1,
-                            structured: false,
-                        },
-                        key,
-                        is_code,
-                        &stem,
-                        query_tokens,
-                        config,
-                    ),
+            light.push((i, byte_pos, key, is_code));
+            heap.push(Reverse((bit_key(eps_res[i].1), light.len() - 1)));
+            if heap.len() > config.top_n {
+                heap.pop();
+            }
+        }
+
+        // Полный набор байтовых позиций (компактно) — до отсева
+        let hit_keys: Vec<usize> = light.iter().map(|(_, b, _, _)| *b).collect();
+
+        // Выжившие индексы (top-N по резонансу) — сцены строим только для них
+        let survivors: Vec<usize> = {
+            let mut v: Vec<usize> = heap.into_iter().map(|Reverse((_, li))| li).collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
+        let mut records: Vec<HitRecord> = Vec::with_capacity(survivors.len());
+        for li in survivors {
+            let (i, byte_pos, key, is_code) = light[li];
+            let bounds = if is_code {
+                None
+            } else {
+                Some(SceneBounds {
+                    chapter: stem.clone(),
+                    start: key.0,
+                    end: key.1,
+                    structured: false,
+                })
+            };
+            // bounds из кэша точнее (chapter/structured), fallback — синтетика
+            let info = scenes.entry(key).or_insert_with(|| {
+                let b = bounds_cache.get(&key).cloned().unwrap_or_else(|| {
+                    bounds.clone().unwrap_or(SceneBounds {
+                        chapter: stem.clone(),
+                        start: key.0,
+                        end: key.1,
+                        structured: false,
+                    })
                 });
-
+                build_scene_info(text, &b, key, is_code, &stem, query_tokens, config)
+            });
             records.push(HitRecord {
                 path: path.to_path_buf(),
                 byte_pos,
@@ -968,7 +1063,7 @@ pub fn pass2_file(
             });
         }
 
-        Some((records, scenes))
+        Some((records, scenes, hit_keys))
     })?
 }
 
@@ -985,7 +1080,7 @@ mod tests {
         let text = "Нокс вонзила когти в сплетение. Нокс и снова нокс";
         let ft = FileTokens::build(text);
         let idx = crate::InvertedIndex::build(text);
-        let ft_owned: Vec<String> = (0..ft.toks_len()).map(|i| ft.tok(i).to_string()).collect();
+        let ft_owned: Vec<&str> = (0..ft.toks_len()).map(|i| ft.tok(i)).collect();
         assert_eq!(ft_owned, idx.tokens);
         assert_eq!(ft.pos.len(), idx.positions.len());
         for (a, b) in ft.pos.iter().zip(idx.positions.iter()) {
@@ -1039,7 +1134,7 @@ mod tests {
             let c = h as usize;
             let start = c.saturating_sub(radius);
             let end = (c + radius + 1).min(n);
-            let window: Vec<String> = (start..end).map(|i| ft.tok(i).to_string()).collect();
+            let window: Vec<&str> = (start..end).map(|i| ft.tok(i)).collect();
             epsilons.push(calculate_epsilon(&window, &query, &gcounts, n, 1.0, 0.0));
         }
         // ε обязаны совпадать с пакетным расчётом окна; R в field-режиме

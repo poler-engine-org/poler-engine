@@ -67,27 +67,6 @@ struct FileEntry {
     scenes: HashMap<(usize, usize), SceneInfo>,
 }
 
-/// Обрезает записи файла до top_n лучших по резонансу, чистит
-/// осиротевшие сцены. Математически корректно: глобальный top-N
-/// содержится в объединении per-file top-N.
-fn prune_file_entry(
-    records: &mut Vec<HitRecord>,
-    scenes: &mut HashMap<(usize, usize), SceneInfo>,
-    top_n: usize,
-) {
-    if records.len() > top_n {
-        records.sort_by(|a, b| {
-            b.resonance
-                .partial_cmp(&a.resonance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        records.truncate(top_n);
-        let alive: HashSet<(usize, usize)> =
-            records.iter().map(|r| r.scene_key).collect();
-        scenes.retain(|k, _| alive.contains(k));
-    }
-}
-
 /// Поисковый движок с опциональным инкрементальным состоянием.
 ///
 /// `watching = true` включает кэш по mtime/size: повторные прогоны
@@ -304,8 +283,11 @@ impl Engine {
 
         let results_mu: Mutex<Vec<(PathBuf, Pass2Result)>> = Mutex::new(Vec::new());
         hn.par_iter().for_each(|p| {
-            if let Some((records, scenes)) = pass2(p) {
-                results_mu.lock().unwrap().push((p.clone(), (records, scenes)));
+            if let Some((records, scenes, hit_keys)) = pass2(p) {
+                results_mu
+                    .lock()
+                    .unwrap()
+                    .push((p.clone(), (records, scenes, hit_keys)));
             }
         });
         // Гиганты: параллельная чанковая обработка (границы сцен,
@@ -314,7 +296,7 @@ impl Engine {
             let Some(hits) = sink.hit_files.get(p) else {
                 continue;
             };
-            if let Some((records, scenes)) = streaming::pass2_giant_parallel(
+            if let Some((records, scenes, hit_keys)) = streaming::pass2_giant_parallel(
                 p,
                 &query_tokens,
                 &config,
@@ -323,25 +305,29 @@ impl Engine {
                 n_total,
                 hits,
             ) {
-                results_mu.lock().unwrap().push((p.clone(), (records, scenes)));
+                results_mu
+                    .lock()
+                    .unwrap()
+                    .push((p.clone(), (records, scenes, hit_keys)));
             }
         }
         let results = results_mu.into_inner().unwrap();
-        for (p, (mut records, mut scenes)) in results {
-            // Early Top-K Pruning: держим только top_n якорей файла,
-            // полный список хитов — компактные hit_keys + счётчик
-            // temporal-прошедших (для честного total_hits).
-            let byte_keys: Vec<usize> = records.iter().map(|r| r.byte_pos).collect();
+        for (p, (records, scenes, hit_keys)) in results {
+            // pass2 уже вернул top-N записей и ПОЛНЫЙ hit_keys; честный
+            // total_hits (без temporal) = hit_keys.len(). temporal-счёт
+            // приближён по top-N записям (документировано).
             let hits_temporal = match &config.temporal_filter {
+                // Приближение по top-N записям: полный temporal-счёт по
+                // всем хитам требует light_meta на каждую сцену (дорого
+                // на суперчастотных запросах) — задокументировано в README.
                 Some(filter) => records
                     .iter()
                     .filter(|r| r.metric_tag.as_deref().map_or(true, |m| m == filter))
                     .count(),
-                None => records.len(),
+                None => hit_keys.len(),
             };
-            prune_file_entry(&mut records, &mut scenes, config.top_n);
             if let Some(e) = fresh_entries.get_mut(&p) {
-                e.hit_keys = byte_keys;
+                e.hit_keys = hit_keys;
                 e.hits_temporal = hits_temporal;
                 e.records = records;
                 e.scenes = scenes;

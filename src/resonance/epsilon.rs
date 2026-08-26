@@ -131,7 +131,7 @@ pub fn semantic_bonus(window_text: &str) -> f64 {
 ///   `1 + ln(1 + count)`, сами они исключаются из unique-суммы;
 /// * `bonus` — заранее посчитанный [`semantic_bonus`] по тексту окна.
 pub fn calculate_epsilon(
-    window_tokens: &[String],
+    window_tokens: &[&str],
     query_tokens: &[String],
     global_counts: &HashMap<String, usize>,
     total_tokens: usize,
@@ -147,10 +147,10 @@ pub fn calculate_epsilon(
     let mut kw_count = 0usize;
     let mut unique: HashSet<&str> = HashSet::new();
     for t in window_tokens {
-        if query_set.contains(t.as_str()) {
+        if query_set.contains(*t) {
             kw_count += 1;
         } else {
-            unique.insert(t.as_str());
+            unique.insert(*t);
         }
     }
 
@@ -307,19 +307,16 @@ mod tests {
         g1.insert("нокс".into(), 1);
         let mut g2 = idx_rare.token_counts.clone();
         g2.insert("нокс".into(), 1);
-        let e_common = calculate_epsilon(&idx_common.tokens, &q(&["нокс"]), &g1, 1000, 1.0, 0.0);
-        let e_rare = calculate_epsilon(&idx_rare.tokens, &q(&["нокс"]), &g2, 1000, 1.0, 0.0);
+        let e_common = calculate_epsilon(&idx_common.tokens.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &q(&["нокс"]), &g1, 1000, 1.0, 0.0);
+        let e_rare = calculate_epsilon(&idx_rare.tokens.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &q(&["нокс"]), &g2, 1000, 1.0, 0.0);
         assert!(e_rare > e_common, "rare={e_rare} common={e_common}");
     }
 
     #[test]
     fn keyword_repetition_raises_intensity() {
         let g = counts(&[("нокс", 5), ("шунт", 5), ("когти", 5)]);
-        let w1: Vec<String> = vec!["нокс", "шунт", "когти"].into_iter().map(String::from).collect();
-        let w2: Vec<String> = vec!["нокс", "нокс", "нокс", "шунт", "когти"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let w1: Vec<&str> = vec!["нокс", "шунт", "когти"];
+        let w2: Vec<&str> = vec!["нокс", "нокс", "нокс", "шунт", "когти"];
         let e1 = calculate_epsilon(&w1, &q(&["нокс"]), &g, 1000, 1.0, 0.0);
         let e2 = calculate_epsilon(&w2, &q(&["нокс"]), &g, 1000, 1.0, 0.0);
         assert!(e2 > e1);
@@ -327,7 +324,7 @@ mod tests {
 
     #[test]
     fn kappa_scales_linearly() {
-        let w: Vec<String> = vec!["нокс", "шунт"].into_iter().map(String::from).collect();
+        let w: Vec<&str> = vec!["нокс", "шунт"];
         let g = counts(&[("нокс", 3), ("шунт", 7)]);
         let e1 = calculate_epsilon(&w, &q(&["нокс"]), &g, 1000, 1.0, 0.0);
         let e2 = calculate_epsilon(&w, &q(&["нокс"]), &g, 1000, 2.0, 0.0);
@@ -336,7 +333,7 @@ mod tests {
 
     #[test]
     fn bonus_is_added() {
-        let w: Vec<String> = vec!["нокс", "шунт"].into_iter().map(String::from).collect();
+        let w: Vec<&str> = vec!["нокс", "шунт"];
         let g = counts(&[("нокс", 3), ("шунт", 7)]);
         let base = calculate_epsilon(&w, &q(&["нокс"]), &g, 1000, 1.0, 0.0);
         let with = calculate_epsilon(&w, &q(&["нокс"]), &g, 1000, 1.0, 5.5);
@@ -379,7 +376,7 @@ mod tests {
             let sliding = slider.advance_to(center, &index);
             let start = center.saturating_sub(radius);
             let end = (center + radius + 1).min(total);
-            let batch = calculate_epsilon(&index.tokens[start..end], &query, &g, total, 1.0, 0.0);
+            let batch = calculate_epsilon(&index.tokens[start..end].iter().map(|s| s.as_str()).collect::<Vec<_>>(), &query, &g, total, 1.0, 0.0);
             assert!(
                 (sliding - batch).abs() < 1e-6,
                 "center={center}: sliding={sliding} batch={batch}"

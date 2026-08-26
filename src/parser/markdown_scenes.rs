@@ -225,6 +225,101 @@ pub fn light_meta(text: &str, bounds: &SceneBounds) -> LightSceneMeta {
     m
 }
 
+/// Кэшированный локатор сцен: заголовки markdown сканируются ОДИН раз
+/// на файл/чанк, затем `locate(off)` выполняется за O(log H + окно).
+/// Прежний `SceneContext::locate` пересканировал весь текст на каждом
+/// хите — на суперчастотных запросах это давало терабайты сканирования.
+pub struct SceneLocator {
+    headings: Vec<(usize, usize, usize, String)>,
+    stem: String,
+}
+
+impl SceneLocator {
+    /// Предвычисляет заголовки (один проход по тексту).
+    pub fn new(text: &str, file_path: &Path) -> Self {
+        let mut headings = Vec::new();
+        let mut pos = 0usize;
+        for line in text.lines() {
+            if let Some((lvl, h)) = parse_heading(line) {
+                headings.push((pos, pos + line.len(), lvl, h));
+            }
+            pos += line.len() + 1;
+        }
+        Self {
+            headings,
+            stem: file_stem(file_path),
+        }
+    }
+
+    /// Локализация сцены для байтового смещения (дёшево).
+    pub fn locate(&self, text: &str, off: usize) -> SceneBounds {
+        let off = off.min(text.len());
+
+        if self.headings.is_empty() {
+            // txt: ограниченный поиск абзаца (64 КБ окно)
+            const PARAGRAPH_WINDOW: usize = 64 * 1024;
+            let mut back_from = off.saturating_sub(PARAGRAPH_WINDOW);
+            while back_from < off && !text.is_char_boundary(back_from) {
+                back_from += 1;
+            }
+            let start = text[back_from..off]
+                .rfind("\n\n")
+                .map(|i| back_from + i + 2)
+                .unwrap_or(back_from);
+            let mut fwd_to = (off + PARAGRAPH_WINDOW).min(text.len());
+            while fwd_to > off && !text.is_char_boundary(fwd_to) {
+                fwd_to += 1;
+            }
+            let fwd_to = fwd_to.min(text.len());
+            let end = text[off..fwd_to]
+                .find("\n\n")
+                .map(|i| off + i)
+                .unwrap_or(fwd_to);
+            return SceneBounds {
+                chapter: self.stem.clone(),
+                start,
+                end,
+                structured: false,
+            };
+        }
+
+        // markdown: ближайший заголовок сверху (бинарный поиск)
+        let idx = self
+            .headings
+            .binary_search_by(|h| h.0.cmp(&off))
+            .map(|i| i + 1)
+            .unwrap_or_else(|i| i);
+        let above = &self.headings[..idx.min(self.headings.len())];
+        let (scene_start, scene_level) = match above.last() {
+            Some(h) => (h.0, h.2),
+            None => (0, 7),
+        };
+        let scene_end = self
+            .headings
+            .iter()
+            .filter(|h| h.0 > scene_start && h.2 <= scene_level)
+            .map(|h| h.0)
+            .min()
+            .unwrap_or(text.len());
+
+        let chapter = self
+            .headings
+            .iter()
+            .rev()
+            .find(|h| h.0 <= off && h.2 == 1)
+            .or_else(|| self.headings.first())
+            .map(|h| h.3.clone())
+            .unwrap_or_else(|| self.stem.clone());
+
+        SceneBounds {
+            chapter,
+            start: scene_start,
+            end: scene_end,
+            structured: true,
+        }
+    }
+}
+
 impl SceneContext {
     /// Лёгкая локализация сцены для байтового смещения (без клонирования
     /// текста) — вызывается на каждое совпадение.
@@ -240,10 +335,31 @@ impl SceneContext {
             pos += line.len() + 1;
         }
 
-        // txt без заголовков: абзац как enclosing scope
+        // txt без заголовков: абзац как enclosing scope.
+        // Поиск границ абзаца ограничен окном PARAGRAPH_WINDOW байт:
+        // в корпусах без пустых строк (LM1B: предложение = строка)
+        // неограниченный поиск перевода-абзаца сканировал весь файл
+        // НА КАЖДОМ хите — терабайты на суперчастотных запросах.
         if headings.is_empty() {
-            let start = text[..off].rfind("\n\n").map(|i| i + 2).unwrap_or(0);
-            let end = text[off..].find("\n\n").map(|i| off + i).unwrap_or(text.len());
+            const PARAGRAPH_WINDOW: usize = 64 * 1024;
+            // выравнивание границ окна по границам символов UTF-8
+            let mut back_from = off.saturating_sub(PARAGRAPH_WINDOW);
+            while back_from < off && !text.is_char_boundary(back_from) {
+                back_from += 1;
+            }
+            let start = text[back_from..off]
+                .rfind("\n\n")
+                .map(|i| back_from + i + 2)
+                .unwrap_or(back_from);
+            let mut fwd_to = (off + PARAGRAPH_WINDOW).min(text.len());
+            while fwd_to > off && !text.is_char_boundary(fwd_to) {
+                fwd_to += 1;
+            }
+            let fwd_to = fwd_to.min(text.len());
+            let end = text[off..fwd_to]
+                .find("\n\n")
+                .map(|i| off + i)
+                .unwrap_or(fwd_to);
             return SceneBounds {
                 chapter: file_stem(file_path),
                 start,
