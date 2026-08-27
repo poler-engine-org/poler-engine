@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.17.3"
+version = "0.17.4"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]

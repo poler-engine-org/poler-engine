@@ -24,6 +24,57 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
 
+## v0.17.4: MCP over HTTP — удалённый агент в блокнотах владельца без передачи пароля
+
+`--mcp` работал только поверх stdio — то есть для агента, сидящего на той же
+машине, что и движок. v0.17.4 добавляет второй транспорт: тот же набор из
+семи инструментов (`poler_nlm` в том числе), но по HTTP с Bearer-токеном —
+**удалённый агент получает доступ к блокнотам NotebookLM владельца, не
+получая ни пароль, ни куки Google**. Движок на машине владельца ходит в
+NotebookLM своим персистентным профилем; наружу (через туннель) уходит
+только JSON-RPC-ответ по предъявленному токену.
+
+```bash
+# 1. на машине владельца (токен напечатается при старте; или задай сам):
+poler-engine --mcp-http 127.0.0.1:8765 --mcp-token <секрет>
+
+# 2. публичный туннель без аккаунта (напечатает https://….trycloudflare.com):
+cloudflared tunnel --url http://127.0.0.1:8765
+
+# 3. удалённый агент подключается обычным HTTP:
+curl -X POST https://<туннель>/mcp \
+  -H "Authorization: Bearer <секрет>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"poler_nlm","arguments":{"action":"notebooks"}}}'
+```
+
+| Параметр | Значение |
+|---|---|
+| CLI | `--mcp-http [BIND]` (по умолчанию `127.0.0.1:8765`; можно просто порт `8765`), `--mcp-token <T>` |
+| Токен | `--mcp-token` → env `POLER_MCP_TOKEN` → автогенерация (32 hex из `/dev/urandom`) |
+| Транспорт | Streamable HTTP: `POST /` и `POST /mcp`, одно сообщение или batch-массив; ответ `application/json` |
+| Auth | `Authorization: Bearer <T>` или `X-Poler-Token: <T>`; сравнение за постоянное время |
+| Эндпоинты | `GET /health` — smoke-проба туннеля без токена; `GET /mcp` → 405; `OPTIONS` → 204 (CORS-preflight) |
+| Реализация | Ручной HTTP/1.1 поверх `std::net` — ноль новых зависимостей; keep-alive, `Expect: 100-continue`, поток на соединение, лимит 16 соединений |
+
+**Модель безопасности**: токен — единственный секрет, который покидает машину
+владельца (и то — по приватному каналу в чате/мессенджере). Куки Google
+остаются в `~/.cache/poler-engine/google-profile/`, наружу отдаются только
+результаты вызовов инструментов. NLM-чат занимает до 90 с — акцептор не
+блокируется (каждое соединение — свой поток). Утечка токена = доступ к
+инструментам движка (чтение блокнотов, чат), но НЕ к аккаунту Google;
+отзыв = Ctrl+C и рестарт с новым токеном.
+
+**Реализация** (`src/mcp_http.rs`, ~700 строк, 20 тестов): рудиментарный
+HTTP/1.1-парсер (CRLF/LF-заголовки, Content-Length, лимиты 16 КБ заголовков /
+8 МБ тела, slow-loris-защита через idle-таймаут), маршрутизатор запросов,
+JSON-RPC-слой поверх общего `McpServer::dispatch()` (выделен из stdio-цикла
+`mcp.rs` — поведение `--mcp` не изменено ни на бит), генератор токена с
+fallback-PRNG splitmix64, если `/dev/urandom` недоступен. E2E-прогон curl-ом:
+401 без токена / с неверным, 200 initialize/tools/list/tools/call, batch
+с уведомлением, 202 на чистое уведомление, -32700/-32600/-32601, keep-alive
+из двух запросов в одном соединении.
+
 ## v0.17.3: Companion Bridge — официальный NotebookLM API рядом с batchexecute
 
 v0.17.1–v0.17.3 соединяют poler-engine с **официальным Pre-GA NotebookLM
@@ -1259,6 +1310,11 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
     --no-sandbox            отключить sandbox Chromium (для root/CI)
     --remote-debugging-port <N>  явный порт отладки Chromium
     --mcp                   v0.10: MCP-сервер (stdio JSON-RPC 2.0) для LLM-агентов
+    --mcp-http [BIND]      v0.17.4: MCP-сервер по HTTP (Streamable HTTP) для
+                           УДАЛЁННОГО агента: POST / или /mcp,
+                           Authorization: Bearer <токен> [default: 127.0.0.1:8765]
+    --mcp-token <TOKEN>    токен для --mcp-http (или env POLER_MCP_TOKEN;
+                           без него — автогенерация при старте)
     --shell                 v0.15+: poler-shell REPL
     --tui                   v0.17: 4-панельный TUI (MiMo Code-style)
     --psi-eta <N>           POLER[Ψ]: шаг ψ-потока [default: 0.05]
