@@ -940,16 +940,24 @@ impl NlmSession {
         }
 
         // 3) дождаться ответа: вопрос появился в тексте → текст стабилизировался
-        let probe = |s: &mut CdpSession, q: &str| -> Result<(usize, bool), String> {
+        //    И модель закончила думать: пока на странице «Обработка…»/кнопка
+        //    stop — стабильность НЕ засчитывается (иначе ответ срезается
+        //    посреди генерации: текст во время раздумья Gemini не меняется).
+        let probe = |s: &mut CdpSession, q: &str| -> Result<(usize, bool, bool), String> {
             let raw = s.eval_async_string(&format!(
-                "(async()=>JSON.stringify({{n:document.body.innerText.length,\
-                  has:document.body.innerText.includes({q})}}))()",
+                "(async()=>{{const t=document.body.innerText;\
+                  const busy=/Обработка|Обробк|Processing|Thinking|Генераци|Generating/i.test(t)\
+                    || [...document.querySelectorAll('button')].some(b=>\
+                         /^stop$/i.test((b.getAttribute('aria-label')||'').trim())\
+                         && b.getClientRects().length>0);\
+                  return JSON.stringify({{n:t.length,has:t.includes({q}),busy}})}})()",
                 q = serde_json::json!(q)
             ))?;
             let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
             Ok((
                 v.get("n").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
                 v.get("has").and_then(|h| h.as_bool()).unwrap_or(false),
+                v.get("busy").and_then(|b| b.as_bool()).unwrap_or(false),
             ))
         };
 
@@ -957,17 +965,22 @@ impl NlmSession {
         // фаза 1: вопрос отрисовался (до 20 с)
         let phase1 = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20));
         while std::time::Instant::now() < phase1 {
-            if let Ok((_, true)) = probe(&mut self.session, question) {
+            if let Ok((_, true, _)) = probe(&mut self.session, question) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(700));
         }
-        // фаза 2: длина текста стабильна 3 poll-а подряд (стриминг ответа кончился)
+        // фаза 2: длина текста стабильна 3 poll-а подряд И не «Обработка…»
         let mut last_len = 0usize;
         let mut stable = 0u32;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1200));
-            if let Ok((n, _)) = probe(&mut self.session, question) {
+            if let Ok((n, _, busy)) = probe(&mut self.session, question) {
+                if busy {
+                    // модель ещё думает — стабильность не считаем, ждём дальше
+                    stable = 0;
+                    continue;
+                }
                 if n == last_len && n > 0 {
                     stable += 1;
                     if stable >= 3 {
@@ -980,12 +993,13 @@ impl NlmSession {
             }
         }
 
-        // 4) ответ = текст после последнего вхождения вопроса
+        // 4) ответ = текст после последнего вхождения вопроса, без UI-мусора
         let text = self.session.eval_async_string("(async()=>document.body.innerText)()")?;
         let answer = match text.rfind(question.trim()) {
             Some(i) => text[i + question.trim().len()..].trim().to_string(),
             None => text.trim().to_string(),
         };
+        let answer = clean_chat_answer(&answer);
         if answer.is_empty() {
             return Err(
                 "ответ пуст — вопрос не отправился или ноутбук не ответил за таймаут \
@@ -995,6 +1009,44 @@ impl NlmSession {
         }
         Ok(answer)
     }
+}
+
+/// Убрать UI-мусор NotebookLM из сырого innerText ответа чата:
+/// футер-дисклеймер («Gemini может ошибаться…» и всё после), верхние
+/// ярлыки интерфейса (Thoughts / expand_more / промо-баннер / close /
+/// docs / счётчик источников «(324)» / stop) — остаётся только ответ.
+fn clean_chat_answer(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    // футер-дисклеймер и хвост страницы после него
+    for marker in [
+        "Gemini Notebook может ошибаться",
+        "Gemini может ошибаться",
+        "Gemini может допускать ошибки",
+        "можете попросить создать диаграммы",
+    ] {
+        if let Some(i) = t.find(marker) {
+            t.truncate(i);
+        }
+    }
+    // верхние строки-ярлыки UI — срезаем, пока первая строка мусорная
+    let junk_line = |f: &str| -> bool {
+        let f = f.trim();
+        f.is_empty()
+            || matches!(f, "Thoughts" | "expand_more" | "🪄" | "close" | "stop" | "docs")
+            || f.starts_with("Gemini Notebook теперь")
+            || f.starts_with("Хотите проанализировать")
+            || f.starts_with("Хотите создать")
+            || (f.starts_with('(') && f.ends_with(')') && f[1..f.len() - 1].chars().all(|c| c.is_ascii_digit()))
+    };
+    let mut lines: Vec<&str> = t.lines().collect();
+    while lines.first().is_some_and(|l| junk_line(l)) {
+        lines.remove(0);
+    }
+    // и хвостовые ярлыки после ответа (сайдбар может идти ниже по DOM)
+    while lines.last().is_some_and(|l| junk_line(l)) {
+        lines.pop();
+    }
+    lines.join("\n").trim().to_string()
 }
 
 /// Минимальный %-encode для path/query компонентов.
@@ -1133,6 +1185,40 @@ pub fn format_artifacts(arts: &[Artifact]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clean_chat_answer_strips_footer_and_labels() {
+        // живой кейс из туннеля: ответ окружён UI-мусором NotebookLM
+        let raw = "Thoughts\nexpand_more\n🪄\nGemini Notebook теперь ещё умнее. Хотите проанализировать данные?\nclose\ndocs\n(324)\nstop\n\nPOLER — это резонансная архитектура поиска.\nОна состоит из трёх компонентов.\n\nGemini Notebook может ошибаться. Обязательно проверяйте ответы.\nОбработка…";
+        let cleaned = clean_chat_answer(raw);
+        assert_eq!(
+            cleaned,
+            "POLER — это резонансная архитектура поиска.\nОна состоит из трёх компонентов."
+        );
+    }
+
+    #[test]
+    fn clean_chat_answer_keeps_clean_text() {
+        assert_eq!(clean_chat_answer("Просто ответ"), "Просто ответ");
+        assert_eq!(clean_chat_answer("  \n Ответ \n "), "Ответ");
+        // «(324)» в середине текста — НЕ мусор, срезаем только сверху/снизу
+        assert_eq!(
+            clean_chat_answer("Ответ (важно) и текст"),
+            "Ответ (важно) и текст"
+        );
+    }
+
+    #[test]
+    fn clean_chat_answer_stops_at_first_footer_marker() {
+        let raw = "Ответ модели\nGemini может ошибаться\nхвост страницы";
+        assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
+
+    #[test]
+    fn clean_chat_answer_trailing_sidebar_labels() {
+        let raw = "Ответ модели\ndocs\n(12)\nstop";
+        assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
 
     #[test]
     fn base64_decode_roundtrip_with_cdp_encoder() {
