@@ -75,6 +75,7 @@ use pqw::mcweeny::purify_p;
 
 use crate::ansatz::Ansatz;
 use crate::born::BornSampler;
+use crate::coherence::binary_entropy;
 use crate::error::{PqcError, Result};
 use crate::rng::Rng;
 use crate::statevector::Statevector;
@@ -339,6 +340,352 @@ pub fn quadratic_target(target: &[f64]) -> impl Fn(&[f64]) -> Vec<f64> + '_ {
     move |p_emp| p_emp.iter().zip(target).map(|(e, t)| e - t).collect()
 }
 
+// ============================================================================
+// Active Inference (RQ6): непрерывное онлайн-обучение фаз из потока
+// ============================================================================
+
+/// Онлайновый оптимизатор Active Inference (RQ6): петля Борна с **адаптивным
+/// шагом** по энтропийному сюрпризу потока — поверх той же математики
+/// параметрического сдвига, что и [`BornOptimizer`].
+///
+/// ## Расписание шага
+///
+/// ```text
+/// η(t) = η₀ · exp(−β · Σ(t)),   Σ(t) = (1/|S|) · Σ_{i∈S} h₂(P(bᵢ = 1))
+/// ```
+///
+/// `Σ(t)` — сюрприз модели: нормированная Born-энтропия **активных дуг**
+/// текущего состояния (фон в `Σ` не входит — структурная часть Π_Λ уже
+/// заморожена). В хаосе (арки ≈ честные монеты, `Σ → 1`) шаг сжимается до
+/// `η₀·e^(−β)` — термодинамическое трение `D = LLᵀ` гасит шум среды; у
+/// стационара (`Σ → 0`, фазы ≈ триты) шаг возвращается к `η₀` — оператор
+/// резонанса `J` держит нить смысла полной скоростью. Это уравнение
+/// субъективного времени `T = dI/dΣ` из архитектурного манифеста:
+/// при `ΔΣ → 0` система достигает стационарности `Ĥ_Ψ = 0`.
+///
+/// ## Защита от полюсов
+///
+/// Трение по умолчанию `γ = 0.5` — вывод анализа RQ5: при `γ ≥ 0.8`
+/// импульс заносит фазу точно на полюс `|p| = 1`, где `dp/dθ = −sin θ`
+/// вырождается, и параметрический сдвиг не может её сдвинуть (залипание
+/// при regime-jump). `γ ≈ 0.5` отслеживает инверсию цели за 10 шагов.
+///
+/// McWeeny-пурификация каждые `K = 5` шагов ликвидирует дрейф идемпотентности
+/// `P² = P` без переобучения.
+///
+/// ## Пример: адаптивная сходимость
+///
+/// ```
+/// use pqc::{ActiveInference, Ansatz, LoadOptions};
+///
+/// let target = vec![0.9, -0.9, 0.8, -0.8];
+/// let start  = vec![0.1, -0.1, 0.2, -0.2];
+/// let mut ansatz = Ansatz::from_phases(&start, &LoadOptions::default()).unwrap();
+/// let mut ai = ActiveInference::new(0.25, 2.0, 4096).with_seed(42);
+///
+/// let reports = ai
+///     .run(&mut ansatz, |p| {
+///         p.iter().zip(&target).map(|(e, t)| e - t).collect()
+///     }, 10)
+///     .unwrap();
+/// assert_eq!(reports.len(), 10);
+///
+/// // Расписание шага: η ≤ η₀ всегда, и растёт по мере падения сюрприза.
+/// assert!(reports.iter().all(|r| r.eta <= 0.25 + 1e-12));
+/// assert!(reports.last().unwrap().eta > reports.first().unwrap().eta);
+/// ```
+pub struct ActiveInference {
+    /// Базовый шаг η₀ > 0.
+    eta0: f64,
+    /// Коэффициент затухания β ≥ 0 (чувствительность к сюрпризу).
+    beta: f64,
+    /// Трение γ ∈ [0, 1); по умолчанию 0.5 (защита полюсов, RQ5).
+    gamma: f64,
+    /// Born-выстрелов на измерение.
+    shots: u64,
+    /// Период McWeeny-пурификации K; 0 = выключена.
+    purify_every: usize,
+    /// Порог проектора Π_Λ.
+    epsilon: f64,
+    /// Счётчик шагов.
+    steps: usize,
+    /// Буфер момента в θ-пространстве.
+    velocity: Vec<f64>,
+    /// ГПСЧ измерений.
+    rng: Rng,
+    /// Сюрприз последнего шага Σ(t−1).
+    last_surprise: f64,
+    /// Шаг последнего применения η(t−1).
+    last_eta: f64,
+}
+
+/// Отчёт об одном шаге Active Inference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveStepReport {
+    /// Номер шага (с единицы).
+    pub step: usize,
+    /// Выстрелов на измерение.
+    pub shots: u64,
+    /// Сюрприз Σ(t) — Born-энтропия активных дуг до шага.
+    pub surprise: f64,
+    /// Адаптивный шаг η(t) = η₀·e^(−βΣ).
+    pub eta: f64,
+    /// Суррогатная потеря `½‖Π_Λ g‖²`.
+    pub surrogate_loss: f64,
+    /// Норма спроецированного градиента `‖Π_Λ ∇_θ F‖₂`.
+    pub grad_norm: f64,
+    /// Максимальное изменение фазы `max |Δp|` за шаг.
+    pub max_dp: f64,
+    /// Средний шум измерения по активным дугам.
+    pub measurement_mad: f64,
+    /// Применялась ли McWeeny-пурификация.
+    pub purified: bool,
+    /// Средний `|p|` по активным дугам.
+    pub mean_abs_p: f64,
+}
+
+impl ActiveInference {
+    /// Новый оптимизатор: `eta0 > 0`, `beta ≥ 0`, `shots ≥ 1`.
+    ///
+    /// Значения по умолчанию: `γ = 0.5` (полюсная защита RQ5),
+    /// McWeeny каждые `K = 5` шагов, `ε = 0`, сид ГПСЧ 0.
+    pub fn new(eta0: f64, beta: f64, shots: u64) -> ActiveInference {
+        ActiveInference {
+            eta0,
+            beta,
+            gamma: 0.5,
+            shots: shots.max(1),
+            purify_every: 5,
+            epsilon: 0.0,
+            steps: 0,
+            velocity: Vec::new(),
+            rng: Rng::seed_from_u64(0),
+            last_surprise: f64::NAN,
+            last_eta: f64::NAN,
+        }
+    }
+
+    /// Сид ГПСЧ-потока измерений (builder).
+    pub fn with_seed(mut self, seed: u64) -> ActiveInference {
+        self.rng = Rng::seed_from_u64(seed);
+        self
+    }
+
+    /// Подключить готовый ГПСЧ (builder).
+    pub fn with_rng(mut self, rng: Rng) -> ActiveInference {
+        self.rng = rng;
+        self
+    }
+
+    /// Трение γ (builder); для отслеживания regime-jump держите γ ≈ 0.5.
+    pub fn with_gamma(mut self, gamma: f64) -> ActiveInference {
+        self.gamma = gamma;
+        self
+    }
+
+    /// Период McWeeny-пурификации K; 0 = выключена (builder).
+    pub fn with_purify_every(mut self, every: usize) -> ActiveInference {
+        self.purify_every = every;
+        self
+    }
+
+    /// Порог проектора причинности Π_Λ (builder).
+    pub fn with_epsilon(mut self, epsilon: f64) -> ActiveInference {
+        self.epsilon = epsilon;
+        self
+    }
+
+    /// Базовый шаг η₀.
+    pub fn eta0(&self) -> f64 {
+        self.eta0
+    }
+
+    /// Коэффициент затухания β.
+    pub fn beta(&self) -> f64 {
+        self.beta
+    }
+
+    /// Трение γ.
+    pub fn gamma(&self) -> f64 {
+        self.gamma
+    }
+
+    /// Число сделанных шагов.
+    pub fn steps(&self) -> usize {
+        self.steps
+    }
+
+    /// Сюрприз последнего шага Σ(t−1) (NaN до первого шага).
+    pub fn last_surprise(&self) -> f64 {
+        self.last_surprise
+    }
+
+    /// Адаптивный шаг последнего применения η(t−1) (NaN до первого шага).
+    pub fn last_eta(&self) -> f64 {
+        self.last_eta
+    }
+
+    /// Расписание шага: `η(Σ) = η₀ · exp(−β·Σ)`, `Σ ∈ [0, 1]`.
+    ///
+    /// Монотонно убывает по сюрпризу: `η(0) = η₀`, `η(1) = η₀·e^(−β)`.
+    pub fn eta_at(&self, surprise: f64) -> f64 {
+        self.eta0 * (-self.beta * surprise.clamp(0.0, 1.0)).exp()
+    }
+
+    /// Сюрприз состояния Σ: нормированная Born-энтропия активных дуг.
+    ///
+    /// Считается по теоретическим маргиналам параметров (без шума
+    /// измерения) — расписание шага детерминировано.
+    pub fn surprise(ansatz: &Ansatz) -> f64 {
+        match ansatz {
+            Ansatz::Statevector(sv) => {
+                let n = sv.n_qubits().max(1) as f64;
+                sv.marginals()
+                    .iter()
+                    .map(|&m| binary_entropy(m))
+                    .sum::<f64>()
+                    / n
+            }
+            Ansatz::Product(pa) => {
+                let n = pa.nnz().max(1) as f64;
+                pa.arcs()
+                    .iter()
+                    .map(|&(_, p)| binary_entropy(0.5 * (1.0 - p)))
+                    .sum::<f64>()
+                    / n
+            }
+        }
+    }
+
+    /// Один шаг петли Active Inference: сюрприз → адаптивный η → измерение →
+    /// суррогатный градиент → Π_Λ → момент → фазовый шаг → (K) пурификация.
+    ///
+    /// Замыкание `grad_at` получает плотный вектор измерения `p_emp`
+    /// (как в [`BornOptimizer::step`]).
+    pub fn step<F>(&mut self, ansatz: &mut Ansatz, grad_at: F) -> Result<ActiveStepReport>
+    where
+        F: FnOnce(&[f64]) -> Vec<f64>,
+    {
+        // 1. Сюрприз и адаптивный шаг ДО обновления: Σ(t) по текущим фазам.
+        let surprise = ActiveInference::surprise(ansatz);
+        let eta = self.eta_at(surprise);
+
+        // 2. Параметры и структурная маска Π_Λ.
+        let p = parameters_of(ansatz)?;
+        let d = p.len();
+        let support = support_of(ansatz, d);
+
+        // 3. Born-измерение.
+        let p_emp = measure(ansatz, &mut self.rng, self.shots)?;
+        debug_assert_eq!(p_emp.len(), d);
+
+        // 4. Суррогатный градиент в точке измерения.
+        let g = grad_at(&p_emp);
+        if g.len() != d {
+            return Err(PqcError::LengthMismatch {
+                expected: d,
+                actual: g.len(),
+            });
+        }
+
+        // 5. Проекция Π_Λ и цепное правило dp/dθ = −√(1−p²).
+        // Π_Λ строгая (улучшение RQ6): у замороженных дуг обнуляется
+        // и момент — фаза не дрейфует от инерции истории.
+        if self.velocity.len() != d {
+            self.velocity = vec![0.0_f64; d];
+        }
+        let mut grad_theta = vec![0.0_f64; d];
+        let mut sq_norm = 0.0_f64;
+        let mut mad_sum = 0.0_f64;
+        let mut mad_n = 0u64;
+        let mut abs_p_sum = 0.0_f64;
+        for i in 0..d {
+            let active = support[i] && p[i].abs() >= self.epsilon;
+            if support[i] {
+                mad_sum += (p_emp[i] - p[i]).abs();
+                abs_p_sum += p[i].abs();
+                mad_n += 1;
+            }
+            if !active {
+                self.velocity[i] = 0.0;
+                continue;
+            }
+            let chain = -(1.0 - p[i] * p[i]).max(0.0).sqrt();
+            let gt = chain * g[i];
+            grad_theta[i] = gt;
+            sq_norm += gt * gt;
+        }
+        let surrogate_loss = 0.5 * sq_norm;
+        let grad_norm = sq_norm.sqrt();
+        let measurement_mad = if mad_n > 0 {
+            mad_sum / mad_n as f64
+        } else {
+            0.0
+        };
+        let mean_abs_p = if mad_n > 0 {
+            abs_p_sum / mad_n as f64
+        } else {
+            0.0
+        };
+
+        // 6. Момент и фазовый шаг с адаптивным η.
+        let mut p_new = vec![0.0_f64; d];
+        let mut max_dp = 0.0_f64;
+        for i in 0..d {
+            self.velocity[i] = self.gamma * self.velocity[i] + grad_theta[i];
+            let theta = p[i].acos();
+            let theta_new = theta - eta * self.velocity[i];
+            let pn = theta_new.cos().clamp(-1.0, 1.0);
+            max_dp = max_dp.max((pn - p[i]).abs());
+            p_new[i] = pn;
+        }
+
+        // 7. McWeeny-пурификация каждые K шагов.
+        self.steps += 1;
+        let purified = self.purify_every > 0 && self.steps % self.purify_every == 0;
+        if purified {
+            for v in p_new.iter_mut() {
+                *v = purify_p(*v).clamp(-1.0, 1.0);
+            }
+        }
+
+        // 8. Перекодировка анзаца и память расписания.
+        set_parameters(ansatz, &p_new)?;
+        self.last_surprise = surprise;
+        self.last_eta = eta;
+
+        Ok(ActiveStepReport {
+            step: self.steps,
+            shots: self.shots,
+            surprise,
+            eta,
+            surrogate_loss,
+            grad_norm,
+            max_dp,
+            measurement_mad,
+            purified,
+            mean_abs_p,
+        })
+    }
+
+    /// `steps` шагов подряд; замыкание вызывается на каждом шаге.
+    pub fn run<F>(
+        &mut self,
+        ansatz: &mut Ansatz,
+        grad_at: F,
+        steps: usize,
+    ) -> Result<Vec<ActiveStepReport>>
+    where
+        F: Fn(&[f64]) -> Vec<f64>,
+    {
+        let mut reports = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            reports.push(self.step(ansatz, |p| grad_at(p))?);
+        }
+        Ok(reports)
+    }
+}
+
 /// Плотный вектор параметров анзаца (см. [`BornOptimizer::parameters`]).
 fn parameters_of(ansatz: &Ansatz) -> Result<Vec<f64>> {
     match ansatz {
@@ -416,29 +763,32 @@ fn set_parameters(ansatz: &mut Ansatz, ps: &[f64]) -> Result<()> {
     }
 }
 
+/// Параметрическая потеря `½‖p − target‖²` (общий тестовый хелпер).
+#[cfg(test)]
+fn param_loss(ansatz: &Ansatz, target: &[f64]) -> f64 {
+    let p = parameters_of(ansatz).unwrap();
+    0.5 * p
+        .iter()
+        .zip(target)
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>()
+}
+
+/// Дрейф-цель: сильные фазы на каждой второй координате (общий хелпер).
+#[cfg(test)]
+fn drift_setup(d: usize) -> (Vec<f64>, Vec<f64>) {
+    let target: Vec<f64> = (0..d)
+        .map(|i| if i % 2 == 0 { 0.9 } else { -0.8 })
+        .collect();
+    let start: Vec<f64> = (0..d).map(|i| 0.15 * (i as f64 % 3.0 - 1.0)).collect();
+    (start, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ansatz::LoadOptions;
     use crate::PhaseAnsatz;
-
-    fn param_loss(ansatz: &Ansatz, target: &[f64]) -> f64 {
-        let p = parameters_of(ansatz).unwrap();
-        0.5 * p
-            .iter()
-            .zip(target)
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-    }
-
-    /// Дрейф-цель: сильные фазы на каждой второй координате.
-    fn drift_setup(d: usize) -> (Vec<f64>, Vec<f64>) {
-        let target: Vec<f64> = (0..d)
-            .map(|i| if i % 2 == 0 { 0.9 } else { -0.8 })
-            .collect();
-        let start: Vec<f64> = (0..d).map(|i| 0.15 * (i as f64 % 3.0 - 1.0)).collect();
-        (start, target)
-    }
 
     #[test]
     fn gradient_chain_rule_formula_is_exact() {
@@ -670,5 +1020,203 @@ mod tests {
         assert_eq!(p[1], 0.0, "фон сдвинулся: {p:?}");
         assert_eq!(p[3], 0.0, "фон сдвинулся: {p:?}");
         assert!(p[0] > 0.99 && p[2] < -0.99, "дуги не очистились: {p:?}");
+    }
+}
+
+#[cfg(test)]
+mod active_inference_tests {
+    use super::*;
+    use crate::ansatz::LoadOptions;
+    use crate::PhaseAnsatz;
+
+    /// η(Σ) = η₀·e^(−βΣ): граничные значения и монотонность.
+    #[test]
+    fn eta_schedule_math_is_exact() {
+        let ai = ActiveInference::new(0.3, 2.0, 64);
+        assert!((ai.eta_at(0.0) - 0.3).abs() < 1e-15);
+        assert!((ai.eta_at(1.0) - 0.3 * (-2.0_f64).exp()).abs() < 1e-15);
+        assert!((ai.eta_at(0.5) - 0.3 * (-1.0_f64).exp()).abs() < 1e-15);
+        // Монотонность по сюрпризу.
+        assert!(ai.eta_at(0.2) > ai.eta_at(0.8));
+        // Выход за [0, 1] клампится, а не NaN.
+        assert!((ai.eta_at(-3.0) - 0.3).abs() < 1e-15);
+        assert!((ai.eta_at(7.0) - 0.3 * (-2.0_f64).exp()).abs() < 1e-15);
+        // β = 0 — постоянный шаг.
+        let flat = ActiveInference::new(0.25, 0.0, 64);
+        assert!((flat.eta_at(0.0) - flat.eta_at(1.0)).abs() < 1e-15);
+    }
+
+    /// Сюрприз: честные монеты дают Σ = 1, чистые триты — Σ = 0.
+    #[test]
+    fn surprise_spans_coin_to_trit() {
+        let coins = Ansatz::from_phases(&[0.0, 0.0, 0.0, 0.0], &LoadOptions::default()).unwrap();
+        assert!((ActiveInference::surprise(&coins) - 1.0).abs() < 1e-12);
+
+        let trits = Ansatz::from_phases(&[1.0, -1.0, 1.0], &LoadOptions::default()).unwrap();
+        assert!(ActiveInference::surprise(&trits).abs() < 1e-12);
+
+        let mixed = Ansatz::from_phases(&[0.6, 0.0], &LoadOptions::default()).unwrap();
+        let s = ActiveInference::surprise(&mixed);
+        assert!(s > 0.0 && s < 1.0);
+
+        // Фон product-движка не входит в Σ: одна сильная дуга на d = 64.
+        let pa = PhaseAnsatz::new(64, vec![(7, 0.8)]).unwrap();
+        let sparse = Ansatz::Product(pa);
+        let s_sp = ActiveInference::surprise(&sparse);
+        assert!(s_sp < 0.5, "sparse surprise = {s_sp}");
+    }
+
+    /// DoD RQ6: адаптивная петля сходится за ≤ 10 шагов (product, d = 512).
+    #[test]
+    fn adaptive_converges_within_ten_steps() {
+        let (start, target) = drift_setup(512);
+        let mut ansatz = Ansatz::from_phases(&start, &LoadOptions::default()).unwrap();
+        let l0 = param_loss(&ansatz, &target);
+
+        let mut ai = ActiveInference::new(0.25, 2.0, 4096).with_seed(42);
+        let reports = ai.run(&mut ansatz, quadratic_target(&target), 10).unwrap();
+        assert_eq!(reports.len(), 10);
+
+        let l10 = param_loss(&ansatz, &target);
+        assert!(
+            l10 < l0 / 20.0,
+            "потеря {l0:.4} → {l10:.4} — адаптивная сходимость недостаточна"
+        );
+        // Расписание: η ≤ η₀ и растёт по мере падения сюрприза.
+        assert!(reports.iter().all(|r| r.eta <= 0.25 + 1e-12));
+        assert!(reports.last().unwrap().eta > reports.first().unwrap().eta);
+        assert!(reports.last().unwrap().surprise < reports.first().unwrap().surprise);
+    }
+
+    /// Регламент RQ5: γ = 0.5 по умолчанию отслеживает инверсию цели.
+    #[test]
+    fn regime_jump_tracked_at_gamma_half() {
+        let start: Vec<f64> = vec![0.3; 32];
+        let target_a = vec![0.9; 32];
+        let target_b = vec![-0.9; 32];
+
+        let mut ansatz = Ansatz::from_phases(&start, &LoadOptions::default()).unwrap();
+        let mut ai = ActiveInference::new(0.25, 1.0, 4096).with_seed(5);
+        assert!((ai.gamma() - 0.5).abs() < 1e-12, "γ по умолчанию не 0.5");
+
+        ai.run(&mut ansatz, quadratic_target(&target_a), 5).unwrap();
+        assert!(param_loss(&ansatz, &target_a) < 0.2);
+
+        let lb0 = param_loss(&ansatz, &target_b);
+        ai.run(&mut ansatz, quadratic_target(&target_b), 10)
+            .unwrap();
+        let lb = param_loss(&ansatz, &target_b);
+        assert!(lb < lb0 / 100.0, "после прыжка: {lb0:.4} → {lb:.4}");
+        // Фазы не залипли на полюсах: все координаты перешли знак.
+        let p = parameters_of(&ansatz).unwrap();
+        assert!(
+            p.iter().all(|&v| v < -0.5),
+            "инверсия не отслежена: {}",
+            p.iter().filter(|v| **v > 0.0).count()
+        );
+    }
+
+    /// McWeeny каждые K = 5 шагов: флаги purification и чистые триты.
+    ///
+    /// γ = 0.5 (регламент RQ6): сильный момент (γ ≥ 0.8) осциллирует
+    /// у полюса |p| = 1 и не даёт пурификации дожать треки до
+    /// residual < 1e−6 за разумное число шагов.
+    #[test]
+    fn purify_every_five_steps() {
+        let target: Vec<f64> = (0..64)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut ansatz = Ansatz::from_phases(&[0.3; 64], &LoadOptions::default()).unwrap();
+        // γ = 0.5 по умолчанию, β = 0: тест про период K = 5.
+        let mut ai = ActiveInference::new(0.25, 0.0, 4096).with_seed(9);
+
+        let reports = ai.run(&mut ansatz, quadratic_target(&target), 20).unwrap();
+        // Шаги 5, 10, 15, 20 — пурифицированные, остальные нет.
+        assert_eq!(reports.len(), 20);
+        assert!((ai.gamma() - 0.5).abs() < 1e-12);
+        for r in &reports {
+            let expect = r.step % 5 == 0;
+            assert_eq!(r.purified, expect, "шаг {}", r.step);
+        }
+        let p = parameters_of(&ansatz).unwrap();
+        for (i, &pv) in p.iter().enumerate() {
+            assert!(pv.abs() > 0.999, "coord {i}: |p| = {pv:.6} — не трит");
+        }
+        let residual = pqw::mcweeny::idempotency_residual(p.iter().copied());
+        assert!(residual < 1e-6, "residual = {residual:.2e}");
+    }
+
+    /// Π_Λ: слабые дуги заморожены, сильные учатся (как в BornOptimizer).
+    #[test]
+    fn epsilon_freezes_weak_arcs() {
+        let start = vec![0.05, 0.6];
+        let target = vec![0.9, 0.9];
+        let mut ansatz = Ansatz::from_phases(&start, &LoadOptions::default()).unwrap();
+        // β = 0: плоское расписание — тест про Π_Λ, а не про адаптацию.
+        let mut ai = ActiveInference::new(0.3, 0.0, 8192)
+            .with_seed(2)
+            .with_epsilon(0.2)
+            .with_purify_every(0)
+            .with_gamma(0.9);
+        ai.run(&mut ansatz, quadratic_target(&target), 6).unwrap();
+        let p = parameters_of(&ansatz).unwrap();
+        assert!((p[0] - 0.05).abs() < 1e-12, "слабая дуга сдвинулась: {p:?}");
+        assert!((p[1] - 0.9).abs() < 0.1, "сильная дуга не сошлась: {p:?}");
+    }
+
+    /// Побитовая воспроизводимость адаптивной траектории.
+    #[test]
+    fn adaptive_is_bit_reproducible() {
+        let (start, target) = drift_setup(128);
+        let run_once = || {
+            let mut ansatz = Ansatz::from_phases(&start, &LoadOptions::default()).unwrap();
+            let mut ai = ActiveInference::new(0.2, 2.0, 2048).with_seed(2026);
+            let reports = ai.run(&mut ansatz, quadratic_target(&target), 8).unwrap();
+            (reports, parameters_of(&ansatz).unwrap())
+        };
+        let (rep_a, p_a) = run_once();
+        let (rep_b, p_b) = run_once();
+        assert_eq!(rep_a, rep_b);
+        assert_eq!(p_a, p_b);
+        // Память расписания синхронна с последним отчётом.
+        let mut ai = ActiveInference::new(0.2, 2.0, 2048).with_seed(2026);
+        let mut ansatz = Ansatz::from_phases(&start, &LoadOptions::default()).unwrap();
+        ai.step(&mut ansatz, quadratic_target(&target)).unwrap();
+        assert!((ai.last_surprise() - rep_a[0].surprise).abs() < 1e-15);
+        assert!((ai.last_eta() - rep_a[0].eta).abs() < 1e-15);
+    }
+
+    /// Длина замыкания валидируется (паритет с BornOptimizer).
+    #[test]
+    fn closure_length_is_validated() {
+        let mut ai = ActiveInference::new(0.1, 1.0, 8);
+        let mut ansatz = Ansatz::from_phases(&[0.1, 0.2], &LoadOptions::default()).unwrap();
+        assert!(matches!(
+            ai.step(&mut ansatz, |_| vec![0.0]),
+            Err(PqcError::LengthMismatch { expected: 2, .. })
+        ));
+    }
+
+    /// В хаосе шаг мал, у стационара — полный: β реально управляет трением.
+    #[test]
+    fn eta_shrinks_with_surprise_in_live_loop() {
+        // Старт из честных монет: Σ = 1 → η = η₀·e^(−β) строго меньше η₀.
+        let mut ansatz = Ansatz::from_phases(&[0.0; 16], &LoadOptions::default()).unwrap();
+        let mut ai = ActiveInference::new(0.25, 3.0, 4096).with_seed(1);
+        let r = ai
+            .step(&mut ansatz, quadratic_target(&vec![0.9; 16]))
+            .unwrap();
+        assert!((r.surprise - 1.0).abs() < 1e-12);
+        assert!((r.eta - 0.25 * (-3.0_f64).exp()).abs() < 1e-12);
+
+        // Старт из чистых тритов: Σ = 0 → η = η₀ (полная скорость у стационара).
+        let mut trit_ansatz =
+            Ansatz::from_phases(&[1.0, -1.0, 1.0, -1.0], &LoadOptions::default()).unwrap();
+        let mut ai2 = ActiveInference::new(0.25, 3.0, 4096).with_seed(1);
+        let r2 = ai2
+            .step(&mut trit_ansatz, quadratic_target(&[1.0, -1.0, 1.0, -1.0]))
+            .unwrap();
+        assert!(r2.surprise.abs() < 1e-12);
+        assert!((r2.eta - 0.25).abs() < 1e-15);
     }
 }

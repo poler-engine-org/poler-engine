@@ -236,7 +236,6 @@ fn ansatz_from_phases_matches_reader_path() {
 #[test]
 fn mmap_pipeline_end_to_end() {
     use pqw::Mmap;
-    use std::path::PathBuf;
 
     let mut path = std::env::temp_dir();
     path.push(format!("pqc-mmap-{}.poler", std::process::id()));

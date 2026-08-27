@@ -98,6 +98,7 @@ pub mod parity;
 pub mod rng;
 pub mod statevector;
 pub mod stream;
+pub mod stream_engine;
 
 pub use ansatz::{
     Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,
@@ -109,8 +110,11 @@ pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;
 pub use json::{Json, JsonError};
-pub use learn::{quadratic_target, BornOptimizer, StepReport};
+pub use learn::{quadratic_target, ActiveInference, ActiveStepReport, BornOptimizer, StepReport};
 pub use parity::{splitmix_phases, ParityAnsatz, ParityMode};
 pub use rng::Rng;
 pub use statevector::{phase_to_theta, Statevector, MAX_QUBITS};
 pub use stream::{StreamReport, ZeroStoragePipeline};
+pub use stream_engine::{
+    fock_residual, strip_html, FockResidual, Forget, StreamChunkReport, StreamEngine,
+};

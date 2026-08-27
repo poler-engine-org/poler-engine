@@ -6,6 +6,9 @@
 //!            [--engine auto|sv|product] [--max-sv-qubits N] [--verify]
 //!            [--marginals]
 //! pqc demo [--n N] [--shots M] [--seed S]
+//! pqc stream (--url URL | --file PATH | --text TEXT | --stdin)
+//!            [--dim N] [--epsilon E] [--shots N] [--steps N] [--seed S]
+//!            [--eta0 H] [--beta B] [--gamma G] [--decay] [--json] [--out F]
 //! ```
 
 use std::path::Path;
@@ -20,8 +23,26 @@ POLER Quantum Core — statevector + Born sampling над .poler/.pqw
 USAGE:
     pqc run <file> [options]
     pqc demo [--n N] [--shots M] [--seed S]
+    pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
 
-OPTIONS:
+STREAM OPTIONS (RQ6: zero-storage потоковое обучение):
+    --url <URL>               http:// страница (zero-dep клиент; https → --file)
+    --file <PATH>             локальный HTML/текст файл
+    --text <TEXT>             встроенный текст чанка
+    --stdin                   читать стандартный ввод до EOF
+    --dim <N>                 размерность d_pol (default 512)
+    --epsilon <E>             порог LENS ε-плотности (default 0.2)
+    --shots <N>               Born-выстрелов на измерение (default 10000)
+    --steps <N>               шагов Active Inference к цели (default 8)
+    --seed <S>                семя xoshiro256++ (default 42)
+    --eta0 <H>                базовый шаг η₀ (default 0.25)
+    --beta <B>                затухание шага по сюрпризу β (default 1.0)
+    --gamma <G>               трение γ (default 0.5, полюсная защита RQ5)
+    --decay                   политика фона Decay (по умолчанию Hold)
+    --json                    машинно-читаемый отчёт (zero-dep JSON)
+    --out <F>                 дамп Packed4-контейнера в файл (опционально)
+
+OPTIONS (run/demo):
     --shots <N>               Born-выстрелов (default 1024)
     --seed <S>                семя xoshiro256++ (default 42)
     --top <K>                 топ-K исходов в отчёте (default 8)
@@ -36,6 +57,7 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("demo") => cmd_demo(&args[1..]),
+        Some("stream") => cmd_stream(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -314,6 +336,535 @@ fn run_reader(
 
 fn p_hat(count: u64, shots: u64) -> f64 {
     count as f64 / shots.max(1) as f64
+}
+
+// ============================================================================
+// pqc stream (RQ6): Zero-Storage Streaming Learning Engine
+// ============================================================================
+
+struct StreamConfig {
+    url: Option<String>,
+    file: Option<String>,
+    text: Option<String>,
+    stdin: bool,
+    dim: u32,
+    epsilon: f32,
+    shots: u64,
+    steps: usize,
+    seed: u64,
+    eta0: f64,
+    beta: f64,
+    gamma: f64,
+    decay: bool,
+    json: bool,
+    out: Option<String>,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        StreamConfig {
+            url: None,
+            file: None,
+            text: None,
+            stdin: false,
+            dim: 512,
+            epsilon: 0.2,
+            shots: 10_000,
+            steps: 8,
+            seed: 42,
+            eta0: 0.25,
+            beta: 1.0,
+            gamma: 0.5,
+            decay: false,
+            json: false,
+            out: None,
+        }
+    }
+}
+
+fn cmd_stream(args: &[String]) -> i32 {
+    let mut cfg = StreamConfig::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].clone();
+        let mut val = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match a.as_str() {
+            "--url" => match val("--url") {
+                Ok(v) => cfg.url = Some(v),
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--file" => match val("--file") {
+                Ok(v) => cfg.file = Some(v),
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--text" => match val("--text") {
+                Ok(v) => cfg.text = Some(v),
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--stdin" => cfg.stdin = true,
+            "--dim" => match val("--dim").and_then(|v| parse_num::<u32>(&v, "--dim")) {
+                Ok(v) => cfg.dim = v,
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--epsilon" => match val("--epsilon")
+                .and_then(|v| v.parse::<f32>().map_err(|_| "bad --epsilon".to_string()))
+            {
+                Ok(v) => cfg.epsilon = v,
+                Err(_) => return stream_usage_err("bad --epsilon"),
+            },
+            "--shots" => match val("--shots").and_then(|v| parse_num::<u64>(&v, "--shots")) {
+                Ok(v) => cfg.shots = v,
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--steps" => match val("--steps").and_then(|v| parse_num::<usize>(&v, "--steps")) {
+                Ok(v) => cfg.steps = v,
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--seed" => match val("--seed").and_then(|v| parse_num::<u64>(&v, "--seed")) {
+                Ok(v) => cfg.seed = v,
+                Err(e) => return stream_usage_err(&e),
+            },
+            "--eta0" => match val("--eta0")
+                .and_then(|v| v.parse::<f64>().map_err(|_| "bad --eta0".to_string()))
+            {
+                Ok(v) => cfg.eta0 = v,
+                Err(_) => return stream_usage_err("bad --eta0"),
+            },
+            "--beta" => match val("--beta")
+                .and_then(|v| v.parse::<f64>().map_err(|_| "bad --beta".to_string()))
+            {
+                Ok(v) => cfg.beta = v,
+                Err(_) => return stream_usage_err("bad --beta"),
+            },
+            "--gamma" => match val("--gamma")
+                .and_then(|v| v.parse::<f64>().map_err(|_| "bad --gamma".to_string()))
+            {
+                Ok(v) => cfg.gamma = v,
+                Err(_) => return stream_usage_err("bad --gamma"),
+            },
+            "--decay" => cfg.decay = true,
+            "--json" => cfg.json = true,
+            "--out" => match val("--out") {
+                Ok(v) => cfg.out = Some(v),
+                Err(e) => return stream_usage_err(&e),
+            },
+            other => return stream_usage_err(&format!("unknown option {other}")),
+        }
+        i += 1;
+    }
+
+    // Ровно один источник входа.
+    let sources = cfg.url.is_some() as u8
+        + cfg.file.is_some() as u8
+        + cfg.text.is_some() as u8
+        + cfg.stdin as u8;
+    if sources != 1 {
+        return stream_usage_err("укажите ровно один источник: --url | --file | --text | --stdin");
+    }
+    if cfg.dim == 0 || cfg.dim > 1 << 20 {
+        return stream_usage_err("--dim должен быть в [1, 1048576]");
+    }
+    if !(0.0..=1.0).contains(&cfg.epsilon) || !cfg.epsilon.is_finite() {
+        return stream_usage_err("--epsilon должен быть в [0, 1]");
+    }
+
+    // Входные байты.
+    let (bytes, source_desc, source_kind) = if let Some(url) = &cfg.url {
+        match http_get(url, MAX_HTTP_BYTES) {
+            Ok((body, final_url)) => (body, final_url, "http".to_string()),
+            Err(e) => {
+                eprintln!("pqc stream: {e}");
+                return 1;
+            }
+        }
+    } else if let Some(path) = &cfg.file {
+        match std::fs::read(path) {
+            Ok(b) => (b, path.clone(), "file".to_string()),
+            Err(e) => {
+                eprintln!("pqc stream: {e}");
+                return 1;
+            }
+        }
+    } else if let Some(text) = &cfg.text {
+        (
+            text.clone().into_bytes(),
+            "--text".to_string(),
+            "text".to_string(),
+        )
+    } else {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("pqc stream: stdin: {e}");
+            return 1;
+        }
+        (buf, "stdin".to_string(), "stdin".to_string())
+    };
+
+    // Движок: zero-storage цикл целиком в RAM.
+    use pqc::stream_engine::{Forget, StreamEngine};
+    let forget = if cfg.decay {
+        Forget::Decay
+    } else {
+        Forget::Hold
+    };
+    let mut engine = match StreamEngine::new(cfg.dim, cfg.epsilon, cfg.seed) {
+        Ok(e) => e
+            .with_shots(cfg.shots)
+            .with_hyper(cfg.eta0, cfg.beta, cfg.gamma)
+            .with_forget(forget),
+        Err(e) => {
+            eprintln!("pqc stream: {e}");
+            return 1;
+        }
+    };
+    let rep = match engine.ingest_html(&bytes, cfg.steps) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc stream: {e}");
+            return 1;
+        }
+    };
+
+    // Опциональный дамп контейнера (единственная точка касания диска).
+    if let Some(out) = &cfg.out {
+        if let Err(e) = std::fs::write(out, engine.container()) {
+            eprintln!("pqc stream: --out: {e}");
+            return 1;
+        }
+    }
+
+    if cfg.json {
+        print_stream_json(&rep, &source_desc, &source_kind, bytes.len(), cfg.dim);
+    } else {
+        print_stream_human(&rep, &source_desc, &source_kind, bytes.len(), &engine);
+    }
+    0
+}
+
+fn stream_usage_err(msg: &str) -> i32 {
+    eprintln!("pqc stream: {msg}\n\n{USAGE}");
+    2
+}
+
+fn print_stream_human(
+    rep: &pqc::stream_engine::StreamChunkReport,
+    source_desc: &str,
+    source_kind: &str,
+    input_bytes: usize,
+    engine: &pqc::stream_engine::StreamEngine,
+) {
+    println!("POLER Quantum Core — Zero-Storage Streaming Engine (RQ6)");
+    println!(
+        "source    : {source_desc} ({:.1} КиБ, {source_kind})",
+        input_bytes as f64 / 1024.0
+    );
+    println!(
+        "text      : {} токенов, LENS eps={:.2}",
+        rep.tokens,
+        engine.epsilon()
+    );
+    if rep.no_hits {
+        println!("barrier   : NO_HITS — свидетельство пусто, детерминированный отказ");
+        println!("fock      : [F, DM]_S = 0 точно (нет факта - нет галлюцинации)");
+    } else {
+        println!(
+            "container : d_pol={} nnz={} {} B (Packed4 v0.2: 4 трита/байт, magic POLER_Q2)",
+            engine.d_pol(),
+            rep.nnz,
+            rep.container_bytes
+        );
+        println!(
+            "buffer    : capacity {} B (реюз, системных аллокаций после прогрева нет)",
+            rep.buffer_capacity
+        );
+        println!(
+            "fock      : raw={:.4} normalized={:.4} (коммутатор [F, DM]_S свидетельство x память)",
+            rep.fock.raw, rep.fock.normalized
+        );
+        if let Some(s) = &rep.step {
+            println!(
+                "step 1    : surprise Sigma={:.4}  eta={:.4}  (eta0*e^(-beta*Sigma))",
+                s.surprise, s.eta
+            );
+        }
+        println!(
+            "loss      : {:.6} ({} шагов Active Inference, gamma={})",
+            rep.param_loss,
+            rep.steps_run,
+            engine.learner().gamma()
+        );
+        println!(
+            "qcm       : theory {:.4}  observed {:.4}  gap {:.4}  ({} выстрелов)",
+            rep.qcm.qcm_theory,
+            rep.qcm.qcm_observed,
+            rep.qcm.qcm_gap(),
+            rep.qcm.shots
+        );
+    }
+    println!(
+        "elapsed   : {:.3} мс (сквозной цикл в RAM, диск не затронут)",
+        rep.elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+fn print_stream_json(
+    rep: &pqc::stream_engine::StreamChunkReport,
+    source_desc: &str,
+    source_kind: &str,
+    input_bytes: usize,
+    dim: u32,
+) {
+    use pqc::json::Json;
+    let step_obj = |s: &pqc::learn::ActiveStepReport| {
+        Json::Obj(vec![
+            ("step".into(), Json::num(s.step as f64)),
+            ("shots".into(), Json::num(s.shots as f64)),
+            ("surprise".into(), Json::num(s.surprise)),
+            ("eta".into(), Json::num(s.eta)),
+            ("surrogate_loss".into(), Json::num(s.surrogate_loss)),
+            ("grad_norm".into(), Json::num(s.grad_norm)),
+            ("max_dp".into(), Json::num(s.max_dp)),
+            ("measurement_mad".into(), Json::num(s.measurement_mad)),
+            ("purified".into(), Json::Bool(s.purified)),
+            ("mean_abs_p".into(), Json::num(s.mean_abs_p)),
+        ])
+    };
+    let obj = Json::Obj(vec![
+        ("source".into(), Json::str(source_desc)),
+        ("source_kind".into(), Json::str(source_kind)),
+        ("input_bytes".into(), Json::num(input_bytes as f64)),
+        ("d_pol".into(), Json::num(dim as f64)),
+        ("tokens".into(), Json::num(rep.tokens as f64)),
+        ("nnz".into(), Json::num(rep.nnz as f64)),
+        (
+            "container_bytes".into(),
+            Json::num(rep.container_bytes as f64),
+        ),
+        (
+            "buffer_capacity".into(),
+            Json::num(rep.buffer_capacity as f64),
+        ),
+        ("docs_seen".into(), Json::num(rep.docs_seen as f64)),
+        ("no_hits".into(), Json::Bool(rep.no_hits)),
+        (
+            "fock".into(),
+            Json::Obj(vec![
+                ("raw".into(), Json::num(rep.fock.raw)),
+                ("normalized".into(), Json::num(rep.fock.normalized)),
+            ]),
+        ),
+        (
+            "step".into(),
+            match &rep.step {
+                Some(s) => step_obj(s),
+                None => Json::Null,
+            },
+        ),
+        ("steps_run".into(), Json::num(rep.steps_run as f64)),
+        ("param_loss".into(), Json::num(rep.param_loss)),
+        (
+            "qcm".into(),
+            Json::Obj(vec![
+                ("theory".into(), Json::num(rep.qcm.qcm_theory)),
+                ("observed".into(), Json::num(rep.qcm.qcm_observed)),
+                (
+                    "born_entropy_bits".into(),
+                    Json::num(rep.qcm.born_entropy_bits),
+                ),
+                ("marginal_mad".into(), Json::num(rep.qcm.marginal_mad)),
+            ]),
+        ),
+        (
+            "elapsed_ms".into(),
+            Json::num(rep.elapsed.as_secs_f64() * 1000.0),
+        ),
+    ]);
+    println!("{}", obj.to_string());
+}
+
+/// Потолок тела HTTP-ответа (защита от бесконечных потоков).
+const MAX_HTTP_BYTES: usize = 16 * 1024 * 1024;
+/// Лимит переходов по редиректам.
+const MAX_REDIRECTS: usize = 3;
+
+/// Минимальный HTTP/1.1 GET-клиент на `std::net::TcpStream` —
+/// **ноль внешних зависимостей** (TLS сознательно не поддерживается:
+/// https-страницу следует сохранить и передать через `--file`).
+fn http_get(url: &str, max_bytes: usize) -> Result<(Vec<u8>, String), String> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let (host, port, path) = parse_http_url(&current)?;
+        let stream = std::net::TcpStream::connect((host.as_str(), port))
+            .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(15)))
+            .map_err(|e| e.to_string())?;
+        let mut stream = stream;
+        let host_header = if port == 80 {
+            host.clone()
+        } else {
+            format!("{host}:{port}")
+        };
+        let req = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {host_header}\r\n\
+             User-Agent: pqc-stream/0.3\r\n\
+             Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8\r\n\
+             Accept-Encoding: identity\r\n\
+             Connection: close\r\n\r\n"
+        );
+        use std::io::{Read, Write};
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("send: {e}"))?;
+
+        // Ответ целиком (Connection: close упрощает границы тела).
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let n = stream.read(&mut chunk).map_err(|e| format!("recv: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            if raw.len() + n > max_bytes + 64 * 1024 {
+                return Err(format!("ответ превышает лимит {max_bytes} байт"));
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        }
+
+        // Заголовки / тело.
+        let sep = find_headers_end(&raw).ok_or("ответ без завершения заголовков")?;
+        let head = String::from_utf8_lossy(&raw[..sep]).to_string();
+        let body = raw[sep + 4..].to_vec();
+        let mut lines = head.split("\r\n");
+        let status_line = lines.next().unwrap_or_default().to_string();
+        let code: u16 = status_line
+            .split_ascii_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| format!("битый статус: {status_line}"))?;
+
+        let mut location = None;
+        let mut chunked = false;
+        for line in lines {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim();
+            if k == "location" {
+                location = Some(v.to_string());
+            }
+            if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+        }
+
+        match code {
+            200..=299 => {
+                let body = if chunked {
+                    decode_chunked(&body, max_bytes)?
+                } else {
+                    body
+                };
+                return Ok((body, current));
+            }
+            301 | 302 | 303 | 307 | 308 => {
+                let loc = location.ok_or_else(|| format!("редирект {code} без Location"))?;
+                current = resolve_url(&current, &loc)?;
+                continue;
+            }
+            _ => return Err(format!("HTTP {code}: {status_line}")),
+        }
+    }
+    Err("слишком много редиректов".into())
+}
+
+/// `http://host[:port]/path?query` → (host, port, path).
+fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
+    if url.starts_with("https://") {
+        return Err(format!(
+            "https не поддерживается zero-dep клиентом: сохраните страницу и передайте --file ({url})"
+        ));
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("неподдерживаемая схема (нужен http://): {url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return Err("пустой хост".into());
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| format!("битый порт: {p}"))?,
+        ),
+        None => (authority.to_string(), 80),
+    };
+    Ok((host, port, path.to_string()))
+}
+
+/// Индекс `\r\n\r\n` (конец заголовков).
+fn find_headers_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Декодирование Transfer-Encoding: chunked.
+fn decode_chunked(body: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let Some(nl) = body[i..].windows(2).position(|w| w == b"\r\n") else {
+            return Err("битый chunked: нет конца size-строки".into());
+        };
+        let size_line = String::from_utf8_lossy(&body[i..i + nl]).to_string();
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| format!("битый chunked размер: {size_hex}"))?;
+        i += nl + 2;
+        if size == 0 {
+            break;
+        }
+        if out.len() + size > max_bytes {
+            return Err(format!("chunked тело превышает лимит {max_bytes} байт"));
+        }
+        if i + size > body.len() {
+            return Err("битый chunked: обрыв данных".into());
+        }
+        out.extend_from_slice(&body[i..i + size]);
+        i += size + 2; // данные + CRLF
+    }
+    Ok(out)
+}
+
+/// Относительный Location → абсолютный URL.
+fn resolve_url(base: &str, location: &str) -> Result<String, String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        if location.starts_with("https://") {
+            return Err("редирект на https не поддерживается zero-dep клиентом".into());
+        }
+        return Ok(location.to_string());
+    }
+    let (host, port, _) = parse_http_url(base)?;
+    let path = if location.starts_with('/') {
+        location.to_string()
+    } else {
+        // Относительный путь от корня (упрощение: без разбора '..').
+        format!("/{location}")
+    };
+    Ok(format!("http://{host}:{port}{path}"))
 }
 
 // --- Команды ---
