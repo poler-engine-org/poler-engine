@@ -1,6 +1,6 @@
 //! # pqc — POLER Quantum Core
 //!
-//! Вычислительное ядро POLER[Ψ] на чистом Rust: statevector-движок с
+//! Вычислительное ядро POLER\[Ψ\] на чистом Rust: statevector-движок с
 //! анзацем `R_y(arccos p)` и Born-сэмплированием поверх контейнера
 //! [`.poler` / `.pqw`](https://docs.rs/pqw) — **без единой внешней
 //! зависимости** (ни faer, ни rand, ни rayon).
@@ -86,19 +86,29 @@
 
 pub mod ansatz;
 pub mod born;
+pub mod coherence;
 pub mod complex;
+pub mod entangle;
 pub mod error;
 pub mod gates;
+pub mod json;
 pub mod parallel;
+pub mod parity;
 pub mod rng;
 pub mod statevector;
+pub mod stream;
 
 pub use ansatz::{
     Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,
 };
 pub use born::BornSampler;
+pub use coherence::{binary_entropy, coherence, CoherenceReport};
 pub use complex::Cx;
+pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;
+pub use json::{Json, JsonError};
+pub use parity::{splitmix_phases, ParityAnsatz, ParityMode};
 pub use rng::Rng;
 pub use statevector::{phase_to_theta, Statevector, MAX_QUBITS};
+pub use stream::{StreamReport, ZeroStoragePipeline};

@@ -164,11 +164,28 @@ impl PqwWriter {
 
     /// Сериализация в память. Детерминизм: одинаковый набор дуг → идентичные байты.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(HEADER_SIZE + self.estimated_size());
+        self.write_to_vec(&mut out)?;
+        Ok(out)
+    }
+
+    /// Дописать контейнер в чужой буфер **без промежуточной сборки файла** —
+    /// zero-storage стриминг: графовый поиск не касается диска вообще.
+    ///
+    /// Ранее записанное содержимое `out` сохраняется (контейнер дописывается
+    /// в хвост), поэтому один буфер можно переиспользовать между чанками.
+    pub fn write_to_vec(&self, out: &mut Vec<u8>) -> Result<()> {
         let (header, payload) = self.build()?;
-        let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
+        out.reserve(HEADER_SIZE + payload.len());
         out.extend_from_slice(&header.to_bytes());
         out.extend_from_slice(&payload);
-        Ok(out)
+        Ok(())
+    }
+
+    /// Оценка размера контейнера в байтах (заголовок + топология + фазы).
+    pub fn estimated_size(&self) -> usize {
+        let width = if self.uses_index16() { 2 } else { 4 };
+        HEADER_SIZE + self.entries.len() * (width + 1)
     }
 
     /// Запись в файл.

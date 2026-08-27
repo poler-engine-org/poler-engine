@@ -22,6 +22,8 @@ pub enum PqcError {
     NotNormalized { norm: f64 },
     /// Индекс дуги вне [0, d_pol).
     BadArc { index: u32, d_pol: u32 },
+    /// Длина вектора фаз не равна числу кубитов анзаца.
+    LengthMismatch { expected: usize, actual: usize },
     /// Дуги не отсортированы по индексу (или дублируются).
     UnsortedArcs,
     /// Ошибка контейнера `.poler` / `.pqw`.
@@ -50,6 +52,12 @@ impl fmt::Display for PqcError {
             }
             PqcError::BadArc { index, d_pol } => {
                 write!(f, "arc index {index} out of range [0, {d_pol})")
+            }
+            PqcError::LengthMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "length mismatch: expected {expected} phases, got {actual}"
+                )
             }
             PqcError::UnsortedArcs => write!(f, "arcs must be strictly sorted by index"),
             PqcError::Pqw(e) => write!(f, "pqw container: {e}"),

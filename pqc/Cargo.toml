@@ -15,3 +15,7 @@ pqw = { path = "../pqw" }
 [[bin]]
 name = "pqc"
 path = "src/bin/pqc.rs"
+
+[[bin]]
+name = "pqc-parity"
+path = "src/bin/pqc-parity.rs"

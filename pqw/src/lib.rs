@@ -1,7 +1,7 @@
 //! # pqw — POLER Quantum Weights
 //!
 //! Бинарный формат `.poler` / `.pqw`: сериализация фазовых состояний
-//! POLER[Ψ] **без единой внешней зависимости** — ни serde, ни memmap2, ни libc.
+//! POLER\[Ψ\] **без единой внешней зависимости** — ни serde, ни memmap2, ни libc.
 //!
 //! ## Слои формата (v1)
 //!
@@ -49,6 +49,7 @@ pub mod mmap;
 pub mod phase;
 pub mod reader;
 pub mod sha256;
+pub mod stream;
 pub mod topology;
 pub mod writer;
 
@@ -56,6 +57,7 @@ pub use error::{PqwError, Result};
 pub use header::{Flags, Header, HyperParams, FORMAT_VERSION, HEADER_SIZE, MAGIC};
 pub use phase::{PhaseByte, Trit, QUANT_EPS, SIGMA_MAX};
 pub use reader::{Arc, PqwReader};
+pub use stream::TextPhaseEncoder;
 pub use writer::PqwWriter;
 
 #[cfg(unix)]

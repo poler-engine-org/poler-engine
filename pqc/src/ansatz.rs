@@ -22,6 +22,7 @@ use pqw::mcweeny::purify_p;
 use pqw::PqwReader;
 
 use crate::born::{counts_from, BornSampler};
+use crate::entangle::{prefix_xor_positions, prefix_xor_words, Entanglement, ProductEnt};
 use crate::error::{PqcError, Result};
 use crate::rng::Rng;
 use crate::statevector::Statevector;
@@ -82,6 +83,22 @@ pub enum Ansatz {
 impl Ansatz {
     /// Загрузка из открытого zero-copy читателя `.poler` / `.pqw`.
     pub fn from_reader(reader: &PqwReader, opts: &LoadOptions) -> Result<Ansatz> {
+        Ansatz::from_reader_entangled(reader, opts, &Entanglement::None)
+    }
+
+    /// Загрузка из читателя с энтанглмент-слоем (RQ4):
+    /// [`Entanglement::FromTopology`] разворачивает соседние LENS-дуги
+    /// в двухкубитные гейты, [`Entanglement::Chain`] даёт резонансный
+    /// слой как в qiskit-анзаце.
+    ///
+    /// Statevector-движок применяет гейты точно; product-движок сэмплирует
+    /// ровное то же распределение через GF(2)-распространение без 2^d
+    /// амплитуд (см. [`crate::entangle`]).
+    pub fn from_reader_entangled(
+        reader: &PqwReader,
+        opts: &LoadOptions,
+        ent: &Entanglement,
+    ) -> Result<Ansatz> {
         if opts.verify_payload {
             reader.verify_payload()?;
         }
@@ -92,12 +109,14 @@ impl Ansatz {
             for (i, p) in reader.decoded() {
                 ps[i as usize] = purify_n(p, opts.purify_steps);
             }
-            Ok(Ansatz::Statevector(Statevector::from_phases(&ps)?))
+            let mut sv = Statevector::from_phases(&ps)?;
+            let arcs: Vec<u32> = reader.indices().into_owned();
+            ent.apply_sv(&mut sv, &arcs)?;
+            Ok(Ansatz::Statevector(sv))
         } else {
-            Ok(Ansatz::Product(PhaseAnsatz::from_reader(
-                reader,
-                opts.purify_steps,
-            )))
+            let mut pa = PhaseAnsatz::from_reader(reader, opts.purify_steps);
+            pa.ent = ent.product_spec();
+            Ok(Ansatz::Product(pa))
         }
     }
 
@@ -172,6 +191,7 @@ impl Ansatz {
                 let expected_weight: f64 = theory.iter().sum();
                 Ok(SampleReport {
                     engine: Engine::Statevector,
+                    d_pol: sv.n_qubits() as u32,
                     shots,
                     distinct,
                     top,
@@ -202,6 +222,7 @@ impl Ansatz {
                     .collect();
                 Ok(SampleReport {
                     engine: Engine::Product,
+                    d_pol: pa.d_pol(),
                     shots,
                     distinct,
                     top,
@@ -221,6 +242,8 @@ impl Ansatz {
 pub struct SampleReport {
     /// Какой движок исполнил выстрелы.
     pub engine: Engine,
+    /// Размерность состояния (для product — d_pol контейнера).
+    pub d_pol: u32,
     /// Число выстрелов.
     pub shots: u64,
     /// Число различных исходов (для product — паттернов дуг или весов).
@@ -243,10 +266,12 @@ pub struct SampleReport {
     pub expected_weight: f64,
 }
 
-/// LENS-разреженный продуктовый анзац `⊗ R_y(arccos p̂)`.
+/// LENS-разреженный продуктовый анзац `⊗ R_y(arccos p̂)`
+/// с опциональным энтанглмент-слоем.
 pub struct PhaseAnsatz {
     d_pol: u32,
     arcs: Vec<(u32, f64)>,
+    ent: ProductEnt,
 }
 
 impl PhaseAnsatz {
@@ -268,7 +293,27 @@ impl PhaseAnsatz {
                 return Err(PqcError::BadPhase(p));
             }
         }
-        Ok(PhaseAnsatz { d_pol, arcs })
+        Ok(PhaseAnsatz {
+            d_pol,
+            arcs,
+            ent: ProductEnt::None,
+        })
+    }
+
+    /// Энтанглмент-слой (builder): см. [`Entanglement`].
+    pub fn with_entanglement(mut self, ent: Entanglement) -> PhaseAnsatz {
+        self.ent = ent.product_spec();
+        self
+    }
+
+    /// Текущая спецификация энтанглмента (имя для отчётов).
+    pub fn entanglement_name(&self) -> &'static str {
+        match self.ent {
+            ProductEnt::None => "none",
+            ProductEnt::Diagonal => "cz",
+            ProductEnt::PrefixAll => "chain:cx",
+            ProductEnt::PrefixArcs => "topology:cx",
+        }
     }
 
     /// Из контейнера: дуги → `(index, p̂)`, опционально McWeeny-заострение.
@@ -281,6 +326,7 @@ impl PhaseAnsatz {
         PhaseAnsatz {
             d_pol: reader.d_pol(),
             arcs,
+            ent: ProductEnt::None,
         }
     }
 
@@ -307,37 +353,213 @@ impl PhaseAnsatz {
             .collect()
     }
 
-    /// Теоретические `P(b_i = 1) = (1 − p̂_i)/2` по хранимым дугам.
+    /// Теоретические `P(b_i = 1) = (1 − p̂_i)/2` по хранимым дугам
+    /// (с учётом энтанглмента — марковская прогонка префиксного XOR).
+    ///
+    /// Без энтанглмента и для CZ-слоёв — произведение; для CX-цепочек
+    /// рекуррентность `P1'_k = P1'_{k−1}(1−p1_k) + (1−P1'_{k−1})p1_k`.
     pub fn marginal_theory(&self) -> Vec<(u32, f64)> {
-        self.arcs
-            .iter()
-            .map(|&(i, p)| (i, 0.5 * (1.0 - p)))
-            .collect()
+        match self.ent {
+            ProductEnt::None | ProductEnt::Diagonal => self
+                .arcs
+                .iter()
+                .map(|&(i, p)| (i, 0.5 * (1.0 - p)))
+                .collect(),
+            ProductEnt::PrefixArcs => {
+                let mut prev: Option<f64> = None;
+                self.arcs
+                    .iter()
+                    .map(|&(i, p)| {
+                        let p1 = 0.5 * (1.0 - p);
+                        let m = match prev {
+                            None => p1,
+                            Some(pr) => pr * (1.0 - p1) + (1.0 - pr) * p1,
+                        };
+                        prev = Some(m);
+                        (i, m)
+                    })
+                    .collect()
+            }
+            ProductEnt::PrefixAll => {
+                // Прогонка по всем координатам: фон p1 = 0.5.
+                let mut out = Vec::with_capacity(self.arcs.len());
+                let mut prev: Option<f64> = None;
+                let mut j = 0usize;
+                for i in 0..self.d_pol as usize {
+                    let is_arc = j < self.arcs.len() && self.arcs[j].0 as usize == i;
+                    let p1 = if is_arc {
+                        let p = self.arcs[j].1;
+                        j += 1;
+                        0.5 * (1.0 - p)
+                    } else {
+                        0.5
+                    };
+                    let m = match prev {
+                        None => p1,
+                        Some(pr) => pr * (1.0 - p1) + (1.0 - pr) * p1,
+                    };
+                    prev = Some(m);
+                    if is_arc {
+                        out.push((i as u32, m));
+                    }
+                }
+                out
+            }
+        }
     }
 
-    /// Теоретическая вероятность паттерна хранимых дуг (nnz ≤ 64).
+    /// Теоретическая вероятность паттерна хранимых дуг (nnz ≤ 64)
+    /// с учётом энтанглмента: марковская цепь по дугам, переход — XOR
+    /// независимых Бернулли зазора между дугами.
     pub fn pattern_probability(&self, pattern: u64) -> f64 {
-        let mut p = 1.0;
-        for (k, &(_, pv)) in self.arcs.iter().enumerate() {
-            let p1 = 0.5 * (1.0 - pv);
-            p *= if (pattern >> k) & 1 == 1 {
-                p1
-            } else {
-                1.0 - p1
-            };
+        match self.ent {
+            ProductEnt::None | ProductEnt::Diagonal => {
+                let mut p = 1.0;
+                for (k, &(_, pv)) in self.arcs.iter().enumerate() {
+                    let p1 = 0.5 * (1.0 - pv);
+                    p *= if (pattern >> k) & 1 == 1 {
+                        p1
+                    } else {
+                        1.0 - p1
+                    };
+                }
+                p
+            }
+            ProductEnt::PrefixArcs => {
+                // b'_{a_k} = init_{a_k} ⊕ b'_{a_{k−1}}: переход зависит
+                // только от значения init на самой дуге.
+                let mut p = 1.0;
+                let mut prev_x: Option<u64> = None;
+                for (k, &(_, pv)) in self.arcs.iter().enumerate() {
+                    let p1 = 0.5 * (1.0 - pv);
+                    let x = (pattern >> k) & 1;
+                    let factor = match prev_x {
+                        None => {
+                            if x == 1 {
+                                p1
+                            } else {
+                                1.0 - p1
+                            }
+                        }
+                        Some(xp) => {
+                            // init_k = x ⊕ xp.
+                            if x ^ xp == 1 {
+                                p1
+                            } else {
+                                1.0 - p1
+                            }
+                        }
+                    };
+                    p *= factor;
+                    prev_x = Some(x);
+                }
+                p
+            }
+            ProductEnt::PrefixAll => {
+                // Зазоры между дугами содержат фоновые координаты (p1 = 0.5,
+                // фактор q = 0): XOR со справедливой монетой «освежает» цепь.
+                let mut p = 1.0;
+                let mut prev_x: Option<u64> = None;
+                let mut q = 1.0_f64; // Π(1−2p1) по зазору (включая текущую дугу)
+                let mut j = 0usize;
+                for i in 0..self.d_pol as usize {
+                    let is_arc = j < self.arcs.len() && self.arcs[j].0 as usize == i;
+                    let p1 = if is_arc {
+                        let pv = self.arcs[j].1;
+                        j += 1;
+                        0.5 * (1.0 - pv)
+                    } else {
+                        0.5
+                    };
+                    q *= 1.0 - 2.0 * p1;
+                    if is_arc {
+                        let k = self
+                            .arcs
+                            .iter()
+                            .position(|&(a, _)| a as usize == i)
+                            .unwrap_or(usize::MAX);
+                        let x = (pattern >> k) & 1;
+                        let px1 = 0.5 * (1.0 - q); // P(XOR зазора = 1)
+                        let factor = match prev_x {
+                            None => {
+                                if x == 1 {
+                                    px1
+                                } else {
+                                    1.0 - px1
+                                }
+                            }
+                            Some(xp) => {
+                                if x ^ xp == 1 {
+                                    px1
+                                } else {
+                                    1.0 - px1
+                                }
+                            }
+                        };
+                        p *= factor;
+                        prev_x = Some(x);
+                        q = 1.0;
+                    }
+                }
+                p
+            }
         }
-        p
     }
 
     /// Теоретическое среднее веса Хэмминга полной битовой строки:
-    /// фон `d_pol − nnz` честных монет + спайки.
+    /// фон `d_pol − nnz` честных монет + спайки (с учётом энтанглмента —
+    /// сумма финальных маргинал).
     pub fn expected_weight(&self) -> f64 {
-        let background = f64::from(self.d_pol) - self.arcs.len() as f64;
-        background * 0.5 + self.arcs.iter().map(|&(_, p)| 0.5 * (1.0 - p)).sum::<f64>()
+        match self.ent {
+            ProductEnt::None | ProductEnt::Diagonal => {
+                let background = f64::from(self.d_pol) - self.arcs.len() as f64;
+                background * 0.5 + self.arcs.iter().map(|&(_, p)| 0.5 * (1.0 - p)).sum::<f64>()
+            }
+            ProductEnt::PrefixArcs => {
+                let background = f64::from(self.d_pol) - self.arcs.len() as f64;
+                background * 0.5 + self.marginal_theory().iter().map(|m| m.1).sum::<f64>()
+            }
+            ProductEnt::PrefixAll => {
+                let mut sum = 0.0_f64;
+                let mut prev: Option<f64> = None;
+                let mut j = 0usize;
+                for i in 0..self.d_pol as usize {
+                    let is_arc = j < self.arcs.len() && self.arcs[j].0 as usize == i;
+                    let p1 = if is_arc {
+                        let pv = self.arcs[j].1;
+                        j += 1;
+                        0.5 * (1.0 - pv)
+                    } else {
+                        0.5
+                    };
+                    let m = match prev {
+                        None => p1,
+                        Some(pr) => pr * (1.0 - p1) + (1.0 - pr) * p1,
+                    };
+                    prev = Some(m);
+                    sum += m;
+                }
+                sum
+            }
+        }
     }
 
     /// Born-сэмплирование: фон — popcount-монеты, спайки — Бернулли.
+    ///
+    /// С энтанглментом (CX-цепочки) фон материализуется словами, дуги —
+    /// битами, затем применяется точное GF(2)-распространение
+    /// (префиксный XOR): итоговое распределение совпадает с
+    /// statevector-гейтами без 2^d амплитуд. CZ-слои сэмплирование
+    /// не меняют (диагональные гейты).
     pub fn sample(&self, rng: &mut Rng, shots: u64) -> ProductStats {
+        match self.ent {
+            ProductEnt::None | ProductEnt::Diagonal => self.sample_product(rng, shots),
+            ProductEnt::PrefixAll | ProductEnt::PrefixArcs => self.sample_entangled(rng, shots),
+        }
+    }
+
+    /// Чистое произведение: попcount-фон + Бернулли-спайки (как в v0.1.1).
+    fn sample_product(&self, rng: &mut Rng, shots: u64) -> ProductStats {
         let background = self.d_pol as usize - self.arcs.len();
         let p1: Vec<f64> = self.arcs.iter().map(|&(_, p)| 0.5 * (1.0 - p)).collect();
         let track_patterns = self.arcs.len() <= 64;
@@ -362,6 +584,79 @@ impl PhaseAnsatz {
                 }
             }
             hist[w as usize] += 1;
+            if let Some(map) = patterns.as_mut() {
+                *map.entry(pat).or_insert(0u64) += 1;
+            }
+        }
+        let (weight_mean, weight_var) = hist_moments(&hist, shots);
+        ProductStats {
+            shots,
+            ones,
+            weight_hist: hist,
+            weight_mean,
+            weight_var,
+            patterns: patterns.map(|m| {
+                let mut v: Vec<(u64, u64)> = m.into_iter().collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                v
+            }),
+        }
+    }
+
+    /// Энтанглмент-сэмплирование: слова фона + биты дуг + префиксный XOR.
+    fn sample_entangled(&self, rng: &mut Rng, shots: u64) -> ProductStats {
+        let d = self.d_pol as usize;
+        let words_len = (d + 63) / 64;
+        let tail = d % 64;
+        let nodes: Vec<u32> = self.arcs.iter().map(|a| a.0).collect();
+        let track_patterns = self.arcs.len() <= 64;
+        let mut ones = vec![0u64; self.arcs.len()];
+        let mut hist = vec![0u64; d + 1];
+        let mut patterns = if track_patterns {
+            Some(BTreeMap::new())
+        } else {
+            None
+        };
+        let mut words = vec![0u64; words_len];
+        for _ in 0..shots {
+            // 1. Независимые начальные биты: фон словами, дуги — Бернулли.
+            for w in words.iter_mut() {
+                *w = rng.next_u64();
+            }
+            if tail != 0 {
+                let last = words_len - 1;
+                words[last] &= (1u64 << tail) - 1;
+            }
+            for &(i, p) in &self.arcs {
+                let p1 = 0.5 * (1.0 - p);
+                let bit = rng.next_f64() < p1;
+                let wi = i as usize / 64;
+                let bi = i as usize % 64;
+                if bit {
+                    words[wi] |= 1u64 << bi;
+                } else {
+                    words[wi] &= !(1u64 << bi);
+                }
+            }
+            // 2. GF(2)-распространение CX-слоя — точное.
+            match self.ent {
+                ProductEnt::PrefixAll => prefix_xor_words(&mut words),
+                ProductEnt::PrefixArcs => prefix_xor_positions(&mut words, &nodes),
+                _ => unreachable!("sample_entangled вызывается только для CX-слоёв"),
+            }
+            // 3. Показания: вес, биты дуг, паттерны.
+            let w: u32 = words.iter().map(|x| x.count_ones()).sum();
+            hist[w as usize] += 1;
+            let mut pat = 0u64;
+            for (k, &(i, _)) in self.arcs.iter().enumerate() {
+                let iu = i as usize;
+                if (words[iu / 64] >> (iu % 64)) & 1 == 1 {
+                    ones[k] += 1;
+                    if track_patterns {
+                        pat |= 1u64 << k;
+                    }
+                }
+            }
             if let Some(map) = patterns.as_mut() {
                 *map.entry(pat).or_insert(0u64) += 1;
             }
