@@ -539,6 +539,10 @@ impl CdpSession {
                 }
             }
         }
+        self.ws
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
         Ok(events)
     }
 

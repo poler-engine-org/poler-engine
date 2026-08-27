@@ -176,7 +176,13 @@ pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
         })?
     };
 
-    let _ = std::fs::create_dir_all(profile_dir());
+    let profile = profile_dir();
+    let _ = std::fs::create_dir_all(&profile);
+    // Автоматическая очистка повисших Singleton-замков после крашей/сигналов
+    let _ = std::fs::remove_file(profile.join("SingletonLock"));
+    let _ = std::fs::remove_file(profile.join("SingletonCookie"));
+    let _ = std::fs::remove_file(profile.join("SingletonSocket"));
+
     let mut args = google_browser_args(port);
     if !headed {
         args.push("--headless".to_string());
