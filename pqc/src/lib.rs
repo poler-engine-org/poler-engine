@@ -1,0 +1,104 @@
+//! # pqc — POLER Quantum Core
+//!
+//! Вычислительное ядро POLER[Ψ] на чистом Rust: statevector-движок с
+//! анзацем `R_y(arccos p)` и Born-сэмплированием поверх контейнера
+//! [`.poler` / `.pqw`](https://docs.rs/pqw) — **без единой внешней
+//! зависимости** (ни faer, ни rand, ни rayon).
+//!
+//! ## Математика анзаца
+//!
+//! Трек `p ∈ [−1, 1]` кодируется кубитом через угол `θ = arccos(p)`:
+//!
+//! ```text
+//! |ψ⟩ = ⊗_q R_y(θ_q)|0⟩,    R_y(θ)|0⟩ = cos(θ/2)|0⟩ + sin(θ/2)|1⟩
+//! ```
+//!
+//! Born-семантика трека: `P(b_q = 1) = sin²(θ_q/2) = (1 − p_q)/2`, а
+//! собственное значение McWeeny `λ_q = (1 + p_q)/2` — это в точности
+//! `P(b_q = 0)`. Чистые триты: `p = +1 → |0⟩`, `p = −1 → |1⟩`,
+//! `p = 0 → честная монета` (фон LENS).
+//!
+//! ## Движки
+//!
+//! | Движок | Условие | Память | Выстрел |
+//! |---|---|---|---|
+//! | [`Statevector`] | `d_pol ≤ 20` (настраивается) | `2^d_pol × 16 B` | `O(d_pol)` бинарный поиск |
+//! | [`PhaseAnsatz`] | любое `d_pol` | `O(nnz)` | `O(nnz + d_pol/64)` |
+//!
+//! ## Пример: анзац из фазового вектора
+//!
+//! ```
+//! use pqc::{Rng, Statevector};
+//!
+//! // Трек p → кубит с P(b=1) = (1−p)/2.
+//! let sv = Statevector::from_phases(&[0.0, -1.0, 1.0]).unwrap();
+//! let m = sv.marginals();               // P(b_q = 1)
+//! assert!((m[0] - 0.5).abs() < 1e-12);  // p = 0  → честная монета
+//! assert!((m[1] - 1.0).abs() < 1e-12);  // p = −1 → |1⟩
+//! assert!(m[2] < 1e-12);                // p = +1 → |0⟩
+//!
+//! // Обратная проверка кодирования: ⟨Z_q⟩ = p_q.
+//! assert!((sv.expect_z(1).unwrap() - (-1.0)).abs() < 1e-12);
+//! let _ = Rng::seed_from_u64(42);
+//! ```
+//!
+//! ## Пример: Born-сэмплирование
+//!
+//! ```
+//! use pqc::{BornSampler, Rng, Statevector};
+//!
+//! let sv = Statevector::from_phases(&[0.6, -0.2]).unwrap();
+//! let mut rng = Rng::seed_from_u64(7);
+//! let sampler = BornSampler::new(&sv).unwrap();
+//! let shots = sampler.sample_n(&mut rng, 1000);
+//! assert_eq!(shots.len(), 1000);
+//!
+//! // Исход 0b10 (b0=0, b1=1): P = P(b0=0)·P(b1=1) = 0.8·0.6.
+//! assert!((sampler.outcome_probability(0b10) - 0.8 * 0.6).abs() < 1e-12);
+//! ```
+//!
+//! ## Пример: конвейер из контейнера .pqw
+//!
+//! ```
+//! use pqc::{Ansatz, LoadOptions, Rng};
+//! use pqw::{PqwReader, PqwWriter};
+//!
+//! let bytes = PqwWriter::new(4)
+//!     .unwrap()
+//!     .add_phase(1, -1.0)
+//!     .unwrap()
+//!     .add_phase(3, 0.0)
+//!     .unwrap()
+//!     .to_bytes()
+//!     .unwrap();
+//!
+//! let reader = PqwReader::from_bytes(&bytes).unwrap();
+//! let ansatz = Ansatz::from_reader(&reader, &LoadOptions::default()).unwrap();
+//! let mut rng = Rng::seed_from_u64(1);
+//! let report = ansatz.sample(&mut rng, 500, 4).unwrap();
+//! assert_eq!(report.shots, 500);
+//! assert_eq!(report.engine.name(), "statevector");
+//!
+//! // p = −1 → кубит 1 всегда в |1⟩: наблюдённая маргинала равна 1.
+//! let q1 = report.marginals.iter().find(|m| m.0 == 1).unwrap();
+//! assert!((q1.2 - 1.0).abs() < 1e-12);
+//! ```
+
+pub mod ansatz;
+pub mod born;
+pub mod complex;
+pub mod error;
+pub mod gates;
+pub mod parallel;
+pub mod rng;
+pub mod statevector;
+
+pub use ansatz::{
+    Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,
+};
+pub use born::BornSampler;
+pub use complex::Cx;
+pub use error::{PqcError, Result};
+pub use gates::Gate;
+pub use rng::Rng;
+pub use statevector::{phase_to_theta, Statevector, MAX_QUBITS};

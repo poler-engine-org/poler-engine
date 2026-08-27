@@ -1,0 +1,17 @@
+[package]
+name = "pqc"
+description = "POLER Quantum Core: statevector engine with Ry(arccos p) ansatz, Born sampling and LENS product engine - zero external dependencies, SIMD-friendly kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["quantum", "statevector", "born-sampling", "simd", "simulation"]
+categories = ["science", "simulation"]
+
+[dependencies]
+pqw = { path = "../pqw" }
+
+[[bin]]
+name = "pqc"
+path = "src/bin/pqc.rs"
