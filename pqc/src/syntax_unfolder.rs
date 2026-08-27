@@ -28,16 +28,20 @@ pub fn is_stationary(p: &[f64], prev: &[f64], eps: f64) -> bool {
 #[inline(always)]
 pub fn unfurl(p_state: &[f64], out_buf: &mut [u8; MAX_OUT]) -> usize {
     let mut out_len = 0;
-    
+
     // Обработка четверками (K=4 трита -> 8 бит -> индекс 0..255)
     let chunks = p_state.chunks_exact(4);
     let remainder = chunks.remainder();
 
     for quad in chunks {
-        let t0 = ((quad[0] > TRIT_THRESHOLD) as usize) | (((quad[0] < -TRIT_THRESHOLD) as usize) << 1);
-        let t1 = ((quad[1] > TRIT_THRESHOLD) as usize) | (((quad[1] < -TRIT_THRESHOLD) as usize) << 1);
-        let t2 = ((quad[2] > TRIT_THRESHOLD) as usize) | (((quad[2] < -TRIT_THRESHOLD) as usize) << 1);
-        let t3 = ((quad[3] > TRIT_THRESHOLD) as usize) | (((quad[3] < -TRIT_THRESHOLD) as usize) << 1);
+        let t0 =
+            ((quad[0] > TRIT_THRESHOLD) as usize) | (((quad[0] < -TRIT_THRESHOLD) as usize) << 1);
+        let t1 =
+            ((quad[1] > TRIT_THRESHOLD) as usize) | (((quad[1] < -TRIT_THRESHOLD) as usize) << 1);
+        let t2 =
+            ((quad[2] > TRIT_THRESHOLD) as usize) | (((quad[2] < -TRIT_THRESHOLD) as usize) << 1);
+        let t3 =
+            ((quad[3] > TRIT_THRESHOLD) as usize) | (((quad[3] < -TRIT_THRESHOLD) as usize) << 1);
 
         let idx = (t0 & 0x03) | ((t1 & 0x03) << 2) | ((t2 & 0x03) << 4) | ((t3 & 0x03) << 6);
         let raw = MORPHEME_CRYSTALS[idx];
@@ -45,7 +49,7 @@ pub fn unfurl(p_state: &[f64], out_buf: &mut [u8; MAX_OUT]) -> usize {
         if raw != 0 && out_len + 4 <= MAX_OUT {
             let bytes = raw.to_le_bytes();
             let len = 4 - (raw.leading_zeros() >> 3) as usize;
-            
+
             let to_write = len.min(MAX_OUT - out_len);
             out_buf[out_len..out_len + to_write].copy_from_slice(&bytes[..to_write]);
             out_len += to_write;
@@ -96,7 +100,7 @@ mod tests {
 
         assert_eq!(len1, len2);
         assert_eq!(&buf1[..len1], &buf2[..len2]);
-        
+
         let s = std::str::from_utf8(&buf1[..len1]).unwrap();
         println!("Unfurled text: '{}' (len={})", s, len1);
     }

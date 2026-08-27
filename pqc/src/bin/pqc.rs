@@ -33,6 +33,7 @@ USAGE:
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
     pqc inspect <file> [options]
+    pqc train (--corpus DIR | --stdin) [options]              накопительное обучение
 
 INSPECT OPTIONS (чтение бинарников, графов и крипто-разведка):
     --hex <N|all>             hex-дамп первых N байтов (default 512)
@@ -64,6 +65,21 @@ STREAM OPTIONS (RQ6: zero-storage потоковое обучение):
     --json                    машинно-читаемый отчёт (zero-dep JSON)
     --out <F>                 дамп Packed4-контейнера в файл (опционально)
 
+TRAIN OPTIONS (RQ8: плотный LENS-граф, накопительная память):
+    --corpus <DIR>            каталог корпуса (рекурсивно, текст. расширения)
+    --stdin                   поток блоков из стандартного ввода
+    --dim <N>                 размерность d_pol (default 4096)
+    --epsilon <E>             порог LENS ε-плотности (default 0.05 — плотный)
+    --block <N>               размер блока в байтах (default 8192)
+    --shots <N>               Born-выстрелов на измерение (default 20000)
+    --steps <N>               шагов Active Inference на блок (default 10)
+    --out <F>                 чекпоинт .pqw накопленной памяти
+    --fingerprint <F>         raw Packed4-отпечаток фазовой памяти (снимок CPU)
+    --snapshot-every <N>      снапшот каждые N блоков (default 64)
+    --max-bytes <N>           потолок корпуса в байтах (default 256 МиБ)
+    --log <F>                 файл телеметрии обучения
+    --every <N>               прогресс в stdout каждые N файлов (default 25)
+
 OPTIONS (run/demo):
     --shots <N>               Born-выстрелов (default 1024)
     --seed <S>                семя xoshiro256++ (default 42)
@@ -82,6 +98,7 @@ fn main() {
         Some("stream") => cmd_stream(&args[1..]),
         Some("unfurl") => cmd_unfurl(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
+        Some("train") => cmd_train(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -1386,7 +1403,12 @@ fn cmd_unfurl(args: &[String]) -> i32 {
     };
 
     println!("POLER Quantum Core — AOT Syntax Unfolder");
-    println!("source    : {} ({} B, d_pol={})", file_path, raw.len(), reader.d_pol());
+    println!(
+        "source    : {} ({} B, d_pol={})",
+        file_path,
+        raw.len(),
+        reader.d_pol()
+    );
 
     let mut ps = vec![0.0f64; reader.d_pol() as usize];
     if reader.header().is_packed() {
@@ -1411,5 +1433,518 @@ fn cmd_unfurl(args: &[String]) -> i32 {
         println!("unfurled  : <zero / background state> (0 bytes)");
     }
 
+    0
+}
+
+// ============================================================================
+// pqc train — накопительное глубокое обучение с плотным LENS-графом (RQ8).
+//
+// Отличие от `pqc stream`: движок ОДИН на весь корпус, чанки (блоки по
+// --block байт) льются подряд, support объединяется (merge_support),
+// а снапшот сериализует НАКОПЛЕННУЮ память engine.model() — не буфер
+// последнего чанка. Файл-отпечаток (raw Packed4) обновляется каждые
+// --snapshot-every блоков: состояние можно мониторить на живую
+// (pqc inspect / hexdump / radare2) прямо во время обучения.
+// ============================================================================
+
+/// Текстовые расширения корпуса обучения.
+const TRAIN_EXTENSIONS: &[&str] = &[
+    "rs", "py", "md", "txt", "json", "c", "h", "cpp", "hpp", "cc", "js", "ts", "html", "htm",
+    "css", "toml", "yaml", "yml", "sh", "java", "scala", "kt", "go", "rb", "php", "sql", "tex",
+];
+
+/// Потолок размера одного файла корпуса (гигантские тома пропускаем).
+const TRAIN_FILE_MAX: u64 = 8 << 20;
+
+struct TrainConfig {
+    corpus: Option<String>,
+    stdin: bool,
+    dim: u32,
+    epsilon: f32,
+    block: usize,
+    shots: u64,
+    steps: usize,
+    seed: u64,
+    eta0: f64,
+    beta: f64,
+    gamma: f64,
+    decay: bool,
+    out: Option<String>,
+    fingerprint: Option<String>,
+    snapshot_every: usize,
+    max_bytes: u64,
+    log: Option<String>,
+    json: bool,
+    every: usize,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        TrainConfig {
+            corpus: None,
+            stdin: false,
+            dim: 4096,
+            epsilon: 0.05,
+            block: 8192,
+            shots: 20_000,
+            steps: 10,
+            seed: 42,
+            eta0: 0.25,
+            beta: 1.0,
+            gamma: 0.5,
+            decay: false,
+            out: None,
+            fingerprint: None,
+            snapshot_every: 64,
+            max_bytes: 256 << 20,
+            log: None,
+            json: false,
+            every: 25,
+        }
+    }
+}
+
+/// Счётчики цикла обучения.
+struct TrainStats {
+    total_tokens: u64,
+    total_blocks: u64,
+    no_hits: u64,
+    last_loss: f64,
+    last_qcm_gap: f64,
+    blocks_since_snapshot: usize,
+    snapshot: (usize, u64, usize),
+}
+
+fn train_usage_err(msg: &str) -> i32 {
+    eprintln!("pqc train: {msg}\n\n{USAGE}");
+    2
+}
+
+/// Рекурсивный обход каталога: текстовые файлы ≤ TRAIN_FILE_MAX, сортировка путей.
+fn collect_corpus(root: &Path, files: &mut Vec<std::path::PathBuf>, total: &mut u64, cap: u64) {
+    let rd = match std::fs::read_dir(root) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if *total >= cap {
+            return;
+        }
+        if p.is_dir() {
+            collect_corpus(&p, files, total, cap);
+        } else if p.is_file() {
+            let ext_ok = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| TRAIN_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+                .unwrap_or(false);
+            if !ext_ok {
+                continue;
+            }
+            let sz = match p.metadata() {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            if sz == 0 || sz > TRAIN_FILE_MAX {
+                continue;
+            }
+            *total += sz;
+            files.push(p);
+        }
+    }
+}
+
+/// Снапшот НАКОПЛЕННОЙ памяти: .pqw-контейнер + raw Packed4-отпечаток.
+fn train_snapshot(
+    engine: &pqc::stream_engine::StreamEngine,
+    cfg: &TrainConfig,
+) -> Result<(usize, u64, usize), String> {
+    let model = engine.model();
+    let mut buf = Vec::new();
+    {
+        let rho = if cfg.decay { 0.0 } else { 1.0 };
+        let w = PqwWriter::new(engine.d_pol())
+            .map_err(|e| e.to_string())?
+            .hyperparams(cfg.eta0 as f32, cfg.gamma as f32, rho, cfg.epsilon);
+        let mut w = w;
+        let state_f32: Vec<f32> = model.iter().map(|&p| p as f32).collect();
+        w.add_state(&state_f32).map_err(|e| e.to_string())?;
+        w.write_packed_trits(&mut buf).map_err(|e| e.to_string())?;
+    }
+    let nnz = PqwReader::from_bytes(&buf)
+        .map_err(|e| e.to_string())?
+        .nnz();
+    if let Some(p) = &cfg.out {
+        std::fs::write(p, &buf).map_err(|e| format!("--out: {e}"))?;
+    }
+    if let Some(p) = &cfg.fingerprint {
+        let payload = &buf[pqw::HEADER_SIZE.min(buf.len())..];
+        std::fs::write(p, payload).map_err(|e| format!("--fingerprint: {e}"))?;
+    }
+    Ok((buf.len(), nnz, engine.model_arcs().len()))
+}
+
+fn cmd_train(args: &[String]) -> i32 {
+    let mut cfg = TrainConfig::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].clone();
+        let mut val = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match a.as_str() {
+            "--corpus" => match val("--corpus") {
+                Ok(v) => cfg.corpus = Some(v),
+                Err(e) => return train_usage_err(&e),
+            },
+            "--stdin" => cfg.stdin = true,
+            "--dim" => match val("--dim").and_then(|v| parse_num::<u32>(&v, "--dim")) {
+                Ok(v) => cfg.dim = v,
+                Err(e) => return train_usage_err(&e),
+            },
+            "--epsilon" => match val("--epsilon")
+                .and_then(|v| v.parse::<f32>().map_err(|_| "bad --epsilon".to_string()))
+            {
+                Ok(v) => cfg.epsilon = v,
+                Err(_) => return train_usage_err("bad --epsilon"),
+            },
+            "--block" => match val("--block").and_then(|v| parse_num::<usize>(&v, "--block")) {
+                Ok(v) => cfg.block = v,
+                Err(e) => return train_usage_err(&e),
+            },
+            "--shots" => match val("--shots").and_then(|v| parse_num::<u64>(&v, "--shots")) {
+                Ok(v) => cfg.shots = v,
+                Err(e) => return train_usage_err(&e),
+            },
+            "--steps" => match val("--steps").and_then(|v| parse_num::<usize>(&v, "--steps")) {
+                Ok(v) => cfg.steps = v,
+                Err(e) => return train_usage_err(&e),
+            },
+            "--seed" => match val("--seed").and_then(|v| parse_num::<u64>(&v, "--seed")) {
+                Ok(v) => cfg.seed = v,
+                Err(e) => return train_usage_err(&e),
+            },
+            "--eta0" => match val("--eta0")
+                .and_then(|v| v.parse::<f64>().map_err(|_| "bad --eta0".to_string()))
+            {
+                Ok(v) => cfg.eta0 = v,
+                Err(_) => return train_usage_err("bad --eta0"),
+            },
+            "--beta" => match val("--beta")
+                .and_then(|v| v.parse::<f64>().map_err(|_| "bad --beta".to_string()))
+            {
+                Ok(v) => cfg.beta = v,
+                Err(_) => return train_usage_err("bad --beta"),
+            },
+            "--gamma" => match val("--gamma")
+                .and_then(|v| v.parse::<f64>().map_err(|_| "bad --gamma".to_string()))
+            {
+                Ok(v) => cfg.gamma = v,
+                Err(_) => return train_usage_err("bad --gamma"),
+            },
+            "--decay" => cfg.decay = true,
+            "--out" => match val("--out") {
+                Ok(v) => cfg.out = Some(v),
+                Err(e) => return train_usage_err(&e),
+            },
+            "--fingerprint" => match val("--fingerprint") {
+                Ok(v) => cfg.fingerprint = Some(v),
+                Err(e) => return train_usage_err(&e),
+            },
+            "--snapshot-every" => {
+                match val("--snapshot-every")
+                    .and_then(|v| parse_num::<usize>(&v, "--snapshot-every"))
+                {
+                    Ok(v) => cfg.snapshot_every = v.max(1),
+                    Err(e) => return train_usage_err(&e),
+                }
+            }
+            "--max-bytes" => {
+                match val("--max-bytes").and_then(|v| parse_num::<u64>(&v, "--max-bytes")) {
+                    Ok(v) => cfg.max_bytes = v,
+                    Err(e) => return train_usage_err(&e),
+                }
+            }
+            "--log" => match val("--log") {
+                Ok(v) => cfg.log = Some(v),
+                Err(e) => return train_usage_err(&e),
+            },
+            "--every" => match val("--every").and_then(|v| parse_num::<usize>(&v, "--every")) {
+                Ok(v) => cfg.every = v.max(1),
+                Err(e) => return train_usage_err(&e),
+            },
+            "--json" => cfg.json = true,
+            other => return train_usage_err(&format!("unknown option {other}")),
+        }
+        i += 1;
+    }
+
+    if cfg.corpus.is_none() && !cfg.stdin {
+        return train_usage_err("укажите --corpus DIR или --stdin");
+    }
+    if cfg.dim == 0 || cfg.dim > 1 << 20 {
+        return train_usage_err("--dim должен быть в [1, 1048576]");
+    }
+    if !(0.0..=1.0).contains(&cfg.epsilon) || !cfg.epsilon.is_finite() {
+        return train_usage_err("--epsilon должен быть в [0, 1]");
+    }
+    if cfg.block == 0 {
+        return train_usage_err("--block должен быть > 0");
+    }
+
+    // Корпус: каталог (рекурсивно) или stdin.
+    let mut log_file = cfg.log.as_ref().and_then(|p| {
+        std::fs::File::create(p)
+            .map(|mut f| {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "=== ПЛОТНОЕ LENS-ОБУЧЕНИЕ (eps={}, block={} B, d_pol={}) ===",
+                    cfg.epsilon, cfg.block, cfg.dim
+                );
+                f
+            })
+            .ok()
+    });
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut corpus_bytes: u64 = 0;
+    if let Some(root) = &cfg.corpus {
+        let mut total = 0u64;
+        collect_corpus(Path::new(root), &mut files, &mut total, cfg.max_bytes);
+        corpus_bytes = total;
+        if files.is_empty() {
+            eprintln!("pqc train: в {root} не найдено текстовых файлов");
+            return 1;
+        }
+    }
+
+    // Движок ОДИН на весь корпус: память накапливается между блоками.
+    use pqc::stream_engine::{Forget, StreamEngine};
+    let forget = if cfg.decay {
+        Forget::Decay
+    } else {
+        Forget::Hold
+    };
+    let mut engine = match StreamEngine::new(cfg.dim, cfg.epsilon, cfg.seed) {
+        Ok(e) => e
+            .with_shots(cfg.shots)
+            .with_hyper(cfg.eta0, cfg.beta, cfg.gamma)
+            .with_forget(forget),
+        Err(e) => {
+            eprintln!("pqc train: {e}");
+            return 1;
+        }
+    };
+
+    if !cfg.json {
+        let src = if let Some(root) = &cfg.corpus {
+            format!(
+                "{root} ({} файлов, {:.1} МиБ)",
+                files.len(),
+                corpus_bytes as f64 / 1048576.0
+            )
+        } else {
+            "stdin".to_string()
+        };
+        println!("POLER Quantum Core — Dense LENS Trainer (RQ8)");
+        println!("corpus    : {src}");
+        println!(
+            "engine    : d_pol={}, eps={}, block={} B, shots={}, steps={}, seed={}",
+            cfg.dim, cfg.epsilon, cfg.block, cfg.shots, cfg.steps, cfg.seed
+        );
+        println!(
+            "policy    : forget={:?}, snapshot every {} блоков",
+            forget, cfg.snapshot_every
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    // Счётчики цикла обучения (владеет замыкание ниже).
+    let mut st = TrainStats {
+        total_tokens: 0,
+        total_blocks: 0,
+        no_hits: 0,
+        last_loss: 0.0,
+        last_qcm_gap: 0.0,
+        blocks_since_snapshot: 0,
+        snapshot: (0usize, 0u64, 0usize),
+    };
+
+    // Начальный снапшот: нулевой отпечаток (квантовый фон).
+    match train_snapshot(&engine, &cfg) {
+        Ok(s) => st.snapshot = s,
+        Err(e) => {
+            eprintln!("pqc train: {e}");
+            return 1;
+        }
+    }
+
+    let feed_block =
+        |data: &[u8], engine: &mut StreamEngine, st: &mut TrainStats| -> Result<(), String> {
+            let text = String::from_utf8_lossy(data);
+            let rep = engine.ingest(&text, cfg.steps).map_err(|e| e.to_string())?;
+            st.total_tokens += rep.tokens as u64;
+            st.total_blocks += 1;
+            if rep.no_hits {
+                st.no_hits += 1;
+            } else {
+                st.last_loss = rep.param_loss;
+                st.last_qcm_gap = rep.qcm.qcm_gap();
+            }
+            st.blocks_since_snapshot += 1;
+            if st.blocks_since_snapshot >= cfg.snapshot_every {
+                st.snapshot = train_snapshot(engine, &cfg)?;
+                st.blocks_since_snapshot = 0;
+            }
+            Ok(())
+        };
+
+    if cfg.stdin {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("pqc train: stdin: {e}");
+            return 1;
+        }
+        for chunk in buf.chunks(cfg.block) {
+            if let Err(e) = feed_block(chunk, &mut engine, &mut st) {
+                eprintln!("pqc train: {e}");
+                return 1;
+            }
+        }
+    } else {
+        for (fi, path) in files.iter().enumerate() {
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let tokens_before = st.total_tokens;
+            let mut file_blocks: u64 = 0;
+            for chunk in data.chunks(cfg.block) {
+                if let Err(e) = feed_block(chunk, &mut engine, &mut st) {
+                    eprintln!("pqc train: {e}");
+                    return 1;
+                }
+                file_blocks += 1;
+            }
+            let file_tokens = st.total_tokens - tokens_before;
+            if let Some(f) = log_file.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "[{}/{}] {:<40} | tokens={:<6} blocks={:<3} | loss={:.6} nnz_lens={} support={}",
+                    fi + 1,
+                    files.len(),
+                    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    file_tokens,
+                    file_blocks,
+                    st.last_loss,
+                    st.snapshot.1,
+                    st.snapshot.2
+                );
+            }
+            if !cfg.json && (fi + 1) % cfg.every == 0 {
+                let el = t0.elapsed().as_secs_f64();
+                println!(
+                    "  [{:>4}/{}] {:<5.1}s | tokens={:<8} nnz_lens={:<5} support={:<5} loss={:.6}",
+                    fi + 1,
+                    files.len(),
+                    el,
+                    st.total_tokens,
+                    st.snapshot.1,
+                    st.snapshot.2,
+                    st.last_loss
+                );
+            }
+        }
+    }
+
+    // Финальный снапшот (гарантированно свежий).
+    match train_snapshot(&engine, &cfg) {
+        Ok(s) => st.snapshot = s,
+        Err(e) => {
+            eprintln!("pqc train: {e}");
+            return 1;
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let (container_bytes, nnz_lens, support) = st.snapshot;
+    let density = nnz_lens as f64 / cfg.dim as f64 * 100.0;
+    let total_tokens = st.total_tokens;
+    let total_blocks = st.total_blocks;
+    let no_hits = st.no_hits;
+    let last_loss = st.last_loss;
+    let last_qcm_gap = st.last_qcm_gap;
+
+    if let Some(f) = log_file.as_mut() {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "=== ИТОГ: blocks={} tokens={} nnz_lens={} support={} density={:.2}% elapsed={:.1}s ===",
+            total_blocks, total_tokens, nnz_lens, support, density, elapsed
+        );
+    }
+
+    if cfg.json {
+        use pqc::json::Json;
+        let j = Json::Obj(vec![
+            ("command".into(), Json::str("train")),
+            ("d_pol".into(), Json::num(cfg.dim as f64)),
+            ("epsilon".into(), Json::num(cfg.epsilon as f64)),
+            ("block".into(), Json::num(cfg.block as f64)),
+            ("blocks".into(), Json::num(total_blocks as f64)),
+            ("tokens".into(), Json::num(total_tokens as f64)),
+            ("files".into(), Json::num(files.len() as f64)),
+            ("no_hits".into(), Json::num(no_hits as f64)),
+            ("nnz_lens".into(), Json::num(nnz_lens as f64)),
+            ("support".into(), Json::num(support as f64)),
+            (
+                "density_pct".into(),
+                Json::num((density * 100.0).round() / 100.0),
+            ),
+            (
+                "final_loss".into(),
+                Json::num((last_loss * 1e8).round() / 1e8),
+            ),
+            (
+                "qcm_gap".into(),
+                Json::num((last_qcm_gap * 1e8).round() / 1e8),
+            ),
+            ("container_bytes".into(), Json::num(container_bytes as f64)),
+            (
+                "elapsed_sec".into(),
+                Json::num((elapsed * 100.0).round() / 100.0),
+            ),
+        ]);
+        println!("{}", j.to_string());
+    } else {
+        println!("------------------------------------------------------------");
+        println!(
+            "learned   : nnz_lens={} дуг (union support={}), плотность {:.2}% от d_pol={}",
+            nnz_lens, support, density, cfg.dim
+        );
+        println!(
+            "stream    : {} блоков, {} токенов, no_hits={}, loss={:.6}, QCM gap={:.6}",
+            total_blocks, total_tokens, no_hits, last_loss, last_qcm_gap
+        );
+        if let Some(p) = &cfg.out {
+            println!("checkpoint: {p} ({container_bytes} B, POLER_Q2 Packed4)");
+        }
+        if let Some(p) = &cfg.fingerprint {
+            let bytes = cfg.dim as usize / 4;
+            println!("fingerprint: {p} ({bytes} B raw Packed4 — снимок фазовой памяти)");
+        }
+        println!(
+            "elapsed   : {:.1}s ({:.1} блоков/с)",
+            elapsed,
+            total_blocks as f64 / elapsed.max(1e-9)
+        );
+    }
     0
 }

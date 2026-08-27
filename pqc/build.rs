@@ -11,7 +11,7 @@ fn main() {
     // 256 crystalline morpheme slots (K=4, 4 trits per crystal = 2^8 combinations)
     // Structured across rust/math keywords, operators, and phonetic syllables
     let mut table = [0u32; 256];
-    
+
     // Seed essential atomic tokens (ASCII packed into u32 LE)
     let core_tokens: &[(&str, usize)] = &[
         ("fn ", 1),
@@ -56,7 +56,11 @@ fn main() {
         table[idx] = u;
     }
 
-    writeln!(f, "/// Предвычисленная AOT-таблица морфемных кристаллов (256 x 4 байта = 1024 B, L1 cache)").unwrap();
+    writeln!(
+        f,
+        "/// Предвычисленная AOT-таблица морфемных кристаллов (256 x 4 байта = 1024 B, L1 cache)"
+    )
+    .unwrap();
     writeln!(f, "pub static MORPHEME_CRYSTALS: [u32; 256] = [").unwrap();
     for val in table.iter() {
         writeln!(f, "    0x{:08X},", val).unwrap();
