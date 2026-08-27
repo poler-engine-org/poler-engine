@@ -139,6 +139,14 @@ impl Ansatz {
         }
     }
 
+    /// Движок, исполняющий этот анзац (для ветвления и отчётов).
+    pub fn engine(&self) -> Engine {
+        match self {
+            Ansatz::Statevector(_) => Engine::Statevector,
+            Ansatz::Product(_) => Engine::Product,
+        }
+    }
+
     /// Born-сэмплирование с движко-независимым отчётом.
     pub fn sample(&self, rng: &mut Rng, shots: u64, top_k: usize) -> Result<SampleReport> {
         match self {
@@ -343,6 +351,28 @@ impl PhaseAnsatz {
     /// Хранимые дуги `(index, p̂)`.
     pub fn arcs(&self) -> &[(u32, f64)] {
         &self.arcs
+    }
+
+    /// Плотная запись фаз хранимых дуг: `ps[i]` → дуга с индексом `i`.
+    ///
+    /// Фон (координаты без дуг) не затрагивается — структурная часть
+    /// проектора причинности Π_Λ петли обучения (см. [`crate::learn`]).
+    /// Длина `ps` обязана равняться `d_pol`.
+    pub fn set_arc_phases(&mut self, ps: &[f64]) -> Result<()> {
+        if ps.len() != self.d_pol as usize {
+            return Err(PqcError::LengthMismatch {
+                expected: self.d_pol as usize,
+                actual: ps.len(),
+            });
+        }
+        for arc in self.arcs.iter_mut() {
+            let p = ps[arc.0 as usize];
+            if !p.is_finite() || p < -1.0 || p > 1.0 {
+                return Err(PqcError::BadPhase(p));
+            }
+            arc.1 = p;
+        }
+        Ok(())
     }
 
     /// Углы анзаца `θ̂ = arccos(p̂)` по хранимым дугам.

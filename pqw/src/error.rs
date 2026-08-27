@@ -47,6 +47,8 @@ pub enum PqwError {
     ReservedTrit(u8),
     /// Значение фазы — NaN / бесконечность / вне `[-1, 1]`.
     BadValue(f32),
+    /// Операция определена только для контейнеров v2 (magic `POLER_Q2`).
+    NotPacked,
 }
 
 impl fmt::Display for PqwError {
@@ -54,11 +56,15 @@ impl fmt::Display for PqwError {
         match self {
             PqwError::Io(e) => write!(f, "i/o error: {e}"),
             PqwError::BadMagic(m) => {
-                write!(f, "bad magic: {m:02x?} (expected \"POLER_QW\")")
+                write!(
+                    f,
+                    "bad magic: {m:02x?} (expected \"POLER_QW\" or \"POLER_Q2\")"
+                )
             }
-            PqwError::UnsupportedVersion(v) => {
-                write!(f, "unsupported format version: {v} (this build supports 1)")
-            }
+            PqwError::UnsupportedVersion(v) => write!(
+                f,
+                "unsupported format version: {v} (this build supports POLER_QW v1 and POLER_Q2 v2)"
+            ),
             PqwError::CorruptHeader { expected, actual } => write!(
                 f,
                 "header checksum mismatch: stored {expected:#018x}, computed {actual:#018x}"
@@ -106,6 +112,12 @@ impl fmt::Display for PqwError {
             }
             PqwError::BadValue(p) => {
                 write!(f, "phase value {p} is not a finite number in [-1, 1]")
+            }
+            PqwError::NotPacked => {
+                write!(
+                    f,
+                    "operation requires a packed v2 container (magic POLER_Q2)"
+                )
             }
         }
     }

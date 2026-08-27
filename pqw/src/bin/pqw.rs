@@ -16,12 +16,13 @@ const USAGE: &str = "\
 POLER Quantum Weights (.poler / .pqw)
 
 USAGE:
-    pqw gen    <file> <d_pol> [nnz] [--seed N] [--eps E]   deterministic sample
-    pqw info   <file>                                        header dump
-    pqw verify <file>                                        full digest verification
-    pqw dump   <file> [--limit N]                            first N arcs (default 20)
+    pqw gen    <file> <d_pol> [nnz] [--seed N] [--eps E] [--packed]   deterministic sample
+    pqw info   <file>                                             header dump
+    pqw verify <file>                                             full digest verification
+    pqw dump   <file> [--limit N]                                 first N arcs (default 20)
 
-Both .poler and .pqw extensions denote the same v1 container.";
+Formats: v1 POLER_QW (sparse + curvature), v2 POLER_Q2 (packed trits,
+4 arcs per byte; --packed selects it for gen).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -102,10 +103,12 @@ fn cmd_gen(args: &[String]) -> i32 {
     let mut nnz: Option<usize> = None;
     let mut seed: u64 = 42;
     let mut eps: f32 = 0.05;
+    let mut packed = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--packed" => packed = true,
             "--seed" => {
                 i += 1;
                 match args.get(i).and_then(|s| s.parse().ok()) {
@@ -180,6 +183,22 @@ fn cmd_gen(args: &[String]) -> i32 {
         return 1;
     }
     let stored = w.nnz();
+    if packed {
+        if let Err(e) = w.write_packed_to(&file) {
+            eprintln!("{e}");
+            return 1;
+        }
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        let packed_len = (d as usize).div_ceil(4);
+        println!("generated {file}");
+        println!(
+            "  d_pol = {d}, arcs requested = {nnz}, significant trits after LENS (eps = {eps}) = {stored}"
+        );
+        println!(
+            "  file size = {size} bytes = 128 header + {packed_len} packed-trit bytes (v2 POLER_Q2)"
+        );
+        return 0;
+    }
     let topo_len = stored * if w.uses_index16() { 2 } else { 4 };
     if let Err(e) = w.write_to(&file) {
         eprintln!("{e}");
@@ -215,9 +234,19 @@ fn cmd_info(args: &[String]) -> i32 {
     };
     let h = r.header();
     let hp = h.hyper;
+    let magic = if h.is_packed() {
+        "POLER_Q2"
+    } else {
+        "POLER_QW"
+    };
     println!("file           : {file} ({} bytes)", src.as_slice().len());
-    println!("magic          : POLER_QW");
+    println!("magic          : {magic}");
     println!("format version : {}", h.format_version);
+    println!(
+        "encoding       : {} ({} bits/arc)",
+        h.encoding().name(),
+        h.encoding().bits_per_arc()
+    );
     println!("d_pol          : {}", h.d_pol);
     println!(
         "hyperparams    : eta = {}, gamma = {}, rho = {}, eps = {}",

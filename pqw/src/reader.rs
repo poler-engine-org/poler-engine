@@ -5,13 +5,23 @@
 //! (заголовок, смещения, длины, сортированность индексов, триты).
 //! Digest payload проверяется отдельно и лениво — [`PqwReader::verify_payload`]:
 //! «мгновенный холодный старт» не должен упираться в хеширование гигабайтов.
+//!
+//! ## Два поколения формата
+//!
+//! * **v1** (`POLER_QW`): разрежённая LENS-топология + байты кривизны;
+//! * **v2** (`POLER_Q2`): плотный массив упакованных тритов (4 дуги на байт),
+//!   топологии нет. Канонический sparse-вид v2 — только ненулевые триты:
+//!   явный `Zero` семантически равен отсутствующей дуге (честная монета,
+//!   λ = ½), поэтому v1- и v2-контейнеры одного тритового состояния
+//!   дают идентичную квантовую семантику. Сырой плотный вид v2 отдаёт
+//!   [`PqwReader::iter_packed_trits`].
 
 use std::borrow::Cow;
 
 use crate::error::{PqwError, Result};
 use crate::header::{Header, HEADER_SIZE};
 use crate::mcweeny;
-use crate::phase::PhaseByte;
+use crate::phase::{packed_trit_at, PhaseByte, Trit, TritEncoding};
 use crate::sha256::sha256_trunc24;
 use crate::topology;
 
@@ -20,7 +30,7 @@ use crate::topology;
 pub struct Arc {
     /// Индекс дуги в состоянии.
     pub index: u32,
-    /// Упакованная фаза: трит + кривизна.
+    /// Упакованная фаза: трит + кривизна (v2: σ = 63 для ±1, 0 для Zero).
     pub phase: PhaseByte,
 }
 
@@ -48,6 +58,10 @@ impl<'a> PqwReader<'a> {
     /// Полный разбор и валидация поверх среза (буфер или mmap).
     pub fn from_bytes(data: &'a [u8]) -> Result<PqwReader<'a>> {
         let header = Header::from_bytes(data)?;
+
+        if header.is_packed() {
+            return Self::validate_packed(header, data);
+        }
 
         let topo_off = header.topology_offset as usize;
         let topo_len = header.topology_len as usize;
@@ -99,6 +113,76 @@ impl<'a> PqwReader<'a> {
         Ok(PqwReader { header, data })
     }
 
+    /// Валидация контейнера v2 (Packed4): плотные триты без топологии.
+    fn validate_packed(header: Header, data: &'a [u8]) -> Result<PqwReader<'a>> {
+        let d = header.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+
+        if header.topology_offset != HEADER_SIZE as u64 {
+            return Err(PqwError::Layout("packed container: topology must be empty"));
+        }
+        if header.topology_len != 0 {
+            return Err(PqwError::Layout("packed container: topology must be empty"));
+        }
+        if header.phase_offset != HEADER_SIZE as u64 {
+            return Err(PqwError::Layout(
+                "packed container: phases must start at 0x80",
+            ));
+        }
+        if header.phase_len != packed_len as u64 {
+            return Err(PqwError::InconsistentTopology {
+                field: "phase_len",
+                expected: packed_len as u64,
+                actual: header.phase_len,
+            });
+        }
+        if header.nnz > u64::from(header.d_pol) {
+            return Err(PqwError::Layout("nnz exceeds d_pol"));
+        }
+        let expected_len = HEADER_SIZE + packed_len;
+        if data.len() < expected_len {
+            return Err(PqwError::Truncated {
+                need: expected_len,
+                have: data.len(),
+            });
+        }
+        if data.len() > expected_len {
+            return Err(PqwError::Layout("trailing bytes after the packed trits"));
+        }
+
+        // Семантическая валидация: коды 0b11 запрещены, пары за пределами
+        // d_pol (хвост последнего байта) обязаны быть Zero, nnz сходится
+        // с точным пересчётом ненулевых тритов.
+        let packed = &data[HEADER_SIZE..expected_len];
+        let mut nonzero: u64 = 0;
+        for (bi, &b) in packed.iter().enumerate() {
+            let mut bits = b;
+            for j in 0..4 {
+                match bits & 0b11 {
+                    0 => {}
+                    1 | 2 => {
+                        // Пара за пределами d_pol — посторонние данные.
+                        if bi * 4 + j >= d {
+                            return Err(PqwError::Layout("padding pair beyond d_pol must be zero"));
+                        }
+                        nonzero += 1;
+                    }
+                    _ => return Err(PqwError::ReservedTrit(b)),
+                }
+                bits >>= 2;
+            }
+        }
+        if nonzero != header.nnz {
+            return Err(PqwError::InconsistentTopology {
+                field: "nnz",
+                expected: nonzero,
+                actual: header.nnz,
+            });
+        }
+
+        Ok(PqwReader { header, data })
+    }
+
     /// Разобранный заголовок.
     pub fn header(&self) -> &Header {
         &self.header
@@ -109,7 +193,7 @@ impl<'a> PqwReader<'a> {
         self.header.d_pol
     }
 
-    /// Число хранимых дуг.
+    /// Число хранимых дуг: v1 — записанных дуг, v2 — ненулевых тритов.
     pub fn nnz(&self) -> u64 {
         self.header.nnz
     }
@@ -117,6 +201,11 @@ impl<'a> PqwReader<'a> {
     /// Гиперпараметры из заголовка.
     pub fn hyperparams(&self) -> crate::header::HyperParams {
         self.header.hyper
+    }
+
+    /// Кодировка фазовых блоков (v1 → Curved, v2 → Packed4).
+    pub fn encoding(&self) -> TritEncoding {
+        self.header.encoding()
     }
 
     /// McWeeny-инвариант на момент записи: max |λ² − λ|.
@@ -130,7 +219,8 @@ impl<'a> PqwReader<'a> {
         &self.data[a..b]
     }
 
-    /// Сырые фазовые блоки (nnz байт) — zero-copy заимствование.
+    /// Сырые фазовые блоки — zero-copy заимствование: v1 — nnz байтов
+    /// кривизны, v2 — `ceil(d_pol/4)` упакованных байтов.
     pub fn phase_bytes(&self) -> &'a [u8] {
         let a = self.header.phase_offset as usize;
         let b = a + self.header.phase_len as usize;
@@ -142,32 +232,63 @@ impl<'a> PqwReader<'a> {
     ///
     /// Ошибка невозможна после `from_bytes` (длина топологии провалидирована).
     pub fn indices(&self) -> Cow<'a, [u32]> {
-        match topology::decode_indices(self.topology_bytes(), self.header.flags.index16()) {
-            Ok(cow) => cow,
-            Err(_) => Cow::Owned(Vec::new()), // unreachable после from_bytes
+        if self.header.is_packed() {
+            // v2: канонический sparse-вид — только ненулевые триты.
+            Cow::Owned(self.arcs().map(|arc| arc.index).collect())
+        } else {
+            match topology::decode_indices(self.topology_bytes(), self.header.flags.index16()) {
+                Ok(cow) => cow,
+                Err(_) => Cow::Owned(Vec::new()), // unreachable после from_bytes
+            }
         }
     }
 
     /// Итератор дуг — zero-copy, без аллокаций.
-    pub fn arcs(&self) -> impl Iterator<Item = Arc> + 'a {
-        let width = self.header.flags.index_width();
-        let topo = self.topology_bytes();
-        let phases = self.phase_bytes();
-        let indices = topo.chunks(width).map(move |c| {
-            // u16-LE укладываем в младшие байты u32: [lo, hi, 0, 0].
-            let mut b = [0u8; 4];
-            b[..width].copy_from_slice(c);
-            u32::from_le_bytes(b)
-        });
-        indices.zip(phases.iter().copied()).map(|(index, raw)| Arc {
-            index,
-            phase: PhaseByte::from_validated(raw),
-        })
+    ///
+    /// v1 обходит топологию + байты кривизны; v2 сканирует плотный массив
+    /// упакованных тритов и отдаёт только ненулевые (Zero ≡ фон ≡ честная
+    /// монета). Триты v2 материализуются как `PhaseByte` с σ = 63:
+    /// `p̂ = ±1` точно, `θ̂ = 0 / π`.
+    pub fn arcs(&self) -> Arcs<'a> {
+        if self.header.is_packed() {
+            Arcs {
+                inner: ArcInner::Packed {
+                    data: self.phase_bytes(),
+                    d: self.header.d_pol,
+                    pos: 0,
+                },
+            }
+        } else {
+            Arcs {
+                inner: ArcInner::Curved {
+                    topo: self
+                        .topology_bytes()
+                        .chunks(self.header.flags.index_width()),
+                    phases: self.phase_bytes().iter(),
+                    width: self.header.flags.index_width(),
+                },
+            }
+        }
     }
 
     /// Деквантованные дуги: `(index, p̂)`.
     pub fn decoded(&self) -> impl Iterator<Item = (u32, f64)> + 'a {
         self.arcs().map(|arc| (arc.index, arc.phase.p()))
+    }
+
+    /// Zero-copy итератор **плотного** упакованного массива v2: все `d_pol`
+    /// позиций, включая Zero — сырой битовый вид файла.
+    ///
+    /// Для контейнера v1 — [`PqwError::NotPacked`].
+    pub fn iter_packed_trits(&self) -> Result<PackedTrits<'a>> {
+        if !self.header.is_packed() {
+            return Err(PqwError::NotPacked);
+        }
+        Ok(PackedTrits {
+            data: self.phase_bytes(),
+            d: self.header.d_pol,
+            pos: 0,
+        })
     }
 
     /// Ленивая проверка целостности payload: SHA-256 (24 байта) поверх
@@ -196,5 +317,81 @@ impl<'a> PqwReader<'a> {
     /// Два шага McWeeny — типовой режим восстановления P² = P (1–2 такта).
     pub fn purified(&self) -> Vec<(u32, f64)> {
         self.purify_steps(2)
+    }
+}
+
+/// Итератор дуг (см. [`PqwReader::arcs`]).
+pub struct Arcs<'a> {
+    inner: ArcInner<'a>,
+}
+
+enum ArcInner<'a> {
+    /// v1: чанки топологии (u16/u32 LE) + по байту кривизны на дугу.
+    Curved {
+        topo: std::slice::Chunks<'a, u8>,
+        phases: std::slice::Iter<'a, u8>,
+        width: usize,
+    },
+    /// v2: плотный упакованный массив; выдаются только ненулевые триты.
+    Packed { data: &'a [u8], d: u32, pos: u32 },
+}
+
+impl<'a> Iterator for Arcs<'a> {
+    type Item = Arc;
+
+    fn next(&mut self) -> Option<Arc> {
+        match &mut self.inner {
+            ArcInner::Curved {
+                topo,
+                phases,
+                width,
+            } => {
+                let chunk = topo.next()?;
+                let raw = *phases.next()?;
+                let mut b = [0u8; 4];
+                b[..*width].copy_from_slice(chunk);
+                let index = u32::from_le_bytes(b);
+                Some(Arc {
+                    index,
+                    phase: PhaseByte::from_validated(raw),
+                })
+            }
+            ArcInner::Packed { data, d, pos } => {
+                while *pos < *d {
+                    let i = *pos;
+                    *pos += 1;
+                    let t = packed_trit_at(data, i as usize);
+                    if t != Trit::Zero {
+                        let phase = match t {
+                            Trit::Pos => PhaseByte::encode(Trit::Pos, 63),
+                            Trit::Neg => PhaseByte::encode(Trit::Neg, 63),
+                            Trit::Zero => PhaseByte::encode(Trit::Zero, 0),
+                        };
+                        return Some(Arc { index: i, phase });
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Плотный итератор упакованных тритов v2 (см. [`PqwReader::iter_packed_trits`]).
+pub struct PackedTrits<'a> {
+    data: &'a [u8],
+    d: u32,
+    pos: u32,
+}
+
+impl<'a> Iterator for PackedTrits<'a> {
+    type Item = (u32, Trit);
+
+    fn next(&mut self) -> Option<(u32, Trit)> {
+        if self.pos >= self.d {
+            return None;
+        }
+        let i = self.pos;
+        self.pos += 1;
+        Some((i, packed_trit_at(self.data, i as usize)))
     }
 }

@@ -54,9 +54,14 @@ pub mod topology;
 pub mod writer;
 
 pub use error::{PqwError, Result};
-pub use header::{Flags, Header, HyperParams, FORMAT_VERSION, HEADER_SIZE, MAGIC};
-pub use phase::{PhaseByte, Trit, QUANT_EPS, SIGMA_MAX};
-pub use reader::{Arc, PqwReader};
+pub use header::{
+    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, HEADER_SIZE, MAGIC, MAGIC_V2,
+};
+pub use phase::{
+    nearest_trit, pack_quad, pack_trit2, unpack_quad, unpack_trit2, PhaseByte, Trit, TritEncoding,
+    QUANT_EPS, SIGMA_MAX,
+};
+pub use reader::{Arc, Arcs, PackedTrits, PqwReader};
 pub use stream::TextPhaseEncoder;
 pub use writer::PqwWriter;
 

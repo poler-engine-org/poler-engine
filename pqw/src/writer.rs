@@ -6,9 +6,9 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::error::{PqwError, Result};
-use crate::header::{Flags, Header, HyperParams, FORMAT_VERSION, HEADER_SIZE};
+use crate::header::{Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, HEADER_SIZE};
 use crate::mcweeny;
-use crate::phase::{quantize, PhaseByte};
+use crate::phase::{nearest_trit, pack_trit2, quantize, PhaseByte, Trit};
 use crate::sha256::sha256_trunc24;
 use crate::topology;
 
@@ -162,11 +162,58 @@ impl PqwWriter {
         Ok((header, payload))
     }
 
+    /// Сборка контейнера v2: плотный массив упакованных тритов
+    /// (4 трита на байт, magic `POLER_Q2`), без топологии.
+    ///
+    /// Правило квантования дуги в трит: `|p| ≥ 0.5 → sign(p)`, иначе `Zero`
+    /// (см. [`crate::phase::nearest_trit`]); ненакопленные координаты —
+    /// фоновые монеты `Zero`. Заголовок: `nnz` — число ненулевых тритов,
+    /// `phase_len = ceil(d_pol / 4)`, флаги нулевые, `mcweeny_residual = 0`
+    /// (чистые триты лежат точно на многообразии P² = P).
+    fn build_packed(&self) -> Result<(Header, Vec<u8>)> {
+        if !self.hyper.is_finite() {
+            return Err(PqwError::BadValue(self.hyper.eta));
+        }
+        let d = self.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+        let mut phases = vec![0u8; packed_len];
+        let mut nonzero: u64 = 0;
+        for (&i, &p) in self.entries.iter() {
+            let t = nearest_trit(p);
+            if t == Trit::Zero {
+                continue;
+            }
+            nonzero += 1;
+            let i = i as usize;
+            phases[i / 4] |= pack_trit2(t) << (2 * (i % 4));
+        }
+        let header = Header {
+            format_version: FORMAT_VERSION_V2,
+            d_pol: self.d_pol,
+            hyper: self.hyper,
+            mcweeny_residual: 0.0,
+            payload_digest: sha256_trunc24(&phases),
+            topology_offset: HEADER_SIZE as u64,
+            topology_len: 0,
+            phase_offset: HEADER_SIZE as u64,
+            phase_len: packed_len as u64,
+            nnz: nonzero,
+            flags: Flags::none(),
+        };
+        Ok((header, phases))
+    }
+
     /// Сериализация в память. Детерминизм: одинаковый набор дуг → идентичные байты.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(HEADER_SIZE + self.estimated_size());
         self.write_to_vec(&mut out)?;
         Ok(out)
+    }
+
+    /// Оценка размера контейнера v1 в байтах (заголовок + топология + фазы).
+    pub fn estimated_size(&self) -> usize {
+        let width = if self.uses_index16() { 2 } else { 4 };
+        HEADER_SIZE + self.entries.len() * (width + 1)
     }
 
     /// Дописать контейнер в чужой буфер **без промежуточной сборки файла** —
@@ -182,15 +229,42 @@ impl PqwWriter {
         Ok(())
     }
 
-    /// Оценка размера контейнера в байтах (заголовок + топология + фазы).
-    pub fn estimated_size(&self) -> usize {
-        let width = if self.uses_index16() { 2 } else { 4 };
-        HEADER_SIZE + self.entries.len() * (width + 1)
+    /// Дописать **упакованный** контейнер v2 (Packed4, 4 трита на байт)
+    /// в чужой буфер без промежуточной сборки файла.
+    ///
+    /// `d = 65536` занимает `16 КиБ` фазовых блоков — против `64 КиБ`
+    /// только байтов кривизны v1 (ровно 4x по фазовым блокам).
+    pub fn write_packed_trits(&self, out: &mut Vec<u8>) -> Result<()> {
+        let (header, payload) = self.build_packed()?;
+        out.reserve(HEADER_SIZE + payload.len());
+        out.extend_from_slice(&header.to_bytes());
+        out.extend_from_slice(&payload);
+        Ok(())
+    }
+
+    /// Сериализация в память в формате v2 (упакованные триты).
+    pub fn to_bytes_packed(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(HEADER_SIZE + self.estimated_size_packed());
+        self.write_packed_trits(&mut out)?;
+        Ok(out)
+    }
+
+    /// Оценка размера контейнера v2 в байтах (заголовок + плотные триты).
+    pub fn estimated_size_packed(&self) -> usize {
+        HEADER_SIZE + (self.d_pol as usize).div_ceil(4)
     }
 
     /// Запись в файл.
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<()> {
         let bytes = self.to_bytes()?;
+        let mut file = std::fs::File::create(path.as_ref())?;
+        file.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Запись упакованного контейнера v2 в файл.
+    pub fn write_packed_to(&self, path: impl AsRef<Path>) -> Result<()> {
+        let bytes = self.to_bytes_packed()?;
         let mut file = std::fs::File::create(path.as_ref())?;
         file.write_all(&bytes)?;
         Ok(())

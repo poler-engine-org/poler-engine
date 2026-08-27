@@ -144,6 +144,125 @@ pub fn quantize(p: f32) -> PhaseByte {
     }
 }
 
+/// Кодировка фазовых блоков контейнера `.pqw`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TritEncoding {
+    /// v1 (magic `POLER_QW`): 1 байт на дугу — трит в битах 0..1,
+    /// 6-битная кривизна σ в битах 2..7. Точное значение `p̂ = trit·σ/63`.
+    Curved,
+    /// v2 (magic `POLER_Q2`): 4 трита на байт по 2 бита, кривизны нет —
+    /// состояние живёт на самой тритовой решётке {−1, 0, +1}.
+    ///
+    /// Битовое отображение (спецификация v0.2): `0b00 → Zero`,
+    /// `0b01 → Pos (+1)`, `0b10 → Neg (−1)`, `0b11 → Reserved`.
+    /// Пары идут в LE-порядке: трит с номером `j` внутри байта занимает
+    /// биты `2j..2j+1`; дуга `i` — пару `i mod 4` байта `i div 4`.
+    ///
+    /// Экономия RAM: `d = 65536 → 16 КиБ` (против 64 КиБ одних байтов v1).
+    Packed4,
+}
+
+impl TritEncoding {
+    /// Бит на дугу.
+    pub fn bits_per_arc(self) -> usize {
+        match self {
+            TritEncoding::Curved => 8,
+            TritEncoding::Packed4 => 2,
+        }
+    }
+
+    /// Дуг на байт.
+    pub fn arcs_per_byte(self) -> usize {
+        match self {
+            TritEncoding::Curved => 1,
+            TritEncoding::Packed4 => 4,
+        }
+    }
+
+    /// Имя кодировки для отчётов.
+    pub fn name(self) -> &'static str {
+        match self {
+            TritEncoding::Curved => "curved",
+            TritEncoding::Packed4 => "packed4",
+        }
+    }
+}
+
+/// 2-битный код трита в формате v2 (Packed4).
+///
+/// ВНИМАНИЕ: отображение отличается от дискриминантов [`Trit`]
+/// (v1: `Neg = 0b00, Zero = 0b01, Pos = 0b10`) — здесь `Zero = 0b00`,
+/// чтобы плотный массив фоновых монет кодировался нулевыми байтами.
+#[inline]
+pub fn pack_trit2(t: Trit) -> u8 {
+    match t {
+        Trit::Zero => 0b00,
+        Trit::Pos => 0b01,
+        Trit::Neg => 0b10,
+    }
+}
+
+/// Обратное отображение v2; пара `0b11` зарезервирована.
+#[inline]
+pub fn unpack_trit2(bits: u8) -> Result<Trit> {
+    match bits & 0b11 {
+        0 => Ok(Trit::Zero),
+        1 => Ok(Trit::Pos),
+        2 => Ok(Trit::Neg),
+        _ => Err(PqwError::ReservedTrit(bits)),
+    }
+}
+
+/// Упаковка четырёх тритов в байт v2: `t[0]` — младшая пара.
+#[inline]
+pub fn pack_quad(ts: [Trit; 4]) -> u8 {
+    (pack_trit2(ts[0]) << 0)
+        | (pack_trit2(ts[1]) << 2)
+        | (pack_trit2(ts[2]) << 4)
+        | (pack_trit2(ts[3]) << 6)
+}
+
+/// Распаковка байта v2 в четыре трита; любая пара `0b11` — ошибка.
+#[inline]
+pub fn unpack_quad(b: u8) -> Result<[Trit; 4]> {
+    Ok([
+        unpack_trit2(b)?,
+        unpack_trit2(b >> 2)?,
+        unpack_trit2(b >> 4)?,
+        unpack_trit2(b >> 6)?,
+    ])
+}
+
+/// Трит по индексу дуги из плотного упакованного массива v2.
+///
+/// Контракт: `data.len() ≥ (i / 4) + 1` — гарантируется читателем
+/// после валидации `phase_len == ceil(d_pol / 4)`.
+#[inline]
+pub(crate) fn packed_trit_at(data: &[u8], i: usize) -> Trit {
+    let b = data[i / 4];
+    let bits = (b >> (2 * (i % 4))) & 0b11;
+    match bits {
+        0 => Trit::Zero,
+        1 => Trit::Pos,
+        2 => Trit::Neg,
+        _ => Trit::Zero, // unreachable: 0b11 отвергается при валидации
+    }
+}
+
+/// Ближайший трит по `p` (правило упаковки v2): `|p| ≥ 0.5 → sign(p)`,
+/// иначе `Zero`. Середина тритовой решётки — ровно 0.5
+/// (v1-эквивалент: σ = 31.5/63).
+#[inline]
+pub fn nearest_trit(p: f32) -> Trit {
+    if p >= 0.5 {
+        Trit::Pos
+    } else if p <= -0.5 {
+        Trit::Neg
+    } else {
+        Trit::Zero
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +338,83 @@ mod tests {
             let b = PhaseByte::from_raw(raw).unwrap();
             assert!((b.theta() - b.p().acos()).abs() < 1e-15);
         }
+    }
+
+    #[test]
+    fn v2_bit_mapping_matches_spec() {
+        // Спецификация v0.2: 0b00 → Zero, 0b01 → +1, 0b10 → −1, 0b11 → Reserved.
+        assert_eq!(pack_trit2(Trit::Zero), 0b00);
+        assert_eq!(pack_trit2(Trit::Pos), 0b01);
+        assert_eq!(pack_trit2(Trit::Neg), 0b10);
+        assert_eq!(unpack_trit2(0b00).unwrap(), Trit::Zero);
+        assert_eq!(unpack_trit2(0b01).unwrap(), Trit::Pos);
+        assert_eq!(unpack_trit2(0b10).unwrap(), Trit::Neg);
+        assert!(matches!(unpack_trit2(0b11), Err(PqwError::ReservedTrit(_))));
+        // Старшие биты маскируются: значение определяется парой 0..1.
+        assert_eq!(unpack_trit2(0b1111_0110).unwrap(), Trit::Neg);
+    }
+
+    #[test]
+    fn v2_quad_roundtrip() {
+        let quads = [
+            [Trit::Zero, Trit::Zero, Trit::Zero, Trit::Zero],
+            [Trit::Pos, Trit::Neg, Trit::Zero, Trit::Pos],
+            [Trit::Neg, Trit::Neg, Trit::Pos, Trit::Pos],
+        ];
+        for q in quads {
+            let b = pack_quad(q);
+            assert_eq!(unpack_quad(b).unwrap(), q);
+        }
+        // Все нули — нулевой байт: плотный фон кодируется нулями.
+        assert_eq!(pack_quad([Trit::Zero; 4]), 0);
+        // t[0] — младшая пара: [Pos,0,0,0] = 0b00000001.
+        assert_eq!(
+            pack_quad([Trit::Pos, Trit::Zero, Trit::Zero, Trit::Zero]),
+            1
+        );
+        // t[3] — старшая пара: [0,0,0,Neg] = 0b10_000000 = 0x80.
+        assert_eq!(
+            pack_quad([Trit::Zero, Trit::Zero, Trit::Zero, Trit::Neg]),
+            0x80
+        );
+    }
+
+    #[test]
+    fn v2_packed_trit_at_le_pair_order() {
+        // Плотный массив: дуга i лежит в паре i mod 4 байта i div 4.
+        let data = [pack_quad([Trit::Pos, Trit::Neg, Trit::Zero, Trit::Pos])];
+        assert_eq!(packed_trit_at(&data, 0), Trit::Pos);
+        assert_eq!(packed_trit_at(&data, 1), Trit::Neg);
+        assert_eq!(packed_trit_at(&data, 2), Trit::Zero);
+        assert_eq!(packed_trit_at(&data, 3), Trit::Pos);
+        let data2 = [
+            0u8,
+            pack_quad([Trit::Neg, Trit::Zero, Trit::Zero, Trit::Zero]),
+        ];
+        assert_eq!(packed_trit_at(&data2, 4), Trit::Neg);
+        assert_eq!(packed_trit_at(&data2, 5), Trit::Zero);
+    }
+
+    #[test]
+    fn nearest_trit_thresholds() {
+        assert_eq!(nearest_trit(0.5), Trit::Pos);
+        assert_eq!(nearest_trit(0.49), Trit::Zero);
+        assert_eq!(nearest_trit(-0.5), Trit::Neg);
+        assert_eq!(nearest_trit(-0.49), Trit::Zero);
+        assert_eq!(nearest_trit(0.0), Trit::Zero);
+        assert_eq!(nearest_trit(1.0), Trit::Pos);
+        assert_eq!(nearest_trit(-1.0), Trit::Neg);
+        assert_eq!(nearest_trit(0.7), Trit::Pos);
+        assert_eq!(nearest_trit(-0.9), Trit::Neg);
+    }
+
+    #[test]
+    fn encoding_dimensions() {
+        assert_eq!(TritEncoding::Curved.bits_per_arc(), 8);
+        assert_eq!(TritEncoding::Curved.arcs_per_byte(), 1);
+        assert_eq!(TritEncoding::Packed4.bits_per_arc(), 2);
+        assert_eq!(TritEncoding::Packed4.arcs_per_byte(), 4);
+        assert_eq!(TritEncoding::Curved.name(), "curved");
+        assert_eq!(TritEncoding::Packed4.name(), "packed4");
     }
 }
