@@ -24,6 +24,7 @@ USAGE:
     pqc run <file> [options]
     pqc demo [--n N] [--shots M] [--seed S]
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
+    pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
 
 STREAM OPTIONS (RQ6: zero-storage потоковое обучение):
     --url <URL>               http:// страница (zero-dep клиент; https → --file)
@@ -58,6 +59,7 @@ fn main() {
         Some("run") => cmd_run(&args[1..]),
         Some("demo") => cmd_demo(&args[1..]),
         Some("stream") => cmd_stream(&args[1..]),
+        Some("unfurl") => cmd_unfurl(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -988,4 +990,54 @@ fn cmd_demo(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn cmd_unfurl(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("pqc unfurl: требуется путь к файлу .poler / .pqw");
+        return 2;
+    }
+    let file_path = &args[0];
+    let raw = match std::fs::read(file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pqc unfurl: ошибка чтения {file_path}: {e}");
+            return 1;
+        }
+    };
+    let reader = match PqwReader::from_bytes(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc unfurl: ошибка парсинга {file_path}: {e}");
+            return 1;
+        }
+    };
+
+    println!("POLER Quantum Core — AOT Syntax Unfolder");
+    println!("source    : {} ({} B, d_pol={})", file_path, raw.len(), reader.d_pol());
+
+    let mut ps = vec![0.0f64; reader.d_pol() as usize];
+    if reader.header().is_packed() {
+        if let Ok(iter) = reader.iter_packed_trits() {
+            for (_i, trit) in iter.enumerate() {
+                ps[trit.0 as usize] = match trit.1 {
+                    pqw::Trit::Pos => 1.0,
+                    pqw::Trit::Neg => -1.0,
+                    pqw::Trit::Zero => 0.0,
+                };
+            }
+        }
+    }
+
+    let mut out_buf = [0u8; pqc::syntax_unfolder::MAX_OUT];
+    let written = pqc::syntax_unfolder::unfurl(&ps, &mut out_buf);
+
+    if written > 0 {
+        let s = std::str::from_utf8(&out_buf[..written]).unwrap_or("<non-utf8 bytes>");
+        println!("unfurled  : '{}' ({} bytes, zero heap alloc)", s, written);
+    } else {
+        println!("unfurled  : <zero / background state> (0 bytes)");
+    }
+
+    0
 }

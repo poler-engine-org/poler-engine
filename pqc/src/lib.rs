@@ -118,3 +118,5 @@ pub use stream::{StreamReport, ZeroStoragePipeline};
 pub use stream_engine::{
     fock_residual, strip_html, FockResidual, Forget, StreamChunkReport, StreamEngine,
 };
+
+pub mod syntax_unfolder;
