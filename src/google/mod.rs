@@ -152,6 +152,37 @@ fn google_browser_args(port: u16) -> Vec<String> {
 /// `headed = true` — с окном (для ручного логина в сервисы без API).
 /// Если браузер уже поднят (например, окно `--google-browse` открыто) —
 /// переиспользуем его.
+/// Автоматическая подтяжка cookies и Local State из основного профиля Chromium хоста (~/.config/chromium)
+fn sync_host_chromium_profile(dest_profile: &std::path::Path) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let host_chromium = std::path::PathBuf::from(home).join(".config/chromium");
+    if !host_chromium.is_dir() {
+        return;
+    }
+    let dest_default = dest_profile.join("Default");
+    let _ = std::fs::create_dir_all(&dest_default);
+    let _ = std::fs::create_dir_all(dest_default.join("Network"));
+
+    let src_local_state = host_chromium.join("Local State");
+    if src_local_state.is_file() {
+        let _ = std::fs::copy(&src_local_state, dest_profile.join("Local State"));
+    }
+
+    let src_default = host_chromium.join("Default");
+    if src_default.is_dir() {
+        for name in &["Cookies", "Cookies-journal"] {
+            let src = src_default.join(name);
+            if src.is_file() {
+                let _ = std::fs::copy(&src, dest_default.join(name));
+            }
+        }
+        let src_net_cookies = src_default.join("Network").join("Cookies");
+        if src_net_cookies.is_file() {
+            let _ = std::fs::copy(&src_net_cookies, dest_default.join("Network").join("Cookies"));
+        }
+    }
+}
+
 pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
     if cdp_alive(port) {
         return Ok(());
@@ -178,6 +209,8 @@ pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
 
     let profile = profile_dir();
     let _ = std::fs::create_dir_all(&profile);
+    // Автоматическая подтяжка кук из ~/.config/chromium хоста
+    sync_host_chromium_profile(&profile);
     // Автоматическая очистка повисших Singleton-замков после крашей/сигналов
     let _ = std::fs::remove_file(profile.join("SingletonLock"));
     let _ = std::fs::remove_file(profile.join("SingletonCookie"));
