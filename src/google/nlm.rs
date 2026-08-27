@@ -1012,9 +1012,10 @@ impl NlmSession {
 }
 
 /// Убрать UI-мусор NotebookLM из сырого innerText ответа чата:
-/// футер-дисклеймер («Gemini может ошибаться…» и всё после), верхние
-/// ярлыки интерфейса (Thoughts / expand_more / промо-баннер / close /
-/// docs / счётчик источников «(324)» / stop) — остаётся только ответ.
+/// футер-дисклеймер, кнопки-действия (keep_pin / copy_all / thumb_up / …),
+/// сгенерированные вопросы-подсказки, промо-баннер и ярлыки интерфейса
+/// (Thoughts / expand_more / close / docs / «(324)» / stop / arrow_forward) —
+/// остаётся только текст ответа модели.
 fn clean_chat_answer(raw: &str) -> String {
     let mut t = raw.trim().to_string();
     // футер-дисклеймер и хвост страницы после него
@@ -1028,15 +1029,36 @@ fn clean_chat_answer(raw: &str) -> String {
             t.truncate(i);
         }
     }
+    // кнопки-действия под ответом: всё от ПЕРВОЙ такой строки — UI-хром
+    // (за ними идут вопросы-подсказки, промо, сайдбар — всё не-ответ)
+    for marker in [
+        "\nkeep_pin",
+        "\ncopy_all",
+        "\nthumb_up",
+        "\nthumb_down",
+        "\nСохранить в заметке",
+        "\narrow_forward",
+        "\nСохранить заметку",
+    ] {
+        if let Some(i) = t.find(marker) {
+            t.truncate(i);
+        }
+    }
     // верхние строки-ярлыки UI — срезаем, пока первая строка мусорная
     let junk_line = |f: &str| -> bool {
         let f = f.trim();
         f.is_empty()
-            || matches!(f, "Thoughts" | "expand_more" | "🪄" | "close" | "stop" | "docs")
+            || matches!(
+                f,
+                "Thoughts" | "expand_more" | "🪄" | "close" | "stop" | "docs"
+                    | "keep_pin" | "copy_all" | "thumb_up" | "thumb_down" | "arrow_forward"
+            )
             || f.starts_with("Gemini Notebook теперь")
             || f.starts_with("Хотите проанализировать")
             || f.starts_with("Хотите создать")
             || (f.starts_with('(') && f.ends_with(')') && f[1..f.len() - 1].chars().all(|c| c.is_ascii_digit()))
+            // ярлык-иконка действия (одна строка = только иконка/токен кнопки)
+            || matches!(f, "Сохранить в заметке" | "Сохранить заметку")
     };
     let mut lines: Vec<&str> = t.lines().collect();
     while lines.first().is_some_and(|l| junk_line(l)) {
@@ -1046,6 +1068,16 @@ fn clean_chat_answer(raw: &str) -> String {
     while lines.last().is_some_and(|l| junk_line(l)) {
         lines.pop();
     }
+    // цитатные чипы NotebookLM: строки из 1-2 голых цифр (сноски «1» «2»)
+    // — не текст ответа; «1.» / «1)» (списки) НЕ трогаем
+    let lines: Vec<String> = lines
+        .iter()
+        .filter(|l| {
+            let s = l.trim();
+            !(s.len() <= 2 && s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty())
+        })
+        .map(|l| l.trim_start_matches('\u{a0}').to_string())
+        .collect();
     lines.join("\n").trim().to_string()
 }
 
@@ -1218,6 +1250,28 @@ mod tests {
     fn clean_chat_answer_trailing_sidebar_labels() {
         let raw = "Ответ модели\ndocs\n(12)\nstop";
         assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
+
+    #[test]
+    fn clean_chat_answer_action_buttons_and_suggestions() {
+        // живой кейс: после ответа — кнопки-действия, вопросы-подсказки, промо
+        let raw = "Ответ модели\nkeep_pin\nСохранить в заметке\ncopy_all\nthumb_up\nthumb_down\n\nКак вывести K?\nЧто такое патч?\n\n🪄\nGemini Notebook теперь ещё умнее. Хотите создать документ?\nclose\ndocs\n(324)\narrow_forward";
+        assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
+
+    #[test]
+    fn clean_chat_answer_strips_citation_chips() {
+        // чипы-сноски «1» «2» на отдельных строках — удаляются,
+        // «1.» (список) — остаётся
+        let raw = "Первое утверждение\n1\n2\n.\nВторое утверждение\n3\n";
+        let cleaned = clean_chat_answer(raw);
+        assert!(cleaned.contains("Первое утверждение"));
+        assert!(cleaned.contains("Второе утверждение"));
+        assert!(!cleaned.contains("\n1\n"));
+        assert!(!cleaned.contains("\n3\n"));
+        let listed = clean_chat_answer("1. пункт списка\n2. второй пункт");
+        assert!(listed.contains("1. пункт списка"));
+        assert!(listed.contains("2. второй пункт"));
     }
 
     #[test]
