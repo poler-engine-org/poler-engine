@@ -33,7 +33,25 @@
 //! - **Ctrl+T** — тестировать выбранный источник (Sources panel)
 //! - **Esc / Ctrl+C** — выход
 //!
-//! ## M4: Enter-handler на источнике (Sources panel)
+//! ## Doc Browser: источник → документы → просмотр (клик/Enter на источнике)
+//!
+//! Клик или Enter на источнике в Sources panel открывает **список его
+//! документов** (popup Doc Browser), клик на документе — **окно просмотра
+//! в том же терминале** (popup Doc Viewer: ↑↓/PgUp/PgDn/колесо — скролл,
+//! `o` — открыть внешне, Ctrl+Y — копировать, Esc — назад).
+//!
+//! | Источник | Документы внутри | Откуда контент |
+//! |---|---|---|
+//! | NLM-источник ноутбука | текст + слайды-медиа | RPC `hizoJc` (кэш на сессию) |
+//! | локальный `file`-каталог | файлы и подкаталоги («..» наверх) | `fs::read` |
+//! | локальный `file`-файл | сам файл | `fs::read` (лимит 2 МБ, не бинарный) |
+//! | локальный `url` | страница | `ureq` GET + html→text |
+//! | локальный `repo` | инфо + ссылка | `o` — браузер, `gh repos` — REST |
+//!
+//! Внешний канал M4 сохранён на клавише **`o`** в Sources panel
+//! (`$EDITOR` / `xdg-open`) — логика `execute_enter_action` ниже.
+//!
+//! ## M4 (история): внешний канал на источнике — теперь клавиша `o`
 //!
 //! Источник из `poler_sources` (file/url/repo) маппится в
 //! `companion::SourceKind` и через `enter_action()` превращается в
@@ -45,6 +63,7 @@
 //! | `url`  (`https://...`) | `Web { url }` | `OpenUrl(url)` → `xdg-open` |
 //! | `repo` (`owner/name`) | `Web { "https://github.com/{owner/name}" }` | `OpenUrl` |
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -61,16 +80,16 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use tui_textarea::TextArea;
 
 use super::commands::{dispatch, CmdResult};
+use super::doc_browser::{self, DocEntry, DocKind, SourceRef, MAX_DIR_ENTRIES, MAX_DOC_BYTES};
 use super::help;
 use super::mouse::{self, MouseAction, SelectionRect};
 use super::state::ShellState;
+use crate::google::nlm::SourceContent;
 
 /// Запустить TUI-режим (`poler-engine --tui`).
 pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
@@ -111,7 +130,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
         String::new(),
     ];
     let mut output_scroll: usize = usize::MAX; // row-offset для Paragraph::scroll; usize::MAX = прилипить к низу
-    // Список ноутбуков (левая панель)
+                                               // Список ноутбуков (левая панель)
     let mut notebooks: Vec<String> = vec!["(r — загрузить список из NotebookLM)".into()];
     let mut notebook_ids: Vec<String> = Vec::new();
     let mut cached_notebooks: Vec<CachedNotebook> = Vec::new();
@@ -125,8 +144,16 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
 
     // Список источников (правая нижняя)
     let mut sources_items: Vec<String> = vec!["(нет источников — sources add)".into()];
+    // Параллельный массив ссылок на источники (NLM или локальные) — по нему
+    // клик/Enter открывает Doc Browser. Длина == sources_items только для
+    // реальных строк; плейсхолдеры не имеют ссылок.
+    let mut sources_refs: Vec<SourceRef> = Vec::new();
     let mut sources_state = ListState::default();
     sources_state.select(Some(0));
+
+    // Кэш контента NLM-источников (RPC hizoJc дорог — 1 раз на источник
+    // за сессию): ключ "nb_id/src_id".
+    let mut nlm_doc_cache: HashMap<String, SourceContent> = HashMap::new();
 
     let mut focus = Focus::Input;
     let mut should_quit = false;
@@ -135,7 +162,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     // Список ноутбуков и их полное содержимое — по 'r' / Enter / клику
     // (87 ноутбуков × 2 RPC на каждое нажатие стрелок заморозили бы TUI).
     refresh_notes_list(&mut state, &mut notes_items);
-    refresh_sources_list(&mut state, &mut sources_items);
+    refresh_sources_list(&mut state, &mut sources_items, &mut sources_refs);
 
     // Drag-select
     let mut selection = SelectionRect::new();
@@ -160,7 +187,8 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     while !should_quit {
         // Снапшот layout — нужен для hit-testing мыши
         let term_size = terminal.size().unwrap_or_default();
-        let layout_snapshot = compute_layout(Rect::new(0, 0, term_size.width, term_size.height));
+        let term_rect = Rect::new(0, 0, term_size.width, term_size.height);
+        let layout_snapshot = compute_layout(term_rect);
         // Нормализация скролла: сентинел usize::MAX / перелимит → точный bottom-offset.
         // Wrap-оценка: строки длиннее ширины панели занимают >1 рендер-строки.
         {
@@ -220,7 +248,8 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                                     nb_id.as_deref(),
                                 ) {
                                     Ok(id) => {
-                                        output_lines.push(format!("✓ Сохранена заметка #{id} «{title}»"));
+                                        output_lines
+                                            .push(format!("✓ Сохранена заметка #{id} «{title}»"));
                                         if let Some(nb) = &nb_id {
                                             output_lines.push(format!(
                                                 "  ↺ в ноутбуке {} — уйдёт в NLM при синке (Enter на ноутбуке / r / nlm notes-sync)",
@@ -257,7 +286,8 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                             palette_state.select(Some((i + 1).min(max)));
                         }
                         (KeyCode::Enter, _) => {
-                            let sc = &help::palette_scenarios()[palette_state.selected().unwrap_or(0)];
+                            let sc =
+                                &help::palette_scenarios()[palette_state.selected().unwrap_or(0)];
                             input_buf.clear();
                             input_buf.push_str(sc.cmd);
                             focus = Focus::Input;
@@ -283,6 +313,26 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     continue;
                 } else {
                     Mode::Normal
+                }
+            }
+            Mode::DocBrowser(bs) => {
+                // Doc Browser: список документов источника. None — режим остаётся.
+                match handle_doc_browser_event(
+                    ev.clone(),
+                    bs,
+                    &nlm_doc_cache,
+                    &mut output_lines,
+                    term_rect,
+                ) {
+                    Some(new_mode) => new_mode,
+                    None => continue,
+                }
+            }
+            Mode::DocViewer(vs) => {
+                // Doc Viewer: окно с документом (scroll/copy/open).
+                match handle_doc_viewer_event(ev.clone(), vs, &mut output_lines, term_rect) {
+                    Some(new_mode) => new_mode,
+                    None => continue,
                 }
             }
             Mode::Normal => {
@@ -314,6 +364,8 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut notes_state,
                     &mut sources_items,
                     &mut sources_state,
+                    &mut sources_refs,
+                    &mut nlm_doc_cache,
                     &mut focus,
                     &mut should_quit,
                     &mut mode,
@@ -345,10 +397,13 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     &mut notes_state,
                     &mut sources_items,
                     &mut sources_state,
+                    &mut sources_refs,
+                    &mut nlm_doc_cache,
                     &mut focus,
                     &mut selection,
                     &mut last_click_time,
                     &mut last_click_pos,
+                    &mut mode,
                 );
             }
             Event::Resize(_, _) => {
@@ -416,6 +471,10 @@ enum Mode {
     Normal,
     Palette,
     NoteEditor(NoteEditorState),
+    /// Список документов выбранного источника (popup).
+    DocBrowser(DocBrowserState),
+    /// Окно просмотра одного документа (popup, read-only).
+    DocViewer(DocViewerState),
 }
 
 #[derive(Debug)]
@@ -430,6 +489,32 @@ enum NoteEditorResult {
     Continue,
     Save(String, String),
     Cancel,
+}
+
+/// Состояние Doc Browser: список документов внутри одного источника.
+/// Для файловых источников поддерживает drill-down по каталогам
+/// (title обновляется, `..` ведёт наверх).
+#[derive(Debug, Default)]
+struct DocBrowserState {
+    /// Заголовок окна: имя источника или текущий каталог при drill-down.
+    title: String,
+    docs: Vec<DocEntry>,
+    state: ListState,
+}
+
+/// Состояние Doc Viewer: read-only окно с текстом документа.
+/// `parent` — список, из которого открыли (Esc возвращает в него).
+#[derive(Debug)]
+struct DocViewerState {
+    title: String,
+    /// Мета-строка: тип/путь/URL — рендерится в заголовке окна.
+    meta: String,
+    text: String,
+    scroll: usize,
+    /// URL для клавиши `o` (открыть в браузере), если применимо.
+    open_url: Option<String>,
+    /// Список документов, из которого открыт просмотр (Esc — назад).
+    parent: Option<Box<DocBrowserState>>,
 }
 
 /// Снапшот вычисленных прямоугольников layout для hit-testing мыши.
@@ -505,7 +590,6 @@ fn compute_layout(area: Rect) -> LayoutSnapshot {
 }
 
 #[allow(clippy::too_many_arguments)]
-
 // ---------------------------------------------------------------------------
 // v0.17.3-fix: Wrap-оценка высоты чата для скролла
 // ---------------------------------------------------------------------------
@@ -556,7 +640,9 @@ fn render_ui(
         .borders(Borders::ALL)
         .title("Repo / Notebooks (r=refresh)")
         .border_style(if matches!(focus, Focus::Notebooks) {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -570,7 +656,9 @@ fn render_ui(
         .borders(Borders::ALL)
         .title("Chat & Responses (drag-select → Ctrl+Y)")
         .border_style(if matches!(focus, Focus::Output) {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -587,10 +675,17 @@ fn render_ui(
 
     // Drag-select overlay — рамка выделения
     if let Some((min_col, min_row, max_col, max_row)) = selection.bbox() {
-        let sel_area = Rect::new(min_col, min_row, max_col - min_col + 1, max_row - min_row + 1);
-        let sel_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        let sel_area = Rect::new(
+            min_col,
+            min_row,
+            max_col - min_col + 1,
+            max_row - min_row + 1,
+        );
+        let sel_block = Block::default().borders(Borders::ALL).border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
         f.render_widget(sel_block, sel_area);
     }
 
@@ -600,7 +695,9 @@ fn render_ui(
             .borders(Borders::ALL)
             .title("Chat & Responses (drag-select → Ctrl+Y)")
             .border_style(if matches!(focus, Focus::Output) {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             }),
@@ -612,7 +709,9 @@ fn render_ui(
         .borders(Borders::ALL)
         .title("Input (Enter=run, ↑↓=history, ?=palette)")
         .border_style(if matches!(focus, Focus::Input) {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -626,7 +725,9 @@ fn render_ui(
         .borders(Borders::ALL)
         .title("Notes (Ctrl+N=new, Ctrl+S=save AI)")
         .border_style(if matches!(focus, Focus::Notes) {
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -642,9 +743,11 @@ fn render_ui(
     // Правая низ — Sources
     let sources_block = Block::default()
         .borders(Borders::ALL)
-        .title("Sources (click=open, Ctrl+T=test)")
+        .title("Sources (click/Enter=документы, o=внешне, Ctrl+T=test)")
         .border_style(if matches!(focus, Focus::Sources) {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -655,7 +758,11 @@ fn render_ui(
     let sources_widget = List::new(sources_list_items)
         .block(sources_block)
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Blue));
-    f.render_stateful_widget(sources_widget, layout.sources_area, &mut sources_state.clone());
+    f.render_stateful_widget(
+        sources_widget,
+        layout.sources_area,
+        &mut sources_state.clone(),
+    );
 
     // Status bar
     let status_text = format!(
@@ -681,6 +788,12 @@ fn render_ui(
         Mode::NoteEditor(editor_state) => {
             render_note_editor_overlay(f, editor_state);
         }
+        Mode::DocBrowser(bs) => {
+            render_doc_browser_overlay(f, bs);
+        }
+        Mode::DocViewer(vs) => {
+            render_doc_viewer_overlay(f, vs);
+        }
         Mode::Normal => {}
     }
 }
@@ -695,7 +808,11 @@ fn render_palette_overlay(f: &mut ratatui::Frame, palette_state: &ListState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("? palette — 10 сценариев (↑↓=select, Enter=use, Esc=cancel)")
-        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        .border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
     let widget = List::new(items)
         .block(block)
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
@@ -717,7 +834,9 @@ fn render_note_editor_overlay(f: &mut ratatui::Frame, editor: &NoteEditorState) 
             "Title (TAB → body)"
         })
         .border_style(if editor.title_active {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -727,12 +846,19 @@ fn render_note_editor_overlay(f: &mut ratatui::Frame, editor: &NoteEditorState) 
     f.render_widget(title_para, title_area);
 
     // Body textarea
-    let body_area = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(3));
+    let body_area = Rect::new(
+        area.x,
+        area.y + 3,
+        area.width,
+        area.height.saturating_sub(3),
+    );
     let body_block = Block::default()
         .borders(Borders::ALL)
         .title("Body (Ctrl+S=save, Esc=cancel)")
         .border_style(if !editor.title_active {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
@@ -761,6 +887,97 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     popup_layout[1]
 }
 
+/// Прямоугольник popup Doc Browser (совпадает с hit-testing в обработчике).
+fn doc_browser_area(term: Rect) -> Rect {
+    centered_rect(70, 70, term)
+}
+
+/// Прямоугольник popup Doc Viewer.
+fn doc_viewer_area(term: Rect) -> Rect {
+    centered_rect(92, 88, term)
+}
+
+/// Popup со списком документов источника.
+fn render_doc_browser_overlay(f: &mut ratatui::Frame, bs: &DocBrowserState) {
+    let area = doc_browser_area(f.area());
+    f.render_widget(Clear, area);
+    let title = truncate_chars(&bs.title, 48);
+    let items: Vec<ListItem> = bs
+        .docs
+        .iter()
+        .map(|d| {
+            let icon = doc_browser::doc_icon(&d.kind);
+            if d.hint.is_empty() {
+                ListItem::new(Line::from(format!("{} {}", icon, d.title)))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{} {} ", icon, d.title)),
+                    Span::styled(
+                        format!("({})", d.hint),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            "📄 {} — {} докум. (Enter/клик=открыть, o=внешне, Esc=назад)",
+            title,
+            bs.docs.len()
+        ))
+        .border_style(
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        );
+    let widget = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Blue));
+    f.render_stateful_widget(widget, area, &mut bs.state.clone());
+}
+
+/// Popup с текстом документа (read-only, скролл).
+fn render_doc_viewer_overlay(f: &mut ratatui::Frame, vs: &DocViewerState) {
+    let area = doc_viewer_area(f.area());
+    f.render_widget(Clear, area);
+    let title = truncate_chars(&vs.title, 40);
+    let meta = truncate_chars(&vs.meta, 48);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!("📜 {title} • {meta}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " ↑↓/PgUp/PgDn/колесо=скролл │ o=браузер │ Ctrl+Y=копия │ Esc=назад ",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .border_style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        );
+    let scroll = vs.scroll.min(u16::MAX as usize) as u16;
+    let para = Paragraph::new(vs.text.as_str())
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(para, area);
+}
+
+/// Обрезать строку по границе символов (UTF-8 безопасно).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key_event(
     k: KeyEvent,
@@ -778,6 +995,8 @@ fn handle_key_event(
     notes_state: &mut ListState,
     sources_items: &mut Vec<String>,
     sources_state: &mut ListState,
+    sources_refs: &mut Vec<SourceRef>,
+    nlm_doc_cache: &mut HashMap<String, SourceContent>,
     focus: &mut Focus,
     should_quit: &mut bool,
     mode: &mut Mode,
@@ -804,7 +1023,14 @@ fn handle_key_event(
             // Ctrl+Y: скопировать выделение (если активно) или весь последний вывод
             if selection.active {
                 if let Some((min_col, min_row, max_col, max_row)) = selection.bbox() {
-                    let text = mouse::extract_text(output_lines, &Rect::new(0, 0, 200, 1000), min_col, min_row, max_col, max_row);
+                    let text = mouse::extract_text(
+                        output_lines,
+                        &Rect::new(0, 0, 200, 1000),
+                        min_col,
+                        min_row,
+                        max_col,
+                        max_row,
+                    );
                     match mouse::copy_to_clipboard(&text) {
                         Ok(via) => output_lines.push(format!(
                             "✓ Скопировано {} символов в буфер ({via})",
@@ -916,7 +1142,7 @@ fn handle_key_event(
                             match crate::sources::delete_source(conn, id) {
                                 Ok(()) => {
                                     output_lines.push(format!("✓ Источник #{id} удалён"));
-                                    refresh_sources_list(state, sources_items);
+                                    refresh_sources_list(state, sources_items, sources_refs);
                                 }
                                 Err(e) => output_lines.push(format!("❌ {e}")),
                             }
@@ -943,7 +1169,7 @@ fn handle_key_event(
                                 }
                                 Err(e) => output_lines.push(format!("❌ {e}")),
                             }
-                            refresh_sources_list(state, sources_items);
+                            refresh_sources_list(state, sources_items, sources_refs);
                             *output_scroll = usize::MAX; // прилипить к низу
                         }
                     }
@@ -951,36 +1177,23 @@ fn handle_key_event(
             }
         }
         (KeyCode::Enter, _) if matches!(focus, Focus::Sources) => {
-            // M4: Enter-handler на источнике → companion::SourceKind::enter_action.
-            // Источник из poler_sources маппится в SourceKind Companion Bridge:
-            //   File  → FileUpload { local_path } → EditLocal(path)
-            //   Url   → Web { url } → OpenUrl(url)
-            //   Repo  → Web { "https://github.com/{value}" } → OpenUrl
+            // Doc Browser: Enter на источнике → список его документов.
+            // Источники бывают NLM (активный ноутбук) и локальные
+            // (poler_sources) — sources_refs держит правильный тип.
             if let Some(idx) = sources_state.selected() {
-                if let Ok(conn) = state.ensure_sources_conn() {
-                    let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
-                    if idx < all.len() {
-                        let src = &all[idx];
-                        let kind = match src.kind {
-                            crate::sources::SourceKind::File => {
-                                crate::google::companion::SourceKind::FileUpload {
-                                    local_path: src.value.clone(),
-                                }
-                            }
-                            crate::sources::SourceKind::Url => {
-                                crate::google::companion::SourceKind::Web {
-                                    url: src.value.clone(),
-                                }
-                            }
-                            crate::sources::SourceKind::Repo => {
-                                crate::google::companion::SourceKind::Web {
-                                    url: format!("https://github.com/{}", src.value),
-                                }
-                            }
-                        };
-                        let action = kind.enter_action(&src.id.to_string());
-                        execute_enter_action(&action, output_lines);
-                    }
+                if idx < sources_refs.len() {
+                    let bs =
+                        open_doc_browser(&sources_refs[idx], state, nlm_doc_cache, output_lines);
+                    *mode = Mode::DocBrowser(bs);
+                }
+            }
+            *output_scroll = usize::MAX; // прилипить к низу
+        }
+        (KeyCode::Char('o'), _) if matches!(focus, Focus::Sources) => {
+            // 'o': внешний канал (M4) — $EDITOR / xdg-open / браузер.
+            if let Some(idx) = sources_state.selected() {
+                if idx < sources_refs.len() {
+                    open_source_external(&sources_refs[idx], output_lines);
                 }
             }
             *output_scroll = usize::MAX; // прилипить к низу
@@ -1002,6 +1215,7 @@ fn handle_key_event(
                     notebook_ids,
                     cached_notebooks,
                     sources_items,
+                    sources_refs,
                     notes_items,
                     output_lines,
                     output_scroll,
@@ -1028,6 +1242,7 @@ fn handle_key_event(
                 notebook_ids,
                 cached_notebooks,
                 sources_items,
+                sources_refs,
                 notes_items,
                 output_lines,
                 output_scroll,
@@ -1038,7 +1253,9 @@ fn handle_key_event(
         (KeyCode::PageUp, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
             *output_scroll = output_scroll.saturating_sub(5);
         }
-        (KeyCode::PageDown, _) if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) => {
+        (KeyCode::PageDown, _)
+            if matches!(focus, Focus::Output) || matches!(focus, Focus::Input) =>
+        {
             // клампит нормализация в главном цикле (bottom-offset с учётом Wrap)
             *output_scroll = (*output_scroll).saturating_add(5);
         }
@@ -1130,7 +1347,7 @@ fn handle_key_event(
                         refresh_notes_list(state, notes_items);
                     }
                     if trimmed.starts_with("sources") {
-                        refresh_sources_list(state, sources_items);
+                        refresh_sources_list(state, sources_items, sources_refs);
                     }
                     for l in out.lines() {
                         output_lines.push(l.to_string());
@@ -1186,11 +1403,7 @@ fn execute_enter_action(
         } => {
             let tmp = std::env::temp_dir().join(suggested_filename);
             if let Err(e) = std::fs::write(&tmp, content) {
-                output_lines.push(format!(
-                    "❌ не удалось записать {}: {}",
-                    tmp.display(),
-                    e
-                ));
+                output_lines.push(format!("❌ не удалось записать {}: {}", tmp.display(), e));
                 return;
             }
             let s = tmp.to_string_lossy().to_string();
@@ -1220,6 +1433,457 @@ fn spawn_editor(path: &str) {
         .spawn();
 }
 
+// ---------------------------------------------------------------------------
+// Doc Browser: источник → документы → просмотр (v0.17.3+)
+// ---------------------------------------------------------------------------
+
+/// Открыть Doc Browser для источника: собрать список его документов.
+///
+/// NLM-источник: контент подтягивается RPC `hizoJc` (кэш на сессию);
+/// при ошибке — честная заглушка с внешней ссылкой. Локальный источник:
+/// каталог листуется, файл/URL/repo — одна запись. Функция всегда
+/// возвращает пригодный к показу список (ошибки — Info-документы).
+fn open_doc_browser(
+    src_ref: &SourceRef,
+    state: &mut ShellState,
+    nlm_doc_cache: &mut HashMap<String, SourceContent>,
+    output_lines: &mut Vec<String>,
+) -> DocBrowserState {
+    let mut bs = DocBrowserState::default();
+    bs.state.select(Some(0));
+    match src_ref {
+        SourceRef::Nlm { nb_id, src } => {
+            let key = format!("{nb_id}/{}", src.id);
+            if !nlm_doc_cache.contains_key(&key) {
+                match state
+                    .ensure_nlm()
+                    .and_then(|s| s.load_source(nb_id, &src.id))
+                {
+                    Ok(sc) => {
+                        nlm_doc_cache.insert(key.clone(), sc);
+                    }
+                    Err(e) => {
+                        // Сеть/сессия подвели — не прячем ошибку: сообщение
+                        // в чат + заглушка в списке + внешняя ссылка.
+                        output_lines.push(format!("⚠ load_source «{}»: {e}", src.title));
+                        output_lines.push(String::new());
+                        let mut docs = vec![DocEntry {
+                            title: "Ошибка загрузки".into(),
+                            hint: String::new(),
+                            kind: DocKind::Info {
+                                text: format!(
+                                    "Не удалось загрузить контент источника из NLM:\n\n  {e}\n\n\
+                                     Переоткройте источник позже (сессия могла протухнуть) \
+                                     или нажмите o — открыть в браузере."
+                                ),
+                                open_url: src.url.clone(),
+                            },
+                        }];
+                        if let Some(u) = src.url.as_deref().filter(|u| !u.is_empty()) {
+                            docs.push(DocEntry {
+                                title: doc_browser::short_url(u),
+                                hint: "веб".into(),
+                                kind: DocKind::WebPage { url: u.to_string() },
+                            });
+                        }
+                        bs.title = src.title.clone();
+                        bs.docs = docs;
+                        return bs;
+                    }
+                }
+            }
+            let Some(sc) = nlm_doc_cache.get(&key).cloned() else {
+                // Недостижимо: выше либо insert при успехе, либо ранний return
+                return bs;
+            };
+            bs.title = format!("{} — {}", src.title, src.kind);
+            bs.docs = doc_browser::nlm_documents(nb_id, &sc, src.url.as_deref());
+        }
+        SourceRef::Local { src } => {
+            bs.title = format!("[{}] {}", src.kind.as_str(), src.value);
+            bs.docs = doc_browser::local_source_documents(src);
+        }
+    }
+    bs
+}
+
+/// Сформировать состояние Doc Viewer для выбранного документа.
+/// Загрузка контента (файл/веб) происходит здесь, один раз при открытии.
+fn open_doc_viewer(
+    entry: &DocEntry,
+    nlm_doc_cache: &HashMap<String, SourceContent>,
+    parent: DocBrowserState,
+) -> DocViewerState {
+    let (meta, text, open_url) = match &entry.kind {
+        DocKind::NlmText { nb_id, src_id, url } => {
+            let key = format!("{nb_id}/{src_id}");
+            let (kind, text) = match nlm_doc_cache.get(&key) {
+                Some(sc) => (
+                    sc.kind.clone(),
+                    sc.content
+                        .clone()
+                        .unwrap_or_else(|| "(у источника нет текстового контента)".to_string()),
+                ),
+                None => (
+                    "NLM".into(),
+                    "⚠ контент не найден в кэше сессии — закройте окно и \
+                     переоткройте источник"
+                        .into(),
+                ),
+            };
+            (format!("NLM • {kind}"), text, url.clone())
+        }
+        DocKind::NlmMedia { url } => (
+            "медиа-слайд".into(),
+            format!(
+                "Изображение слайда:\n\n  {url}\n\n\
+                 Терминал не отображает картинки — нажмите o, чтобы открыть \
+                 в браузере; Ctrl+Y — скопировать ссылку."
+            ),
+            Some(url.clone()),
+        ),
+        DocKind::LocalFile { path } => {
+            let meta = path.display().to_string();
+            match doc_browser::read_local_document(path, MAX_DOC_BYTES) {
+                Ok(text) => (meta, text, None),
+                Err(e) => (meta, format!("⚠ {e}"), None),
+            }
+        }
+        DocKind::LocalDir { path } => {
+            // В viewer директория попадает только теоретически (клик всегда
+            // уходит в drill-down) — на всякий случай покажем листинг текстом.
+            let meta = path.display().to_string();
+            match doc_browser::dir_documents(path, MAX_DIR_ENTRIES) {
+                Ok(docs) => {
+                    let text = docs
+                        .iter()
+                        .map(|d| {
+                            if d.hint.is_empty() {
+                                d.title.clone()
+                            } else {
+                                format!("{} ({})", d.title, d.hint)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (meta, text, None)
+                }
+                Err(e) => (meta, format!("⚠ {e}"), None),
+            }
+        }
+        DocKind::WebPage { url } => {
+            let meta = url.clone();
+            match doc_browser::fetch_web_document(url, MAX_DOC_BYTES) {
+                Ok(text) => (meta, text, Some(url.clone())),
+                Err(e) => (meta, format!("⚠ {e}"), Some(url.clone())),
+            }
+        }
+        DocKind::Info { text, open_url } => ("инфо".into(), text.clone(), open_url.clone()),
+    };
+    DocViewerState {
+        title: entry.title.clone(),
+        meta,
+        text,
+        scroll: 0,
+        open_url,
+        parent: Some(Box::new(parent)),
+    }
+}
+
+/// Открыть выбранный в Doc Browser документ: LocalDir — drill-down в новый
+/// листинг, остальное — Doc Viewer. `None` = остались в списке.
+fn open_selected_doc(
+    bs: &mut DocBrowserState,
+    nlm_doc_cache: &HashMap<String, SourceContent>,
+) -> Option<Mode> {
+    let idx = bs.state.selected()?;
+    let entry = bs.docs.get(idx)?.clone();
+    if let DocKind::LocalDir { path } = &entry.kind {
+        // Drill-down: заменяем содержимое списка («..» добавит родителя),
+        // заголовок — путь текущего каталога.
+        bs.docs = doc_browser::local_source_documents(&crate::sources::Source {
+            id: 0,
+            kind: crate::sources::SourceKind::File,
+            value: path.display().to_string(),
+            label: None,
+            added_at: 0,
+            last_tested_at: None,
+            last_status: String::new(),
+        });
+        bs.title = format!("📁 {}", path.display());
+        bs.state.select(Some(0));
+        return None;
+    }
+    let parent = DocBrowserState {
+        title: bs.title.clone(),
+        docs: bs.docs.clone(),
+        state: bs.state.clone(),
+    };
+    Some(Mode::DocViewer(open_doc_viewer(
+        &entry,
+        nlm_doc_cache,
+        parent,
+    )))
+}
+
+/// Внешний канал для источника (клавиша `o` / правый клик в Sources panel):
+/// локальные — `$EDITOR`/`xdg-open` через M4 `execute_enter_action`,
+/// NLM — открыть URL в браузере.
+fn open_source_external(src_ref: &SourceRef, output_lines: &mut Vec<String>) {
+    match src_ref {
+        SourceRef::Nlm { src, .. } => match src.url.as_deref().filter(|u| !u.is_empty()) {
+            Some(u) => {
+                crate::google::open_in_user_browser(u);
+                output_lines.push(format!("→ открыть в браузере: {u}"));
+            }
+            None => output_lines.push(format!(
+                "ℹ у NLM-источника «{}» нет внешнего URL (тип: {})",
+                src.title, src.kind
+            )),
+        },
+        SourceRef::Local { src } => {
+            let kind = match src.kind {
+                crate::sources::SourceKind::File => {
+                    crate::google::companion::SourceKind::FileUpload {
+                        local_path: src.value.clone(),
+                    }
+                }
+                crate::sources::SourceKind::Url => crate::google::companion::SourceKind::Web {
+                    url: src.value.clone(),
+                },
+                crate::sources::SourceKind::Repo => crate::google::companion::SourceKind::Web {
+                    url: format!("https://github.com/{}", src.value),
+                },
+            };
+            let action = kind.enter_action(&src.id.to_string());
+            execute_enter_action(&action, output_lines);
+        }
+    }
+}
+
+/// Обработчик событий Doc Browser (список документов).
+/// `Some(new_mode)` — сменить режим, `None` — остались в списке.
+fn handle_doc_browser_event(
+    ev: Event,
+    bs: &mut DocBrowserState,
+    nlm_doc_cache: &HashMap<String, SourceContent>,
+    output_lines: &mut Vec<String>,
+    term: Rect,
+) -> Option<Mode> {
+    let area = doc_browser_area(term);
+    match ev {
+        Event::Key(k) => match (k.code, k.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Mode::Normal),
+            (KeyCode::Up, _) => {
+                let i = bs.state.selected().unwrap_or(0);
+                bs.state.select(Some(i.saturating_sub(1)));
+                None
+            }
+            (KeyCode::Down, _) => {
+                let i = bs.state.selected().unwrap_or(0);
+                let max = bs.docs.len().saturating_sub(1);
+                bs.state.select(Some((i + 1).min(max)));
+                None
+            }
+            (KeyCode::PageUp, _) => {
+                let i = bs.state.selected().unwrap_or(0);
+                bs.state.select(Some(i.saturating_sub(10)));
+                None
+            }
+            (KeyCode::PageDown, _) => {
+                let i = bs.state.selected().unwrap_or(0);
+                let max = bs.docs.len().saturating_sub(1);
+                bs.state.select(Some((i + 10).min(max)));
+                None
+            }
+            (KeyCode::Home, _) => {
+                bs.state.select(Some(0));
+                None
+            }
+            (KeyCode::End, _) => {
+                let max = bs.docs.len().saturating_sub(1);
+                bs.state.select(Some(max));
+                None
+            }
+            (KeyCode::Enter, _) => open_selected_doc(bs, nlm_doc_cache),
+            (KeyCode::Char('o'), _) => {
+                // внешний канал для выбранного документа
+                if let Some(idx) = bs.state.selected() {
+                    if let Some(entry) = bs.docs.get(idx) {
+                        match &entry.kind {
+                            DocKind::WebPage { url } | DocKind::NlmMedia { url } => {
+                                crate::google::open_in_user_browser(url);
+                                output_lines.push(format!("→ открыть в браузере: {url}"));
+                            }
+                            DocKind::LocalFile { path } => {
+                                let p = path.display().to_string();
+                                spawn_editor(&p);
+                                output_lines.push(format!("→ открыть в $EDITOR: {p}"));
+                            }
+                            DocKind::Info { open_url, .. } => {
+                                if let Some(u) = open_url {
+                                    crate::google::open_in_user_browser(u);
+                                    output_lines.push(format!("→ открыть в браузере: {u}"));
+                                }
+                            }
+                            DocKind::NlmText { url, .. } => {
+                                if let Some(u) = url {
+                                    crate::google::open_in_user_browser(u);
+                                    output_lines.push(format!("→ открыть в браузере: {u}"));
+                                } else {
+                                    output_lines.push("ℹ у документа нет внешнего URL".into());
+                                }
+                            }
+                            DocKind::LocalDir { .. } => {
+                                output_lines
+                                    .push("ℹ каталог открывается Enter'ом (drill-down)".into());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        },
+        Event::Mouse(me) => match mouse::parse_event(me) {
+            MouseAction::ScrollUp => {
+                let i = bs.state.selected().unwrap_or(0);
+                bs.state.select(Some(i.saturating_sub(1)));
+                None
+            }
+            MouseAction::ScrollDown => {
+                let i = bs.state.selected().unwrap_or(0);
+                let max = bs.docs.len().saturating_sub(1);
+                bs.state.select(Some((i + 1).min(max)));
+                None
+            }
+            // Клик по строке = выбор + открытие (как просил пользователь:
+            // «тыкаешь на документ — открывается окно»)
+            MouseAction::DragEnd { col, row } if mouse::hit(&area, col, row) => {
+                let local_row = row.saturating_sub(area.y).saturating_sub(1) as usize;
+                if local_row < bs.docs.len() {
+                    bs.state.select(Some(local_row));
+                    open_selected_doc(bs, nlm_doc_cache)
+                } else {
+                    None
+                }
+            }
+            MouseAction::RightClick { col, row } if mouse::hit(&area, col, row) => {
+                let local_row = row.saturating_sub(area.y).saturating_sub(1) as usize;
+                if local_row < bs.docs.len() {
+                    bs.state.select(Some(local_row));
+                    // правый клик = внешний канал выбранного документа
+                    if let Some(entry) = bs.docs.get(local_row) {
+                        match &entry.kind {
+                            DocKind::WebPage { url } | DocKind::NlmMedia { url } => {
+                                crate::google::open_in_user_browser(url);
+                                output_lines.push(format!("→ открыть в браузере: {url}"));
+                            }
+                            DocKind::LocalFile { path } => {
+                                let p = path.display().to_string();
+                                spawn_editor(&p);
+                                output_lines.push(format!("→ открыть в $EDITOR: {p}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Сколько рендер-строк занимает текст при Wrap по ширине `width`
+/// (оценка — тот же принцип, что у Chat panel).
+fn viewer_bottom_scroll(text: &str, width: usize, height: usize) -> usize {
+    let total: usize = text.lines().map(|l| wrapped_rows(l, width)).sum();
+    total.saturating_sub(height)
+}
+
+/// Обработчик событий Doc Viewer (окно с документом).
+/// `Some(new_mode)` — сменить режим (Esc → назад в список), `None` — остались.
+fn handle_doc_viewer_event(
+    ev: Event,
+    vs: &mut DocViewerState,
+    output_lines: &mut Vec<String>,
+    term: Rect,
+) -> Option<Mode> {
+    let area = doc_viewer_area(term);
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    let bottom = viewer_bottom_scroll(&vs.text, inner_w, inner_h);
+    match ev {
+        Event::Key(k) => match (k.code, k.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                // Esc — назад к списку документов (не в Normal!)
+                vs.parent
+                    .take()
+                    .map(|b| Mode::DocBrowser(*b))
+                    .or(Some(Mode::Normal))
+            }
+            (KeyCode::Up, _) => {
+                vs.scroll = vs.scroll.saturating_sub(1);
+                None
+            }
+            (KeyCode::Down, _) => {
+                vs.scroll = (vs.scroll + 1).min(bottom);
+                None
+            }
+            (KeyCode::PageUp, _) => {
+                vs.scroll = vs.scroll.saturating_sub(10);
+                None
+            }
+            (KeyCode::PageDown, _) => {
+                vs.scroll = (vs.scroll + 10).min(bottom);
+                None
+            }
+            (KeyCode::Home, _) => {
+                vs.scroll = 0;
+                None
+            }
+            (KeyCode::End, _) => {
+                vs.scroll = bottom;
+                None
+            }
+            (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+                match mouse::copy_to_clipboard(&vs.text) {
+                    Ok(via) => output_lines.push(format!(
+                        "✓ Документ скопирован ({} символов, {via})",
+                        vs.text.chars().count()
+                    )),
+                    Err(e) => output_lines.push(format!("❌ clipboard: {e}")),
+                }
+                None
+            }
+            (KeyCode::Char('o'), _) => {
+                if let Some(u) = &vs.open_url {
+                    crate::google::open_in_user_browser(u);
+                    output_lines.push(format!("→ открыть в браузере: {u}"));
+                } else {
+                    output_lines.push("ℹ у документа нет внешнего URL".into());
+                }
+                None
+            }
+            _ => None,
+        },
+        Event::Mouse(me) => match mouse::parse_event(me) {
+            MouseAction::ScrollUp => {
+                vs.scroll = vs.scroll.saturating_sub(3);
+                None
+            }
+            MouseAction::ScrollDown => {
+                vs.scroll = (vs.scroll + 3).min(bottom);
+                None
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse_event(
     me: MouseEvent,
@@ -1238,10 +1902,13 @@ fn handle_mouse_event(
     notes_state: &mut ListState,
     sources_items: &mut Vec<String>,
     sources_state: &mut ListState,
+    sources_refs: &mut Vec<SourceRef>,
+    nlm_doc_cache: &mut HashMap<String, SourceContent>,
     focus: &mut Focus,
     selection: &mut SelectionRect,
     last_click_time: &mut Option<Instant>,
     last_click_pos: &mut Option<(u16, u16)>,
+    mode: &mut Mode,
 ) {
     let action = mouse::parse_event(me);
     match action {
@@ -1283,20 +1950,58 @@ fn handle_mouse_event(
                     } else {
                         // Это был одиночный клик — обрабатываем как клик
                         handle_single_click(
-                            col, row, layout, state, input_buf, input_history,
-                            input_history_idx, output_lines, output_scroll,
-                            notebooks, notebook_ids, cached_notebooks, nb_state, notes_items, notes_state,
-                            sources_items, sources_state, focus, last_click_time, last_click_pos,
+                            col,
+                            row,
+                            layout,
+                            state,
+                            input_buf,
+                            input_history,
+                            input_history_idx,
+                            output_lines,
+                            output_scroll,
+                            notebooks,
+                            notebook_ids,
+                            cached_notebooks,
+                            nb_state,
+                            notes_items,
+                            notes_state,
+                            sources_items,
+                            sources_state,
+                            sources_refs,
+                            nlm_doc_cache,
+                            focus,
+                            last_click_time,
+                            last_click_pos,
+                            mode,
                         );
                     }
                 }
             } else {
                 // Событие Up без активного drag — обрабатываем как одиночный клик
                 handle_single_click(
-                    col, row, layout, state, input_buf, input_history,
-                    input_history_idx, output_lines, output_scroll,
-                    notebooks, notebook_ids, cached_notebooks, nb_state, notes_items, notes_state,
-                    sources_items, sources_state, focus, last_click_time, last_click_pos,
+                    col,
+                    row,
+                    layout,
+                    state,
+                    input_buf,
+                    input_history,
+                    input_history_idx,
+                    output_lines,
+                    output_scroll,
+                    notebooks,
+                    notebook_ids,
+                    cached_notebooks,
+                    nb_state,
+                    notes_items,
+                    notes_state,
+                    sources_items,
+                    sources_state,
+                    sources_refs,
+                    nlm_doc_cache,
+                    focus,
+                    last_click_time,
+                    last_click_pos,
+                    mode,
                 );
             }
         }
@@ -1338,24 +2043,13 @@ fn handle_mouse_event(
             }
         }
         MouseAction::RightClick { col, row } => {
-            // Правый клик по источнику → открыть в xdg-open
+            // Правый клик по источнику → внешний канал (M4): xdg-open/$EDITOR
+            // для локальных, браузер для NLM-источников.
             if mouse::hit(&layout.sources_area, col, row) {
                 if let Some(idx) = sources_state.selected() {
-                    if let Ok(conn) = state.ensure_sources_conn() {
-                        let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
-                        if idx < all.len() {
-                            let id = all[idx].id;
-                            match crate::sources::open_source(conn, id) {
-                                Ok(()) => {
-                                    output_lines.push(format!("✓ #{id}: отправлено в xdg-open"));
-                                    *output_scroll = usize::MAX; // прилипить к низу
-                                }
-                                Err(e) => {
-                                    output_lines.push(format!("❌ {e}"));
-                                    *output_scroll = usize::MAX; // прилипить к низу
-                                }
-                            }
-                        }
+                    if idx < sources_refs.len() {
+                        open_source_external(&sources_refs[idx], output_lines);
+                        *output_scroll = usize::MAX; // прилипить к низу
                     }
                 }
             }
@@ -1382,9 +2076,12 @@ fn handle_single_click(
     notes_state: &mut ListState,
     sources_items: &mut Vec<String>,
     sources_state: &mut ListState,
+    sources_refs: &mut Vec<SourceRef>,
+    nlm_doc_cache: &mut HashMap<String, SourceContent>,
     focus: &mut Focus,
     last_click_time: &mut Option<Instant>,
     _last_click_pos: &mut Option<(u16, u16)>,
+    mode: &mut Mode,
 ) {
     // Клик по левой панели → выбор ноутбука
     if mouse::hit(&layout.nb_area, col, row) {
@@ -1404,6 +2101,7 @@ fn handle_single_click(
                     notebook_ids,
                     cached_notebooks,
                     sources_items,
+                    sources_refs,
                     notes_items,
                     output_lines,
                     output_scroll,
@@ -1439,11 +2137,17 @@ fn handle_single_click(
         return;
     }
 
-    // Клик по Sources → выбор
+    // Клик по Sources → выбор + Doc Browser (список документов источника)
     if mouse::hit(&layout.sources_area, col, row) {
         *focus = Focus::Sources;
         let local_row = row.saturating_sub(layout.sources_area.y).saturating_sub(1) as usize;
         sources_state.select(Some(local_row));
+        // Плейсхолдеры («нет источников», «⚠ …») не имеют ссылок.
+        if local_row < sources_refs.len() {
+            let bs = open_doc_browser(&sources_refs[local_row], state, nlm_doc_cache, output_lines);
+            *mode = Mode::DocBrowser(bs);
+            *output_scroll = usize::MAX; // прилипить к низу
+        }
         return;
     }
 
@@ -1527,7 +2231,11 @@ impl CachedNotebook {
 
 /// Строка левой панели: до загрузки `3. 🌌 Название`, после — `3. ✓ 🌌 Название [S ист.]`.
 fn nb_panel_line(idx: usize, cn: &CachedNotebook) -> String {
-    let emoji = if cn.emoji.is_empty() { "📓" } else { &cn.emoji };
+    let emoji = if cn.emoji.is_empty() {
+        "📓"
+    } else {
+        &cn.emoji
+    };
     let mark = if cn.loaded() { "✓ " } else { "" };
     let counts = cn
         .sources
@@ -1597,6 +2305,7 @@ fn refresh_notebooks_list(
 /// `sources_items` ← источники NLM; `notes_items` ← единый список заметок
 /// ноутбука из SQLite (после двустороннего синка там лежат и облачные,
 /// и локальные — «везде одинаковые заметки»).
+/// `sources_refs` ← те же источники как [`SourceRef::Nlm`] для Doc Browser.
 fn activate_notebook(
     idx: usize,
     state: &mut ShellState,
@@ -1604,6 +2313,7 @@ fn activate_notebook(
     notebook_ids: &[String],
     cached_notebooks: &mut [CachedNotebook],
     sources_items: &mut Vec<String>,
+    sources_refs: &mut Vec<SourceRef>,
     notes_items: &mut Vec<String>,
     output_lines: &mut Vec<String>,
     output_scroll: &mut usize,
@@ -1642,6 +2352,7 @@ fn activate_notebook(
 
     // ---- Sources panel ----
     sources_items.clear();
+    sources_refs.clear();
     match &cached_notebooks[idx].sources {
         Some(srcs) if !srcs.is_empty() => {
             for (si, src) in srcs.iter().enumerate() {
@@ -1652,6 +2363,10 @@ fn activate_notebook(
                     .filter(|u| !u.is_empty())
                     .unwrap_or(src.kind.as_str());
                 sources_items.push(format!("{}. {} {} — {}", si + 1, icon, src.title, info));
+                sources_refs.push(SourceRef::Nlm {
+                    nb_id: id.clone(),
+                    src: src.clone(),
+                });
             }
         }
         Some(_) => {
@@ -1720,7 +2435,11 @@ fn refresh_notes_list(state: &mut ShellState, notes_items: &mut Vec<String>) {
     *notes_items = filtered
         .iter()
         .map(|n| {
-            let origin = if n.source == "nlm" { "[nlm]" } else { "[лок]" };
+            let origin = if n.source == "nlm" {
+                "[nlm]"
+            } else {
+                "[лок]"
+            };
             let preview = n
                 .body
                 .lines()
@@ -1734,13 +2453,25 @@ fn refresh_notes_list(state: &mut ShellState, notes_items: &mut Vec<String>) {
                 n.id,
                 origin,
                 n.title,
-                if preview.is_empty() { String::new() } else { format!(" — {preview}") }
+                if preview.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {preview}")
+                }
             )
         })
         .collect();
 }
 
-fn refresh_sources_list(state: &mut ShellState, sources_items: &mut Vec<String>) {
+/// Обновить Sources panel из poler_sources (локальные источники) и
+/// синхронно заполнить `sources_refs` — по нему клик/Enter открывает
+/// Doc Browser с правильным типом источника.
+fn refresh_sources_list(
+    state: &mut ShellState,
+    sources_items: &mut Vec<String>,
+    sources_refs: &mut Vec<SourceRef>,
+) {
+    sources_refs.clear();
     if let Ok(conn) = state.ensure_sources_conn() {
         let all = crate::sources::list_sources(conn, 500).unwrap_or_default();
         if all.is_empty() {
@@ -1749,7 +2480,11 @@ fn refresh_sources_list(state: &mut ShellState, sources_items: &mut Vec<String>)
             *sources_items = all
                 .iter()
                 .map(|s| {
-                    let lbl = s.label.as_ref().map(|l| format!(" ({})", l)).unwrap_or_default();
+                    let lbl = s
+                        .label
+                        .as_ref()
+                        .map(|l| format!(" ({})", l))
+                        .unwrap_or_default();
                     let st = match s.last_status.as_str() {
                         "ok" => "✓",
                         "fail" => "✗",
@@ -1758,6 +2493,9 @@ fn refresh_sources_list(state: &mut ShellState, sources_items: &mut Vec<String>)
                     format!("#{} [{}] {} {}{}", s.id, st, s.kind.as_str(), s.value, lbl)
                 })
                 .collect();
+            for s in all {
+                sources_refs.push(SourceRef::Local { src: s });
+            }
         }
     }
 }
@@ -1798,5 +2536,127 @@ mod tests {
         let ls = LayoutSnapshot::default();
         assert_eq!(ls.nb_area, Rect::default());
         assert_eq!(ls.palette_area, None);
+    }
+
+    // ---- Doc Browser / Doc Viewer ----
+
+    #[test]
+    fn truncate_chars_utf8_safe() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("12345", 3), "12…");
+        // кириллица — режем по границе символов, не байтов
+        let s = "привіт".repeat(20);
+        let t = truncate_chars(&s, 10);
+        assert_eq!(t.chars().count(), 10);
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn viewer_bottom_scroll_counts_wrapped_rows() {
+        // 10 строк по ≤10 символов при ширине 10 → 10 рендер-строк,
+        // высота 3 → bottom = 7
+        let text = "aaaa\nbbbb\ncccc\ndddd\neeee\nffff\ngggg\nhhhh\niiii\njjjj";
+        assert_eq!(viewer_bottom_scroll(text, 10, 3), 7);
+        // текст меньше окна → скролл 0
+        assert_eq!(viewer_bottom_scroll("одна строка", 40, 10), 0);
+        // длинная строка занимает несколько рендер-строк (Wrap)
+        let long = "x".repeat(25);
+        assert_eq!(viewer_bottom_scroll(&long, 10, 5), 0); // 3 строки < 5
+        assert_eq!(viewer_bottom_scroll(&long, 10, 2), 1); // 3 строки - 2
+    }
+
+    #[test]
+    fn doc_browser_state_default_selects_nothing() {
+        let bs = DocBrowserState::default();
+        assert!(bs.docs.is_empty());
+        assert!(bs.title.is_empty());
+        assert!(bs.state.selected().is_none());
+    }
+
+    #[test]
+    fn open_doc_viewer_local_file_reads_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.md");
+        std::fs::write(&p, "# Заголовок\nтекст документа").unwrap();
+
+        let entry = DocEntry {
+            title: "doc.md".into(),
+            hint: "24 B".into(),
+            kind: DocKind::LocalFile { path: p.clone() },
+        };
+        let parent = DocBrowserState {
+            title: "src".into(),
+            ..Default::default()
+        };
+        let vs = open_doc_viewer(&entry, &HashMap::new(), parent);
+        assert_eq!(vs.title, "doc.md");
+        assert!(vs.text.contains("Заголовок"));
+        assert_eq!(vs.meta, p.display().to_string());
+        assert!(vs.parent.is_some());
+        assert_eq!(vs.scroll, 0);
+    }
+
+    #[test]
+    fn open_doc_viewer_info_entry_is_verbatim() {
+        let entry = DocEntry {
+            title: "Инфо".into(),
+            hint: String::new(),
+            kind: DocKind::Info {
+                text: "просто текст".into(),
+                open_url: Some("https://example.com".into()),
+            },
+        };
+        let vs = open_doc_viewer(&entry, &HashMap::new(), DocBrowserState::default());
+        assert_eq!(vs.text, "просто текст");
+        assert_eq!(vs.open_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn open_selected_doc_dir_drills_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "x").unwrap();
+
+        let mut bs = DocBrowserState {
+            title: "источник".into(),
+            docs: vec![DocEntry {
+                title: "sub".into(),
+                hint: "каталог".into(),
+                kind: DocKind::LocalDir { path: sub.clone() },
+            }],
+            state: ListState::default(),
+        };
+        bs.state.select(Some(0));
+        // drill-down: остаёмся в списке (None), docs заменились
+        assert!(open_selected_doc(&mut bs, &HashMap::new()).is_none());
+        assert!(bs.title.contains("sub"));
+        let titles: Vec<&str> = bs.docs.iter().map(|d| d.title.as_str()).collect();
+        assert!(titles.contains(&".."));
+        assert!(titles.contains(&"inner.txt"));
+    }
+
+    #[test]
+    fn open_selected_doc_file_opens_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "контент").unwrap();
+        let mut bs = DocBrowserState {
+            title: "src".into(),
+            docs: vec![DocEntry {
+                title: "a.txt".into(),
+                hint: "14 B".into(),
+                kind: DocKind::LocalFile { path: f },
+            }],
+            state: ListState::default(),
+        };
+        bs.state.select(Some(0));
+        match open_selected_doc(&mut bs, &HashMap::new()) {
+            Some(Mode::DocViewer(vs)) => {
+                assert!(vs.text.contains("контент"));
+                assert!(vs.parent.is_some());
+            }
+            other => panic!("ожидали DocViewer, получили {other:?}"),
+        }
     }
 }

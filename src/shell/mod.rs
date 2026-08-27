@@ -33,6 +33,7 @@
 
 pub mod commands;
 pub mod completer;
+pub mod doc_browser;
 pub mod help;
 pub mod mouse;
 pub mod state;

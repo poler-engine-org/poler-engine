@@ -147,6 +147,9 @@ pub fn help_overview() -> String {
     s.push_str("  ↑/↓ — навігація у списках / історія у вводі\n");
     s.push_str("  PgUp/PgDn — прокрутка Chat panel\n");
     s.push_str("  Enter — виконати команду\n");
+    s.push_str("  клік/Enter на джерелі (Sources) — список документів джерела (Doc Browser)\n");
+    s.push_str("  клік/Enter на документі — вікно з документом у тому ж терміналі (Doc Viewer)\n");
+    s.push_str("  o — відкрити джерело/документ зовні ($EDITOR / браузер)\n");
     s.push_str("  Ctrl+N — нова замітка (вбудований редактор)\n");
     s.push_str("  Ctrl+S — зберегти відповідь AI як замітку\n");
     s.push_str("  Ctrl+Y — копіювати виділення мишею в буфер (OSC 52 + системний)\n");
