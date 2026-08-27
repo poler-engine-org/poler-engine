@@ -91,6 +91,7 @@ pub mod complex;
 pub mod entangle;
 pub mod error;
 pub mod gates;
+pub mod inspect;
 pub mod json;
 pub mod learn;
 pub mod parallel;
@@ -109,6 +110,12 @@ pub use complex::Cx;
 pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;
+pub use inspect::{
+    arcs_csr_text, arcs_dot, ascii_matrix, ascii_strings, born_entropy, crypto_recon, detect_kind,
+    graph_stats, header_rows, hex_dump, qcm_theory, raw_arcs, raw_packed4_arcs, reader_arcs,
+    report_json, try_pqw_reader, CryptoRecon, DecodedArc, FieldRow, FileKind, GraphStats,
+    ARCS_PREVIEW, MATRIX_D_MAX,
+};
 pub use json::{Json, JsonError};
 pub use learn::{quadratic_target, ActiveInference, ActiveStepReport, BornOptimizer, StepReport};
 pub use parity::{splitmix_phases, ParityAnsatz, ParityMode};
@@ -120,3 +127,4 @@ pub use stream_engine::{
 };
 
 pub mod syntax_unfolder;
+

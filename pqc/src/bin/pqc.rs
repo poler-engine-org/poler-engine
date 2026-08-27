@@ -9,11 +9,18 @@
 //! pqc stream (--url URL | --file PATH | --text TEXT | --stdin)
 //!            [--dim N] [--epsilon E] [--shots N] [--steps N] [--seed S]
 //!            [--eta0 H] [--beta B] [--gamma G] [--decay] [--json] [--out F]
+//! pqc inspect <file> [--hex N|all] [--decode all|N] [--graph] [--dot F|-]
+//!            [--matrix] [--strings] [--raw-dim N] [--json] [--all]
 //! ```
 
 use std::path::Path;
 use std::process::exit;
 
+use pqc::inspect::{
+    arcs_csr_text, arcs_dot, ascii_matrix, ascii_strings, born_entropy, crypto_recon, detect_kind,
+    graph_stats, header_rows, hex_dump, qcm_theory, raw_arcs, reader_arcs, report_json,
+    try_pqw_reader, CryptoRecon, DecodedArc, FileKind, ARCS_PREVIEW, MATRIX_D_MAX,
+};
 use pqc::{Ansatz, LoadOptions, Rng, DEFAULT_MAX_SV_QUBITS, MAX_QUBITS};
 use pqw::{PqwReader, PqwWriter};
 
@@ -25,6 +32,20 @@ USAGE:
     pqc demo [--n N] [--shots M] [--seed S]
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
+    pqc inspect <file> [options]
+
+INSPECT OPTIONS (чтение бинарников, графов и крипто-разведка):
+    --hex <N|all>             hex-дамп первых N байтов (default 512)
+    --no-hex                  без hex-дампа
+    --decode <all|N>          декод дуг: все или первые N (default 64)
+    --graph                   CSR-дамп дуг + статистика LENS-графа
+    --dot <FILE|->            Graphviz DOT в файл ('-' — в stdout)
+    --matrix                  ASCII-матрица смежности (d_pol <= 64)
+    --strings                 печатаемые ASCII-строки (min 6)
+    --raw-dim <N>             raw Packed4 с d_pol = N (<= 4 × размер)
+    --json                    машинно-читаемый отчёт (zero-dep JSON)
+    --all                     полный отчёт: весь hex, все дуги, граф,
+                              матрица, строки
 
 STREAM OPTIONS (RQ6: zero-storage потоковое обучение):
     --url <URL>               http:// страница (zero-dep клиент; https → --file)
@@ -60,6 +81,7 @@ fn main() {
         Some("demo") => cmd_demo(&args[1..]),
         Some("stream") => cmd_stream(&args[1..]),
         Some("unfurl") => cmd_unfurl(&args[1..]),
+        Some("inspect") => cmd_inspect(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -870,6 +892,356 @@ fn resolve_url(base: &str, location: &str) -> Result<String, String> {
 }
 
 // --- Команды ---
+
+fn cmd_inspect(args: &[String]) -> i32 {
+    struct InspectConfig {
+        hex_limit: Option<usize>, // None — без hex
+        decode: Option<usize>,    // None — без декода; usize::MAX — все дуги
+        graph: bool,
+        dot: Option<String>,
+        matrix: bool,
+        strings: bool,
+        raw_dim: Option<u32>,
+        json: bool,
+    }
+    let mut cfg = InspectConfig {
+        hex_limit: Some(512),
+        decode: Some(ARCS_PREVIEW),
+        graph: false,
+        dot: None,
+        matrix: false,
+        strings: false,
+        raw_dim: None,
+        json: false,
+    };
+    let mut file: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        macro_rules! val {
+            ($name:expr) => {{
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("pqc inspect: missing value for {}\n\n{USAGE}", $name);
+                    return 2;
+                };
+                v.clone()
+            }};
+        }
+        match a {
+            "--hex" => {
+                let v = val!("--hex");
+                cfg.hex_limit = if v == "all" {
+                    Some(usize::MAX)
+                } else {
+                    match v.parse::<usize>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            eprintln!("pqc inspect: bad --hex: {v} (N|all)\n\n{USAGE}");
+                            return 2;
+                        }
+                    }
+                };
+            }
+            "--no-hex" => cfg.hex_limit = None,
+            "--decode" => {
+                let v = val!("--decode");
+                cfg.decode = if v == "all" {
+                    Some(usize::MAX)
+                } else {
+                    match v.parse::<usize>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            eprintln!("pqc inspect: bad --decode: {v} (all|N)\n\n{USAGE}");
+                            return 2;
+                        }
+                    }
+                };
+            }
+            "--graph" => cfg.graph = true,
+            "--dot" => cfg.dot = Some(val!("--dot")),
+            "--matrix" => cfg.matrix = true,
+            "--strings" => cfg.strings = true,
+            "--raw-dim" => {
+                let v = val!("--raw-dim");
+                match v.parse::<u32>() {
+                    Ok(n) if n > 0 => cfg.raw_dim = Some(n),
+                    _ => {
+                        eprintln!("pqc inspect: bad --raw-dim: {v} (> 0)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            "--json" => cfg.json = true,
+            "--all" => {
+                cfg.hex_limit = Some(usize::MAX);
+                cfg.decode = Some(usize::MAX);
+                cfg.graph = true;
+                cfg.matrix = true;
+                cfg.strings = true;
+            }
+            other if !other.starts_with("--") => {
+                if file.replace(other.to_string()).is_some() {
+                    eprintln!("pqc inspect: file given twice\n\n{USAGE}");
+                    return 2;
+                }
+            }
+            other => {
+                eprintln!("pqc inspect: unknown option {other}\n\n{USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(file) = file else {
+        eprintln!("pqc inspect: file required\n\n{USAGE}");
+        return 2;
+    };
+    let src = match load(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pqc inspect: {e}");
+            return 1;
+        }
+    };
+    let data = src.as_slice();
+    let size = data.len();
+
+    // ── Детект формата и загрузка дуг ──
+    let mut kind = detect_kind(data);
+    let mut parse_error: Option<String> = None;
+    let mut reader: Option<PqwReader> = None;
+    let mut arcs: Vec<DecodedArc> = Vec::new();
+    let mut d_pol: u32 = 0;
+
+    match kind {
+        FileKind::PqwV1 | FileKind::PqwV2 => match try_pqw_reader(data) {
+            Ok(Some(r)) => {
+                d_pol = r.d_pol();
+                arcs = reader_arcs(&r);
+                reader = Some(r);
+            }
+            Ok(None) => parse_error = Some("file shorter than the 128-byte header".into()),
+            Err(e) => parse_error = Some(e),
+        },
+        FileKind::RawPacked4 { d_pol: d } => {
+            d_pol = cfg.raw_dim.unwrap_or(d);
+            if d_pol as usize > size * 4 {
+                eprintln!(
+                    "pqc inspect: --raw-dim {d_pol} exceeds 4 × {size} = {} trits",
+                    size * 4
+                );
+                return 2;
+            }
+            arcs = raw_arcs(data);
+            arcs.retain(|a| a.index < d_pol);
+        }
+        FileKind::Opaque => {
+            if let Some(d) = cfg.raw_dim {
+                kind = FileKind::RawPacked4 { d_pol: d };
+                d_pol = d;
+                if d_pol as usize > size * 4 {
+                    eprintln!(
+                        "pqc inspect: --raw-dim {d_pol} exceeds 4 × {size} = {} trits",
+                        size * 4
+                    );
+                    return 2;
+                }
+                arcs = raw_arcs(data);
+                arcs.retain(|a| a.index < d_pol);
+            }
+        }
+    }
+
+    let recon: CryptoRecon = crypto_recon(data);
+
+    // ── JSON-режим: единый объект и выход ──
+    if cfg.json {
+        println!(
+            "{}",
+            report_json(&file, data, kind, &arcs, d_pol, &recon).to_string()
+        );
+        return 0;
+    }
+
+    // ── Человекочитаемый отчёт ──
+    println!("POLER Quantum Core — inspect");
+    println!("file      : {file} ({size} B, {})", src.kind());
+    println!("sha256    : {}", pqc::inspect::sha256_hex(data));
+    if let Some(e) = &parse_error {
+        println!("parse     : ERROR — {e} (дальше — сырая разведка)");
+    }
+
+    println!("\nFORMAT");
+    println!("  kind       : {}", kind.name());
+    if d_pol > 0 {
+        let neg = arcs.iter().filter(|a| a.trit < 0).count();
+        let pos = arcs.iter().filter(|a| a.trit > 0).count();
+        let density = arcs.len() as f64 / f64::from(d_pol) * 100.0;
+        println!("  d_pol      : {d_pol}");
+        println!(
+            "  nnz        : {} ({} × −1, {} × +1), density {density:.3}%",
+            arcs.len(),
+            neg,
+            pos
+        );
+        println!(
+            "  born       : H = {:.4} bits, QCM = {:.6}",
+            born_entropy(&arcs),
+            qcm_theory(&arcs, d_pol)
+        );
+    }
+
+    println!("\nCRYPTO RECON");
+    println!("  entropy    : {:.4} / 8.0000 bits/byte", recon.entropy);
+    if recon.chi2.is_finite() {
+        println!(
+            "  chi2       : {:.1} (uniform band 255 ± 352) — {}",
+            recon.chi2,
+            if (recon.chi2 - 255.0).abs() <= 352.0 {
+                "uniform"
+            } else {
+                "NOT uniform"
+            }
+        );
+    }
+    println!("  distinct   : {} / 256 byte values", recon.distinct);
+    if !recon.blocks.is_empty() {
+        let line: Vec<String> = recon.blocks.iter().map(|h| format!("{h:.2}")).collect();
+        println!("  blocks 64B : {}", line.join(" "));
+    }
+    if recon.container_hits.is_empty() {
+        println!("  containers : — (шифро-контейнеров не найдено)");
+    } else {
+        println!("  containers : {}", recon.container_hits.join("; "));
+    }
+    match recon.verdict {
+        "structured" => {
+            println!("  verdict    : structured — шифрования НЕТ, данные полностью читаемы")
+        }
+        "compressed" => {
+            println!("  verdict    : compressed — похоже на сжатые данные (структура скрыта)")
+        }
+        _ => println!(
+            "  verdict    : encrypted-like — похоже на шифр/случайность; без ключа не читать"
+        ),
+    }
+
+    // ── Побайтовая карта заголовка .pqw ──
+    if let Some(r) = &reader {
+        println!("\nBYTE MAP (header 0x00..0x80)");
+        println!("  offset size  field                    value");
+        for row in header_rows(data, r) {
+            println!(
+                "  0x{:04x} {:>4}   {:<24} {}",
+                row.offset, row.size, row.name, row.value
+            );
+        }
+        println!("  секции: header 0x00..0x80 → topology → phases → EOF");
+    }
+
+    // ── Hex-дамп ──
+    if let Some(limit) = cfg.hex_limit {
+        let shown = limit.min(size);
+        println!("\nHEX (first {shown} B of {size})");
+        print!("{}", hex_dump(data, shown));
+        if shown < size {
+            println!("  … (обрезано; --hex all — весь файл)");
+        }
+    }
+
+    // ── Декод дуг ──
+    if let Some(limit) = cfg.decode {
+        if !arcs.is_empty() {
+            let shown = limit.min(arcs.len());
+            println!("\nARCS ({} of {}; --decode all — все)", shown, arcs.len());
+            println!("       idx   hex   trit   p̂        θ̂");
+            print!("{}", arcs_csr_text(&arcs[..shown]));
+        }
+    }
+
+    // ── Граф LENS ──
+    if cfg.graph && !arcs.is_empty() {
+        let indices: Vec<u32> = arcs.iter().map(|a| a.index).collect();
+        let stats = graph_stats(&indices, d_pol);
+        println!("\nGRAPH (LENS: рёбра = соседние дуги u_k → u_k+1)");
+        println!(
+            "  nodes {}, edges {}, components {}, density {:.3}%",
+            stats.nodes,
+            stats.edges,
+            stats.components,
+            stats.density * 100.0
+        );
+        let csr: Vec<String> = indices.iter().map(|i| i.to_string()).collect();
+        println!("  CSR indices: [{}]", csr.join(", "));
+    }
+
+    // ── DOT ──
+    if let Some(target) = &cfg.dot {
+        let dot = arcs_dot(&arcs, d_pol);
+        if target == "-" {
+            println!("\nDOT");
+            print!("{dot}");
+        } else {
+            match std::fs::write(target, dot) {
+                Ok(()) => println!("\nDOT       : written to {target}"),
+                Err(e) => {
+                    eprintln!("pqc inspect: cannot write --dot {target}: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // ── ASCII-матрица ──
+    if cfg.matrix {
+        if d_pol == 0 {
+            println!("\nMATRIX    : нет дуг — матрица пуста");
+        } else if let Some(m) = ascii_matrix(&arcs, d_pol) {
+            println!("\nMATRIX (adjacency, d_pol = {d_pol}; '#' — активная дуга, 'X' — ребро)");
+            print!("{m}");
+        } else {
+            println!(
+                "\nMATRIX    : пропущена — d_pol = {d_pol} > {MATRIX_D_MAX} (матрица осмысленна при d_pol ≤ {MATRIX_D_MAX})"
+            );
+        }
+    }
+
+    // ── Строки ──
+    if cfg.strings {
+        let strings = ascii_strings(data, 6);
+        if strings.is_empty() {
+            println!("\nSTRINGS   : — (печатаемых ASCII-строк ≥ 6 нет)");
+        } else {
+            println!("\nSTRINGS (ASCII ≥ 6, первые {})", strings.len());
+            for s in &strings {
+                println!("  {s}");
+            }
+        }
+    }
+
+    // ── Целостность (для контейнеров .pqw) ──
+    if let Some(r) = &reader {
+        println!("\nINTEGRITY");
+        println!("  header checksum : OK (FNV-1a64, валидирована при разборе)");
+        match r.verify_payload() {
+            Ok(()) => println!("  payload digest  : OK (SHA-256 trunc-24)"),
+            Err(e) => println!("  payload digest  : FAIL — {e}"),
+        }
+        println!("  mcweeny stored  : {:.3e}", r.mcweeny_residual());
+        let residual = pqc::inspect::mcweeny_of_arcs(&arcs);
+        if residual.is_finite() {
+            println!("  mcweeny actual  : {residual:.3e} (max |λ² − λ| по дугам)");
+        }
+    } else if kind.is_pqw() {
+        println!("\nINTEGRITY");
+        println!("  недоступна: контейнер не разобран (см. parse ERROR выше)");
+    }
+
+    0
+}
 
 fn cmd_run(args: &[String]) -> i32 {
     let mut cfg = RunConfig::default();
