@@ -95,6 +95,7 @@ pub mod entangle;
 pub mod error;
 pub mod gates;
 pub mod gyro;
+pub mod gyro_lattice;
 pub mod inspect;
 pub mod json;
 pub mod learn;
@@ -121,6 +122,11 @@ pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;
 pub use gyro::{precess_step, resonant_modes_from_pairs, GyroMode, Gyroscope};
+pub use gyro_lattice::{
+    precess_step_packed4, EngineMemory, MomentumEvent, MomentumLattice, PrecessScratch,
+    PrecessStats, QuantizedGyroCurriculum, QuantizedGyroReport, TransportMode, TritGyro,
+    IGNITE_THRESHOLD, MAX_DIM_GYRO, MOMENTUM_UNIT, SIN_LUT, STALL_THRESHOLD,
+};
 pub use inspect::{
     arcs_csr_text, arcs_dot, ascii_matrix, ascii_strings, born_entropy, crypto_recon, detect_kind,
     graph_stats, header_rows, hex_dump, qcm_theory, raw_arcs, raw_packed4_arcs, reader_arcs,

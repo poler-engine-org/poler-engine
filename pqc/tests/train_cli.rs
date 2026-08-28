@@ -594,6 +594,17 @@ fn write_uniform_corpus(dir: &std::path::Path) {
     .unwrap();
 }
 
+/// Неравные частоты (как в юнит-тестах RQ16): сильная дуга phase (tf 3),
+/// средняя lattice (tf 2), слабые born/trit/crystal (tf 1). Слабые дуги
+/// остаются фоном — волне рассуждения L5 есть куда кристаллизоваться.
+fn write_uneven_corpus(dir: &std::path::Path) {
+    fs::write(
+        dir.join("q.txt"),
+        "phase phase phase lattice lattice born trit crystal\n".repeat(16),
+    )
+    .unwrap();
+}
+
 #[test]
 fn train_quantized_crystallizes_lattice() {
     let dir = tmp_dir("q15_crystallize");
@@ -756,10 +767,15 @@ fn train_quantized_eta_dead_zone() {
 }
 
 #[test]
-fn train_quantized_rejects_gyro_and_decay() {
+fn train_quantized_rejects_decay_and_budget() {
+    // RQ16 разблокировал --quantized --gyro (слияние решётки с
+    // гироскопом); остаются честными отказы: --decay (фон заморожен)
+    // и --gyro-budget (плотная решётка пар не бюджетируется).
     for bad in [
-        vec!["train", "--quantized", "--stdin", "--gyro"],
         vec!["train", "--quantized", "--stdin", "--decay"],
+        vec!["train", "--quantized", "--stdin", "--gyro", "--gyro-budget", "128"],
+        vec!["train", "--quantized", "--stdin", "--gyro", "--dim", "32768"],
+        vec!["train", "--stdin", "--dt", "0.3"],
     ] {
         let st = Command::new(bin_path()).args(&bad).output().unwrap();
         assert_eq!(
@@ -768,6 +784,266 @@ fn train_quantized_rejects_gyro_and_decay() {
             "аргументы {bad:?} должны отклоняться"
         );
     }
+}
+
+#[test]
+fn train_quantized_gyro_runs_and_reports() {
+    // RQ16: слияние решётки с гироскопом — J в тритовых руслах,
+    // 2-битный момент, шаги авторегрессионного рассуждения (L5).
+    let dir = tmp_dir("q16_fused");
+    write_uniform_corpus(&dir);
+    let out = dir.join("state.pqw");
+
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--quantized",
+            "--gyro",
+            "8",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "8192",
+            "--steps",
+            "2",
+            "--dt",
+            "0.6",
+            "--out",
+            out.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&st.stdout),
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let j = pqc::json::Json::parse(String::from_utf8_lossy(&st.stdout).trim()).unwrap();
+    assert_eq!(j.get("mode").unwrap().as_str().unwrap(), "quantized_gyro");
+    // Born-петля и момент: кристаллизация свидетельства произошла.
+    assert!(j.get("moved_total").unwrap().as_f64().unwrap() >= 1.0);
+    assert!(j.get("nnz_lens").unwrap().as_f64().unwrap() >= 1.0);
+    // Русла J: насыщенная циркуляция живёт в тритовой решётке пар.
+    let gyro = j.get("gyro").unwrap();
+    assert!(gyro.get("channels").unwrap().as_f64().unwrap() >= 1.0);
+    assert_eq!(
+        gyro.get("pair_bytes").unwrap().as_f64().unwrap(),
+        ((512 * 511 / 2) as usize).div_ceil(2) as f64
+    );
+    // Момент: зажигания есть, инерция жива.
+    let momentum = j.get("momentum").unwrap();
+    assert!(momentum.get("ignited_total").unwrap().as_f64().unwrap() >= 1.0);
+    // Транспорт L5: корпус = 2 блока × 2 шага рассуждения = 4 шага.
+    let transport = j.get("transport").unwrap();
+    assert_eq!(transport.get("steps").unwrap().as_f64().unwrap(), 4.0);
+    assert_eq!(transport.get("dt").unwrap().as_f64().unwrap(), 0.6);
+    // Плотная раскладка памяти: фазы + момент + пары + doc_freq.
+    let mem = j.get("memory_bytes").unwrap();
+    assert_eq!(mem.get("lattice").unwrap().as_f64().unwrap(), 128.0);
+    assert_eq!(mem.get("momentum").unwrap().as_f64().unwrap(), 128.0);
+    assert_eq!(
+        mem.get("pairs").unwrap().as_f64().unwrap(),
+        ((512 * 511 / 2) as usize).div_ceil(2) as f64
+    );
+    assert_eq!(mem.get("doc_freq").unwrap().as_f64().unwrap(), 2048.0);
+
+    // Контейнер v3: фазы Packed4 + топологическая секция GYRO.
+    let raw = fs::read(&out).unwrap();
+    assert_eq!(&raw[..8], b"POLER_Q3", "слияние пишет контейнер v3");
+    let reader = pqw::PqwReader::from_bytes(&raw).unwrap();
+    assert!(reader.gyro().is_some(), "секция GYRO на месте");
+    assert_eq!(reader.gyro().unwrap().pairs().len() >= 1, true);
+
+    // RQ14-совместимость: pqc bloch читает v3-чекпоинт слияния.
+    let bl = Command::new(bin_path())
+        .args(["bloch", out.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(bl.status.success());
+    let bj = pqc::json::Json::parse(String::from_utf8_lossy(&bl.stdout).trim()).unwrap();
+    assert_eq!(bj.get("encoding").unwrap().as_str().unwrap(), "packed4");
+    assert!(bj.get("density").unwrap().as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn train_quantized_gyro_resume_bit_exact() {
+    // Context-Free Resilience слияния: решётка фаз И русла J переживают
+    // рестарт бит-в-бит; повторный прогон не двигает ни одного трита
+    // (полюса держат, моментные ворота закрыты — инерция не пережила
+    // рестарт, покоя нет дрейфа).
+    let dir = tmp_dir("q16_resume");
+    write_uniform_corpus(&dir);
+    let out1 = dir.join("s1.pqw");
+    let out2 = dir.join("s2.pqw");
+    let base = [
+        "train",
+        "--quantized",
+        "--gyro",
+        "8",
+        "--corpus",
+        dir.to_str().unwrap(),
+        "--dim",
+        "512",
+        "--epsilon",
+        "0.05",
+        "--block",
+        "512",
+        "--shots",
+        "8192",
+        "--steps",
+        "0",
+    ];
+
+    let mut args1 = base.to_vec();
+    args1.push("--out");
+    args1.push(out1.to_str().unwrap());
+    args1.push("--json");
+    let st1 = Command::new(bin_path()).args(&args1).output().unwrap();
+    assert!(
+        st1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st1.stderr)
+    );
+    let j1 = pqc::json::Json::parse(String::from_utf8_lossy(&st1.stdout).trim()).unwrap();
+    let nnz1 = j1.get("nnz_lens").unwrap().as_f64().unwrap();
+    assert!(nnz1 >= 1.0, "первый прогон обязан кристаллизовать дуги");
+    let channels1 = j1
+        .get("gyro")
+        .unwrap()
+        .get("channels")
+        .unwrap()
+        .as_f64()
+        .unwrap();
+
+    let mut args2 = base.to_vec();
+    args2.push("--resume");
+    args2.push(out1.to_str().unwrap());
+    args2.push("--out");
+    args2.push(out2.to_str().unwrap());
+    args2.push("--json");
+    let st2 = Command::new(bin_path()).args(&args2).output().unwrap();
+    assert!(
+        st2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st2.stderr)
+    );
+    let j2 = pqc::json::Json::parse(String::from_utf8_lossy(&st2.stdout).trim()).unwrap();
+    assert_eq!(
+        j2.get("resume_nnz").unwrap().as_f64().unwrap(),
+        nnz1,
+        "поднятая решётка обязана сохранить все дуги"
+    );
+    assert_eq!(
+        j2.get("moved_total").unwrap().as_f64().unwrap(),
+        0.0,
+        "выученное мнение не требует движений при повторе"
+    );
+    assert_eq!(
+        j2.get("gyro").unwrap().get("channels").unwrap().as_f64().unwrap(),
+        channels1,
+        "русла J пережили рестарт"
+    );
+
+    // Бит-экзактность фазовой секции между сессиями (секция GYRO
+    // несёт новый счётчик тактов — сравниваем фазы и русла раздельно).
+    let r1 = fs::read(&out1).unwrap();
+    let r2 = fs::read(&out2).unwrap();
+    let phase_len = 512 / 4;
+    assert_eq!(&r1[128..128 + phase_len], &r2[128..128 + phase_len]);
+    let g1 = pqw::PqwReader::from_bytes(&r1).unwrap().gyro().unwrap().clone();
+    let g2 = pqw::PqwReader::from_bytes(&r2).unwrap().gyro().unwrap().clone();
+    let pairs1: Vec<_> = g1.pairs().iter().map(|p| (p.i, p.j, p.weight)).collect();
+    let pairs2: Vec<_> = g2.pairs().iter().map(|p| (p.i, p.j, p.weight)).collect();
+    assert_eq!(pairs1, pairs2, "русла J изменились после рестарта");
+}
+
+#[test]
+fn train_quantized_gyro_reasoning_steps_transport() {
+    // Квантованные шаги авторегрессионного рассуждения: --steps N
+    // гонит волну кристаллизации по руслам J — транспорт двигает
+    // триты за пределами born-свидетельства (слабые дуги кристаллизует
+    // только волна, не born-шаг).
+    let dir = tmp_dir("q16_reasoning");
+    write_uneven_corpus(&dir);
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--quantized",
+            "--gyro",
+            "8",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "8192",
+            "--steps",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let j = pqc::json::Json::parse(String::from_utf8_lossy(&st.stdout).trim()).unwrap();
+    assert_eq!(j.get("mode").unwrap().as_str().unwrap(), "quantized_gyro");
+    let transport = j.get("transport").unwrap();
+    // Корпус = 2 блока × 3 шага рассуждения = 6 шагов L5.
+    assert_eq!(transport.get("steps").unwrap().as_f64().unwrap(), 6.0);
+    assert!(
+        transport.get("moved_total").unwrap().as_f64().unwrap() >= 1.0,
+        "волна рассуждения двинула триты по руслам J"
+    );
+    assert!(transport.get("theta_shift").unwrap().as_f64().unwrap() > 0.0);
+    // Рассуждение расширило мнение за пределы born-свидетельства:
+    // без слияния (plain --quantized) слабые дуги остаются фоном.
+    let plain = Command::new(bin_path())
+        .args([
+            "train",
+            "--quantized",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "8192",
+            "--steps",
+            "0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    let jp = pqc::json::Json::parse(String::from_utf8_lossy(&plain.stdout).trim()).unwrap();
+    assert_eq!(
+        jp.get("nnz_lens").unwrap().as_f64().unwrap(),
+        2.0,
+        "без транспорта кристаллизуются только сильные дуги"
+    );
+    assert!(
+        j.get("nnz_lens").unwrap().as_f64().unwrap() > 2.0,
+        "транспорт L5 расширил кристалл за пределы свидетельства"
+    );
 }
 
 #[test]

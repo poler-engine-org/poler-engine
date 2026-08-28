@@ -86,7 +86,8 @@ STREAM OPTIONS (RQ6: zero-storage потоковое обучение):
     --json                    машинно-читаемый отчёт (zero-dep JSON)
     --out <F>                 дамп Packed4-контейнера в файл (опционально)
 
-TRAIN OPTIONS (RQ8: плотный LENS-граф; RQ15: --quantized — решётка тритов):
+TRAIN OPTIONS (RQ8: плотный LENS-граф; RQ15: --quantized — решётка тритов;
+              RQ16: --quantized --gyro — слияние решётки с гироскопом):
     --corpus <DIR>            каталог корпуса (рекурсивно, текст. расширения)
     --stdin                   поток блоков из стандартного ввода
     --dim <N>                 размерность d_pol (default 4096)
@@ -114,7 +115,19 @@ TRAIN OPTIONS (RQ8: плотный LENS-граф; RQ15: --quantized — решё
                               бит-в-бит (чекпоинт без переквантования),
                               гистерезис π/3, полюса детерминированы;
                               η — калибровка RQ14 (0.6), если --eta0 не задан;
-                              несовместим с --gyro и --decay (v1)
+                              несовместим с --decay
+    --quantized --gyro [W]    RQ16: СЛИЯНИЕ решётки с гироскопом — J = A − Aᵀ
+                              в тритовой решётке русел (плотная треугольная
+                              индексация пар, ниббл на пару, ноль HashMap),
+                              2-битный насыщающий момент (τ_ign=0.5,
+                              τ_stall=1.0, амплитуда 2.0 — инерция без
+                              затухания), транспорт L5 p ← Π_Λ(e^{Δt·J}p);
+                              --steps N = N шагов авторегрессионного
+                              рассуждения после born-шага; чекпоинт v3
+                              (фазы + секция GYRO); d_pol ≤ 16384 (O(d²));
+                              несовместим с --decay и --gyro-budget
+    --dt <H>                  RQ16: шаг Δt транспорта L5 (default 0.6;
+                              только с --quantized --gyro)
 
 INSPECT OPTIONS (дополнительно):
     --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
@@ -2512,6 +2525,8 @@ struct TrainConfig {
     quantized: bool,
     /// --eta0 задан явно (иначе квантованный путь берёт калибровку RQ14 η=0.6).
     eta0_explicit: bool,
+    /// RQ16: шаг транспорта L5 — Δt оператора Π_Λ(e^{Δt·J} p).
+    dt: f64,
 }
 
 /// Один уровень фазовой сборки (RQ9): размер чанка, шаги Born-петли,
@@ -2569,6 +2584,7 @@ impl Default for TrainConfig {
             gyro_budget: 65_536,
             quantized: false,
             eta0_explicit: false,
+            dt: 0.6,
         }
     }
 }
@@ -2730,11 +2746,13 @@ fn collect_corpus(root: &Path, files: &mut Vec<std::path::PathBuf>, total: &mut 
     }
 }
 
-/// Диспетчер учебных движков cmd_train: плотный LENS (RQ8) или
-/// квантованная решётка тритов (RQ15).
+/// Диспетчер учебных движков cmd_train: плотный LENS (RQ8),
+/// квантованная решётка тритов (RQ15) или слияние решётки с гироскопом
+/// (RQ16: квантованный гироскоп + 2-битный момент + транспорт L5).
 enum Trainer {
     Dense(pqc::stream_engine::StreamEngine),
     Quantized(pqc::qcurriculum::QuantizedCurriculum),
+    QuantizedGyro(pqc::gyro_lattice::QuantizedGyroCurriculum),
 }
 
 /// Итог одного блока обучения для счётчиков цикла.
@@ -2773,6 +2791,19 @@ impl Trainer {
                     moved_frac: r.moved_frac,
                 })
             }
+            // RQ16: steps = шаги авторегрессионного рассуждения (транспорт
+            // L5 по руслам J) после born-шага.
+            Trainer::QuantizedGyro(q) => {
+                let r = q.ingest(text, steps)?;
+                Ok(FeedOutcome {
+                    tokens: r.tokens,
+                    no_hits: r.no_hits,
+                    param_loss: r.param_loss,
+                    qcm_gap: 0.0,
+                    moved: r.moved,
+                    moved_frac: r.moved_frac,
+                })
+            }
         }
     }
 
@@ -2783,6 +2814,9 @@ impl Trainer {
             Trainer::Quantized(q) => {
                 q.set_shots(shots);
             }
+            Trainer::QuantizedGyro(q) => {
+                q.set_shots(shots);
+            }
         }
     }
 
@@ -2791,6 +2825,7 @@ impl Trainer {
         match self {
             Trainer::Dense(e) => e.resume_from_reader(reader),
             Trainer::Quantized(q) => q.resume_from_reader(reader),
+            Trainer::QuantizedGyro(q) => q.resume_from_reader(reader),
         }
     }
 }
@@ -2837,6 +2872,11 @@ fn train_snapshot(
             buf
         }
         Trainer::Quantized(q) => q.checkpoint().map_err(|e| e.to_string())?,
+        // RQ16: чекпоинт v3 — фазы бит-в-бит + секция GYRO из русел J.
+        Trainer::QuantizedGyro(q) => {
+            gyro_pairs = q.channel_count();
+            q.checkpoint().map_err(|e| e.to_string())?
+        }
     };
     let phase_len = (cfg.dim as usize).div_ceil(4);
     let reader = PqwReader::from_bytes(&buf).map_err(|e| e.to_string())?;
@@ -2845,6 +2885,7 @@ fn train_snapshot(
         Trainer::Dense(engine) => engine.model_arcs().len(),
         // Решётка: union support ≡ ненулевые триты (память = контейнер).
         Trainer::Quantized(q) => q.nnz(),
+        Trainer::QuantizedGyro(q) => q.nnz(),
     };
     if let Some(p) = &cfg.out {
         std::fs::write(p, &buf).map_err(|e| format!("--out: {e}"))?;
@@ -3097,6 +3138,10 @@ fn cmd_train(args: &[String]) -> i32 {
             },
             "--decay" => cfg.decay = true,
             "--quantized" => cfg.quantized = true,
+            "--dt" => match val("--dt").and_then(|v| parse_num::<f64>(&v, "--dt")) {
+                Ok(v) if v.is_finite() && v >= 0.0 => cfg.dt = v,
+                _ => return train_usage_err("--dt должен быть конечным ≥ 0"),
+            },
             "--out" => match val("--out") {
                 Ok(v) => cfg.out = Some(v),
                 Err(e) => return train_usage_err(&e),
@@ -3190,16 +3235,32 @@ fn cmd_train(args: &[String]) -> i32 {
     if cfg.block == 0 {
         return train_usage_err("--block должен быть > 0");
     }
-    // RQ15: квантованный curriculum — честные ограничения v1.
-    if cfg.quantized && cfg.gyro.is_some() {
-        return train_usage_err(
-            "--quantized несовместим с --gyro (v1: решётка хранит только фазы)",
-        );
-    }
+    // RQ15/RQ16: честные ограничения квантованных путей.
     if cfg.quantized && cfg.decay {
         return train_usage_err(
-            "--quantized несовместим с --decay (v1: политика Hold — фон заморожен)",
+            "--quantized несовместим с --decay (политика Hold — фон заморожен)",
         );
+    }
+    // RQ16 РАЗБЛОКИРУЕТ --quantized --gyro: слияние решётки с гироскопом
+    // (J в тритовой решётке пар + 2-битный момент + транспорт L5).
+    if cfg.quantized
+        && cfg.gyro.is_some()
+        && cfg.dim > pqc::gyro_lattice::MAX_DIM_GYRO
+    {
+        return train_usage_err(&format!(
+            "--quantized --gyro: решётка пар O(d²) — d_pol ≤ {} (задано {})",
+            pqc::gyro_lattice::MAX_DIM_GYRO,
+            cfg.dim
+        ));
+    }
+    if cfg.quantized && cfg.gyro_budget != 65_536 {
+        return train_usage_err(
+            "--gyro-budget несовместим с --quantized: плотная решётка пар \
+             не бюджетируется (RQ16: индексация пар без HashMap)",
+        );
+    }
+    if cfg.dt != 0.6 && !(cfg.quantized && cfg.gyro.is_some()) {
+        return train_usage_err("--dt требует --quantized --gyro (транспорт L5)");
     }
 
     // Расписание фазовой сборки: маркер по умолчанию разворачивается здесь,
@@ -3224,7 +3285,9 @@ fn cmd_train(args: &[String]) -> i32 {
         std::fs::File::create(p)
             .map(|mut f| {
                 use std::io::Write;
-                let title = if cfg.quantized {
+                let title = if cfg.quantized && cfg.gyro.is_some() {
+                    "КВАНТОВАННЫЙ ГИРОСКОП-СЛИЯНИЕ (RQ16): J в тритах + момент 2 бит + транспорт L5"
+                } else if cfg.quantized {
                     "КВАНТОВАННЫЙ CURRICULUM (RQ15): born-шаг в решётке тритов"
                 } else {
                     "ПЛОТНОЕ LENS-ОБУЧЕНИЕ"
@@ -3254,8 +3317,24 @@ fn cmd_train(args: &[String]) -> i32 {
     // Движок ОДИН на весь корпус: память накапливается между блоками.
     // RQ15: --quantized — born-шаг прямо в 2-битной решётке (η = --eta0
     // напрямую; β не используется — расписание сюрприза остаётся у плотного).
+    // RQ16: --quantized --gyro — слияние: J в тритовой решётке пар,
+    // 2-битный насыщающий момент, транспорт L5; --steps = шаги рассуждения.
     use pqc::stream_engine::{Forget, StreamEngine};
-    let mut trainer = if cfg.quantized {
+    let mut trainer = if cfg.quantized && cfg.gyro.is_some() {
+        let window = cfg.gyro.unwrap();
+        match pqc::gyro_lattice::QuantizedGyroCurriculum::new(cfg.dim, cfg.epsilon, cfg.seed, window)
+        {
+            Ok(mut q) => {
+                let eta = if cfg.eta0_explicit { cfg.eta0 } else { 0.6 };
+                q.set_shots(cfg.shots).set_eta(eta).set_dt(cfg.dt);
+                Trainer::QuantizedGyro(q)
+            }
+            Err(e) => {
+                eprintln!("pqc train: {e}");
+                return 1;
+            }
+        }
+    } else if cfg.quantized {
         match pqc::qcurriculum::QuantizedCurriculum::new(cfg.dim, cfg.epsilon, cfg.seed) {
             Ok(mut q) => {
                 // Калибровка: плотный дефолт η₀ = 0.25 НЕ пересекает порог
@@ -3346,13 +3425,32 @@ fn cmd_train(args: &[String]) -> i32 {
         } else {
             "stdin".to_string()
         };
-        println!("POLER Quantum Core — {}", if cfg.quantized {
+        let fused = cfg.quantized && cfg.gyro.is_some();
+        println!("POLER Quantum Core — {}", if fused {
+            "Quantized Gyro Trainer (RQ16): слияние решётки с гироскопом J = A − Aᵀ, транспорт L5"
+        } else if cfg.quantized {
             "Quantized Born Trainer (RQ15): решётка тритов, born-шаг в 2-битных регистрах"
         } else {
             "Dense LENS Trainer (RQ8/RQ9)"
         });
         println!("corpus    : {src}");
-        if cfg.quantized {
+        if fused {
+            let pair_bytes =
+                (cfg.dim as usize) * (cfg.dim as usize - 1) / 2 / 2;
+            println!(
+                "lattice   : d_pol={} → фазы {} Б + момент {} Б + русла J {} Б — ноль HashMap",
+                cfg.dim,
+                (cfg.dim as usize).div_ceil(4),
+                (cfg.dim as usize).div_ceil(4),
+                pair_bytes
+            );
+            println!(
+                "physics   : η={}, Δt={}, момент 2 бит (τ_ign=0.5, τ_stall=1.0, амплитуда 2.0), инерция без затухания{}",
+                if cfg.eta0_explicit { cfg.eta0 } else { 0.6 },
+                cfg.dt,
+                if cfg.eta0_explicit { "" } else { " (η — калибровка RQ14)" }
+            );
+        } else if cfg.quantized {
             println!(
                 "lattice   : d_pol={} тритов × 2 бита = {} Б Packed4 (память = контейнер v2)",
                 cfg.dim,
@@ -3384,16 +3482,27 @@ fn cmd_train(args: &[String]) -> i32 {
             );
         }
         if let Some(w) = cfg.gyro {
-            println!(
-                "gyro      : J = A − Aᵀ, окно {w} токенов, бюджет {} пар — топологическая секция v3",
-                cfg.gyro_budget
-            );
+            if fused {
+                println!(
+                    "gyro      : J = A − Aᵀ в тритах русел, окно {w} токенов, порог насыщения 2 события"
+                );
+            } else {
+                println!(
+                    "gyro      : J = A − Aᵀ, окно {w} токенов, бюджет {} пар — топологическая секция v3",
+                    cfg.gyro_budget
+                );
+            }
         }
         if !cfg.quantized {
             println!(
                 "policy    : forget={:?}, snapshot every {} блоков",
                 if cfg.decay { Forget::Decay } else { Forget::Hold },
                 cfg.snapshot_every
+            );
+        } else if fused {
+            println!(
+                "reasoning : --steps {} = шаги Π_Λ(e^{{Δt·J}}p) после born-шага, snapshot every {} блоков",
+                cfg.steps, cfg.snapshot_every
             );
         } else {
             println!("policy    : Hold (фон заморожен), snapshot every {} блоков", cfg.snapshot_every);
@@ -3659,7 +3768,9 @@ fn cmd_train(args: &[String]) -> i32 {
             ("command".into(), Json::str("train")),
             (
                 "mode".into(),
-                Json::str(if cfg.quantized {
+                Json::str(if cfg.quantized && cfg.gyro.is_some() {
+                    "quantized_gyro"
+                } else if cfg.quantized {
                     "quantized"
                 } else {
                     "dense"
@@ -3692,7 +3803,7 @@ fn cmd_train(args: &[String]) -> i32 {
                 Json::num((elapsed * 100.0).round() / 100.0),
             ),
         ];
-        // RQ15: телеметрия квантованной решётки — «обучение произошло»
+        // RQ15/RQ16: телеметрия квантованной решётки — «обучение произошло»
         // в числах: перещёлкивания тритов и живой момент.
         if cfg.quantized {
             pairs.push(("moved_total".into(), Json::num(st.moved_total as f64)));
@@ -3703,6 +3814,55 @@ fn cmd_train(args: &[String]) -> i32 {
             pairs.push((
                 "lattice_bytes".into(),
                 Json::num((cfg.dim as usize).div_ceil(4) as f64),
+            ));
+        }
+        // RQ16: слияние решётки с гироскопом — русла J в тритах, момент,
+        // квантованные шаги авторегрессионного рассуждения (транспорт L5).
+        if let (Some(window), Trainer::QuantizedGyro(q)) = (cfg.gyro, &trainer) {
+            let mem = q.memory();
+            let section_bytes = container_bytes
+                .saturating_sub(pqw::HEADER_SIZE + (cfg.dim as usize).div_ceil(4));
+            pairs.push((
+                "gyro".into(),
+                Json::Obj(vec![
+                    ("window".into(), Json::num(window as f64)),
+                    ("ticks".into(), Json::num(q.gyro_ticks() as f64)),
+                    ("channels".into(), Json::num(q.channel_count() as f64)),
+                    ("pair_bytes".into(), Json::num(q.pair_bytes() as f64)),
+                    ("section_bytes".into(), Json::num(section_bytes as f64)),
+                ]),
+            ));
+            pairs.push((
+                "momentum".into(),
+                Json::Obj(vec![
+                    ("ignited_total".into(), Json::num(q.ignited_total() as f64)),
+                    ("stalled_total".into(), Json::num(q.stalled_total() as f64)),
+                    ("kinetic_now".into(), Json::num(q.momentum_kinetic() as f64)),
+                    ("ignite_threshold".into(), Json::num(q.momentum_ignite())),
+                    ("stall_threshold".into(), Json::num(q.momentum_stall())),
+                ]),
+            ));
+            pairs.push((
+                "transport".into(),
+                Json::Obj(vec![
+                    ("steps".into(), Json::num(q.reasoning_steps_total() as f64)),
+                    ("moved_total".into(), Json::num(q.transport_moved_total() as f64)),
+                    (
+                        "theta_shift".into(),
+                        Json::num((q.transport_theta_total() * 1e6).round() / 1e6),
+                    ),
+                    ("dt".into(), Json::num(cfg.dt)),
+                ]),
+            ));
+            pairs.push((
+                "memory_bytes".into(),
+                Json::Obj(vec![
+                    ("lattice".into(), Json::num(mem.lattice as f64)),
+                    ("momentum".into(), Json::num(mem.momentum as f64)),
+                    ("pairs".into(), Json::num(mem.pairs as f64)),
+                    ("doc_freq".into(), Json::num(mem.doc_freq as f64)),
+                    ("total".into(), Json::num(mem.total as f64)),
+                ]),
             ));
         }
         // RQ10: гироскоп J = A − Aᵀ — статистика реляционной памяти
@@ -3790,7 +3950,33 @@ fn cmd_train(args: &[String]) -> i32 {
             "learned   : nnz_lens={} дуг (union support={}), плотность {:.2}% от d_pol={}",
             nnz_lens, support, density, cfg.dim
         );
-        if cfg.quantized {
+        if let (Some(_), Trainer::QuantizedGyro(q)) = (cfg.gyro, &trainer) {
+            let section_bytes = container_bytes
+                .saturating_sub(pqw::HEADER_SIZE + (cfg.dim as usize).div_ceil(4));
+            println!(
+                "stream    : {} блоков, {} токенов, no_hits={}, loss={:.6}, перещёлкнуто тритов={} (доля {:.4})",
+                total_blocks, total_tokens, no_hits, last_loss, st.moved_total, st.last_moved_frac
+            );
+            println!(
+                "gyro      : {} тактов, {} насыщенных русел J, решётка пар {} Б (ниббл на пару), секция {} Б",
+                q.gyro_ticks(),
+                q.channel_count(),
+                q.pair_bytes(),
+                section_bytes
+            );
+            println!(
+                "momentum  : зажиганий {}, срывов {}, кинетических дуг сейчас {} — инерция без затухания",
+                q.ignited_total(),
+                q.stalled_total(),
+                q.momentum_kinetic()
+            );
+            println!(
+                "reasoning : {} шагов Π_Λ(e^{{Δt·J}}p), транспорт двинул {} тритов (Σ|Δθ| = {:.1})",
+                q.reasoning_steps_total(),
+                q.transport_moved_total(),
+                q.transport_theta_total()
+            );
+        } else if cfg.quantized {
             println!(
                 "stream    : {} блоков, {} токенов, no_hits={}, loss={:.6}, перещёлкнуто тритов={} (доля {:.4})",
                 total_blocks, total_tokens, no_hits, last_loss, st.moved_total, st.last_moved_frac
