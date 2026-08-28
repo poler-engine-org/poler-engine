@@ -52,6 +52,7 @@ pub mod reader;
 pub mod sha256;
 pub mod stream;
 pub mod topology;
+pub mod trit_bloch;
 pub mod writer;
 
 pub use error::{PqwError, Result};

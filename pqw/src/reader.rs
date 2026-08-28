@@ -29,6 +29,7 @@ use crate::mcweeny;
 use crate::phase::{packed_trit_at, PhaseByte, Trit, TritEncoding};
 use crate::sha256::sha256_trunc24;
 use crate::topology;
+use crate::trit_bloch;
 
 /// Одна хранимая дуга: индекс в `[0, d_pol)` + упакованная фаза.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,6 +412,42 @@ impl<'a> PqwReader<'a> {
             d: self.header.d_pol,
             pos: 0,
         })
+    }
+
+    /// RQ14: плотный поток углов Блоха `(индекс, θ)` из Packed4-блоков —
+    /// zero-copy из mmap, θ по LUT (без acos). Только v2.
+    pub fn bloch_angles(&self) -> Result<trit_bloch::BlochAngles<'a>> {
+        if !self.header.is_packed() {
+            return Err(PqwError::NotPacked);
+        }
+        Ok(trit_bloch::BlochAngles::new(
+            self.phase_bytes(),
+            self.header.d_pol,
+        ))
+    }
+
+    /// RQ14: разреженный (LENS) поток дуг `(индекс, θ)` — только ненулевые
+    /// триты; готовые дуги для продуктового анзаца. Только v2.
+    pub fn bloch_arcs(&self) -> Result<trit_bloch::BlochArcs<'a>> {
+        if !self.header.is_packed() {
+            return Err(PqwError::NotPacked);
+        }
+        Ok(trit_bloch::BlochArcs::new(
+            self.phase_bytes(),
+            self.header.d_pol,
+        ))
+    }
+
+    /// RQ14: статистика тритовой решётки (нулевое вздутие, баланс знаков).
+    /// Только v2.
+    pub fn bloch_counts(&self) -> Result<trit_bloch::TritCounts> {
+        if !self.header.is_packed() {
+            return Err(PqwError::NotPacked);
+        }
+        Ok(trit_bloch::counts(
+            self.phase_bytes(),
+            self.header.d_pol as usize,
+        ))
     }
 
     /// Ленивая проверка целостности payload: SHA-256 (24 байта) поверх

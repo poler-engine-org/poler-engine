@@ -787,7 +787,7 @@ mod tests {
         // J[3→8] = 7−2 = 5; пары с разделителями (J=±1) — ниже порога 0.25·5.
         let pairs = g.skew_pairs(0.25);
         assert_eq!(pairs, vec![(3, 8, 5.0)]);
-        let data = g.gyro_data(0.25, 4096).expect("циркуляция должна выжить");;
+        let data = g.gyro_data(0.25, 4096).expect("циркуляция должна выжить");
         assert_eq!(data.window(), 1);
         assert_eq!(data.ticks(), g.ticks());
         assert_eq!(data.pairs().len(), 1);

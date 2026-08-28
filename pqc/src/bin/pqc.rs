@@ -23,6 +23,7 @@ use pqc::inspect::{
 };
 use pqc::json::Json;
 use pqc::{Ansatz, LoadOptions, Rng, DEFAULT_MAX_SV_QUBITS, MAX_QUBITS};
+use pqc::bloch_stream;
 use pqw::{PqwReader, PqwWriter};
 
 const USAGE: &str = "\
@@ -34,6 +35,7 @@ USAGE:
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
     pqc precess <file> [options]                              RQ11: петля архетипа поверх чекпоинта
+    pqc bloch <file.pqw> [--head N] [--window W] [--json]    RQ14: триты → углы Блоха (mmap, θ на лету)
     pqc encrypt <IN> --key <ARCH.pqw> --out <C.pqt> [opts]    RQ13: триты GF(3), прецессия+лавина
     pqc decrypt <C.pqt> --key <ARCH.pqw> [--out <PLAIN>]      RQ13: m = p* ⊕ (a ⊗_ε p*) точно
     pqc inspect <file> [options]
@@ -145,6 +147,7 @@ fn main() {
         Some("stream") => cmd_stream(&args[1..]),
         Some("unfurl") => cmd_unfurl(&args[1..]),
         Some("precess") => cmd_precess(&args[1..]),
+        Some("bloch") => cmd_bloch(&args[1..]),
         Some("encrypt") => cmd_encrypt(&args[1..]),
         Some("decrypt") => cmd_decrypt(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
@@ -2761,6 +2764,178 @@ fn train_snapshot(
         std::fs::write(p, payload).map_err(|e| format!("--fingerprint: {e}"))?;
     }
     Ok((buf.len(), nnz, engine.model_arcs().len(), gyro_pairs))
+}
+
+/// RQ14: mmap-разворот тритов в углы Блоха — θ = arccos(p) на лету.
+///
+/// Стриминг Packed4 → углы: LUT из трёх констант (θ ∈ {0, π/2, π}),
+/// полный вектор углов не материализуется.
+fn cmd_bloch(args: &[String]) -> i32 {
+    let mut file: Option<String> = None;
+    let mut json = false;
+    let mut head: usize = 8; // превью первых углов
+    let mut window: usize = 4096; // окно стримера
+    let mut i = 0usize;
+    macro_rules! val {
+        ($name:literal) => {{
+            i += 1;
+            if i >= args.len() {
+                eprintln!("pqc bloch: {} требует значение\n\n{USAGE}", $name);
+                return 2;
+            }
+            args[i].clone()
+        }};
+    }
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--head" => {
+                let v = val!("--head");
+                match v.parse::<usize>() {
+                    Ok(n) => head = n,
+                    Err(_) => {
+                        eprintln!("pqc bloch: bad --head: {v}\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            "--window" => {
+                let v = val!("--window");
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 => window = n,
+                    _ => {
+                        eprintln!("pqc bloch: bad --window: {v} (> 0)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            other => {
+                if other.starts_with("--") {
+                    eprintln!("pqc bloch: неизвестный флаг {other}\n\n{USAGE}");
+                    return 2;
+                }
+                if file.is_some() {
+                    eprintln!("pqc bloch: один файл за вызов\n\n{USAGE}");
+                    return 2;
+                }
+                file = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = file else {
+        eprintln!("pqc bloch: нужен контейнер v2 (.pqw)\n\n{USAGE}");
+        return 2;
+    };
+    let src = match load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pqc bloch: {path}: {e}");
+            return 1;
+        }
+    };
+    let reader = match PqwReader::from_bytes(src.as_slice()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc bloch: {path}: {e}");
+            return 1;
+        }
+    };
+    let counts = match reader.bloch_counts() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pqc bloch: контейнер не Packed4 (v2): {e}");
+            return 1;
+        }
+    };
+    let d = reader.d_pol() as usize;
+
+    // Полный стриминговый проход по углам (микробенчмарк на лету).
+    let t0 = std::time::Instant::now();
+    let mut stream = bloch_stream::Packed4Angles::new(reader.phase_bytes(), d, window);
+    let mut theta_sum = 0.0_f64;
+    while let Some((_, w)) = stream.next_chunk() {
+        for &t in w {
+            theta_sum += t;
+        }
+    }
+    let elapsed = t0.elapsed();
+    let per_trit_ns = elapsed.as_nanos() as f64 / d.max(1) as f64;
+
+    let preview: Vec<(u32, f64)> = reader
+        .bloch_angles()
+        .unwrap()
+        .take(head)
+        .collect::<Vec<_>>();
+
+    if json {
+        let report = Json::Obj(vec![
+            (
+                "cmd".into(),
+                Json::Str("bloch".into()),
+            ),
+            ("file".into(), Json::Str(path.clone())),
+            ("d_pol".into(), Json::Num(d as f64)),
+            (
+                "encoding".into(),
+                Json::Str(reader.encoding().name().into()),
+            ),
+            ("pos".into(), Json::Num(counts.pos as f64)),
+            ("neg".into(), Json::Num(counts.neg as f64)),
+            ("zero".into(), Json::Num(counts.zero as f64)),
+            ("density".into(), Json::Num(counts.density())),
+            ("balance".into(), Json::Num(counts.balance())),
+            (
+                "theta_head".into(),
+                Json::Arr(
+                    preview
+                        .iter()
+                        .map(|(i, t)| Json::Arr(vec![Json::Num(*i as f64), Json::Num(*t)]))
+                        .collect(),
+                ),
+            ),
+            (
+                "theta_mean".into(),
+                Json::Num(theta_sum / d.max(1) as f64),
+            ),
+            (
+                "stream_ns_per_trit".into(),
+                Json::Num(per_trit_ns),
+            ),
+            (
+                "window".into(),
+                Json::Num(window as f64),
+            ),
+        ]);
+        println!("{}", report.to_string());
+        return 0;
+    }
+
+    println!("RQ14: разворот тритов в углы Блоха — mmap, θ = arccos(p) на лету");
+    println!("  файл      : {path} ({})", src.kind());
+    println!("  d_pol     : {d} тритов, кодировка {}", reader.encoding().name());
+    println!(
+        "  решётка   : +1 × {}, −1 × {}, 0 × {}  (плотность LENS {:.4}, баланс {:.4})",
+        counts.pos,
+        counts.neg,
+        counts.zero,
+        counts.density(),
+        counts.balance()
+    );
+    println!(
+        "  стриминг  : окно {window}, {:.2} нс/трит (полный проход, без материализации)",
+        per_trit_ns
+    );
+    println!("  средний θ : {:.6} рад", theta_sum / d.max(1) as f64);
+    if !preview.is_empty() {
+        let s = preview
+            .iter()
+            .map(|(i, t)| format!("#{i}: {:.4}", t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  первые углы: {s}");
+    }
+    0
 }
 
 fn cmd_train(args: &[String]) -> i32 {
