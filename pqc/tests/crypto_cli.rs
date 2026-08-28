@@ -1,9 +1,9 @@
-//! Интеграционные тесты CLI `pqc encrypt` / `pqc decrypt` (RQ12).
+//! Интеграционные тесты CLI `pqc encrypt` / `pqc decrypt` (RQ12–RQ13).
 //!
-//! Схема алгебры архетипа (файл 285): `p* = a ⊗_ε p* ⊕ m`,
-//! восстановление `m = p* ⊕ (a ⊗_ε p*)`. Ключ — контейнер v3 с
-//! гироскопом J; проектор — плотные моды Im(P) (идемпотентность
-//! `a ⊗_ε a = a` точна, невязки ~1e-16).
+//! По умолчанию — трит-схема GF(3) (RQ13): `p* = a ⊗_ε p* ⊕ m` в
+//! Packed4-тритах, прецессия по руслам J + решётка LENS, лавина ~2/3.
+//! `--f32` — исследовательская схема RQ12 на фазах f32. Ключ —
+//! контейнер v3 с гироскопом J; расшифровка автодетектит магию PQT1/PQC1.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -71,8 +71,8 @@ fn cli_encrypt_decrypt_roundtrip() {
         "42",
     ]);
     assert_eq!(code, 0, "encrypt failed: {err}\n{out}");
-    assert!(out.contains("RQ12"));
-    assert!(out.contains("p* = a ⊗_ε p* ⊕ m"));
+    assert!(out.contains("RQ13"), "out: {out}");
+    assert!(out.contains("лавина"), "out: {out}");
     assert!(cipher.exists());
 
     let (code, out, err) = run(&[
@@ -84,7 +84,8 @@ fn cli_encrypt_decrypt_roundtrip() {
         plain.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "decrypt failed: {err}\n{out}");
-    assert!(out.contains("m = p* ⊕ (a ⊗_ε p*)"));
+    assert!(out.contains("RQ13"));
+    assert!(out.contains("GF(3)"));
     assert_eq!(std::fs::read(&plain).unwrap(), payload);
 }
 
@@ -202,7 +203,7 @@ fn cli_wrong_key_rejected_or_garbage() {
     if code == 0 {
         let got = std::fs::read(&plain).unwrap();
         assert_ne!(got, b"secret message for the archetype");
-        assert!(out.contains("RQ12"));
+        assert!(out.contains("RQ13"));
     } else {
         assert!(!err.is_empty());
     }
@@ -256,4 +257,139 @@ fn cli_corruption_and_missing_args() {
     ]);
     assert_eq!(code, 2);
     assert!(err.contains("--text") || err.contains("stdin"));
+}
+
+#[test]
+fn cli_f32_legacy_roundtrip() {
+    // --f32: исследовательская схема RQ12 (фазы f32, магия PQC1).
+    let dir = tmp_dir("f32-legacy");
+    let key = dir.join("key.pqw");
+    make_key(&key);
+    let msg = dir.join("msg.bin");
+    let cipher = dir.join("msg.pqc");
+    let plain = dir.join("plain.bin");
+    let payload: Vec<u8> = (0..512u32).map(|i| (i * 29 + 3) as u8).collect();
+    std::fs::write(&msg, &payload).unwrap();
+
+    let (code, out, err) = run(&[
+        "encrypt",
+        msg.to_str().unwrap(),
+        "--key",
+        key.to_str().unwrap(),
+        "--out",
+        cipher.to_str().unwrap(),
+        "--seed",
+        "11",
+        "--f32",
+    ]);
+    assert_eq!(code, 0, "{err}\n{out}");
+    assert!(out.contains("RQ12"), "ожидалась legacy-схема RQ12: {out}");
+    let bytes = std::fs::read(&cipher).unwrap();
+    assert_eq!(&bytes[..4], b"PQC1", "магия PQC1");
+
+    let (code, out, err) = run(&[
+        "decrypt",
+        cipher.to_str().unwrap(),
+        "--key",
+        key.to_str().unwrap(),
+        "--out",
+        plain.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}\n{out}");
+    assert!(out.contains("RQ12"));
+    assert_eq!(std::fs::read(&plain).unwrap(), payload);
+}
+
+#[test]
+fn cli_autodetect_both_schemes() {
+    // Расшифровка автодетектит схему по магии PQT1/PQC1 без флагов.
+    let dir = tmp_dir("autodetect");
+    let key = dir.join("key.pqw");
+    make_key(&key);
+    let payload = b"same payload both schemes".to_vec();
+
+    let trite_cipher = dir.join("t.pqt");
+    let f32_cipher = dir.join("t.pqc");
+    let trite_args: Vec<&str> = vec!["--seed", "5"];
+    let f32_args: Vec<&str> = vec!["--seed", "5", "--f32"];
+    for (out_path, extra) in [(&trite_cipher, &trite_args), (&f32_cipher, &f32_args)] {
+        let mut args: Vec<&str> = vec![
+            "encrypt",
+            "--text",
+            "same payload both schemes",
+            "--key",
+            key.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let (code, _, err) = run(&args);
+        assert_eq!(code, 0, "{err}");
+    }
+    assert_eq!(&std::fs::read(&trite_cipher).unwrap()[..4], b"PQT1");
+    assert_eq!(&std::fs::read(&f32_cipher).unwrap()[..4], b"PQC1");
+    // Трит-контейнер в ~10 раз меньше f32 на том же сообщении.
+    assert!(
+        std::fs::read(&trite_cipher).unwrap().len() * 4
+            < std::fs::read(&f32_cipher).unwrap().len()
+    );
+
+    for cipher in [&trite_cipher, &f32_cipher] {
+        let (code, out, err) = run(&[
+            "decrypt",
+            cipher.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("same payload both schemes"), "out: {out}");
+    }
+    let _ = payload;
+}
+
+#[test]
+fn cli_trite_json_telemetry() {
+    // JSON трит-схемы: схема, измеренная лавина и расширение.
+    let dir = tmp_dir("trite-json");
+    let key = dir.join("key.pqw");
+    make_key(&key);
+    let msg = dir.join("msg.bin");
+    let cipher = dir.join("m.pqt");
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i * 31 + 7) as u8).collect();
+    std::fs::write(&msg, &payload).unwrap();
+
+    let (code, out, err) = run(&[
+        "encrypt",
+        msg.to_str().unwrap(),
+        "--key",
+        key.to_str().unwrap(),
+        "--out",
+        cipher.to_str().unwrap(),
+        "--seed",
+        "3",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{err}\n{out}");
+    assert!(out.contains("\"scheme\":\"trite-gf3\""), "out: {out}");
+    assert!(out.contains("\"avalanche\":"), "out: {out}");
+    assert!(out.contains("\"expansion\":"), "out: {out}");
+    assert!(out.contains("\"ticks\":"), "out: {out}");
+    assert!(out.contains("\"digest\":\""), "out: {out}");
+    // Расширение ≤ ×2 (заголовок+IV амортизируются на 2 КиБ).
+    let exp: f64 = out
+        .split("\"expansion\":")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(99.0);
+    assert!(exp <= 2.0, "расширение ×{exp} — триты не экономят");
+    // Лавина измерена и в разумных границах (≥ 0.4, ≤ 2/3 + допуск).
+    let av: f64 = out
+        .split("\"avalanche\":")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0);
+    assert!(av >= 0.4, "лавина {av} — диффузии нет");
+    assert!(av <= 0.72, "лавина {av} выше потолка GF(3)");
 }

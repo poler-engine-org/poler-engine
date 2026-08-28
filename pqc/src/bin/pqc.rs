@@ -34,16 +34,19 @@ USAGE:
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
     pqc precess <file> [options]                              RQ11: петля архетипа поверх чекпоинта
-    pqc encrypt <IN> --key <ARCH.pqw> --out <C.pqc> [opts]    RQ12: m -> p* (алгебра архетипа)
-    pqc decrypt <C.pqc> --key <ARCH.pqw> [--out <PLAIN>]      RQ12: m = p* ⊕ (a ⊗_ε p*)
+    pqc encrypt <IN> --key <ARCH.pqw> --out <C.pqt> [opts]    RQ13: триты GF(3), прецессия+лавина
+    pqc decrypt <C.pqt> --key <ARCH.pqw> [--out <PLAIN>]      RQ13: m = p* ⊕ (a ⊗_ε p*) точно
     pqc inspect <file> [options]
     pqc train (--corpus DIR | --stdin) [options]              накопительное обучение
 
-ENCRYPT/DECRYPT OPTIONS (RQ12: крипто-схема алгебры архетипа, файл 285):
+ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию, файл 285;
+                          --f32 — исследовательская схема RQ12):
     --key <F>                 контейнер-ключ .pqw v3 с гироскопом J
                               (precess --out / train --gyro)
-    --out <F>                 encrypt: файл шифртекста .pqc (обязателен);
+    --out <F>                 encrypt: файл шифртекста .pqt (обязателен);
                               decrypt: файл открытого текста (без — stdout)
+    --f32                     RQ12-схема на f32-фазах (×43, без лавины) —
+                              для сравнения/воспроизведения RQ12
     --modes <N>               число мод проектора (default: авто-калибровка
                               по помехе проекции; 1..=8)
     --seed <S>                семя IV xoshiro256++ (default: энтропия)
@@ -1965,6 +1968,8 @@ struct CryptoConfig {
     text: Option<String>,
     stdin: bool,
     json: bool,
+    /// RQ12-схема на f32-фазах (legacy; трит-схема GF(3) — по умолчанию).
+    legacy_f32: bool,
 }
 
 impl Default for CryptoConfig {
@@ -1977,6 +1982,7 @@ impl Default for CryptoConfig {
             text: None,
             stdin: false,
             json: false,
+            legacy_f32: false,
         }
     }
 }
@@ -2023,6 +2029,7 @@ fn parse_crypto_args(cmd: &str, args: &[String]) -> Result<(Option<String>, Cryp
             "--text" => cfg.text = Some(val!("--text")),
             "--stdin" => cfg.stdin = true,
             "--json" => cfg.json = true,
+            "--f32" => cfg.legacy_f32 = true,
             other if !other.starts_with("--") => {
                 if file.replace(other.to_string()).is_some() {
                     eprintln!("pqc {cmd}: файл задан дважды\n\n{USAGE}");
@@ -2064,6 +2071,30 @@ fn load_cipher_key(path: &str, modes: usize) -> Result<pqc::CipherKey, i32> {
     }
 }
 
+fn load_trite_key(path: &str, modes: usize) -> Result<pqc::trite::TritKey, i32> {
+    let raw = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pqc crypto: ошибка чтения ключа {path}: {e}");
+            return Err(1);
+        }
+    };
+    let reader = match PqwReader::from_bytes(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc crypto: ошибка парсинга ключа {path}: {e}");
+            return Err(1);
+        }
+    };
+    match pqc::trite::TritKey::from_reader(&reader, modes) {
+        Ok(k) => Ok(k),
+        Err(e) => {
+            eprintln!("pqc crypto: {e}");
+            Err(1)
+        }
+    }
+}
+
 fn cmd_encrypt(args: &[String]) -> i32 {
     let (file, cfg) = match parse_crypto_args("encrypt", args) {
         Ok(v) => v,
@@ -2074,7 +2105,7 @@ fn cmd_encrypt(args: &[String]) -> i32 {
         return 2;
     };
     let Some(out_path) = &cfg.out else {
-        eprintln!("pqc encrypt: требуется --out <CIPHER.pqc>");
+        eprintln!("pqc encrypt: требуется --out <CIPHER.pqt>");
         return 2;
     };
     // Сообщение: --text | --stdin | файл.
@@ -2100,6 +2131,10 @@ fn cmd_encrypt(args: &[String]) -> i32 {
         eprintln!("pqc encrypt: нужен вход: файл, --text или --stdin");
         return 2;
     };
+
+    if !cfg.legacy_f32 {
+        return cmd_encrypt_trite(key_path, out_path, &msg, &cfg);
+    }
 
     let key = match load_cipher_key(key_path, cfg.modes) {
         Ok(k) => k,
@@ -2156,6 +2191,67 @@ fn cmd_encrypt(args: &[String]) -> i32 {
     0
 }
 
+/// RQ13: шифрование трит-схемы GF(3) (по умолчанию).
+fn cmd_encrypt_trite(key_path: &str, out_path: &str, msg: &[u8], cfg: &CryptoConfig) -> i32 {
+    let key = match load_trite_key(key_path, cfg.modes) {
+        Ok(k) => k,
+        Err(c) => return c,
+    };
+    let mut rng = match cfg.seed {
+        Some(s) => pqc::Rng::seed_from_u64(s),
+        None => pqc::Rng::from_entropy(),
+    };
+    let t0 = std::time::Instant::now();
+    let (cipher, rep) = match pqc::trite::encrypt(&key, msg, &mut rng) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc encrypt: {e}");
+            return 1;
+        }
+    };
+    let dt = t0.elapsed();
+    if let Err(e) = std::fs::write(out_path, &cipher) {
+        eprintln!("pqc encrypt: ошибка записи {out_path}: {e}");
+        return 1;
+    }
+
+    if cfg.json {
+        let obj = pqc::Json::Obj(vec![
+            ("key".into(), pqc::Json::str(key_path)),
+            ("out".into(), pqc::Json::str(out_path)),
+            ("scheme".into(), pqc::Json::str("trite-gf3")),
+            ("msg_len".into(), pqc::Json::num(rep.msg_len as f64)),
+            ("out_len".into(), pqc::Json::num(rep.out_len as f64)),
+            ("blocks".into(), pqc::Json::num(rep.blocks as f64)),
+            ("d_pol".into(), pqc::Json::num(key.d_pol as f64)),
+            ("k_modes".into(), pqc::Json::num(rep.k_modes as f64)),
+            ("capacity_trites".into(), pqc::Json::num(rep.capacity_trites as f64)),
+            ("raw_pairs".into(), pqc::Json::num(key.raw_pairs as f64)),
+            ("pairs_total".into(), pqc::Json::num(rep.pairs_total as f64)),
+            ("ticks".into(), pqc::Json::num(rep.ticks as f64)),
+            ("avalanche".into(), pqc::Json::num(rep.avalanche)),
+            ("expansion".into(), pqc::Json::num(rep.expansion)),
+            ("ritz_max".into(), pqc::Json::num(key.ritz_max)),
+            ("ortho_max".into(), pqc::Json::num(key.ortho_max)),
+            ("digest".into(), pqc::Json::str(&rep.digest_hex)),
+            ("seconds".into(), pqc::Json::num(dt.as_secs_f64())),
+        ]);
+        println!("{}", obj.to_string());
+    } else {
+        println!("POLER Quantum Core — Encrypt: трит-схема алгебры архетипа (RQ13, GF(3))");
+        println!("key       : {key_path} (d_pol={}, русел J={}, мод K={})", key.d_pol, key.raw_pairs, key.k_modes);
+        println!("            Ritz {:.1e} | орто {:.1e} (идемпотентность a ⊗ a = a)", key.ritz_max, key.ortho_max);
+        println!("message   : {} B → {} блоков × {} трит (упаковка {}↔{})", rep.msg_len, rep.blocks, rep.capacity_trites, 19, 30);
+        println!("cipher    : {out_path} ({} B, расширение ×{:.2} — было ×43 в RQ12)", rep.out_len, rep.expansion);
+        println!("прецессия : {} тактов × {} русл (J {} + решётка LENS {})", rep.ticks, rep.pairs_total, key.raw_pairs, rep.pairs_total - key.raw_pairs);
+        println!("лавина    : {:.1}% трит блока от 1 бита (было: 1 бит → 1 фаза в RQ12; потолок GF(3) 66.7%)", 100.0 * rep.avalanche);
+        println!("digest    : sha256-24 = {}", rep.digest_hex);
+        println!("время     : {:.3} с", dt.as_secs_f64());
+        println!("уравнение : p* = a ⊗_ε p* ⊕ m — Packed4-триты, расшифровка побитово точна (GF(3))");
+    }
+    0
+}
+
 fn cmd_decrypt(args: &[String]) -> i32 {
     let (file, cfg) = match parse_crypto_args("decrypt", args) {
         Ok(v) => v,
@@ -2166,7 +2262,7 @@ fn cmd_decrypt(args: &[String]) -> i32 {
         return 2;
     };
     let Some(cipher_path) = &file else {
-        eprintln!("pqc decrypt: требуется путь к шифртексту .pqc");
+        eprintln!("pqc decrypt: требуется путь к шифртексту .pqt / .pqc");
         return 2;
     };
     let cipher = match std::fs::read(cipher_path) {
@@ -2176,6 +2272,11 @@ fn cmd_decrypt(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // Автодетект схемы по магии контейнера: PQT1 — триты RQ13,
+    // PQC1 — f32-фазы RQ12 (legacy).
+    if cipher.len() >= 4 && cipher[..4] == pqc::trite::TRITE_MAGIC {
+        return cmd_decrypt_trite(key_path, &cipher, &cfg, cipher_path);
+    }
     let key = match load_cipher_key(key_path, cfg.modes) {
         Ok(k) => k,
         Err(c) => return c,
@@ -2229,6 +2330,67 @@ fn cmd_decrypt(args: &[String]) -> i32 {
         );
         println!("запас     : min {:.4} | средний {:.4} (порог ε/2 = {:.4})",
             rep.margin_min, rep.margin_mean, pqc::crypto::DECODE_THRESHOLD);
+        println!("время     : {:.3} с", dt.as_secs_f64());
+    }
+    0
+}
+
+/// RQ13: расшифровка трит-схемы GF(3) — побитово точная (без порогов).
+fn cmd_decrypt_trite(
+    key_path: &str,
+    cipher: &[u8],
+    cfg: &CryptoConfig,
+    cipher_path: &str,
+) -> i32 {
+    let key = match load_trite_key(key_path, cfg.modes) {
+        Ok(k) => k,
+        Err(c) => return c,
+    };
+    let t0 = std::time::Instant::now();
+    let (msg, rep) = match pqc::trite::decrypt(&key, cipher) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc decrypt: {e}");
+            return 1;
+        }
+    };
+    let dt = t0.elapsed();
+    match &cfg.out {
+        Some(out_path) => {
+            if let Err(e) = std::fs::write(out_path, &msg) {
+                eprintln!("pqc decrypt: ошибка записи {out_path}: {e}");
+                return 1;
+            }
+        }
+        None => match String::from_utf8(msg.clone()) {
+            Ok(text) => print!("{text}"),
+            Err(_) => {
+                eprintln!("pqc decrypt: бинарное сообщение — запишите через --out");
+                return 1;
+            }
+        },
+    }
+
+    if cfg.json {
+        let obj = pqc::Json::Obj(vec![
+            ("key".into(), pqc::Json::str(key_path)),
+            ("cipher".into(), pqc::Json::str(cipher_path)),
+            ("scheme".into(), pqc::Json::str("trite-gf3")),
+            ("blocks".into(), pqc::Json::num(rep.blocks as f64)),
+            ("msg_len".into(), pqc::Json::num(rep.msg_len as f64)),
+            ("ticks".into(), pqc::Json::num(rep.ticks as f64)),
+            ("seconds".into(), pqc::Json::num(dt.as_secs_f64())),
+        ]);
+        println!("{}", obj.to_string());
+    } else {
+        println!("POLER Quantum Core — Decrypt: m = p* ⊕ (a ⊗_ε p*) в GF(3) (RQ13)");
+        println!("cipher    : {cipher_path} ({} блоков, {} тактов прецессии)", rep.blocks, rep.ticks);
+        println!(
+            "message   : {} B → {}",
+            rep.msg_len,
+            cfg.out.as_deref().unwrap_or("<stdout>")
+        );
+        println!("точность  : GF(3)-арифметика целая — расшифровка побитово точна");
         println!("время     : {:.3} с", dt.as_secs_f64());
     }
     0

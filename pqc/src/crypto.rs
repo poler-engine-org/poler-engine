@@ -99,6 +99,12 @@ impl CipherKey {
     pub fn capacity(&self) -> usize {
         self.positions.len()
     }
+
+    /// Холодные позиции битов сообщения (RQ13: трит-схема переиспользует
+    /// ту же геометрию — триты сообщения живут на этих узлах).
+    pub fn positions(&self) -> &[u32] {
+        &self.positions
+    }
 }
 
 impl CipherKey {
@@ -224,7 +230,7 @@ impl CipherKey {
     }
 
     /// Ключевой поток: S-часть стартовых фаз `a·p₀`.
-    fn keystream(&self) -> Vec<f64> {
+    pub fn keystream(&self) -> Vec<f64> {
         self.project(&self.thetas0)
     }
 }
@@ -367,7 +373,7 @@ fn delta_to_bits(delta: &[f64]) -> (Vec<bool>, f64, f64) {
 }
 
 /// Байты → биты (младший бит первого).
-fn bytes_to_bits(bytes: &[u8]) -> Vec<bool> {
+pub(crate) fn bytes_to_bits(bytes: &[u8]) -> Vec<bool> {
     let mut bits = Vec::with_capacity(bytes.len() * 8);
     for &b in bytes {
         for j in 0..8 {
@@ -378,7 +384,7 @@ fn bytes_to_bits(bytes: &[u8]) -> Vec<bool> {
 }
 
 /// Биты → байты (младший бит первого; длина кратна 8).
-fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
+pub(crate) fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
     let mut bytes = vec![0u8; bits.len() / 8];
     for (k, &bit) in bits.iter().enumerate() {
         if bit {
@@ -389,23 +395,23 @@ fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
 }
 
 /// LE-помощники сериализации (zero-dep).
-fn put_u16(out: &mut Vec<u8>, v: u16) {
+pub(crate) fn put_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn put_u32(out: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn put_u64(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn get_u16(buf: &[u8], off: usize) -> u16 {
+pub(crate) fn get_u16(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
-fn get_u32(buf: &[u8], off: usize) -> u32 {
+pub(crate) fn get_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
-fn get_u64(buf: &[u8], off: usize) -> u64 {
+pub(crate) fn get_u64(buf: &[u8], off: usize) -> u64 {
     let mut b = [0u8; 8];
     b.copy_from_slice(&buf[off..off + 8]);
     u64::from_le_bytes(b)

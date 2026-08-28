@@ -103,6 +103,7 @@ pub mod rng;
 pub mod statevector;
 pub mod stream;
 pub mod stream_engine;
+pub mod trite;
 
 pub use ansatz::{
     Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,
@@ -128,6 +129,9 @@ pub use json::{Json, JsonError};
 pub use learn::{quadratic_target, ActiveInference, ActiveStepReport, BornOptimizer, StepReport};
 pub use parity::{splitmix_phases, ParityAnsatz, ParityMode};
 pub use rng::Rng;
+pub use trite::{
+    decrypt as trite_decrypt, encrypt as trite_encrypt, TritKey, TRITE_MAGIC,
+};
 pub use statevector::{phase_to_theta, Statevector, MAX_QUBITS};
 pub use stream::{StreamReport, ZeroStoragePipeline};
 pub use stream_engine::{
