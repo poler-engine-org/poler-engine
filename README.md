@@ -10,6 +10,37 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.17.4: Transcript / Response View — лента чата в окне TUI
+
+Восстановление ключевой функции Ask-вкладки Web GUI (удалён в v0.17.0 —
+Next.js весил 1.2 ГБ, а функция нужна): **«Історія чату» + «Відповідь»**
+теперь живут в самом TUI как окно-оверлей.
+
+- **Персистентность**: каждая пара `nlm ask` (вопрос, ответ, notebook_id,
+  время) автоматически пишется в таблицу `poler_chat` той же SQLite-БД
+  (`web-index.db`) — лента переживает перезапуски движка.
+- **F3 — Transcript**: лента пар в feed-порядке (новые снизу):
+  `#id [дата время] NB вопрос → N символов`. ↑↓/PgUp/PgDn/Home/End —
+  навигация, Enter — полный ответ, y — копировать ответ в буфер,
+  d — удалить пару, r — обновить, Esc — закрыть.
+- **Response View**: вопрос в шапке + полный ответ с прокруткой
+  (↑↓/PgUp/PgDn), y — копировать, Esc — назад к ленте.
+- **Мышь**: клик по строке ленты открывает ответ.
+- Модуль `shell::transcript`: схема `poler_chat`, CRUD, форматирование
+  времени без внешних зависимостей (алгоритм Хиннанта), 6 юнит-тестов;
+  рендер-смоуки на ratatui TestBackend.
+
+```
+poler-engine --tui
+F3                    # лента чата: все пары nlm ask
+  ↑↓ Enter            # выбрать пару → полный ответ
+  y                   # скопировать ответ в буфер обмена
+poler> nlm ask <NB_ID> "новый вопрос"   # пара попадёт в ленту автоматически
+```
+
+
+---
+
 ## Проблема: почему grep и RAG больше не достаточны
 
 | # | Проблема | Симптом | Механизм POLER |
@@ -19,111 +50,6 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 | 3 | **Chunk Fragmentation** | Нарезка по 500 токенов рвёт причинно-следственные связи | **Semantic Boundary Chunking**: границы окон = заголовки сцен / границы функций |
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
-
-## v0.17.3: Companion Bridge — официальный NotebookLM API рядом с batchexecute
-
-v0.17.1–v0.17.3 соединяют poler-engine с **официальным Pre-GA NotebookLM
-Enterprise API** (Discovery Engine `v1alpha`) — не заменяя
-реверс-инжиниренный batchexecute-клиент v0.13.0, а достроив **сменный мост**
-поверх обоих. Разведка API подтвердила исходную гипотезу: официальный API силён
-там, где batchexecute слаб (пакетное создание источников, upload файлов,
-аудио-обзоры, удаление), и слаб там, где batchexecute силён (чтение контента,
-заметки, артефакты, чат — endpoints отсутствуют или возвращают пустые данные).
-Мост маршрутизирует каждую операцию к сильнейшему провайдеру и молча падает
-назад при отказе.
-
-### Архитектура HybridProvider (`src/google/companion.rs`, ~2000 строк)
-
-| Компонент | Роль |
-|---|---|
-| `SourceContentProvider` trait | единый контракт: 13 операций (`Op` enum) для всех провайдеров |
-| `GcpEnterpriseProvider` | официальный Pre-GA API: Discovery Engine `v1alpha`, ureq + Bearer (scope `cloud-platform`), 9 операций — M2 ✓ |
-| `CdpBatchexecuteProvider` | потребительский протокол v0.13.0: чтение контента, заметки, артефакты, чат |
-| `HybridProvider` | routing: primary по `supports(op)`, fallback на `NotSupported`/`NotConfigured` — M3 ✓ |
-
-Routing policy: режим `Auto` (по умолчанию) ведёт GCP-first для 9
-enterprise-операций и CDP-first для 4 операций чтения; `GcpOnly`/`CdpOnly`
-принудительно фиксируют провайдер (fallback off). Серверные ошибки
-(`Http`/`Transport`/`Parse`) **не** переключают провайдера — это разные
-данные, а не сбой транспорта.
-
-```
-$POLER_GCP_PROJECT_NUMBER   # GCP-проект с включённым Discovery Engine API
-$POLER_GCP_REGION           # us | eu | global (default: us)
-$POLER_GCP_LOCATION         # (default: global)
-$POLER_COMPANION_MODE       # auto | gcp | cdp (default: auto)
-```
-
-Milestone-разбивка: **v0.17.1** — M1 skeleton (trait-контракт, 10 URL-билдеров
-с `sources:uploadFile` media-конвенцией `/upload/v1alpha/...`, 24 теста);
-**v0.17.3** — M2 реальные вызовы (9 операций, refresh-токены из
-`oauth::ensure_gcp_fresh`), M3 HybridProvider routing + fallback (8 тестов
-routing-политики), M4 TUI Enter-handler. v0.17.2 намеренно пропущен
-(reserved).
-
-### M4: Enter на источнике в TUI
-
-Клавиша Enter в панели Sources больше не «ничего не делает» — источник
-маппится в `SourceKind` → `EnterAction`:
-
-| Тип источника | Enter-действие |
-|---|---|
-| `File` | `$EDITOR` на локальном файле (fallback `nano`) |
-| `Url` | открыть в браузере пользователя (`xdg-open`) |
-| `Repo` | открыть `https://github.com/{value}` в браузере |
-| NLM-контент | `FallbackFetch` → `get_source_content` через HybridProvider |
-
-### Горизонт: Zero-Storage Streaming Archives (SA1–SA7)
-
-`docs/future-streaming-archives.md` фиксирует следующий рывок — потоковое
-чтение петабайтных архивов (Common Crawl `.tar.zst`, Hugging Face `.zip`)
-**через HTTP Range без скачивания на диск**: топологическая адресация
-zip central-directory (O(δ) ≈ 64 КБ для 50 ГБ архива), streaming ε + IIR
-резонанс, SimHash-дедуп с Bloom-фильтром (m=2²⁰, k=7), importance sampling
-батчей `P(d→batch) ∝ exp(λ₁·ψ + λ₂·H − λ₃·Redundancy)` — десятки МБ RAM на
-корпуса интернета. Четыре потребителя: обучение локальных LLM, RAG-батчи для
-готовых моделей, TUI discovery, параллельный поиск по N архивам (rayon).
-
----
-
-## v0.17.0: TUI Redesign + Pure-Rust Git Clone & LFS — без системного git
-
-Два релиза в одном: полный редизайн терминального интерфейса в стиле MiMo
-Code и закрытие последних заглушек v0.16.0 — `gix clone` и Git LFS теперь
-работают на чистом Rust, без системного `git` и `git-lfs` в `$PATH`.
-
-### TUI Redesign (M1–M4, M6)
-
-- **4-панельный дашборд**: Output (главный поток), Notes, Sources, Help —
-  переключение фокуса, resize, scroll в каждой панели.
-- **Мышь**: клики по панелям, drag-select текста, clipboard через `arboard`
-  (копирование выделенного в системный буфер).
-- **Notes/Sources CRUD**: заметки и источники живут в `poler-shell.db`
-  (`src/notes/mod.rs`, `src/sources/mod.rs`) — создаются, редактируются,
-  удаляются прямо из TUI.
-- **Help 2.0**: `src/shell/help.rs` — палитра `?` с 11 пресетами сценариев
-  (от «первый запрос» до «Pure-Rust git clone + LFS»), детальная справка по
-  каждой команде.
-
-### M5: Pure-Rust Git Clone & LFS
-
-`gix clone <URL> <PATH> [--depth N] [--branch B]` — настоящий clone через
-`gix::clone::PrepareFetch` (shallow-depth, checkout в worktree), без
-вызова системного git. `gix lfs list|fetch <PATH>` — Pure-Rust LFS-клиент:
-детект pointer-файлов (`version https://git-lfs/...`), batch-запрос
-`POST /objects/batch`, скачивание блобов в `.git/lfs/objects/<oid[:2]>/...`,
-авторизация `Bearer $POLER_GIT_TOKEN`.
-
-### Метрики релиза
-
-| Метрика | v0.16.0 | v0.17.0 |
-|---|---|---|
-| Тесты | 413 | 486 (+24: clone/lfs, notes/sources, help) |
-| Бинарник | 8.4 МБ | 12 МБ (+3 МБ: `blocking-network-client` gix) |
-| Rust-файлов | 51 | 57 (+notes, sources, help, mouse, clone, lfs) |
-| Web GUI (Next.js) | ~1.2 ГБ | удалён (M6) |
-
----
 
 ## v0.16.0: Unified VCS & Data Mesh — нативные адаптеры GitHub/GitLab/Gitea + Pure-Rust git (gix)
 
@@ -217,13 +143,13 @@ VCS-страницы в `web-index.db` — это обычные `WebDoc` со �
 вебом, NLM и локальным кодом. `poler> search "Планковська геодезична"`
 пробивает всё сразу.
 
-### Известные ограничения (закрыты в v0.17.0)
+### Известные ограничения (перенесены в v0.17.0)
 
-- ~~`gix clone` — заглушка v0.16.0~~ ✓ реализовано в v0.17.0 (M5:
-  `gix::clone::PrepareFetch`, shallow-depth, checkout; feature-флаг
-  `blocking-network-client` подключён).
-- ~~Git LFS pointer-resolve~~ ✓ реализовано в v0.17.0 (M5: Pure-Rust
-  LFS-клиент, `gix lfs list|fetch`).
+- `gix clone` — заглушка v0.16.0; для синхронного clone требуются
+  feature-флаги `blocking-network-client` (добавлены в v0.17.0).
+  Пока: `git clone URL path` в соседнем окне, затем `poler> gix log path`.
+- Git LFS pointer-resolve (`.gitattributes` + `version https://git-lfs/...`)
+  — v0.17.0 (см. FUTURE_ROADMAP.md §6.3, шаг 3).
 - Hugging Face Hub (model cards + datasets) — v0.18.0 (`hf://` URL-схема).
 - DVC + Oxen.ai (data-versioning pointer files) — v0.19.0.
 - HugeSCM/Lit/ParamLake — v0.20.0+.
@@ -1239,32 +1165,6 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
     --nlm-chat <NB> <Q>     вопрос к модели ноутбука ПО ЕГО ИСТОЧНИКАМ
     --nlm-media <URL>       скачать медиа профильным Chromium → ~/.cache/poler-engine/nlm/
     --nlm-shot <URL>        скриншот страницы NotebookLM → PNG
-    --nlm-sync [NB]         v0.14: залить ВСЕ ноутбуки в web-index.db (nlm:// URL)
-    --web <URL>             v0.8: отрендерить страницу через Chromium CDP
-    --web-search <Q>        v0.9+: поиск по web-index.db (BM25+PageRank+фразы)
-    --web-db <PATH>         путь к индексу [default: ./web-index.db]
-    --web-stats             статистика индекса: страницы, ссылки, PageRank
-    --crawl <URL>           краулер: BFS от URL (robots.txt + sitemap + SimHash-дедуп)
-    --crawl-depth <N>       глубина краула [default: 2]
-    --crawl-max <N>         лимит страниц [default: 25]
-    --crawl-delay-ms <N>    задержка между запросами [default: 1000]
-    --cross-site            разрешить краулу переходы на другие домены
-    --cdp-port <N>          порт CDP Chromium [default: 9222]
-    --web-wait-ms <N>       ожидание рендера страницы [default: 1200]
-    --headless              headless-режим Chromium
-    --no-sandbox            отключить sandbox Chromium (для root/CI)
-    --remote-debugging-port <N>  явный порт отладки Chromium
-    --mcp                   v0.10: MCP-сервер (stdio JSON-RPC 2.0) для LLM-агентов
-    --shell                 v0.15+: poler-shell REPL
-    --tui                   v0.17: 4-панельный TUI (MiMo Code-style)
-    --psi-eta <N>           POLER[Ψ]: шаг ψ-потока [default: 0.05]
-    --psi-gamma <N>         POLER[Ψ]: наклон потенциала [default: 0.5]
-    --psi-rho <N>           POLER[Ψ]: вес резонанса [default: 0.9]
-    --psi-depth <N>         POLER[Ψ]: глубина [default: 8]
-    --poler-eta <N>         POLER-цикл: learning rate [default: 0.01]
-    --poler-gamma <N>       POLER-цикл: γ [default: 0.1]
-    --poler-mix <N>         POLER-цикл: микс [default: 0.1]
-    --poler-dissipator <N>  POLER-цикл: диссипатор [default: 0.02]
 -v, --verbose               статистика прогона в stderr
 ```
 
@@ -1321,20 +1221,12 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
 
 ```
 poler-engine/
-├── Cargo.toml                  # clap, rayon, memmap2, petgraph, serde, regex, aho-corasick, walkdir,
-│                               # rusqlite, ratatui, crossterm, rustyline, ureq, gix, arboard, tui-textarea, globset
+├── Cargo.toml                  # clap, rayon, memmap2, petgraph, serde, regex, aho-corasick, walkdir
 ├── FUTURE_ROADMAP.md           # «превзойти Google»: цель записана, срок не определён
-├── docs/
-│   ├── companion-bridge-design.md        # v0.17.1+: оф. NotebookLM API как auxiliary I/O gateway
-│   └── future-streaming-archives.md      # v0.17.3: Zero-Storage Streaming Archives (SA1–SA7)
 └── src/
     ├── main.rs                 # CLI: --format [ai-json|md|simple], grep-совместимые коды выхода
     ├── mcp.rs                  # MCP-сервер (stdio JSON-RPC 2.0) для LLM-агентов
     ├── lib.rs                  # двухпроходный параллельный пайплайн, EngineConfig, ScanStats
-    ├── engine.rs               # движок запросов поверх индексов
-    ├── streaming.rs            # потоковый конвейер: multi-pass + zero-copy FileTokens + aho-corasick
-    ├── psi.rs                  # POLER[Ψ]: Ω(o)=tanh(o), свободная энергия, ψ-поток, stability condition
-    ├── poler.rs                # канонический POLER-цикл из P3_Engine
     ├── web/                    # v0.8–v0.11: веб-поиск
     │   ├── cdp.rs              # нативный Chromium CDP-клиент (WebSocket RFC 6455)
     │   ├── crawl.rs            # frontier BFS, robots.txt, sitemap, SimHash-дедуп
@@ -1342,35 +1234,11 @@ poler-engine/
     │   ├── phrase.rs           # v0.11: позиционный кодек (delta-varint) + фразовый поиск
     │   ├── stem.rs             # кириллический стеммер (uk/рос)
     │   └── …                   # robots, simhash, urlnorm, extract
-    ├── google/                  # v0.12–v0.17: сервисы Google без пароля
+    ├── google/                  # v0.12–v0.13: сервисы Google без пароля
     │   ├── mod.rs              # google-браузер (порт 9223) + персистентный профиль + GoogleHttp
     │   ├── oauth.rs            # OAuth 2.0 loopback (RFC 8252), refresh, хранилище 0600
     │   ├── api.rs              # Gmail/Drive readonly-API + форматтеры
-    │   ├── nlm.rs              # v0.13: NotebookLM batchexecute-протокол + медиа-канал
-    │   ├── nlm_ingest.rs       # v0.14: NLM → web-index.db (FNV-1a content_hash, nlm:// URL)
-    │   └── companion.rs        # v0.17.1+: Companion Bridge (HybridProvider, GCP + CDP)
-    ├── vcs/                    # v0.16–v0.17: Unified VCS & Data Mesh
-    │   ├── mod.rs              # VcsAdapter trait, sync_vcs()
-    │   ├── github.rs           # REST API GitHub v3 через ureq
-    │   ├── gitlab.rs           # REST API GitLab v4
-    │   ├── gitea.rs            # REST API Gitea/Forgejo
-    │   ├── local.rs            # Pure-Rust git через gix: discover/rev_walk/decode
-    │   ├── clone.rs            # v0.17.0: gix::clone::PrepareFetch (shallow, branch, bare)
-    │   ├── lfs.rs              # v0.17.0: Pure-Rust LFS-клиент (pointer-detect, batch API)
-    │   └── ingest.rs           # VcsCommit/VcsIssue → WebDoc
-    ├── shell/                  # v0.15–v0.17: poler-shell TUI/REPL
-    │   ├── tui.rs              # 4-панельный дашборд (MiMo Code-style) + Enter-handler
-    │   ├── commands.rs         # все команды REPL (search, crawl, gh/gl/gt/gix, sync, …)
-    │   ├── completer.rs        # Tab-completion + Hinter
-    │   ├── help.rs             # Help 2.0: палитра `?`, 11 пресетов сценариев
-    │   ├── mouse.rs            # мышь: клики, drag-select, SGR-1006
-    │   └── state.rs            # состояние сессии, poler-shell.db
-    ├── notes/                  # v0.17.0: CRUD заметок (TUI Notes panel)
-    ├── sources/                # v0.17.0: CRUD источников (TUI Sources panel)
-    ├── aidde/                  # AI-Interpreted Dependency & Impact Engine
-    │   ├── impact.rs           # impact-паспорта символов (upstream/downstream)
-    │   ├── sqlite_store.rs     # disk-backed таблица символов (65K+ файлов)
-    │   └── symbols.rs          # symbol table + call graph
+    │   └── nlm.rs              # v0.13: NotebookLM batchexecute-протокол + медиа-канал
     ├── tokenizer/
     │   ├── pii.rs              # zero-copy (Cow) маскирование PII
     │   └── inverted_index.rs   # индекс всех токенов, включая отрицания
@@ -1402,21 +1270,13 @@ poler-engine/
   совпадений);
 * память: индексы hit-файлов и их кэшированный текст (до 1 МБ на файл)
   удерживаются до конца прогона; для сверхбольших репозиториев используйте
-  `--local-stats` и послабление `--max-file-size`;
-* Companion Bridge: `GcpEnterpriseProvider` требует GCP-проект с включённым
-  Discovery Engine API (Pre-GA — контракты могут меняться);
-  `CdpBatchexecuteProvider`-методы (chat/get_notes/list_artifacts/
-  get_source_content) до v0.18.0 остаются skeleton — чтение идёт через
-  `--nlm-*` CLI v0.13–v0.14;
-* TUI-мышь рассчитана на SGR-1006 (все современные терминалы); на legacy-
-  терминалах события могут не доставляться.
+  `--local-stats` и послабление `--max-file-size`.
 
 ## Тестирование
 
-563 теста: unit (математика ε/IIR/POLER[Ψ], сканер скобок, raw-строки, PII,
-разбиение предложений, K-hop, temporal-фильтр, URL-билдеры Companion Bridge,
-routing-политика HybridProvider, LFS pointer-парсер, completer) +
-интеграционные (контракт спецификации на фикстуре главы 36, call graph,
+143 теста: 105 unit (математика ε/IIR, сканер скобок, raw-строки, PII,
+разбиение предложений, K-hop, temporal-фильтр) + 38 интеграционных
+(воспроизведение контракта спецификации на фикстуре главы 36, call graph,
 PII-маскирование, детерминизм, сортировка, режимы резонанса).
 
 ```bash
@@ -1443,5 +1303,4 @@ CI (`.github/workflows/ci.yml`): матрица ubuntu/macos, clippy с `-D warn
 
 ## Лицензия
 
-MIT OR Apache-2.0 — двойная лицензия на выбор (файлы `LICENSE-MIT` и
-`LICENSE-APACHE` в корне репозитория).
+MIT OR Apache-2.0.

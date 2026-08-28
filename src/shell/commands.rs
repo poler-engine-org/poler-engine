@@ -367,6 +367,11 @@ fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
                 Ok(answer) => {
                     // v0.17.0: Запомнить ответ для Ctrl+S (save_last_ai_reply_as_note)
                     state.remember_ai_reply(answer.clone(), Some(nb.clone()));
+                    // v0.17.4: пара → лента чата (Transcript, F3 в TUI);
+                    // сбой записи не ломает команду — лента best-effort.
+                    if let Ok(conn) = state.ensure_notes_conn() {
+                        let _ = super::transcript::add_entry(conn, Some(&nb), &q, &answer);
+                    }
                     let out = format!("💬 вопрос: {q}\n→ {answer}");
                     state.set_output(out.clone());
                     CmdResult::Done(out)

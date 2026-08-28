@@ -206,22 +206,13 @@ API**, не забивая локальный диск сотнями гигаб
    + `sync vcs`. ✅ shipped (2026-08-26)
 4. **v0.17.0 — gix clone + LFS pointer resolve**: feature-флаги
    `blocking-network-client` для синхронного `gix clone` (без `git` CLI);
-   Git LFS pointer-файлы `version https://git-lfs/...` — Pure-Rust клиент
-   (detect + batch API + fetch в `.git/lfs/objects/`). Плюс TUI Redesign:
-   4-панельный дашборд, мышь, Notes/Sources CRUD, Help 2.0. ✅ shipped
-   (v0.17.0, 486 тестов; бинарник 12 МБ)
-5. **v0.17.1–v0.17.3 — Companion Bridge**: официальный Pre-GA NotebookLM
-   Enterprise API (Discovery Engine `v1alpha`) как auxiliary I/O gateway
-   рядом с batchexecute. M1 skeleton ✅ / M2 реальные вызовы (9 операций,
-   Bearer cloud-platform) ✅ / M3 HybridProvider routing + fallback ✅ /
-   M4 TUI Enter-handler ✅ — всё в v0.17.3 (521 тест). M5 CLI-подкоманды
-   (`nlm upload`, `nlm aoview`, `nlm batch-add`) → v0.18.0.
-6. **v0.18.0 — Hugging Face Hub**: model cards + datasets API → влитие в
-   web-index.db как `hf://` URL-схема + M5 Companion Bridge CLI + фикс
-   скролла TUI.
-7. **v0.19.0 — DVC + Oxen**: data-versioning pointer files, remote storage
+   Git LFS `.gitattributes` + pointer-файлы `version https://git-lfs/...`
+   для resolve `lfs://` URL без full fetch.
+5. **v0.18.0 — Hugging Face Hub**: model cards + datasets API → влитие в
+   web-index.db как `hf://` URL-схема.
+6. **v0.19.0 — DVC + Oxen**: data-versioning pointer files, remote storage
    resolve.
-8. **v0.20.0+ — HugeSCM/Lit/ParamLake**: новые адаптеры для China-scale
+7. **v0.20.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+
@@ -235,42 +226,3 @@ API**, не забивая локальный диск сотнями гигаб
 Это сохраняет invariant v0.14.0: один `--web-search` пробивает ВСЕ юниверсы
 (NLM + веб + локальный код + GitHub + HuggingFace + …) с единой PageRank
 топологией.
-
-## 7. Горизонт v0.18+: Zero-Storage Streaming Archives (SA1–SA7)
-
-Зафиксировано в v0.17.3 (`docs/future-streaming-archives.md`, ~16 КБ):
-петабайтные архивы интернета (Common Crawl `.tar.zst`, Hugging Face `.zip`)
-читаются **потоком через HTTP Range без скачивания на диск** — десятки МБ RAM
-на корпуса размером с интернет. Не замена кроулингу v0.9.0, а второй вход
-в тот же web-index.db.
-
-### 7.1. Математика (переиспользует существующие модули)
-
-| Механизм | Модуль-донор | Что добавляем |
-|---|---|---|
-| Топологическая адресация zip central-directory | — | O(δ) ≈ 64 КБ для 50 ГБ архива |
-| ε(W_k) информационная плотность | `resonance/epsilon.rs` | окно по потоку, а не по файлу |
-| IIR резонанс R[n] | `resonance/iir_filter.rs` | готов, O(1) памяти |
-| SimHash-дедуп | `web/simhash.rs` | + Bloom-фильтр (m=2²⁰, k=7) |
-| POLER[Ψ] importance sampling | `psi.rs`, `poler.rs` | P(d→batch) ∝ exp(λ₁·ψ + λ₂·H − λ₃·Redundancy) |
-| Потоковый конвейер | `streaming.rs` | zero-copy FileTokens поверх HTTP Range |
-
-### 7.2. Milestones
-
-- **SA1** — HTTP Range-транспорт + zip central-directory reader (end-of-archive
-  seek, δ-зона);
-- **SA2** — tar.zst streaming (последовательный, без адресации);
-- **SA3** — streaming ε + IIR + SimHash/Bloom поверх потока;
-- **SA4** — POLER[Ψ] importance sampling → обучающие батчи (4 выхода:
-  LLM-тренинг / RAG / TUI discovery / параллельный поиск);
-- **SA5** — CLI `stream-archive index|list|extract` + `stream-search`;
-- **SA6** — rayon par_iter по N архивам параллельно;
-- **SA7** — инвариант: web-index.db не меняется, `sa://` URL-схема.
-
-### 7.3. Правила
-
-- Никаких TLS-стеков в Rust-коде — HTTP через существующий транспортный
-  слой (CDP/ureq);
-- PII-маскирование (`tokenizer/pii.rs`) включено до попадания в батчи;
-- Честность перед лимитами: если сервер не поддерживает Range — отказ, а не
-  full download.

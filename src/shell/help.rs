@@ -97,6 +97,7 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Notes, cmd: "notes edit <id>", short: "Редагувати замітку (TUI редактор)" },
         HelpEntry { group: HelpGroup::Notes, cmd: "notes rm <id>", short: "Видалити замітку" },
         HelpEntry { group: HelpGroup::Notes, cmd: "notes save-from-ai", short: "Зберегти останню відповідь nlm ask як замітку (ті саме що Ctrl+S)" },
+        HelpEntry { group: HelpGroup::Notes, cmd: "F3 (Transcript)", short: "Лента чату nlm ask в TUI: пари питання→відповідь, повна відповідь, копіювання" },
 
         HelpEntry { group: HelpGroup::Sources, cmd: "sources list", short: "Усі джерела" },
         HelpEntry { group: HelpGroup::Sources, cmd: "sources add <value> [--kind file|url|repo] [--label \"...\"]", short: "Додати джерело (kind авто-детектується)" },
@@ -148,6 +149,8 @@ pub fn help_overview() -> String {
     s.push_str("  Enter — виконати команду\n");
     s.push_str("  Ctrl+N — нова замітка (вбудований редактор)\n");
     s.push_str("  Ctrl+S — зберегти відповідь AI як замітку\n");
+    s.push_str("  F3 — Transcript: лента чату nlm ask (пари питання→відповідь,\n");
+    s.push_str("       переживають перезапуски; Enter — повна відповідь, y — копіювати)\n");
     s.push_str("  Ctrl+Y — копіювати виділення мишею в буфер\n");
     s.push_str("  ? — палітра сценаріїв (11 пресетів)\n");
     s.push_str("  Esc / Ctrl+C — вихід\n");

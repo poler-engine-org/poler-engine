@@ -71,6 +71,7 @@ use super::commands::{dispatch, CmdResult};
 use super::help;
 use super::mouse::{self, MouseAction, SelectionRect};
 use super::state::ShellState;
+use super::transcript::{self, ChatEntry};
 
 /// Запустить TUI-режим (`poler-engine --tui`).
 pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
@@ -259,6 +260,133 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     Mode::Normal
                 }
             }
+            Mode::Transcript(ts) => {
+                // v0.17.4: Transcript / Response View.
+                let mut next: Option<Mode> = None;
+                if let Event::Key(k) = ev {
+                    match (k.code, k.modifiers) {
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            next = Some(Mode::Normal);
+                        }
+                        (KeyCode::Esc, _) => {
+                            if ts.viewing.is_some() {
+                                // Response View → назад к ленте
+                                ts.viewing = None;
+                                ts.view_scroll = 0;
+                                ts.status.clear();
+                            } else {
+                                next = Some(Mode::Normal);
+                            }
+                        }
+                        (KeyCode::Up, _) => {
+                            if ts.viewing.is_some() {
+                                ts.view_scroll_up();
+                            } else {
+                                ts.move_up();
+                            }
+                        }
+                        (KeyCode::Down, _) => {
+                            if ts.viewing.is_some() {
+                                ts.view_scroll_down();
+                            } else {
+                                ts.move_down();
+                            }
+                        }
+                        (KeyCode::PageUp, _) => {
+                            if ts.viewing.is_some() {
+                                ts.view_page_up();
+                            } else {
+                                for _ in 0..5 {
+                                    ts.move_up();
+                                }
+                            }
+                        }
+                        (KeyCode::PageDown, _) => {
+                            if ts.viewing.is_some() {
+                                ts.view_page_down();
+                            } else {
+                                for _ in 0..5 {
+                                    ts.move_down();
+                                }
+                            }
+                        }
+                        (KeyCode::Home, _) => {
+                            if ts.viewing.is_none() && !ts.entries.is_empty() {
+                                ts.list.select(Some(0));
+                            }
+                        }
+                        (KeyCode::End, _) => {
+                            if ts.viewing.is_none() && !ts.entries.is_empty() {
+                                ts.list.select(Some(ts.entries.len() - 1));
+                            }
+                        }
+                        (KeyCode::Enter, _) => {
+                            if ts.viewing.is_none() {
+                                ts.open_selected();
+                            }
+                        }
+                        (KeyCode::Char('y'), _) => {
+                            // Копировать ответ (текущий в Response View или
+                            // выбранный в ленте) в буфер обмена.
+                            let src = if ts.viewing.is_some() {
+                                ts.viewing_entry()
+                            } else {
+                                ts.selected()
+                            };
+                            if let Some(e) = src {
+                                match mouse::copy_to_clipboard(&e.answer) {
+                                    Ok(()) => ts.status = format!(
+                                        "✓ Скопировано {} символов ответа #{}",
+                                        e.answer.chars().count(),
+                                        e.id
+                                    ),
+                                    Err(err) => ts.status = format!("❌ clipboard: {err}"),
+                                }
+                            }
+                        }
+                        (KeyCode::Char('r'), _) => {
+                            ts.reload(&mut state);
+                        }
+                        (KeyCode::Char('d'), _) => {
+                            // Удалить выбранную пару из ленты.
+                            if ts.viewing.is_none() {
+                                if let Some(e) = ts.selected() {
+                                    let id = e.id;
+                                    match state.ensure_notes_conn() {
+                                        Ok(conn) => match transcript::delete_entry(conn, id) {
+                                            Ok(()) => {
+                                                ts.reload(&mut state);
+                                                ts.status = format!("✓ Пара #{id} удалена");
+                                            }
+                                            Err(err) => ts.status = format!("❌ {err}"),
+                                        },
+                                        Err(err) => ts.status = format!("❌ {err}"),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Event::Mouse(me) = ev {
+                    if let MouseAction::DragEnd { col, row } = mouse::parse_event(me) {
+                        if let Some(area) = layout_snapshot.transcript_area() {
+                            if mouse::hit(&area, col, row) {
+                                // Клик по строке ленты → выбор + открыть ответ.
+                                let local = row.saturating_sub(area.y + 1) as usize;
+                                if local < ts.entries.len() {
+                                    ts.list.select(Some(local));
+                                    ts.open_selected();
+                                }
+                            }
+                        }
+                    }
+                }
+                match next {
+                    Some(m) => m,
+                    None => continue,
+                }
+            }
             Mode::Normal => {
                 // Не меняем режим, переходим к обычной обработке событий
                 Mode::Normal
@@ -378,6 +506,121 @@ enum Mode {
     Normal,
     Palette,
     NoteEditor(NoteEditorState),
+    /// v0.17.4: Transcript / Response View — лента чата `nlm ask`
+    /// (F3). `viewing == None` — лента пар; `Some(i)` — полный ответ
+    /// записи `entries[i]` (Response View).
+    Transcript(TranscriptState),
+}
+
+/// Состояние окна ленты чата: пары вопрос→ответ + просмотровый режим.
+#[derive(Debug)]
+struct TranscriptState {
+    /// Пары ленты (старые сверху, новые снизу — feed-порядок).
+    entries: Vec<ChatEntry>,
+    /// Выбранная строка ленты.
+    list: ListState,
+    /// Индекс записи в Response View (None — показываем ленту).
+    viewing: Option<usize>,
+    /// Вертикальная прокрутка ответа.
+    view_scroll: u16,
+    /// Всего записей в БД (лента показывает последние TRANSCRIPT_LIMIT).
+    total: i64,
+    /// Строка статуса последней операции (копирование и т.п.).
+    status: String,
+}
+
+/// Сколько последних пар грузим в окно.
+const TRANSCRIPT_LIMIT: usize = 200;
+/// Шаг прокрутки PgUp/PgDn в Response View.
+const VIEW_PAGE: u16 = 12;
+
+impl TranscriptState {
+    fn new(state: &mut ShellState) -> Self {
+        let mut ts = TranscriptState {
+            entries: Vec::new(),
+            list: ListState::default(),
+            viewing: None,
+            view_scroll: 0,
+            total: 0,
+            status: String::new(),
+        };
+        ts.reload(state);
+        ts
+    }
+
+    /// Перечитать ленту из БД (r). Выбор — на самой свежей паре.
+    fn reload(&mut self, state: &mut ShellState) {
+        self.status.clear();
+        match state.ensure_notes_conn() {
+            Ok(conn) => match transcript::list_entries(conn, TRANSCRIPT_LIMIT) {
+                Ok(feed) => {
+                    self.total = transcript::count(conn).unwrap_or(feed.len() as i64);
+                    let n = feed.len();
+                    self.entries = feed;
+                    self.list = ListState::default();
+                    if n > 0 {
+                        self.list.select(Some(n - 1));
+                    }
+                    if self.total as usize > n {
+                        self.status = format!(
+                            "показаны последние {n} из {} пар",
+                            self.total
+                        );
+                    }
+                }
+                Err(e) => self.status = format!("❌ {e}"),
+            },
+            Err(e) => self.status = format!("❌ {e}"),
+        }
+        self.viewing = None;
+        self.view_scroll = 0;
+    }
+
+    fn move_up(&mut self) {
+        let i = self.list.selected().unwrap_or(0);
+        self.list.select(Some(i.saturating_sub(1)));
+    }
+
+    fn move_down(&mut self) {
+        let i = self.list.selected().unwrap_or(0);
+        let max = self.entries.len().saturating_sub(1);
+        self.list.select(Some((i + 1).min(max)));
+    }
+
+    /// Ответ выбранной записи (лента).
+    fn selected(&self) -> Option<&ChatEntry> {
+        self.list.selected().and_then(|i| self.entries.get(i))
+    }
+
+    /// Открыть Response View выбранной пары.
+    fn open_selected(&mut self) {
+        if self.list.selected().is_some() && !self.entries.is_empty() {
+            self.viewing = self.list.selected();
+            self.view_scroll = 0;
+            self.status.clear();
+        }
+    }
+
+    /// Ответ в просмотровом режиме.
+    fn viewing_entry(&self) -> Option<&ChatEntry> {
+        self.viewing.and_then(|i| self.entries.get(i))
+    }
+
+    fn view_scroll_up(&mut self) {
+        self.view_scroll = self.view_scroll.saturating_sub(1);
+    }
+
+    fn view_scroll_down(&mut self) {
+        self.view_scroll = self.view_scroll.saturating_add(1).min(65_535);
+    }
+
+    fn view_page_up(&mut self) {
+        self.view_scroll = self.view_scroll.saturating_sub(VIEW_PAGE);
+    }
+
+    fn view_page_down(&mut self) {
+        self.view_scroll = self.view_scroll.saturating_add(VIEW_PAGE).min(65_535);
+    }
 }
 
 #[derive(Debug)]
@@ -397,6 +640,8 @@ enum NoteEditorResult {
 /// Снапшот вычисленных прямоугольников layout для hit-testing мыши.
 #[derive(Debug, Clone, Default)]
 struct LayoutSnapshot {
+    /// v0.17.4: прямоугольник окна Transcript (оверлей F3) для кликов.
+    transcript: Option<Rect>,
     nb_area: Rect,
     chat_area: Rect,
     input_area: Rect,
@@ -407,6 +652,10 @@ struct LayoutSnapshot {
 }
 
 impl LayoutSnapshot {
+    /// Прямоугольник окна Transcript (совпадает с рендером centered_rect).
+    fn transcript_area(&self) -> Option<Rect> {
+        self.transcript
+    }
     fn palette_area(&self) -> Option<Rect> {
         self.palette_area
     }
@@ -463,6 +712,7 @@ fn compute_layout(area: Rect) -> LayoutSnapshot {
         sources_area,
         status_area: status,
         palette_area: None,
+        transcript: Some(centered_rect(88, 84, area)),
     }
 }
 
@@ -592,7 +842,7 @@ fn render_ui(
 
     // Status bar
     let status_text = format!(
-        " poler-shell {}  │  db: {:?}  │  fmt: {:?}  │  top: {}  │  focus: {}  │  F2=Chat  ?=palette  Ctrl+N=note  Ctrl+S=save AI",
+        " poler-shell {}  │  db: {:?}  │  fmt: {:?}  │  top: {}  │  focus: {}  │  F2=Chat  F3=лента чата  ?=palette  Ctrl+N=note  Ctrl+S=save AI",
         env!("CARGO_PKG_VERSION"),
         state.db_path(),
         state.format,
@@ -614,8 +864,141 @@ fn render_ui(
         Mode::NoteEditor(editor_state) => {
             render_note_editor_overlay(f, editor_state);
         }
+        Mode::Transcript(ts) => {
+            render_transcript_overlay(f, ts);
+        }
         Mode::Normal => {}
     }
+}
+
+/// v0.17.4: окно Transcript / Response View.
+///
+/// Лента (viewing == None): список пар `#id [время] NB вопрос → N симв.`
+/// в feed-порядке (новые снизу). Response View (Some): вопрос в шапке,
+/// полный ответ с прокруткой — восстановление «Історія чату | Відповідь»
+/// Ask-вкладки Web GUI (удалён в v0.17.0).
+fn render_transcript_overlay(f: &mut ratatui::Frame, ts: &TranscriptState) {
+    let area = centered_rect(88, 84, f.size());
+    f.render_widget(Clear, area);
+
+    if let Some(idx) = ts.viewing {
+        if let Some(e) = ts.entries.get(idx) {
+            // ----- Response View -----
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Відповідь #{} · {} · {} симв. ",
+                    e.id,
+                    transcript::format_ts(e.created_at),
+                    e.answer.chars().count()
+                ))
+                .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+            let inner = {
+                let b = block.inner(area);
+                f.render_widget(&block, area);
+                b
+            };
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // вопрос
+                    Constraint::Min(3),    // ответ
+                    Constraint::Length(2), // статус/подсказки
+                ])
+                .split(inner);
+            // Вопрос (шапка).
+            let nb = e.notebook_id.as_deref().unwrap_or("—").to_string();
+            let q_text = format!("❯ {}  [{}]", e.question, nb);
+            let q_block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Питання ")
+                .border_style(Style::default().fg(Color::Yellow));
+            let q_para = Paragraph::new(q_text)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Yellow));
+            f.render_widget(q_para, q_block.inner(chunks[0]));
+            f.render_widget(q_block, chunks[0]);
+            // Ответ (прокручиваемый).
+            let a_block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Відповідь (↑↓/PgUp/PgDn — прокрутка) ")
+                .border_style(Style::default().fg(Color::Green));
+            let a_para = Paragraph::new(e.answer.as_str())
+                .wrap(Wrap { trim: false })
+                .scroll((ts.view_scroll, 0));
+            f.render_widget(a_para, a_block.inner(chunks[1]));
+            f.render_widget(a_block, chunks[1]);
+            // Статус/подсказки.
+            let hint = if ts.status.is_empty() {
+                " y — копировать ответ · r — обновить · Esc — к ленте ".to_string()
+            } else {
+                format!(" {} · Esc — к ленте ", ts.status)
+            };
+            let hint_para = Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )));
+            f.render_widget(hint_para, chunks[2]);
+            return;
+        }
+    }
+
+    // ----- Лента пар -----
+    let title = if ts.entries.is_empty() {
+        " Transcript — лента чата (пусто: nlm ask <NB> \"вопрос\") ".to_string()
+    } else {
+        format!(
+            " Transcript — лента чата: {} пар ({} всего) · F3 ",
+            ts.entries.len(),
+            ts.total
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let inner = {
+        let b = block.inner(area);
+        f.render_widget(&block, area);
+        b
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .split(inner);
+    if ts.entries.is_empty() {
+        let empty = Paragraph::new(
+            "Лента пуста. Выполните nlm ask — каждая пара вопрос→ответ
+             автоматически попадает сюда и переживает перезапуски.",
+        )
+        .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(empty, chunks[0]);
+    } else {
+        let items: Vec<ListItem> = ts
+            .entries
+            .iter()
+            .map(|e| ListItem::new(transcript::feed_line(e)))
+            .collect();
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list, chunks[0], &mut ts.list.clone());
+    }
+    let hint = if ts.status.is_empty() {
+        " ↑↓ — навигация · Enter — ответ · y — копировать · d — удалить · r — обновить · Esc — закрыть ".to_string()
+    } else {
+        format!(" {} ", ts.status)
+    };
+    let hint_para = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(hint_para, chunks[1]);
 }
 
 fn render_palette_overlay(f: &mut ratatui::Frame, palette_state: &ListState) {
@@ -717,6 +1100,10 @@ fn handle_key_event(
     selection: &mut SelectionRect,
 ) {
     match (k.code, k.modifiers) {
+        (KeyCode::F(3), _) => {
+            // v0.17.4: Transcript — лента чата nlm ask (окно-оверлей).
+            *mode = Mode::Transcript(TranscriptState::new(state));
+        }
         (KeyCode::Esc, _) => {
             if selection.active {
                 selection.clear();
@@ -1463,5 +1850,110 @@ mod tests {
         let ls = LayoutSnapshot::default();
         assert_eq!(ls.nb_area, Rect::default());
         assert_eq!(ls.palette_area, None);
+    }
+
+    #[test]
+    fn transcript_state_navigation() {
+        let mut ts = TranscriptState {
+            entries: vec![
+                ChatEntry { id: 1, notebook_id: None, question: "q1".into(), answer: "a1".into(), created_at: 100 },
+                ChatEntry { id: 2, notebook_id: Some("nb".into()), question: "q2".into(), answer: "ответ 2".into(), created_at: 200 },
+            ],
+            list: ListState::default(),
+            viewing: None,
+            view_scroll: 0,
+            total: 2,
+            status: String::new(),
+        };
+        ts.list.select(Some(1)); // самая свежая
+        assert_eq!(ts.selected().unwrap().id, 2);
+        ts.move_up();
+        assert_eq!(ts.selected().unwrap().id, 1);
+        ts.move_up();
+        assert_eq!(ts.selected().unwrap().id, 1, "не выше первой");
+        ts.move_down();
+        ts.move_down();
+        assert_eq!(ts.selected().unwrap().id, 2, "не ниже последней");
+        // Response View
+        ts.open_selected();
+        assert_eq!(ts.viewing, Some(1));
+        assert_eq!(ts.viewing_entry().unwrap().question, "q2");
+        ts.view_scroll_down();
+        assert_eq!(ts.view_scroll, 1);
+        ts.view_page_up();
+        assert_eq!(ts.view_scroll, 0, "скролл не уходит в минус");
+    }
+
+    #[test]
+    fn transcript_overlay_renders_feed_and_response() {
+        use ratatui::backend::TestBackend;
+        let entries = vec![
+            ChatEntry {
+                id: 7,
+                notebook_id: Some("nb-12345678".into()),
+                question: "Как добавить квитки?".into(),
+                answer: "Короткий ответ на вопрос.".into(),
+                created_at: 1_787_920_496,
+            },
+        ];
+        // Лента
+        let mut ts = TranscriptState {
+            entries: entries.clone(),
+            list: ListState::default(),
+            viewing: None,
+            view_scroll: 0,
+            total: 1,
+            status: String::new(),
+        };
+        ts.list.select(Some(0));
+        let backend = TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            render_transcript_overlay(f, &ts);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.area() as usize)
+            .map(|i| buf.content()[i].symbol().to_string())
+            .collect();
+        assert!(text.contains("Transcript"), "заголовок ленты: {text}");
+        assert!(text.contains("Как добавить"), "строка пары: {text}");
+        // Response View
+        ts.viewing = Some(0);
+        term.draw(|f| {
+            render_transcript_overlay(f, &ts);
+        })
+        .unwrap();
+        let buf2 = term.backend().buffer().clone();
+        let text2: String = (0..buf2.area.area() as usize)
+            .map(|i| buf2.content()[i].symbol().to_string())
+            .collect();
+        assert!(text2.contains("Відповідь #7"), "шапка ответа: {text2}");
+        assert!(text2.contains("Питання"), "шапка вопроса: {text2}");
+        assert!(text2.contains("Короткий ответ"), "тело ответа: {text2}");
+    }
+
+    #[test]
+    fn transcript_overlay_empty_feed() {
+        use ratatui::backend::TestBackend;
+        let ts = TranscriptState {
+            entries: Vec::new(),
+            list: ListState::default(),
+            viewing: None,
+            view_scroll: 0,
+            total: 0,
+            status: String::new(),
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            render_transcript_overlay(f, &ts);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.area() as usize)
+            .map(|i| buf.content()[i].symbol().to_string())
+            .collect();
+        assert!(text.contains("пусто"), "пустая лента: {text}");
     }
 }

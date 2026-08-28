@@ -36,6 +36,7 @@ pub mod completer;
 pub mod help;
 pub mod mouse;
 pub mod state;
+pub mod transcript;
 pub mod tui;
 
 pub use commands::{dispatch, run_shell, tokenize, CmdResult};

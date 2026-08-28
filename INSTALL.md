@@ -1,6 +1,11 @@
-# poler-engine v0.17.3 — Companion Bridge M2+M3+M4 + future-streaming-archives
+# poler-engine v0.17.4 — Transcript / Response View (лента чата в TUI)
 
 ## Что нового
+
+### v0.17.4 (Transcript / Response View)
+- F3 в TUI — лента чата nlm ask (пары вопрос→ответ, персистентны в
+  poler_chat); Enter — полный ответ, y — копировать, d — удалить, r —
+  обновить; клик мышью открывает ответ.
 
 ### v0.17.3 (Companion Bridge M2+M3+M4)
 
@@ -35,14 +40,14 @@
 
 ```bash
 # Распаковать
-tar -xzf poler-engine-v0.17.3-linux-x86_64.tar.gz
+tar -xzf poler-engine-v0.17.4-linux-x86_64.tar.gz
 
 # Установить в ~/.local/bin
 install -m 0755 poler-engine ~/.local/bin/
 
 # Проверить
 poler-engine --version
-# poler-engine 0.17.3
+# poler-engine 0.17.4
 ```
 
 ## Companion Bridge: первый запуск
