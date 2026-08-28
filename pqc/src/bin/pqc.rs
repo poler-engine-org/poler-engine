@@ -79,6 +79,11 @@ TRAIN OPTIONS (RQ8: плотный LENS-граф, накопительная п�
     --max-bytes <N>           потолок корпуса в байтах (default 256 МиБ)
     --log <F>                 файл телеметрии обучения
     --every <N>               прогресс в stdout каждые N файлов (default 25)
+    --resume <F>              RQ9: поднять память из .pqw и продолжить обучение
+    --curriculum [SCHEDULE]   RQ9: фазовая сборка — уровни с растущим чанком;
+                              default 10:1:512:8K,128:2:1024:32K,
+                              1024:4:4096:256K + LENS-уровень из --block/--steps
+                              формат уровня BLOCK[:STEPS[:SHOTS[:BUDGET]]]]
 
 OPTIONS (run/demo):
     --shots <N>               Born-выстрелов (default 1024)
@@ -1476,6 +1481,37 @@ struct TrainConfig {
     log: Option<String>,
     json: bool,
     every: usize,
+    /// RQ9: поднять накопленную память из .pqw-чекпоинта перед обучением.
+    resume: Option<String>,
+    /// RQ9: фазовая сборка — расписание уровней с растущим чанком.
+    curriculum: Option<Vec<TrainStage>>,
+}
+
+/// Один уровень фазовой сборки (RQ9): размер чанка, шаги Born-петли,
+/// выстрелы на измерение и бюджет уровня в байтах (0 = без потолка).
+#[derive(Clone)]
+struct TrainStage {
+    block: usize,
+    steps: usize,
+    shots: u64,
+    budget: u64,
+}
+
+/// Статистика пройденного уровня curriculum.
+struct StageStats {
+    level: usize,
+    name: &'static str,
+    block: usize,
+    steps: usize,
+    shots: u64,
+    budget: u64,
+    blocks: u64,
+    tokens: u64,
+    nnz_before: u64,
+    nnz_after: u64,
+    support_before: usize,
+    support_after: usize,
+    elapsed: f64,
 }
 
 impl Default for TrainConfig {
@@ -1500,8 +1536,111 @@ impl Default for TrainConfig {
             log: None,
             json: false,
             every: 25,
+            resume: None,
+            curriculum: None,
         }
     }
+}
+
+/// Расписание фазовой сборки по умолчанию: три уровня разогрева памяти
+/// (микрочанки → морфемы → синтаксис) + финальный LENS-уровень из
+/// --block/--steps/--shots. Бюджеты уровней — префиксы корпуса.
+///
+/// Калибровка (физика стоимости): Born-шаг стоит O(shots × support), а
+/// микро-чанки рождают дуги почти на каждый токен — support взлетает к
+/// ~90% d_pol за первые же сотни блоков. Поэтому бюджеты разогрева —
+/// выборки алфавита (он повторяется!), а не весь корпус: алфавит и
+/// морфемы выучиваются на малой доле данных, полную LENS-топологию
+/// строит финальный уровень на всём объёме.
+fn default_curriculum(cfg: &TrainConfig) -> Vec<TrainStage> {
+    vec![
+        TrainStage {
+            block: 10,
+            steps: 1,
+            shots: 512,
+            budget: 8 << 10,
+        },
+        TrainStage {
+            block: 128,
+            steps: 2,
+            shots: 1024,
+            budget: 32 << 10,
+        },
+        TrainStage {
+            block: 1024,
+            steps: 4,
+            shots: 4096,
+            budget: 256 << 10,
+        },
+        TrainStage {
+            block: cfg.block,
+            steps: cfg.steps,
+            shots: cfg.shots,
+            budget: 0,
+        },
+    ]
+}
+
+/// Имя уровня для баннера (физика фазовой сборки).
+fn stage_name(level: usize, total: usize) -> &'static str {
+    match (level, total) {
+        (1, 4) => "РЕГИСТРЫ: буквы, опкоды, шум тактов",
+        (2, 4) => "МОРФЕМЫ: стыковка корней и типов",
+        (3, 4) => "СИНТАКСИС: правила блоков и скобок",
+        (4, 4) => "LENS-ТОПОЛОГИЯ: граф связей реальности",
+        _ => "УРОВЕНЬ",
+    }
+}
+
+/// Парсер расписания `B1[:S1[:H1[:Z1]]],B2:...` (block:steps:shots:budget).
+fn parse_curriculum(spec: &str) -> Result<Vec<TrainStage>, String> {
+    let mut stages = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("пустой уровень в --curriculum".to_string());
+        }
+        let fields: Vec<&str> = part.split(':').collect();
+        if fields.len() > 4 {
+            return Err(format!(
+                "уровень '{part}': максимум 4 поля block:steps:shots:budget"
+            ));
+        }
+        let block: usize = fields[0]
+            .parse()
+            .map_err(|_| format!("уровень '{part}': block не число"))?;
+        if block == 0 {
+            return Err(format!("уровень '{part}': block должен быть > 0"));
+        }
+        let steps: usize = match fields.get(1) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| format!("уровень '{part}': steps не число"))?,
+            None => 1,
+        };
+        let shots: u64 = match fields.get(2) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| format!("уровень '{part}': shots не число"))?,
+            None => 2_000,
+        };
+        let budget: u64 = match fields.get(3) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| format!("уровень '{part}': budget не число"))?,
+            None => 0,
+        };
+        stages.push(TrainStage {
+            block,
+            steps,
+            shots,
+            budget,
+        });
+    }
+    if stages.is_empty() {
+        return Err("--curriculum: пустое расписание".to_string());
+    }
+    Ok(stages)
 }
 
 /// Счётчики цикла обучения.
@@ -1679,6 +1818,26 @@ fn cmd_train(args: &[String]) -> i32 {
                 Err(e) => return train_usage_err(&e),
             },
             "--json" => cfg.json = true,
+            "--resume" => match val("--resume") {
+                Ok(v) => cfg.resume = Some(v),
+                Err(e) => return train_usage_err(&e),
+            },
+            "--curriculum" => {
+                // Значение опционально: следующий аргумент без "--" — расписание,
+                // иначе расписание по умолчанию (пустой вектор — маркер,
+                // разворачивается после парсинга, когда известны --block/--steps).
+                let next = args.get(i + 1).map(|s| s.as_str());
+                match next {
+                    Some(s) if !s.starts_with("--") => {
+                        i += 1;
+                        match parse_curriculum(s) {
+                            Ok(st) => cfg.curriculum = Some(st),
+                            Err(e) => return train_usage_err(&e),
+                        }
+                    }
+                    _ => cfg.curriculum = Some(Vec::new()),
+                }
+            }
             other => return train_usage_err(&format!("unknown option {other}")),
         }
         i += 1;
@@ -1696,6 +1855,23 @@ fn cmd_train(args: &[String]) -> i32 {
     if cfg.block == 0 {
         return train_usage_err("--block должен быть > 0");
     }
+
+    // Расписание фазовой сборки: маркер по умолчанию разворачивается здесь,
+    // когда --block/--steps/--shots уже известны. Без --curriculum —
+    // одиночный проход классическими параметрами.
+    if let Some(stages) = &cfg.curriculum {
+        if stages.is_empty() {
+            cfg.curriculum = Some(default_curriculum(&cfg));
+        }
+    }
+    let stages: Vec<TrainStage> = cfg.curriculum.clone().unwrap_or_else(|| {
+        vec![TrainStage {
+            block: cfg.block,
+            steps: cfg.steps,
+            shots: cfg.shots,
+            budget: 0,
+        }]
+    });
 
     // Корпус: каталог (рекурсивно) или stdin.
     let mut log_file = cfg.log.as_ref().and_then(|p| {
@@ -1742,6 +1918,40 @@ fn cmd_train(args: &[String]) -> i32 {
         }
     };
 
+    // RQ9: resume — поднять накопленную память из .pqw-чекпоинта.
+    let mut resumed_nnz: Option<usize> = None;
+    if let Some(path) = &cfg.resume {
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("pqc train: --resume: ошибка чтения {path}: {e}");
+                return 1;
+            }
+        };
+        let reader = match pqw::PqwReader::from_bytes(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("pqc train: --resume: ошибка парсинга {path}: {e}");
+                return 1;
+            }
+        };
+        if reader.d_pol() != cfg.dim {
+            eprintln!(
+                "pqc train: --resume: d_pol контейнера {} ≠ --dim {}",
+                reader.d_pol(),
+                cfg.dim
+            );
+            return 1;
+        }
+        match engine.resume_from_reader(&reader) {
+            Ok(n) => resumed_nnz = Some(n),
+            Err(e) => {
+                eprintln!("pqc train: --resume: {e}");
+                return 1;
+            }
+        }
+    }
+
     if !cfg.json {
         let src = if let Some(root) = &cfg.corpus {
             format!(
@@ -1752,12 +1962,26 @@ fn cmd_train(args: &[String]) -> i32 {
         } else {
             "stdin".to_string()
         };
-        println!("POLER Quantum Core — Dense LENS Trainer (RQ8)");
+        println!("POLER Quantum Core — Dense LENS Trainer (RQ8/RQ9)");
         println!("corpus    : {src}");
-        println!(
-            "engine    : d_pol={}, eps={}, block={} B, shots={}, steps={}, seed={}",
-            cfg.dim, cfg.epsilon, cfg.block, cfg.shots, cfg.steps, cfg.seed
-        );
+        if stages.len() > 1 {
+            println!(
+                "curriculum: {} уровней фазовой сборки — чанк растёт, память одна",
+                stages.len()
+            );
+        } else {
+            println!(
+                "engine    : d_pol={}, eps={}, block={} B, shots={}, steps={}, seed={}",
+                cfg.dim, cfg.epsilon, cfg.block, cfg.shots, cfg.steps, cfg.seed
+            );
+        }
+        if let Some(n) = resumed_nnz {
+            println!(
+                "resumed   : {} ({} дуг поднято из чекпоинта)",
+                cfg.resume.as_deref().unwrap_or("?"),
+                n
+            );
+        }
         println!(
             "policy    : forget={:?}, snapshot every {} блоков",
             forget, cfg.snapshot_every
@@ -1776,7 +2000,7 @@ fn cmd_train(args: &[String]) -> i32 {
         snapshot: (0usize, 0u64, 0usize),
     };
 
-    // Начальный снапшот: нулевой отпечаток (квантовый фон).
+    // Начальный снапшот: нулевой (или поднятый из чекпоинта) отпечаток.
     match train_snapshot(&engine, &cfg) {
         Ok(s) => st.snapshot = s,
         Err(e) => {
@@ -1785,84 +2009,206 @@ fn cmd_train(args: &[String]) -> i32 {
         }
     }
 
-    let feed_block =
-        |data: &[u8], engine: &mut StreamEngine, st: &mut TrainStats| -> Result<(), String> {
-            let text = String::from_utf8_lossy(data);
-            let rep = engine.ingest(&text, cfg.steps).map_err(|e| e.to_string())?;
-            st.total_tokens += rep.tokens as u64;
-            st.total_blocks += 1;
-            if rep.no_hits {
-                st.no_hits += 1;
-            } else {
-                st.last_loss = rep.param_loss;
-                st.last_qcm_gap = rep.qcm.qcm_gap();
-            }
-            st.blocks_since_snapshot += 1;
-            if st.blocks_since_snapshot >= cfg.snapshot_every {
-                st.snapshot = train_snapshot(engine, &cfg)?;
-                st.blocks_since_snapshot = 0;
-            }
-            Ok(())
-        };
-
-    if cfg.stdin {
+    // stdin читается ОДИН раз до цикла уровней: уровни берут префиксы буфера.
+    let stdin_buf: Vec<u8> = if cfg.stdin {
         use std::io::Read;
         let mut buf = Vec::new();
         if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
             eprintln!("pqc train: stdin: {e}");
             return 1;
         }
-        for chunk in buf.chunks(cfg.block) {
-            if let Err(e) = feed_block(chunk, &mut engine, &mut st) {
+        buf
+    } else {
+        Vec::new()
+    };
+
+    let feed_block = |data: &[u8],
+                      engine: &mut StreamEngine,
+                      st: &mut TrainStats,
+                      steps: usize|
+     -> Result<(), String> {
+        let text = String::from_utf8_lossy(data);
+        let rep = engine.ingest(&text, steps).map_err(|e| e.to_string())?;
+        st.total_tokens += rep.tokens as u64;
+        st.total_blocks += 1;
+        if rep.no_hits {
+            st.no_hits += 1;
+        } else {
+            st.last_loss = rep.param_loss;
+            st.last_qcm_gap = rep.qcm.qcm_gap();
+        }
+        st.blocks_since_snapshot += 1;
+        if st.blocks_since_snapshot >= cfg.snapshot_every {
+            st.snapshot = train_snapshot(engine, &cfg)?;
+            st.blocks_since_snapshot = 0;
+        }
+        Ok(())
+    };
+
+    // Статистика уровней фазовой сборки (RQ9).
+    let mut stage_stats: Vec<StageStats> = Vec::new();
+
+    for (li, stage) in stages.iter().enumerate() {
+        let level = li + 1;
+        // Пересборка ученика под бюджет выстрелов уровня (детерминизм: сид тот же).
+        engine = engine.with_shots(stage.shots);
+
+        // Снапшот на входе в уровень: отпечаток фиксирует границу перехода.
+        match train_snapshot(&engine, &cfg) {
+            Ok(s) => st.snapshot = s,
+            Err(e) => {
                 eprintln!("pqc train: {e}");
                 return 1;
             }
         }
-    } else {
-        for (fi, path) in files.iter().enumerate() {
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(_) => continue,
+        let (nnz_before, support_before) = (st.snapshot.1, st.snapshot.2);
+        let (blocks_before, tokens_before) = (st.total_blocks, st.total_tokens);
+        let t_stage = std::time::Instant::now();
+
+        if !cfg.json && stages.len() > 1 {
+            let budget = if stage.budget == 0 {
+                "весь корпус".to_string()
+            } else {
+                format!("{:.0} КиБ", stage.budget as f64 / 1024.0)
             };
-            let tokens_before = st.total_tokens;
-            let mut file_blocks: u64 = 0;
-            for chunk in data.chunks(cfg.block) {
-                if let Err(e) = feed_block(chunk, &mut engine, &mut st) {
+            println!(
+                "── УРОВЕНЬ {}/{} «{}»: чанк {} B × steps={} × shots={}, бюджет {} ──",
+                level,
+                stages.len(),
+                stage_name(level, stages.len()),
+                stage.block,
+                stage.steps,
+                stage.shots,
+                budget
+            );
+        }
+
+        if cfg.stdin {
+            let input: &[u8] = if stage.budget > 0 {
+                &stdin_buf[..stdin_buf.len().min(stage.budget as usize)]
+            } else {
+                &stdin_buf
+            };
+            for chunk in input.chunks(stage.block) {
+                if let Err(e) = feed_block(chunk, &mut engine, &mut st, stage.steps) {
                     eprintln!("pqc train: {e}");
                     return 1;
                 }
-                file_blocks += 1;
             }
-            let file_tokens = st.total_tokens - tokens_before;
-            if let Some(f) = log_file.as_mut() {
-                use std::io::Write;
-                let _ = writeln!(
-                    f,
-                    "[{}/{}] {:<40} | tokens={:<6} blocks={:<3} | loss={:.6} nnz_lens={} support={}",
-                    fi + 1,
-                    files.len(),
-                    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                    file_tokens,
-                    file_blocks,
-                    st.last_loss,
-                    st.snapshot.1,
-                    st.snapshot.2
-                );
-            }
-            if !cfg.json && (fi + 1) % cfg.every == 0 {
-                let el = t0.elapsed().as_secs_f64();
-                println!(
-                    "  [{:>4}/{}] {:<5.1}s | tokens={:<8} nnz_lens={:<5} support={:<5} loss={:.6}",
-                    fi + 1,
-                    files.len(),
-                    el,
-                    st.total_tokens,
-                    st.snapshot.1,
-                    st.snapshot.2,
-                    st.last_loss
-                );
+        } else {
+            // Префикс корпуса под бюджет уровня (0 = весь корпус).
+            // Бюджет обрезает ПОТОК БАЙТ, а не список файлов: один крупный
+            // том не должен раздувать уровень (файл может быть больше
+            // бюджета — тогда уровень видит лишь его префикс).
+            let root = cfg.corpus.as_deref().unwrap_or(".");
+            let stage_files: Vec<std::path::PathBuf> = if stage.budget > 0 {
+                let mut f = Vec::new();
+                let mut t = 0u64;
+                collect_corpus(Path::new(root), &mut f, &mut t, stage.budget);
+                f
+            } else {
+                files.clone()
+            };
+            let mut fed: u64 = 0;
+            'files: for (fi, path) in stage_files.iter().enumerate() {
+                let data = match std::fs::read(path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let take: usize = if stage.budget > 0 {
+                    let remaining = (stage.budget.saturating_sub(fed)) as usize;
+                    if remaining == 0 {
+                        break 'files;
+                    }
+                    data.len().min(remaining)
+                } else {
+                    data.len()
+                };
+                fed += take as u64;
+                let tokens_before_file = st.total_tokens;
+                let mut file_blocks: u64 = 0;
+                for chunk in data[..take].chunks(stage.block) {
+                    if let Err(e) = feed_block(chunk, &mut engine, &mut st, stage.steps) {
+                        eprintln!("pqc train: {e}");
+                        return 1;
+                    }
+                    file_blocks += 1;
+                }
+                let file_tokens = st.total_tokens - tokens_before_file;
+                if let Some(f) = log_file.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[L{}/{} {}/{}] {:<36} | tokens={:<6} blocks={:<3} | loss={:.6} nnz_lens={} support={}",
+                        level,
+                        stages.len(),
+                        fi + 1,
+                        stage_files.len(),
+                        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                        file_tokens,
+                        file_blocks,
+                        st.last_loss,
+                        st.snapshot.1,
+                        st.snapshot.2
+                    );
+                }
+                if !cfg.json && (fi + 1) % cfg.every == 0 {
+                    let el = t_stage.elapsed().as_secs_f64();
+                    println!(
+                        "  [{:>4}/{}] {:<5.1}s | tokens={:<8} nnz_lens={:<5} support={:<5} loss={:.6}",
+                        fi + 1,
+                        stage_files.len(),
+                        el,
+                        st.total_tokens,
+                        st.snapshot.1,
+                        st.snapshot.2,
+                        st.last_loss
+                    );
+                }
+                if stage.budget > 0 && fed >= stage.budget {
+                    break 'files;
+                }
             }
         }
+
+        // Снапшот на выходе уровня: отпечаток = завершённый уровень.
+        match train_snapshot(&engine, &cfg) {
+            Ok(s) => st.snapshot = s,
+            Err(e) => {
+                eprintln!("pqc train: {e}");
+                return 1;
+            }
+        }
+        st.blocks_since_snapshot = 0;
+        let stats = StageStats {
+            level,
+            name: stage_name(level, stages.len()),
+            block: stage.block,
+            steps: stage.steps,
+            shots: stage.shots,
+            budget: stage.budget,
+            blocks: st.total_blocks - blocks_before,
+            tokens: st.total_tokens - tokens_before,
+            nnz_before,
+            nnz_after: st.snapshot.1,
+            support_before,
+            support_after: st.snapshot.2,
+            elapsed: t_stage.elapsed().as_secs_f64(),
+        };
+        if !cfg.json && stages.len() > 1 {
+            println!(
+                "  L{}: blocks={} tokens={} nnz {}→{} support {}→{} ({:.1}s)",
+                stats.level,
+                stats.blocks,
+                stats.tokens,
+                stats.nnz_before,
+                stats.nnz_after,
+                stats.support_before,
+                stats.support_after,
+                stats.elapsed
+            );
+        }
+        stage_stats.push(stats);
     }
 
     // Финальный снапшот (гарантированно свежий).
@@ -1893,7 +2239,7 @@ fn cmd_train(args: &[String]) -> i32 {
 
     if cfg.json {
         use pqc::json::Json;
-        let j = Json::Obj(vec![
+        let mut pairs: Vec<(String, Json)> = vec![
             ("command".into(), Json::str("train")),
             ("d_pol".into(), Json::num(cfg.dim as f64)),
             ("epsilon".into(), Json::num(cfg.epsilon as f64)),
@@ -1921,10 +2267,60 @@ fn cmd_train(args: &[String]) -> i32 {
                 "elapsed_sec".into(),
                 Json::num((elapsed * 100.0).round() / 100.0),
             ),
-        ]);
+        ];
+        if let Some(p) = &cfg.resume {
+            pairs.push(("resume_path".into(), Json::str(p.clone())));
+            if let Some(n) = resumed_nnz {
+                pairs.push(("resume_nnz".into(), Json::num(n as f64)));
+            }
+        }
+        if stages.len() > 1 {
+            let arr: Vec<Json> = stage_stats
+                .iter()
+                .map(|s| {
+                    Json::Obj(vec![
+                        ("level".into(), Json::num(s.level as f64)),
+                        ("name".into(), Json::str(s.name)),
+                        ("block".into(), Json::num(s.block as f64)),
+                        ("steps".into(), Json::num(s.steps as f64)),
+                        ("shots".into(), Json::num(s.shots as f64)),
+                        ("budget_bytes".into(), Json::num(s.budget as f64)),
+                        ("blocks".into(), Json::num(s.blocks as f64)),
+                        ("tokens".into(), Json::num(s.tokens as f64)),
+                        ("nnz_before".into(), Json::num(s.nnz_before as f64)),
+                        ("nnz_after".into(), Json::num(s.nnz_after as f64)),
+                        ("support_before".into(), Json::num(s.support_before as f64)),
+                        ("support_after".into(), Json::num(s.support_after as f64)),
+                        (
+                            "elapsed_sec".into(),
+                            Json::num((s.elapsed * 100.0).round() / 100.0),
+                        ),
+                    ])
+                })
+                .collect();
+            pairs.push(("curriculum".into(), Json::Arr(arr)));
+        }
+        let j = Json::Obj(pairs);
         println!("{}", j.to_string());
     } else {
         println!("------------------------------------------------------------");
+        if stages.len() > 1 {
+            println!("фазовая сборка (память одна, чанк растёт):");
+            for s in &stage_stats {
+                println!(
+                    "  L{} {:<38} чанк {:>5} B | nnz {:>4}→{:<4} | support {:>4}→{:<4} | {:>6.1}s",
+                    s.level,
+                    format!("«{}»", s.name),
+                    s.block,
+                    s.nnz_before,
+                    s.nnz_after,
+                    s.support_before,
+                    s.support_after,
+                    s.elapsed
+                );
+            }
+            println!("------------------------------------------------------------");
+        }
         println!(
             "learned   : nnz_lens={} дуг (union support={}), плотность {:.2}% от d_pol={}",
             nnz_lens, support, density, cfg.dim

@@ -319,6 +319,35 @@ impl StreamEngine {
         &self.buf
     }
 
+    /// Resume: поднять накопленную память из `.pqw`-контейнера (RQ9).
+    ///
+    /// Контейнер хранит trit-проекцию памяти — union support + знаки дуг.
+    /// Анзац восстанавливается из деквантованных дуг (±1 — «затвердевшее
+    /// мнение»), плотная память `model` — их проекцией; непрерывные
+    /// амплитуды заново уточняются измерениями новых чанков
+    /// («мнение рождается измерением»). Возвращает число поднятых дуг.
+    ///
+    /// Размерность контейнера обязана совпадать с `d_pol` движка.
+    pub fn resume_from_reader(&mut self, reader: &PqwReader) -> crate::Result<usize> {
+        if reader.d_pol() != self.d_pol {
+            return Err(crate::PqcError::LengthMismatch {
+                expected: self.d_pol as usize,
+                actual: reader.d_pol() as usize,
+            });
+        }
+        let arcs: Vec<(u32, f64)> = reader.decoded().collect();
+        let n = arcs.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        self.ansatz = Ansatz::Product(PhaseAnsatz::new(self.d_pol, arcs.clone())?);
+        self.model = vec![0.0_f64; self.d_pol as usize];
+        for &(i, p) in &arcs {
+            self.model[i as usize] = p;
+        }
+        Ok(n)
+    }
+
     /// Движок обучающей петли (для диагностики расписания η).
     pub fn learner(&self) -> &ActiveInference {
         &self.learner
@@ -1041,6 +1070,64 @@ mod tests {
             best.as_secs_f64() < 150.0 / 1_000_000.0,
             "QCM + коммутатор заняли {best:?} — бюджет 150 мкс превышен"
         );
+    }
+
+    #[test]
+    fn resume_from_container_preserves_support_and_grows() {
+        // Сессия 1: движок выучивает две темы; сериализуется TRIT-проекция
+        // памяти (|p| ≥ ε) — «затвердевшие мнения». Слабые дуги |p| < ε
+        // порог LENS не пропускает: ε-фильтр и есть врата памяти.
+        let mut a = StreamEngine::new(512, 0.05, 7).unwrap();
+        a.ingest(&topic_a(), 2).unwrap();
+        a.ingest(&topic_b(), 2).unwrap();
+        assert!(!a.model_arcs().is_empty());
+
+        // Полный чекпоинт накопленной памяти: сериализуем model().
+        let mut full = Vec::new();
+        {
+            let mut w = PqwWriter::new(512).unwrap();
+            let state: Vec<f32> = a.model().iter().map(|&p| p as f32).collect();
+            w.add_state(&state).unwrap();
+            w.write_packed_trits(&mut full).unwrap();
+        }
+        let reader = PqwReader::from_bytes(&full).unwrap();
+        let container_nnz = reader.nnz() as usize;
+        assert!(
+            container_nnz >= 1,
+            "контейнер обязан хранить хотя бы одну дугу |p| ≥ ε"
+        );
+
+        // Сессия 2: resume → поднят ВЕСЬ nnz контейнера, знаки восстановлены.
+        let mut b = StreamEngine::new(512, 0.05, 7).unwrap();
+        let lifted = b.resume_from_reader(&reader).unwrap();
+        assert_eq!(lifted, container_nnz, "поднят весь nnz контейнера");
+        assert_eq!(b.model_arcs().len(), container_nnz);
+        let sign_sum: f64 = b.model().iter().map(|p| p.abs()).sum();
+        assert!(
+            (sign_sum - container_nnz as f64).abs() < 1e-9,
+            "знаки дуг = ±1 на всём поднятом support"
+        );
+
+        // Дальнейшее обучение растит граф, не теряя поднятого.
+        b.ingest(&topic_a(), 2).unwrap();
+        assert!(b.model_arcs().len() >= container_nnz);
+        assert!(b.docs_seen() >= 1, "resume не отменяет счётчик документов");
+    }
+
+    #[test]
+    fn resume_rejects_dimension_mismatch() {
+        let mut a = StreamEngine::new(256, 0.05, 1).unwrap();
+        a.ingest(&topic_a(), 0).unwrap();
+        let mut full = Vec::new();
+        {
+            let mut w = PqwWriter::new(256).unwrap();
+            let state: Vec<f32> = a.model().iter().map(|&p| p as f32).collect();
+            w.add_state(&state).unwrap();
+            w.write_packed_trits(&mut full).unwrap();
+        }
+        let reader = PqwReader::from_bytes(&full).unwrap();
+        let mut other = StreamEngine::new(512, 0.05, 1).unwrap();
+        assert!(other.resume_from_reader(&reader).is_err());
     }
 }
 

@@ -142,3 +142,230 @@ fn train_rejects_bad_args() {
         assert_eq!(st.status.code(), Some(code), "args: {args:?}");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RQ9: фазовая сборка (curriculum) + resume
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn train_resume_carries_memory_between_sessions() {
+    let dir = tmp_dir("resume");
+    write_corpus(&dir);
+    let out1 = dir.join("session1.pqw");
+    let out2 = dir.join("session2.pqw");
+
+    // Сессия 1: первый проход.
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "256",
+            "--steps",
+            "1",
+            "--shots",
+            "200",
+            "--out",
+            out1.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let text1 = String::from_utf8_lossy(&st.stdout).to_string();
+    let nnz1: f64 = {
+        // простейший парсер: "nnz_lens":N до запятой
+        let i = text1.find("\"nnz_lens\":").unwrap() + "\"nnz_lens\":".len();
+        let rest = &text1[i..];
+        rest.split(',').next().unwrap().parse().unwrap()
+    };
+    assert!(nnz1 >= 4.0, "сессия 1 должна накопить дуги, nnz={nnz1}");
+
+    // Сессия 2: resume + ДРУГОЙ корпус (следующая порция интернета).
+    let dir2 = tmp_dir("resume2");
+    fs::write(
+        dir2.join("c.rs"),
+        "impl fock resonance topological kernel coherence projector operator spectrum\n".repeat(40),
+    )
+    .unwrap();
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir2.to_str().unwrap(),
+            "--resume",
+            out1.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "256",
+            "--steps",
+            "1",
+            "--shots",
+            "200",
+            "--out",
+            out2.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let text2 = String::from_utf8_lossy(&st.stdout).to_string();
+    assert!(text2.contains("\"resume_path\""), "{text2}");
+    assert!(text2.contains("\"resume_nnz\""), "{text2}");
+    let nnz2: f64 = {
+        let i = text2.find("\"nnz_lens\":").unwrap() + "\"nnz_lens\":".len();
+        let rest = &text2[i..];
+        rest.split(',').next().unwrap().parse().unwrap()
+    };
+    assert!(
+        nnz2 >= nnz1,
+        "resume обязан сохранить память: nnz {nnz1} → {nnz2}"
+    );
+}
+
+#[test]
+fn train_resume_rejects_dimension_mismatch() {
+    let dir = tmp_dir("resume_dim");
+    write_corpus(&dir);
+    let out = dir.join("state.pqw");
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "256",
+            "--steps",
+            "1",
+            "--shots",
+            "200",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+
+    // Resume с другой размерностью — отказ с кодом 1.
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--resume",
+            out.to_str().unwrap(),
+            "--dim",
+            "1024",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "256",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(st.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&st.stderr).to_string();
+    assert!(err.contains("d_pol"), "{err}");
+}
+
+#[test]
+fn train_curriculum_grows_chunk_and_memory() {
+    let dir = tmp_dir("curriculum");
+    write_corpus(&dir);
+    let fp = dir.join("fingerprint.bin");
+
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--curriculum",
+            "16:1:200,64:1:200,256:2:200",
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--shots",
+            "200",
+            "--fingerprint",
+            fp.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let text = String::from_utf8_lossy(&st.stdout).to_string();
+    assert!(text.contains("\"curriculum\":"), "{text}");
+    // Три уровня в JSON-массиве.
+    let starts = text.matches("\"level\":").count();
+    assert!(starts >= 3, "ожидались 3 уровня, найдено {starts}: {text}");
+    assert!(text.contains("\"nnz_after\":"), "{text}");
+    // Итоговый nnz > 0: память не пуста.
+    let nnz: f64 = {
+        let i = text.find("\"nnz_lens\":").unwrap() + "\"nnz_lens\":".len();
+        let rest = &text[i..];
+        rest.split(',').next().unwrap().parse().unwrap()
+    };
+    assert!(nnz >= 4.0, "curriculum должен собрать дуги, nnz={nnz}");
+    // Отпечаток — raw Packed4: 512/4 = 128 байт.
+    assert_eq!(fs::metadata(&fp).unwrap().len(), 128);
+}
+
+#[test]
+fn train_curriculum_default_schedule() {
+    let dir = tmp_dir("curriculum_default");
+    write_corpus(&dir);
+    // Без значения — расписание по умолчанию (4 уровня).
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--curriculum",
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--shots",
+            "200",
+            "--steps",
+            "2",
+            "--block",
+            "512",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let text = String::from_utf8_lossy(&st.stdout).to_string();
+    assert!(text.contains("УРОВЕНЬ 1/4"), "{text}");
+    assert!(text.contains("УРОВЕНЬ 4/4"), "{text}");
+    assert!(text.contains("РЕГИСТРЫ"), "{text}");
+    assert!(text.contains("LENS-ТОПОЛОГИЯ"), "{text}");
+}
+
+#[test]
+fn train_curriculum_rejects_bad_schedule() {
+    for sched in ["", "0:1", "abc", "16:1:200:64:extra"] {
+        let st = Command::new(bin_path())
+            .args(["train", "--stdin", "--curriculum", sched])
+            .output()
+            .unwrap();
+        assert_eq!(
+            st.status.code(),
+            Some(2),
+            "расписание '{sched}' должно отклоняться"
+        );
+    }
+}
