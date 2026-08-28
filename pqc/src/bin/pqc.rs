@@ -33,6 +33,7 @@ USAGE:
     pqc demo [--n N] [--shots M] [--seed S]
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
+    pqc precess <file> [options]                              RQ11: петля архетипа поверх чекпоинта
     pqc inspect <file> [options]
     pqc train (--corpus DIR | --stdin) [options]              накопительное обучение
 
@@ -92,6 +93,22 @@ TRAIN OPTIONS (RQ8: плотный LENS-граф, накопительная п�
 
 INSPECT OPTIONS (дополнительно):
     --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
+                              RQ11: моды печатаются с невязками Ritz (инвариантность
+                              плоскости) и ортонормальности ≡ идемпотентности
+                              A² = A + захватом компонент
+
+PRECESS OPTIONS (RQ11: уравнение архетипа a ⊗_ε a = a, p* = a ⊗_ε p*):
+    --eta <H>                 шаг прецессии (default: eta из контейнера;
+                              веса J нормируются на max|J| — H задаёт скорость)
+    --ticks <N>               лимит тиков (default 16384)
+    --delta <D>               стоп-порог max|Δθ| за тик (default 1e-9)
+    --purify-every <K>        проекция McWeeny каждые K тиков (default 0 —
+                              чистая унитарная прецессия; K=2..4 — оседание
+                              к архетипу: фазы стягиваются в триты)
+    --out <F>                 записать итоговое состояние (контейнер v3,
+                              фазы p = cos θ, русла J сохраняются)
+    --trace                   печатать всю траекторию (тик, |Δθ|, r, torque)
+    --json                    машинно-читаемый отчёт
 
 OPTIONS (run/demo):
     --shots <N>               Born-выстрелов (default 1024)
@@ -110,6 +127,7 @@ fn main() {
         Some("demo") => cmd_demo(&args[1..]),
         Some("stream") => cmd_stream(&args[1..]),
         Some("unfurl") => cmd_unfurl(&args[1..]),
+        Some("precess") => cmd_precess(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("train") => cmd_train(&args[1..]),
         _ => {
@@ -1145,6 +1163,9 @@ fn cmd_inspect(args: &[String]) -> i32 {
                 .map(|m| {
                     Json::Obj(vec![
                         ("lambda".into(), Json::num(m.lambda)),
+                        ("ritz_residual".into(), Json::num(m.ritz_residual)),
+                        ("ortho_residual".into(), Json::num(m.ortho_residual)),
+                        ("capture".into(), Json::num(m.capture)),
                         ("u".into(), comp(&m.u)),
                         ("v".into(), comp(&m.v)),
                     ])
@@ -1223,14 +1244,19 @@ fn cmd_inspect(args: &[String]) -> i32 {
         if let Some(modes) = &gyro_modes {
             if !modes.is_empty() {
                 println!("\n  моды Im(P): плоскости вращения (u, v), λ = угловая скорость;");
-                println!("               θ = arccos(p̂) — фазовый угол дуги (вектор смысла)");
+                println!("               θ = arccos(p̂) — фазовый угол дуги (вектор смысла);");
+                println!("               Ritz — инвариантность плоскости, орто ≡ идемпотентность");
+                println!("               A² = A (уравнение архетипа), захват — доля массы в ≤12 дугах");
                 let phase: std::collections::HashMap<u32, f64> =
                     arcs.iter().map(|a| (a.index, a.p_hat)).collect();
                 for (k, m) in modes.iter().enumerate() {
                     println!(
-                        "  λ{} = {:.4}:",
+                        "  λ{} = {:.4}  [Ritz {:.1e} | орто {:.1e} | захват {:.1}%]",
                         k + 1,
-                        m.lambda
+                        m.lambda,
+                        m.ritz_residual,
+                        m.ortho_residual,
+                        100.0 * m.capture
                     );
                     for (label, vec) in [("u", &m.u), ("v", &m.v)] {
                         let shown = vec.len().min(6);
@@ -1526,6 +1552,384 @@ fn cmd_demo(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+// ============================================================================
+// pqc precess — RQ11: петля архетипа поверх чекпоинта.
+//
+// Уравнение архетипа в алгебре смыслов (O, ⊕, ⊗_ε):
+//   * a ⊗_ε a = a      — идемпотентность (McWeeny / спектральные проекторы мод);
+//   * p* = a ⊗_ε p*    — фиксация (неподвижная точка транспорта фаз).
+//
+// Петля: транспорт фаз precess_step (унитарный, O(nnz(J))) с опциональной
+// проекцией McWeeny каждые K тиков (диссипативная половина). Чистая
+// прецессия орбитирует вокруг архетипа (спектр J мнимый); с очисткой
+// фазы садятся на триты {0, ±1} при погашенных моментах — контейнер-
+// архетип с нулевым остатком идемпотентности.
+// ============================================================================
+
+struct PrecessConfig {
+    eta: Option<f64>,
+    ticks: u64,
+    delta: f64,
+    purify_every: u64,
+    out: Option<String>,
+    trace: bool,
+    json: bool,
+}
+
+impl Default for PrecessConfig {
+    fn default() -> PrecessConfig {
+        PrecessConfig {
+            eta: None,
+            ticks: 16_384,
+            delta: 1e-9,
+            purify_every: 0,
+            out: None,
+            trace: false,
+            json: false,
+        }
+    }
+}
+
+fn cmd_precess(args: &[String]) -> i32 {
+    let mut cfg = PrecessConfig::default();
+    let mut file: Option<String> = None;
+    let mut i = 0usize;
+    macro_rules! val {
+        ($name:literal) => {{
+            i += 1;
+            if i >= args.len() {
+                eprintln!("pqc precess: {} требует значение\n\n{USAGE}", $name);
+                return 2;
+            }
+            args[i].clone()
+        }};
+    }
+    while i < args.len() {
+        match args[i].as_str() {
+            "--eta" => {
+                let v = val!("--eta");
+                match v.parse::<f64>() {
+                    Ok(h) if h > 0.0 && h.is_finite() => cfg.eta = Some(h),
+                    _ => {
+                        eprintln!("pqc precess: bad --eta: {v} (> 0)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            "--ticks" => {
+                let v = val!("--ticks");
+                match v.parse::<u64>() {
+                    Ok(n) if n > 0 && n <= 100_000_000 => cfg.ticks = n,
+                    _ => {
+                        eprintln!("pqc precess: bad --ticks: {v} (1..=1e8)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            "--delta" => {
+                let v = val!("--delta");
+                match v.parse::<f64>() {
+                    Ok(d) if d > 0.0 && d.is_finite() => cfg.delta = d,
+                    _ => {
+                        eprintln!("pqc precess: bad --delta: {v} (> 0)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            "--purify-every" => {
+                let v = val!("--purify-every");
+                match v.parse::<u64>() {
+                    Ok(k) if k <= 1024 => cfg.purify_every = k,
+                    _ => {
+                        eprintln!("pqc precess: bad --purify-every: {v} (0..=1024)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
+            "--out" => cfg.out = Some(val!("--out")),
+            "--trace" => cfg.trace = true,
+            "--json" => cfg.json = true,
+            other if !other.starts_with("--") => {
+                if file.replace(other.to_string()).is_some() {
+                    eprintln!("pqc precess: file given twice\n\n{USAGE}");
+                    return 2;
+                }
+            }
+            other => {
+                eprintln!("pqc precess: неизвестный флаг {other}\n\n{USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let Some(file_path) = file else {
+        eprintln!("pqc precess: требуется путь к контейнеру .poler / .pqw (v3 с --gyro)\n\n{USAGE}");
+        return 2;
+    };
+
+    let raw = match std::fs::read(&file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pqc precess: ошибка чтения {file_path}: {e}");
+            return 1;
+        }
+    };
+    let reader = match PqwReader::from_bytes(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc precess: ошибка парсинга {file_path}: {e}");
+            return 1;
+        }
+    };
+    let Some(section) = reader.gyro() else {
+        eprintln!(
+            "pqc precess: контейнер без топологической секции (v1/v2) — \\\n\
+             петле архетипа нужен гироскоп J = A − Aᵀ; обучите с --gyro"
+        );
+        return 1;
+    };
+
+    let d_pol = reader.d_pol() as usize;
+    let hyper = reader.hyperparams();
+    let eta = cfg.eta.unwrap_or(f64::from(hyper.eta));
+
+    // Вектор фаз: θ = arccos(p̂) для хранимых дуг, фон π/2 (p = 0).
+    let mut thetas = vec![std::f64::consts::FRAC_PI_2; d_pol];
+    for (idx, p) in reader.decoded() {
+        if (idx as usize) < d_pol {
+            thetas[idx as usize] = p.clamp(-1.0, 1.0).acos();
+        }
+    }
+
+    let pairs: Vec<(u32, u32, f64)> = section
+        .pairs()
+        .iter()
+        .map(|p| (p.i, p.j, p.weight))
+        .collect();
+    // Дуги русел J (уникальные) — для сводки.
+    let mut channel_arcs: Vec<u32> = pairs.iter().flat_map(|&(i, j, _)| [i, j]).collect();
+    channel_arcs.sort_unstable();
+    channel_arcs.dedup();
+
+    if !cfg.json {
+        println!("POLER Quantum Core — Precess: петля архетипа (RQ11)");
+        println!("container : {file_path} ({} B)", raw.len());
+        println!(
+            "d_pol     : {d_pol} | фазы: {} дуг | русла J: {} пар, {} дуг | такты гироскопа: {}",
+            reader.nnz(),
+            pairs.len(),
+            channel_arcs.len(),
+            section.ticks()
+        );
+        println!(
+            "eta       : {eta:.4} ({}) | лимит: {} тиков | стоп: |Δθ| < {:.0e} | McWeeny: {}",
+            if cfg.eta.is_some() { "флаг" } else { "из контейнера" },
+            cfg.ticks,
+            cfg.delta,
+            match cfg.purify_every {
+                0 => "выключена (чистая прецессия)".to_string(),
+                k => format!("каждые {k} тиков"),
+            }
+        );
+        if cfg.purify_every == 0 {
+            println!("режим     : унитарная прецессия — орбита вокруг архетипа (спектр J мнимый);");
+            println!("            для оседания к тритам добавьте --purify-every 4");
+        }
+    }
+
+    // Петля.
+    let report = pqc::archetype::precess_to_fixpoint(
+        &pairs,
+        &mut thetas,
+        eta,
+        cfg.ticks,
+        cfg.delta,
+        cfg.purify_every,
+    );
+
+    if cfg.json {
+        let mut obj = vec![
+            ("file".into(), Json::str(&file_path)),
+            ("d_pol".into(), Json::num(d_pol as f64)),
+            ("nnz".into(), Json::num(reader.nnz() as f64)),
+            ("eta".into(), Json::num(eta)),
+            ("ticks_limit".into(), Json::num(cfg.ticks as f64)),
+            ("stop_delta".into(), Json::num(cfg.delta)),
+            ("purify_every".into(), Json::num(cfg.purify_every as f64)),
+            ("gyro_pairs".into(), Json::num(pairs.len() as f64)),
+            ("gyro_ticks".into(), Json::num(section.ticks() as f64)),
+            ("fixated".into(), Json::Bool(report.fixated)),
+            ("ticks".into(), Json::num(report.ticks as f64)),
+            ("participants".into(), Json::num(report.participants as f64)),
+            ("delta_first".into(), Json::num(report.delta_first)),
+            ("delta_last".into(), Json::num(report.delta_last)),
+            ("contraction".into(), Json::num(report.contraction)),
+            ("r_initial".into(), Json::num(report.r_initial)),
+            ("r_final".into(), Json::num(report.r_final)),
+            ("torque_initial".into(), Json::num(report.torque_initial)),
+            ("torque_final".into(), Json::num(report.torque_final)),
+            ("omega".into(), Json::num(report.omega)),
+            ("travel_max".into(), Json::num(report.travel_max)),
+            ("travel_mean".into(), Json::num(report.travel_mean)),
+            ("trits_exact".into(), Json::Bool(report.trits_exact)),
+        ];
+        let trace: Vec<Json> = report
+            .trace
+            .iter()
+            .map(|p| {
+                Json::Obj(vec![
+                    ("tick".into(), Json::num(p.tick as f64)),
+                    ("delta".into(), Json::num(p.delta)),
+                    ("r".into(), Json::num(p.r)),
+                    ("torque".into(), Json::num(p.torque)),
+                ])
+            })
+            .collect();
+        obj.push(("trace".into(), Json::Arr(trace)));
+        println!("{}", Json::Obj(obj).to_string());
+    } else {
+        println!("\nтик        max|Δθ|      r       torque");
+        let print_point = |p: &pqc::archetype::TracePoint| {
+            println!(
+                "{:>8}  {:>10.3e}  {:7.4}  {:8.2e}{}",
+                p.tick,
+                p.delta,
+                p.r,
+                p.torque,
+                if p.tick == report.ticks && report.fixated {
+                    "   ← фиксация"
+                } else {
+                    ""
+                }
+            );
+        };
+        if cfg.trace {
+            for p in &report.trace {
+                print_point(p);
+            }
+        } else {
+            let n = report.trace.len();
+            for p in &report.trace[..n.min(4)] {
+                print_point(p);
+            }
+            if n > 7 {
+                println!("       ... ({} точек, --trace — вся траектория)", n);
+                for p in &report.trace[n - 3..] {
+                    print_point(p);
+                }
+            }
+        }
+
+        println!("\nРЕЗУЛЬТАТ");
+        println!(
+            "фиксация     : {}",
+            if report.fixated {
+                format!("достигнута за {} тиков (лимит {})", report.ticks, cfg.ticks)
+            } else if report.torque_final < 1e-6 {
+                format!(
+                    "квази-фиксация: невязка p* = {:.1e}, остаточная микро-орбита |Δθ| = {:.1e} \
+                     (меньше η — например --eta 0.05 — снимает её)",
+                    report.torque_final, report.delta_last
+                )
+            } else {
+                format!("нет за {} тиков — орбита/маховик", report.ticks)
+            }
+        );
+        println!(
+            "сжатие ρ     : {:.5} за тик ({})",
+            report.contraction,
+            if report.contraction < 1.0 {
+                "Банах: отображение сжимающее"
+            } else {
+                "сжатия нет — унитарный транспорт"
+            }
+        );
+        println!(
+            "r (Курамото) : {:.4} → {:.4}",
+            report.r_initial, report.r_final
+        );
+        println!(
+            "невязка p*   : torque {:.2e} → {:.2e}   (уравнение p* = a ⊗_ε p*)",
+            report.torque_initial, report.torque_final
+        );
+        if !report.fixated && report.torque_final >= 1e-6 {
+            println!(
+                "маховик ω    : {:+.6} рад/тик (циркуляция не утихает)",
+                report.omega
+            );
+        }
+        println!(
+            "пробег дуг   : max {:.3} рад, средний {:.3} рад",
+            report.travel_max, report.travel_mean
+        );
+        println!(
+            "триты        : {}",
+            if report.trits_exact {
+                "точные (|cos θ| ∈ {0,1}) — идемпотентность a ⊗_ε a = a"
+            } else {
+                "нет (фазы вне решётки {0, π/2, π})"
+            }
+        );
+        let both = report.trits_exact && report.torque_final < 1e-6;
+        println!(
+            "архетип      : {}",
+            if both {
+                "ДОСТИГНУТ — оба уравнения выполнены"
+            } else if report.torque_final < 1e-6 {
+                "фиксация без идемпотентности (добавьте --purify-every 2..4)"
+            } else {
+                "вращение (орбита вокруг архетипа)"
+            }
+        );
+    }
+
+    // Запись итогового состояния: контейнер v3, фазы p = cos θ,
+    // русла J переносятся без изменений (веса исходного масштаба).
+    if let Some(out_path) = &cfg.out {
+        let state_f32: Vec<f32> = thetas.iter().map(|&t| t.cos() as f32).collect();
+        let gyro_pairs: Vec<(u32, u32, f64)> = section
+            .pairs()
+            .iter()
+            .map(|p| (p.i, p.j, p.weight))
+            .collect();
+        let write = (|| -> Result<usize, String> {
+            let mut w = PqwWriter::new(d_pol as u32)
+                .map_err(|e| e.to_string())?
+                .hyperparams(hyper.eta, hyper.gamma, hyper.rho, hyper.epsilon_threshold);
+            w.add_state(&state_f32).map_err(|e| e.to_string())?;
+            let data = pqw::GyroData::new(section.window(), section.ticks(), gyro_pairs, d_pol as u32)
+                .map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            w.write_v3(&mut buf, &data).map_err(|e| e.to_string())?;
+            std::fs::write(out_path, &buf).map_err(|e| e.to_string())?;
+            Ok(buf.len())
+        })();
+        match write {
+            Ok(len) => {
+                if !cfg.json {
+                    let back = PqwReader::from_bytes(&std::fs::read(out_path).unwrap_or_default())
+                        .ok()
+                        .map(|r| r.nnz());
+                    println!(
+                        "\nзаписано     : {out_path} (v3, {len} B, {} дуг, {} пар J)",
+                        back.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                        section.pairs().len()
+                    );
+                    if !report.trits_exact {
+                        println!("               (снимок орбиты — фазы не на тритовой решётке)");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("pqc precess: --out: {e}");
+                return 1;
+            }
+        }
+    }
+
+    0
 }
 
 fn cmd_unfurl(args: &[String]) -> i32 {

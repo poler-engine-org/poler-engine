@@ -124,6 +124,11 @@ fn unpack_pair(k: u64) -> (u32, u32) {
 
 /// Одна резонансная мода гироскопа: плоскость вращения `(u, v)`
 /// с угловой скоростью `λ`.
+///
+/// RQ11: мода — это **архетип** в смысле уравнения `a ⊗_ε a = a`:
+/// спектральный проектор `A_k = u_k u_kᵀ + v_k v_kᵀ` идемпотентен
+/// `A_k² = A_k` тогда и только тогда, когда `(u, v)` ортонормированы —
+/// невязка ортонормальности и есть невязка идемпотентности.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GyroMode {
     /// Угловая скорость моды: собственная пара `±iλ` оператора J.
@@ -132,6 +137,17 @@ pub struct GyroMode {
     pub u: Vec<(u32, f64)>,
     /// Второй вектор плоскости: `J·v = −λ·u`.
     pub v: Vec<(u32, f64)>,
+    /// Ritz-невязка `max(‖Ju − λv‖₂, ‖Jv + λu‖₂)/λ` — насколько
+    /// плоскость действительно инвариантна относительно `J`.
+    pub ritz_residual: f64,
+    /// Невязка ортонормальности `|u·v| + |‖u‖−1| + |‖v‖−1|` —
+    /// тождественно невязка идемпотентности `A² = A` проектора
+    /// `A = uuᵀ + vvᵀ` (уравнение архетипа).
+    pub ortho_residual: f64,
+    /// Доля массы плоскости в sparse-представлении:
+    /// `(‖u_kept‖² + ‖v_kept‖²)/2` — «захват» архетипа доминирующими
+    /// компонентами (≤ 12 на вектор).
+    pub capture: f64,
 }
 
 /// Максимальное число итераций степенной процедуры на моду.
@@ -370,7 +386,7 @@ pub fn resonant_modes_from_pairs(pairs: &[(u32, u32, f64)], k: usize) -> Vec<Gyr
         norm
     };
 
-    let mut modes: Vec<(f64, Vec<f64>, Vec<f64>)> = Vec::new();
+    let mut modes: Vec<(f64, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
     let mut found_u: Vec<Vec<f64>> = Vec::new();
     let mut found_v: Vec<Vec<f64>> = Vec::new();
 
@@ -468,17 +484,64 @@ pub fn resonant_modes_from_pairs(pairs: &[(u32, u32, f64)], k: usize) -> Vec<Gyr
             }
         }
 
+        // RQ11: невязки плоскости — численная верификация уравнения
+        // архетипа `a ⊗_ε a = a` для спектрального проектора A = uuᵀ + vvᵀ.
+        //
+        // Ritz: плоскость обязана удовлетворять Ju = +λv, Jv = −λu
+        // (инвариантность относительно J) — иначе это не плоскость вращения.
+        let mut ju = Vec::with_capacity(n);
+        matvec(&u, &mut ju);
+        let mut jv = Vec::with_capacity(n);
+        matvec(&v, &mut jv);
+        let l_safe = lambda.max(1e-12);
+        let ritz_u = ju
+            .iter()
+            .zip(v.iter())
+            .map(|(&a, &b)| {
+                let d = a - lambda * b;
+                d * d
+            })
+            .sum::<f64>()
+            .sqrt()
+            / l_safe;
+        let ritz_v = jv
+            .iter()
+            .zip(u.iter())
+            .map(|(&a, &b)| {
+                let d = a + lambda * b;
+                d * d
+            })
+            .sum::<f64>()
+            .sqrt()
+            / l_safe;
+        let ritz = ritz_u.max(ritz_v);
+        // Ортонормальность (u, v) ⟺ идемпотентность A = uuᵀ + vvᵀ:
+        // A² = A распадается на ‖u‖=1, ‖v‖=1, u·v=0.
+        let dot_uv: f64 = u.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+        let ortho = dot_uv.abs() + (l2(&u) - 1.0).abs() + (l2(&v) - 1.0).abs();
+
         found_u.push(u.clone());
         found_v.push(v.clone());
-        modes.push((lambda, u, v));
+        modes.push((lambda, u, v, ritz, ortho));
     }
 
     modes
         .into_iter()
-        .map(|(lambda, u, v)| GyroMode {
-            lambda,
-            u: sparsify(&nodes, &u),
-            v: sparsify(&nodes, &v),
+        .map(|(lambda, u, v, ritz_residual, ortho_residual)| {
+            let su = sparsify(&nodes, &u);
+            let sv = sparsify(&nodes, &v);
+            // Захват: доля массы плоскости в ≤12 компонентах на вектор.
+            let capture = (su.iter().map(|&(_, c)| c * c).sum::<f64>()
+                + sv.iter().map(|&(_, c)| c * c).sum::<f64>())
+                / 2.0;
+            GyroMode {
+                lambda,
+                u: su,
+                v: sv,
+                ritz_residual,
+                ortho_residual,
+                capture,
+            }
         })
         .collect()
 }
@@ -705,6 +768,38 @@ mod tests {
             assert!((-w * u4 - m.lambda * v9).abs() < 1e-9, "(Ju)_9 ≠ λv_9");
             assert!((u4 * v4 + u9 * v9).abs() < 1e-9, "u·v ≠ 0");
         }
+    }
+
+    #[test]
+    fn mode_residuals_on_exact_plane() {
+        // RQ11: одиночная пара — точная плоскость вращения. Ritz- и
+        // орто-невязки ~ машинной точности, идемпотентность A² = A
+        // проектора A = uuᵀ + vvᵀ выполняется точно; захват = 1.
+        for w in [5.0_f64, -5.0, 0.5] {
+            let modes = resonant_modes_from_pairs(&[(0u32, 1u32, w)], 1);
+            assert_eq!(modes.len(), 1);
+            let m = &modes[0];
+            assert!((m.lambda - w.abs()).abs() < 1e-9, "lambda {}", m.lambda);
+            assert!(m.ritz_residual < 1e-9, "ritz = {}", m.ritz_residual);
+            assert!(m.ortho_residual < 1e-12, "ortho = {}", m.ortho_residual);
+            assert!(m.capture > 0.999, "capture = {}", m.capture);
+        }
+    }
+
+    #[test]
+    fn mode_residuals_triangle_circulation() {
+        // RQ11: циркуляция 0→1→2→0. Спектр J: {0, ±i√3·w} — одна
+        // плоскость вращения с λ = √3. Нулевая ось модой не является
+        // (после дефляции λ² → 0, процедура останавливается).
+        let pairs = vec![(0u32, 1u32, 1.0), (1u32, 2u32, 1.0), (0u32, 2u32, -1.0)];
+        let modes = resonant_modes_from_pairs(&pairs, 2);
+        assert_eq!(modes.len(), 1);
+        let m = &modes[0];
+        assert!((m.lambda - 3.0_f64.sqrt()).abs() < 1e-9, "lambda {}", m.lambda);
+        assert!(m.ritz_residual < 1e-9, "ritz = {}", m.ritz_residual);
+        assert!(m.ortho_residual < 1e-12, "ortho = {}", m.ortho_residual);
+        // Все три дуги в моде равного веса — захват полный.
+        assert!(m.capture > 0.999, "capture = {}", m.capture);
     }
 
     #[test]

@@ -85,6 +85,7 @@
 //! ```
 
 pub mod ansatz;
+pub mod archetype;
 pub mod born;
 pub mod coherence;
 pub mod complex;
@@ -105,6 +106,7 @@ pub mod stream_engine;
 pub use ansatz::{
     Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,
 };
+pub use archetype::{precess_to_fixpoint, PrecessReport, TracePoint};
 pub use born::BornSampler;
 pub use coherence::{binary_entropy, coherence, CoherenceReport};
 pub use complex::Cx;
