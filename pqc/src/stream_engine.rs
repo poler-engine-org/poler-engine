@@ -256,9 +256,16 @@ impl StreamEngine {
 
     /// Выстрелов на измерение в петле обучения (builder).
     pub fn with_shots(mut self, shots: u64) -> StreamEngine {
+        self.set_shots(shots);
+        self
+    }
+
+    /// Выстрелов на измерение — мутабельная версия [`StreamEngine::with_shots`]
+    /// для уровней curriculum: пересобирает ученика (сид фиксирован —
+    /// детерминизм уровня не зависит от бюджета выстрелов).
+    pub fn set_shots(&mut self, shots: u64) {
         self.shots = shots;
         self.learner = self.build_learner();
-        self
     }
 
     /// Гиперпараметры петли: `η₀`, `β`, `γ` (builder).
@@ -578,33 +585,15 @@ impl StreamEngine {
 
     /// TF-IDF ε-плотность чанка: знаковый tf по координатам хеш-пространства,
     /// idf по частоте документов, L∞-нормализация.
+    ///
+    /// Тонкая обёртка над разреженным ядром [`tfidf_arcs`] (общим с
+    /// квантованным curriculum RQ15): дуги материализуются в плотный вектор.
     fn encode_chunk(&self, text: &str) -> (Vec<f64>, usize) {
         let d = self.d_pol as usize;
-        let mut tf = vec![0i64; d];
-        let mut tokens = 0usize;
-        for token in tokenize(text) {
-            tokens += 1;
-            let h = fnv1a64(token.as_bytes());
-            let idx = (h % self.d_pol as u64) as usize;
-            let sign: i64 = if (h >> 63) & 1 == 1 { 1 } else { -1 };
-            tf[idx] += sign;
-        }
-        let n = self.docs as f64 + 1.0;
+        let (arcs, tokens) = tfidf_arcs(self.d_pol, self.docs, |i| self.doc_freq[i as usize], text);
         let mut state = vec![0.0_f64; d];
-        let mut max = 0.0_f64;
-        for i in 0..d {
-            if tf[i] == 0 {
-                continue;
-            }
-            let idf = ((1.0 + n) / (1.0 + self.doc_freq[i] as f64)).ln();
-            let s = tf[i] as f64 * idf;
-            state[i] = s;
-            max = max.max(s.abs());
-        }
-        if max > 0.0 {
-            for s in &mut state {
-                *s /= max;
-            }
+        for (i, s) in arcs {
+            state[i as usize] = s;
         }
         (state, tokens)
     }
@@ -649,6 +638,50 @@ impl StreamEngine {
             }
         }
     }
+}
+
+/// Разреженное TF-IDF-ядро чанка (общее для RQ8 и RQ15).
+///
+/// Знаковый tf по координатам хеш-пространства (`fnv1a64 mod d_pol`,
+/// полярность — старший бит хеша), idf по частоте документов
+/// `ln((1+n)/(1+df))`, L∞-нормализация на максимум. Возвращает дуги
+/// `(индекс, значение)` ДО ε-ворот, отсортированные по индексу, и число
+/// токенов. Плотный движок материализует дуги в вектор, квантованный
+/// curriculum потребляет их напрямую — свидетельство у обоих ОДНО.
+///
+/// Порядок `HashMap`-итераций не влияет на результат: значения
+/// координато-независимы, сортировка канонизирует порядок.
+pub(crate) fn tfidf_arcs<F: Fn(u32) -> u32>(
+    d_pol: u32,
+    docs: u64,
+    df_of: F,
+    text: &str,
+) -> (Vec<(u32, f64)>, usize) {
+    let mut tf: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+    let mut tokens = 0usize;
+    for token in tokenize(text) {
+        tokens += 1;
+        let h = fnv1a64(token.as_bytes());
+        let idx = (h % d_pol as u64) as u32;
+        let sign: i64 = if (h >> 63) & 1 == 1 { 1 } else { -1 };
+        *tf.entry(idx).or_insert(0) += sign;
+    }
+    let n = docs as f64 + 1.0;
+    let mut arcs: Vec<(u32, f64)> = Vec::with_capacity(tf.len());
+    let mut max = 0.0_f64;
+    for (&i, &t) in tf.iter() {
+        let idf = ((1.0 + n) / (1.0 + df_of(i) as f64)).ln();
+        let s = t as f64 * idf;
+        max = max.max(s.abs());
+        arcs.push((i, s));
+    }
+    if max > 0.0 {
+        for (_, s) in arcs.iter_mut() {
+            *s /= max;
+        }
+    }
+    arcs.sort_unstable_by_key(|a| a.0);
+    (arcs, tokens)
 }
 
 /// Срезание HTML-разметки: теги, `<script>`, `<style>`, комментарии и

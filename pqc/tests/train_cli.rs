@@ -579,3 +579,231 @@ fn train_without_gyro_stays_v2() {
     let raw = fs::read(&out).unwrap();
     assert_eq!(&raw[..8], b"POLER_Q2");
 }
+
+// ============================================================================
+// RQ15: квантованный curriculum — born-шаг в тритовой решётке (--quantized)
+// ============================================================================
+
+/// Корпус одного словаря: нет конфликтов знаков между файлами — решётка
+/// сходится к стабильным полюсам (для бит-экзактных проверок resume).
+fn write_uniform_corpus(dir: &std::path::Path) {
+    fs::write(
+        dir.join("q.txt"),
+        "phase lattice born trit crystal memory\n".repeat(24),
+    )
+    .unwrap();
+}
+
+#[test]
+fn train_quantized_crystallizes_lattice() {
+    let dir = tmp_dir("q15_crystallize");
+    write_uniform_corpus(&dir);
+    let out = dir.join("state.pqw");
+
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--quantized",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "8192",
+            "--steps",
+            "2",
+            "--out",
+            out.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&st.stdout),
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let j = pqc::json::Json::parse(String::from_utf8_lossy(&st.stdout).trim()).unwrap();
+    assert_eq!(j.get("mode").unwrap().as_str().unwrap(), "quantized");
+    assert_eq!(j.get("command").unwrap().as_str().unwrap(), "train");
+    // Кристалл двинулся: триты перещёлкнулись, дуги кристаллизовались.
+    assert!(j.get("moved_total").unwrap().as_f64().unwrap() >= 1.0);
+    assert!(j.get("nnz_lens").unwrap().as_f64().unwrap() >= 1.0);
+    assert_eq!(j.get("lattice_bytes").unwrap().as_f64().unwrap(), 128.0);
+    // Контейнер v2: заголовок 128 B + решётка бит-в-бит.
+    assert_eq!(
+        j.get("container_bytes").unwrap().as_f64().unwrap(),
+        (128 + 512 / 4) as f64
+    );
+    let raw = fs::read(&out).unwrap();
+    assert_eq!(raw.len(), 128 + 512 / 4);
+    assert_eq!(&raw[..8], b"POLER_Q2");
+
+    // RQ14-консистентность: pqc bloch читает квантованный чекпоинт.
+    let bl = Command::new(bin_path())
+        .args(["bloch", out.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(bl.status.success());
+    let bj = pqc::json::Json::parse(String::from_utf8_lossy(&bl.stdout).trim()).unwrap();
+    assert_eq!(bj.get("encoding").unwrap().as_str().unwrap(), "packed4");
+    assert!(bj.get("density").unwrap().as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn train_quantized_resume_is_bit_exact() {
+    // Context-Free Resilience в одном тесте: решётка переживает рестарт
+    // процесса БИТ-В-БИТ — выученное мнение не теряется, второй прогон
+    // по тому же корпусу не двигает ни одного трита.
+    let dir = tmp_dir("q15_resume");
+    write_uniform_corpus(&dir);
+    let out1 = dir.join("s1.pqw");
+    let out2 = dir.join("s2.pqw");
+    let base = [
+        "train",
+        "--quantized",
+        "--corpus",
+        dir.to_str().unwrap(),
+        "--dim",
+        "512",
+        "--epsilon",
+        "0.05",
+        "--block",
+        "512",
+        "--shots",
+        "8192",
+        "--steps",
+        "2",
+    ];
+
+    let mut args1 = base.to_vec();
+    args1.push("--out");
+    args1.push(out1.to_str().unwrap());
+    args1.push("--json");
+    let st1 = Command::new(bin_path()).args(&args1).output().unwrap();
+    assert!(st1.status.success(), "stderr: {}", String::from_utf8_lossy(&st1.stderr));
+    let j1 = pqc::json::Json::parse(String::from_utf8_lossy(&st1.stdout).trim()).unwrap();
+    let nnz1 = j1.get("nnz_lens").unwrap().as_f64().unwrap();
+    assert!(nnz1 >= 1.0, "первый прогон обязан кристаллизовать дуги");
+
+    let mut args2 = base.to_vec();
+    args2.push("--resume");
+    args2.push(out1.to_str().unwrap());
+    args2.push("--out");
+    args2.push(out2.to_str().unwrap());
+    args2.push("--json");
+    let st2 = Command::new(bin_path()).args(&args2).output().unwrap();
+    assert!(st2.status.success(), "stderr: {}", String::from_utf8_lossy(&st2.stderr));
+    let j2 = pqc::json::Json::parse(String::from_utf8_lossy(&st2.stdout).trim()).unwrap();
+    assert_eq!(
+        j2.get("resume_nnz").unwrap().as_f64().unwrap(),
+        nnz1,
+        "поднятая решётка обязана сохранить все дуги"
+    );
+    assert_eq!(
+        j2.get("moved_total").unwrap().as_f64().unwrap(),
+        0.0,
+        "выученное мнение не требует движений при повторе"
+    );
+
+    // Бит-экзактность: фазовая секция (решётка) идентична между сессиями.
+    let r1 = fs::read(&out1).unwrap();
+    let r2 = fs::read(&out2).unwrap();
+    assert_eq!(r1.len(), r2.len());
+    assert_eq!(&r1[128..], &r2[128..], "решётка изменилась после рестарта");
+}
+
+#[test]
+fn train_quantized_eta_dead_zone() {
+    // Физика решётки: плотный дефолт η = 0.25 не пересекает порог
+    // кристаллизации (η·v* = 0.5 < π/6) — мёртвая зона честная, решётка
+    // не двинется ни на один трит. Поэтому --quantized без явного --eta0
+    // берёт калибровку RQ14 (η = 0.6), а ЯВНАЯ подача 0.25 даёт тишину.
+    let dir = tmp_dir("q15_deadzone");
+    write_uniform_corpus(&dir);
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--quantized",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "8192",
+            "--steps",
+            "2",
+            "--eta0",
+            "0.25",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let j = pqc::json::Json::parse(String::from_utf8_lossy(&st.stdout).trim()).unwrap();
+    assert_eq!(j.get("moved_total").unwrap().as_f64().unwrap(), 0.0);
+    assert_eq!(j.get("nnz_lens").unwrap().as_f64().unwrap(), 0.0);
+}
+
+#[test]
+fn train_quantized_rejects_gyro_and_decay() {
+    for bad in [
+        vec!["train", "--quantized", "--stdin", "--gyro"],
+        vec!["train", "--quantized", "--stdin", "--decay"],
+    ] {
+        let st = Command::new(bin_path()).args(&bad).output().unwrap();
+        assert_eq!(
+            st.status.code(),
+            Some(2),
+            "аргументы {bad:?} должны отклоняться"
+        );
+    }
+}
+
+#[test]
+fn train_quantized_curriculum_stages() {
+    // Квантованная фазовая сборка: уровни меняют чанк/шаги/выстрелы,
+    // решётка одна на все уровни.
+    let dir = tmp_dir("q15_curriculum");
+    write_uniform_corpus(&dir);
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--quantized",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--curriculum",
+            "64:1:512:8192,512:2:8192:0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let j = pqc::json::Json::parse(String::from_utf8_lossy(&st.stdout).trim()).unwrap();
+    assert_eq!(j.get("mode").unwrap().as_str().unwrap(), "quantized");
+    let cur = j.get("curriculum").unwrap();
+    assert_eq!(
+        cur.as_arr().map(|a| a.len()).unwrap_or(0),
+        2,
+        "два уровня расписания"
+    );
+    assert!(j.get("nnz_lens").unwrap().as_f64().unwrap() >= 1.0);
+}

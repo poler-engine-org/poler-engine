@@ -166,6 +166,76 @@ pub fn born_step_packed4(
     Ok(stats)
 }
 
+/// Разреженный фазовый шаг Born в Packed4-байтах (ядро RQ15).
+///
+/// Математика идентична [`born_step_packed4`], но применяется **только к
+/// перечисленным координатам** `vel` (Π_Λ-носитель шага): остальная
+/// решётка не читается и не пишется. Это режим квантованного curriculum:
+/// свидетельство чанка разрежено, фон решётки неприкосновенен.
+///
+/// Инвариант: на носителе результат совпадает с плотным шагом при
+/// градиенте, равном нулю вне носителя (тест ниже).
+///
+/// Контракт: `bytes.len() ≥ ceil(d/4)`, `i < d` для всех пар, координаты
+/// в `vel` уникальны. Статистика считается по носителю: `total = vel.len()`
+/// (`moved` — подмножество носителя; полные счётчики решётки —
+/// [`pqw::trit_bloch::counts`]).
+pub fn born_step_packed4_sparse(
+    bytes: &mut [u8],
+    d: usize,
+    vel: &[(u32, f64)],
+    eta: f64,
+) -> Result<PackedBornStats> {
+    if bytes.len() < d.div_ceil(4) {
+        return Err(PqcError::LengthMismatch {
+            expected: d.div_ceil(4),
+            actual: bytes.len(),
+        });
+    }
+    let lut = theta_lut();
+    let mut stats = PackedBornStats {
+        moved: 0,
+        total: vel.len(),
+        theta_shift: 0.0,
+        pos: 0,
+        neg: 0,
+        zero: 0,
+    };
+    for &(i, v) in vel {
+        let i = i as usize;
+        if i >= d {
+            return Err(PqcError::BadArc {
+                index: i as u32,
+                d_pol: d as u32,
+            });
+        }
+        let byte = bytes[i / 4];
+        let shift = 2 * (i % 4);
+        let code = ((byte >> shift) & 0b11) as usize;
+        let theta = lut[code];
+        let (new_code, delta) = if v == 0.0 {
+            (code, 0.0)
+        } else {
+            let theta_next = theta - eta * v;
+            let p_next = theta_next.cos();
+            let trit = pqw::phase::nearest_trit(p_next as f32);
+            let next = pqw::phase::pack_trit2(trit) as usize;
+            (next, (theta_next - theta).abs())
+        };
+        stats.theta_shift += delta;
+        if new_code != code {
+            bytes[i / 4] = (byte & !(0b11 << shift)) | ((new_code as u8) << shift);
+            stats.moved += 1;
+        }
+        match new_code {
+            1 => stats.pos += 1,
+            2 => stats.neg += 1,
+            _ => stats.zero += 1,
+        }
+    }
+    Ok(stats)
+}
+
 /// Анзац прямо из Packed4-байтов (без материализации p-вектора для
 /// product-пути): SV-путь заполняет окно из [`fill_thetas`]-аналога для p,
 /// product-путь собирает дуги из ненулевых тритов.
@@ -206,6 +276,7 @@ pub fn ansatz_from_packed4(
 mod tests {
     use super::*;
     use pqw::phase::{pack_quad, Trit};
+    use pqw::trit_bloch::trit_at;
 
     fn sample_bytes() -> [u8; 2] {
         [
@@ -298,6 +369,68 @@ mod tests {
         assert!(born_step_packed4(&mut bytes, 8, &[0.0; 8], 0.1).is_err());
         let mut ok = [0u8; 2];
         assert!(born_step_packed4(&mut ok, 8, &[0.0; 4], 0.1).is_err());
+    }
+
+    #[test]
+    fn sparse_step_matches_dense_on_support() {
+        // Носитель — подмножество координат; вне носителя градиент нулевой.
+        // Разреженный шаг обязан совпадать с плотным на носителе и не
+        // трогать фон.
+        let data = sample_bytes();
+        let support = [(0u32, 2.0_f64), (3, -2.0), (7, 0.5)];
+        let mut sparse = data;
+        let s = born_step_packed4_sparse(&mut sparse, 8, &support, 0.6).unwrap();
+        let mut dense = data;
+        let mut dense_grad = [0.0_f64; 8];
+        for &(i, v) in &support {
+            dense_grad[i as usize] = v;
+        }
+        let dstat = born_step_packed4(&mut dense, 8, &dense_grad, 0.6).unwrap();
+        assert_eq!(sparse, dense, "решётки разошлись");
+        // Статистика: по носителю против полной.
+        assert_eq!(s.moved, dstat.moved);
+        assert_eq!(s.total, support.len());
+        assert!((s.theta_shift - dstat.theta_shift).abs() < 1e-12);
+        // Пустой носитель — тождество.
+        let mut same = data;
+        let z = born_step_packed4_sparse(&mut same, 8, &[], 0.6).unwrap();
+        assert_eq!(z.moved, 0);
+        assert_eq!(z.total, 0);
+        assert_eq!(same, data);
+    }
+
+    #[test]
+    fn sparse_step_pole_hysteresis_no_teleport() {
+        // Физика решётки (RQ15): полюс под инвертирующим импульсом уходит
+        // в Zero (экватор), но НЕ телепортируется в противоположный полюс.
+        // Смена знака — только через честную монету: Pos → Zero → Neg.
+        let mut bytes = [pack_quad([Trit::Pos; 4]), 0u8];
+        // p_emp = +1, target = −1 → g = 2 → v = −2, η·|v| = 1.2 > π/3:
+        // полюс покидается, но cos(1.2) ≈ 0.36 > −0.5 → Zero, не Neg.
+        let s1 = born_step_packed4_sparse(&mut bytes, 8, &[(0, -2.0)], 0.6).unwrap();
+        assert_eq!(s1.moved, 1);
+        assert_eq!(trit_at(&bytes, 0), Trit::Zero);
+        // Второй импульс с экватора: θ = π/2 − 1.2 → cos < −0.5 → Neg.
+        let s2 = born_step_packed4_sparse(&mut bytes, 8, &[(0, -2.0)], 0.6).unwrap();
+        assert_eq!(s2.moved, 1);
+        assert_eq!(trit_at(&bytes, 0), Trit::Neg);
+        // Прямая телепортация недостижима одним шагом: даже |v| = 3
+        // с экватора даёт cos(π/2 − 1.8) ≈ −0.97 — верно, но с ПОЛЮСА
+        // θ = 0 + 1.8 → cos ≈ −0.23 → Zero (не Neg): граница 2π/3.
+        let mut pole = [pack_quad([Trit::Pos; 4]), 0u8];
+        let s3 = born_step_packed4_sparse(&mut pole, 8, &[(0, -3.0)], 0.6).unwrap();
+        assert_eq!(trit_at(&pole, 0), Trit::Zero);
+        assert_eq!(s3.moved, 1);
+    }
+
+    #[test]
+    fn sparse_contract_violations_are_errors() {
+        let mut bytes = [0u8; 2];
+        // Индекс за пределами d_pol.
+        assert!(born_step_packed4_sparse(&mut bytes, 8, &[(8, 1.0)], 0.6).is_err());
+        // Байтов меньше ceil(d/4).
+        let mut short = [0u8; 1];
+        assert!(born_step_packed4_sparse(&mut short, 8, &[(0, 1.0)], 0.6).is_err());
     }
 
     #[test]

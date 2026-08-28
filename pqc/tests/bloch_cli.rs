@@ -120,7 +120,7 @@ fn bloch_window_flag_accepted() {
 
 #[test]
 fn bloch_missing_file_and_bad_flags_are_errors() {
-    let (code, out, err) = run(&["bloch"]);
+    let (code, _out, err) = run(&["bloch"]);
     assert_eq!(code, 2);
     assert!(err.contains("нужен контейнер"), "{err}");
     let (code, _, err) = run(&["bloch", "/nonexistent/x.pqw"]);

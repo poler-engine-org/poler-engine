@@ -100,6 +100,7 @@ pub mod json;
 pub mod learn;
 pub mod parallel;
 pub mod parity;
+pub mod qcurriculum;
 pub mod rng;
 pub mod statevector;
 pub mod stream;

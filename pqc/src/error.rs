@@ -26,6 +26,9 @@ pub enum PqcError {
     LengthMismatch { expected: usize, actual: usize },
     /// Дуги не отсортированы по индексу (или дублируются).
     UnsortedArcs,
+    /// Операция не поддерживается для данного формата/конфигурации
+    /// (например, квантованный curriculum требует контейнер v2/v3 Packed4).
+    Unsupported { what: &'static str },
     /// Ошибка контейнера `.poler` / `.pqw`.
     Pqw(pqw::PqwError),
 }
@@ -60,6 +63,7 @@ impl fmt::Display for PqcError {
                 )
             }
             PqcError::UnsortedArcs => write!(f, "arcs must be strictly sorted by index"),
+            PqcError::Unsupported { what } => write!(f, "unsupported: {what}"),
             PqcError::Pqw(e) => write!(f, "pqw container: {e}"),
         }
     }

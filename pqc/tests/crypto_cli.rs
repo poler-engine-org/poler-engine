@@ -97,7 +97,7 @@ fn cli_encrypt_text_stdin_json() {
     let cipher = dir.join("t.pqc");
 
     // --text
-    let (code, out, err) = run(&[
+    let (code, _out, err) = run(&[
         "encrypt",
         "--text",
         "POLER archetype cipher",
