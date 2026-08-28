@@ -101,6 +101,8 @@ pub mod gyro_lattice;
 pub mod inspect;
 pub mod json;
 pub mod learn;
+pub mod learn_net;
+pub mod netfetch;
 pub mod parallel;
 pub mod parity;
 pub mod qcurriculum;
@@ -108,7 +110,10 @@ pub mod rng;
 pub mod statevector;
 pub mod stream;
 pub mod stream_engine;
+pub mod tls13;
+pub mod tlsprim;
 pub mod trite;
+pub mod wikisrc;
 
 pub use ansatz::{
     Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,

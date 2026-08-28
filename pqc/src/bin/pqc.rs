@@ -45,6 +45,8 @@ USAGE:
     pqc step (--brain F | --corpus TEXT) [--prompt T] [opts]  RQ17: один квант авторегрессии
     pqc ask «вопрос» --brain F [opts]                          RQ17: диалог с памятью
     pqc chat --brain F [opts]                                  RQ17: REPL-диалог (сохранение на выходе)
+    pqc archetype (--brain F [--prompt T|--with F]) [opts]     RQ18: мозг ⊗_ε промпт/мозг
+    pqc learn «ТЕМА» --brain F [opts]                          RQ19: интернет-ингест (TLS 1.3 zero-dep)
 
 ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию, файл 285;
                           --f32 — исследовательская схема RQ12):
@@ -168,6 +170,26 @@ ARCHETYPE OPTIONS (RQ18: нелинейная алгебра a ⊗_ε b — мы
     --eps <F>                 порог гейта ∈ (0,1] (default 0.5)
     --json                    машинно-читаемый отчёт
 
+LEARN OPTIONS (RQ19: pqc learn \"ТЕМА\" — целенаправленный интернет-ингест;
+              TLS 1.3 + HTTP/1.1 с нуля, zero-dep; источник — Wikipedia API):
+    --brain <F>               контейнер-мозг .pqw: существует — расширяется,
+                              нет — создаётся свежий (v4, d_pol 4096)
+    --pages <N>               страниц на раунд поиска (default 5)
+    --rounds <N>              раундов; раунд ≥ 2 — самоуправляемый поиск:
+                              модель сама уточняет запрос топ-новым словом
+                              корпуса (default 2)
+    --lang <auto|ru|en>       языковой раздел Wikipedia (default auto:
+                              кириллица в теме → ru, иначе en)
+    --full                    полные статьи вместо вводных секций (больше
+                              текста, дольше ингест)
+    --ask <ВОПРОС>            проверка инференса сразу после обучения
+    --seed <S>                сид движка (default 42)
+    --dim <N>                 d_pol свежего мозга (default 4096; для
+                              существующего берётся из контейнера)
+    --text <T>                offline-режим: одна «страница» из строки —
+                              без сети (тема = заголовок)
+    --json                    машинно-читаемый отчёт (zero-dep JSON)
+
 INSPECT OPTIONS (дополнительно):
     --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
                               RQ11: моды печатаются с невязками Ritz (инвариантность
@@ -215,6 +237,7 @@ fn main() {
         Some("ask") => cmd_ask(&args[1..], false),
         Some("chat") => cmd_ask(&args[1..], true),
         Some("archetype") => cmd_archetype(&args[1..]),
+        Some("learn") => cmd_learn(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -4608,6 +4631,259 @@ fn cmd_archetype(args: &[String]) -> i32 {
         None => println!(
             "продукт  : Zero — ложных ассоциаций не существует (E < ε)"
         ),
+    }
+    0
+}
+
+// ============================================================================
+// RQ19: pqc learn — целенаправленный интернет-ингест
+// ============================================================================
+
+fn learn_usage_err(msg: &str) -> i32 {
+    eprintln!("pqc learn: {msg}");
+    eprintln!("формат: pqc learn \"ТЕМА\" --brain F [--pages N] [--rounds N]");
+    2
+}
+
+/// Offline-источник: одна «страница» из --text (тема = заголовок).
+struct OfflineSource {
+    topic: String,
+    text: String,
+}
+
+impl pqc::learn_net::TextSource for OfflineSource {
+    fn search(&mut self, query: &str, _limit: usize) -> Result<Vec<(String, String)>, String> {
+        if query == self.topic {
+            Ok(vec![(self.topic.clone(), self.text.chars().take(60).collect())])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    fn extracts(&mut self, titles: &[String], _intro: bool) -> Result<Vec<(String, String)>, String> {
+        Ok(titles
+            .iter()
+            .filter(|t| t.as_str() == self.topic)
+            .map(|t| (t.clone(), self.text.clone()))
+            .collect())
+    }
+}
+
+fn cmd_learn(args: &[String]) -> i32 {
+    let mut topic = String::new();
+    let mut brain: Option<String> = None;
+    let mut pages = 5usize;
+    let mut rounds = 2usize;
+    let mut lang = String::from("auto");
+    let mut full = false;
+    let mut ask: Option<String> = None;
+    let mut seed = 42u64;
+    let mut dim = 4096u32;
+    let mut text: Option<String> = None;
+    let mut json = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].clone();
+        let mut val = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("нет значения у {name}"))
+        };
+        match a.as_str() {
+            "--brain" => match val("--brain") {
+                Ok(v) => brain = Some(v),
+                Err(e) => return learn_usage_err(&e),
+            },
+            "--pages" => match val("--pages").unwrap_or_default().parse::<usize>() {
+                Ok(n) if n >= 1 && n <= 50 => pages = n,
+                _ => return learn_usage_err("--pages: целое 1..=50"),
+            },
+            "--rounds" => match val("--rounds").unwrap_or_default().parse::<usize>() {
+                Ok(n) if n >= 1 && n <= 10 => rounds = n,
+                _ => return learn_usage_err("--rounds: целое 1..=10"),
+            },
+            "--lang" => match val("--lang").unwrap_or_default() {
+                v if v == "auto" || v == "ru" || v == "en" => lang = v,
+                _ => return learn_usage_err("--lang: auto | ru | en"),
+            },
+            "--full" => full = true,
+            "--ask" => match val("--ask") {
+                Ok(v) => ask = Some(v),
+                Err(e) => return learn_usage_err(&e),
+            },
+            "--seed" => match val("--seed").unwrap_or_default().parse::<u64>() {
+                Ok(s) => seed = s,
+                _ => return learn_usage_err("--seed: целое u64"),
+            },
+            "--dim" => match val("--dim").unwrap_or_default().parse::<u32>() {
+                Ok(d) if (64..=16384).contains(&d) => dim = d,
+                _ => return learn_usage_err("--dim: 64..=16384"),
+            },
+            "--text" => match val("--text") {
+                Ok(v) => text = Some(v),
+                Err(e) => return learn_usage_err(&e),
+            },
+            "--json" => json = true,
+            _ if !a.starts_with("--") && topic.is_empty() => topic = a,
+            _ => return learn_usage_err(&format!("неизвестная опция: {a}")),
+        }
+        i += 1;
+    }
+    let err = |m: &str| -> i32 {
+        eprintln!("pqc learn: {m}");
+        2
+    };
+    if topic.trim().is_empty() {
+        return err("нужна тема: pqc learn \"квантовая механика\" --brain brain.pqw");
+    }
+    let Some(path) = brain else {
+        return err("нужен --brain F (мозг создаётся/расширяется и сохраняется)");
+    };
+    let cfg = pqc::learn_net::LearnConfig {
+        topic: topic.trim().to_string(),
+        pages,
+        rounds,
+        full,
+        seed,
+        dim,
+        ask,
+        ..pqc::learn_net::LearnConfig::default()
+    };
+
+    if !json {
+        println!("POLER Quantum Core — Learn (RQ19): целенаправленный интернет-ингест");
+        if let Some(t) = &text {
+            println!("режим   : offline (--text, {} Б без сети)", t.len());
+        } else {
+            println!("источник: {}.wikipedia.org API (TLS 1.3 zero-dep)", {
+                if lang == "auto" {
+                    pqc::wikisrc::WikiSource::detect_language(&cfg.topic)
+                } else {
+                    lang.as_str()
+                }
+            });
+        }
+        println!("мозг    : {path} (d_pol={dim}, раундов={rounds}, страниц/раунд={pages})");
+    }
+
+    // Существующий мозг — расширяем; отсутствующий — создаём.
+    let brain_bytes: Option<Vec<u8>> = match std::fs::read(&path) {
+        Ok(b) => Some(b),
+        Err(_) => None,
+    };
+    let brain_existed = brain_bytes.is_some();
+    let (engine, report) = match &text {
+        Some(t) => {
+            let mut src = OfflineSource { topic: cfg.topic.clone(), text: t.clone() };
+            match pqc::learn_net::learn(&cfg, &mut src, brain_bytes.as_deref()) {
+                Ok(x) => x,
+                Err(e) => return err(&e),
+            }
+        }
+        None => {
+            let lang = if lang == "auto" {
+                pqc::wikisrc::WikiSource::detect_language(&cfg.topic).to_string()
+            } else {
+                lang.clone()
+            };
+            let mut src = pqc::wikisrc::WikiSource::new(&lang);
+            match pqc::learn_net::learn(&cfg, &mut src, brain_bytes.as_deref()) {
+                Ok(x) => x,
+                Err(e) => return err(&format!("{e} (сеть/Wikipedia API)")),
+            }
+        }
+    };
+
+    // Сохранение контейнера v4.
+    let bytes = match engine.checkpoint() {
+        Ok(b) => b,
+        Err(e) => return err(&format!("чекпоинт: {e}")),
+    };
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        return err(&format!("запись {path}: {e}"));
+    }
+
+    if json {
+        let rounds_json: Vec<Json> = report
+            .rounds
+            .iter()
+            .map(|r| {
+                Json::Obj(vec![
+                    ("query".into(), Json::str(&r.query)),
+                    ("titles".into(), Json::Arr(r.titles.iter().map(|t| Json::str(t)).collect())),
+                    ("ingested".into(), Json::num(r.ingested as f64)),
+                    ("chars".into(), Json::num(r.chars as f64)),
+                    ("moved".into(), Json::num(r.moved as f64)),
+                ])
+            })
+            .collect();
+        let mut j = vec![
+            ("brain".into(), Json::Obj(vec![
+                ("path".into(), Json::str(&path)),
+                ("existed".into(), Json::Bool(brain_existed)),
+                ("d_pol".into(), Json::num(engine.d_pol() as f64)),
+                ("channels".into(), Json::num(report.channels_after as f64)),
+                ("lexicon".into(), Json::num(report.lexicon_after as f64)),
+                ("bytes".into(), Json::num(report.brain_bytes as f64)),
+            ])),
+            ("topic".into(), Json::str(&cfg.topic)),
+            ("pages".into(), Json::num(report.pages as f64)),
+            ("chars".into(), Json::num(report.chars as f64)),
+            ("moved_total".into(), Json::num(report.moved_total() as f64)),
+            ("lexicon".into(), Json::Obj(vec![
+                ("before".into(), Json::num(report.lexicon_before as f64)),
+                ("after".into(), Json::num(report.lexicon_after as f64)),
+            ])),
+            ("channels".into(), Json::Obj(vec![
+                ("before".into(), Json::num(report.channels_before as f64)),
+                ("after".into(), Json::num(report.channels_after as f64)),
+            ])),
+            ("lattice_nnz".into(), Json::num(report.lattice_nnz as f64)),
+            ("rounds".into(), Json::Arr(rounds_json)),
+        ];
+        if let Some(ans) = &report.answer {
+            j.push(("ask".into(), Json::Obj(vec![
+                ("question".into(), Json::str(cfg.ask.as_deref().unwrap_or(""))),
+                ("answer".into(), Json::str(&ans.text)),
+                ("tokens".into(), Json::num(ans.steps.len() as f64)),
+            ])));
+        }
+        println!("{}", Json::Obj(j).to_string());
+    } else {
+        for r in &report.rounds {
+            println!(
+                "\nраунд  : «{}» → {} стр. ({} Б)",
+                r.query,
+                r.titles.len(),
+                r.chars
+            );
+            for t in r.titles.iter().take(5) {
+                println!("         • {t}");
+            }
+        }
+        println!(
+            "\nингест : {} страниц, {} Б текста, {} born-перещёлкиваний",
+            report.pages,
+            report.chars,
+            report.moved_total()
+        );
+        println!(
+            "решётка: nnz={}, русла J {} → {}, лексикон {} → {} слов",
+            report.lattice_nnz,
+            report.channels_before,
+            report.channels_after,
+            report.lexicon_before,
+            report.lexicon_after
+        );
+        println!("сохранено: {path} → v4 контейнер ({} Б)", report.brain_bytes);
+        if let Some(ans) = &report.answer {
+            println!(
+                "\nвопрос : {}",
+                cfg.ask.as_deref().unwrap_or("")
+            );
+            println!("ответ  : {}", if ans.text.is_empty() { "(молчание)" } else { &ans.text });
+        }
+        println!("\nпроверка: pqc ask \"{}\" --brain {path}", cfg.topic);
     }
     0
 }
