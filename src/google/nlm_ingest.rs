@@ -235,6 +235,21 @@ pub fn ingest_notebook(
     nb: &Notebook,
     stats: &mut IngestStats,
 ) -> Result<(), String> {
+    // Если LIST_NOTEBOOKS (wXbhsf) не дал источников — подтягиваем полный
+    // паспорт через GET_PROJECT (rLM1Ne): там источники всегда полные.
+    // Ошибка паспорта не фатальна: инжестим то, что есть (заметки/артефакты).
+    let nb_full;
+    let nb = if nb.sources.is_empty() {
+        match sess.get_notebook(&nb.id) {
+            Ok(full) => {
+                nb_full = full;
+                &nb_full
+            }
+            Err(_) => nb,
+        }
+    } else {
+        nb
+    };
     // 1) Паспорт ноутбука — title + source list (короткий, для обнаружения
     //    по имени ноутбука и навигации к источникам).
     let mut nb_text = format!("# {} {}\n\n", nb.emoji, nb.title);

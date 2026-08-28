@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn list_commits_parses_minimal_payload() {
         // нельзя дёрнуть реальный GitHub без токена, но проверим парсинг через mock JSON.
-        let a = GithubAdapter::anonymous();
+        // (GithubAdapter::anonymous() здесь не нужен — тестируем только хелперы парсинга.)
         let body = serde_json::json!([
             {
                 "sha": "abcdef1234567890",

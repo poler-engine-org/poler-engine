@@ -48,6 +48,7 @@ pub mod engine;
 pub mod google;
 pub mod graph;
 pub mod mcp;
+pub mod mcp_http;
 pub mod notes;
 pub mod output;
 pub mod parser;

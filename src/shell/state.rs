@@ -111,7 +111,7 @@ impl ShellState {
 
     /// Подкоманды `nlm ...` для Tab-completion.
     pub fn nlm_subcommands() -> &'static [&'static str] {
-        &["list", "notes", "artifacts", "source", "account", "ask", "sync", "shot", "media"]
+        &["list", "notes", "notes-sync", "artifacts", "source", "account", "ask", "sync", "shot", "media"]
     }
 
     /// v0.16.0: Подкоманды `gh`/`gl`/`gt` (одинаковые для всех REST-адаптеров).
@@ -270,6 +270,28 @@ impl ShellState {
         let r = f(&mut ix, &mut nlm);
         self.ix = Some(ix);
         self.nlm = Some(nlm);
+        r
+    }
+
+    /// Одномоментно заимствовать `&mut NlmSession` и `&mut Connection`
+    /// (poler_notes) для синхронизации заметок (`nlm notes-sync`, TUI).
+    /// Тот же take + put-back паттерн, что [`Self::with_nlm_index`].
+    pub fn with_nlm_notes<R>(
+        &mut self,
+        f: impl FnOnce(&mut NlmSession, &mut rusqlite::Connection) -> Result<R, String>,
+    ) -> Result<R, String> {
+        if self.nlm.is_none() {
+            let n = NlmSession::open().map_err(|e| format!("NlmSession::open: {e}"))?;
+            self.nlm = Some(n);
+        }
+        if self.notes_conn.is_none() {
+            self.notes_conn = Some(notes::open(&self.db_path)?);
+        }
+        let mut nlm = self.nlm.take().expect("nlm just ensured");
+        let mut conn = self.notes_conn.take().expect("notes_conn just ensured");
+        let r = f(&mut nlm, &mut conn);
+        self.nlm = Some(nlm);
+        self.notes_conn = Some(conn);
         r
     }
 }

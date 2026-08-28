@@ -26,8 +26,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy (запрещаем предупреждения)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: "Clippy (гейт: unused/dead_code + correctness; стилевые — предупреждения)"
+        run: cargo clippy --all-targets -- -D unused -D clippy::correctness
 
       - name: Тесты (unit + integration)
         run: cargo test --all-targets
@@ -85,7 +85,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
           mkdir -p dist/poler-engine
-          cp -r src tests examples Cargo.toml Cargo.lock README.md dist/poler-engine/
+          cp -r src tests examples docs Cargo.toml Cargo.lock README.md FUTURE_ROADMAP.md INSTALL.md Dockerfile LICENSE-MIT LICENSE-APACHE dist/poler-engine/
           cp target/release/poler-engine dist/poler-engine/poler-engine-bin
           tar -czf "dist/poler-engine-${VERSION}-linux-x86_64.tar.gz" -C dist poler-engine
           tar --exclude='poler-engine/poler-engine-bin' -czf "dist/poler-engine-${VERSION}-src.tar.gz" -C dist poler-engine

@@ -116,51 +116,6 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
     }
 }
 
-fn help_text(_args: &[String]) -> String {
-    let mut s = String::new();
-    s.push_str("poler-shell — доступные команды:\n\n");
-    s.push_str("  search \"<query>\" [--top N]   — поиск по web-index.db (NLM+веб+локал)\n");
-    s.push_str("  web \"<query>\"                — алиас для search\n");
-    s.push_str("  stats                         — статистика web-index.db (страниц, байт, PageRank)\n");
-    s.push('\n');
-    s.push_str("  nlm list                      — список 87 ноутбуков аккаунта\n");
-    s.push_str("  nlm notes <NB_ID>             — заметки/чат ноутбука (JSON)\n");
-    s.push_str("  nlm artifacts <NB_ID>         — Studio-артефакты (Audio/Slide/Report/Video/Quiz)\n");
-    s.push_str("  nlm source <NB_ID> <SRC_ID>   — контент источника + URL слайдов\n");
-    s.push_str("  nlm account                    — email/настройки сессии\n");
-    s.push_str("  nlm ask <NB_ID> \"<question>\" — ответ модели ПО ИСТОЧНИКАМ ноутбука\n");
-    s.push_str("  nlm sync [<NB_ID>]            — синк NLM в web-index.db (без арг = все)\n");
-    s.push('\n');
-    // v0.15.1: нативные crawl/impact в шелле
-    s.push_str("  crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]\n");
-    s.push_str("                                — обход URL → web-index.db (CDP+Chromium)\n");
-    s.push_str("  impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]\n");
-    s.push_str("                                — AIDDE impact-паспорт символа в кодовой базе\n");
-    s.push('\n');
-    s.push_str("  set format md|json|simple     — переключить формат вывода\n");
-    s.push_str("  set top N                     — топ-K по умолчанию для search\n");
-    s.push('\n');
-    // v0.16.0: Unified VCS & Data Mesh — нативные адаптеры
-    s.push_str("  gh search <Q> [--top N]      — поиск по коду GitHub (требует $GITHUB_TOKEN)\n");
-    s.push_str("  gh repos <USER>               — список репозиториев пользователя GitHub\n");
-    s.push_str("  gh commits <OWNER/REPO>       — последние 20 коммитов репо\n");
-    s.push_str("  gh issues <OWNER/REPO>        — issues+PR репозитория\n");
-    s.push_str("  gl search <Q>                 — поиск по GitLab (REST v4)\n");
-    s.push_str("  gl commits <GROUP/PROJ>       — коммиты GitLab проекта\n");
-    s.push_str("  gl issues <GROUP/PROJ>        — issues+MR GitLab\n");
-    s.push_str("  gt search <Q>                 — поиск по Gitea/Forgejo ($GITEA_HOST)\n");
-    s.push_str("  gt commits <OWNER/REPO>       — коммиты Gitea\n");
-    s.push_str("  gix log <PATH> [--top N]      — git log локального репо через Pure-Rust gix\n");
-    s.push_str("  gix clone <URL> <PATH>        — (заглушка v0.16: используйте git clone)\n");
-    s.push_str("  sync vcs [gh|gl|gt] <OWNER>  — синк VCS-страниц в web-index.db\n");
-    s.push('\n');
-    s.push_str("  version | v                    — версия poler-engine + poler-shell\n");
-    s.push_str("  quit | exit | q                — выйти из шелла\n");
-    s.push_str("  help | ?                       — эта справка\n");
-    s.push('\n');
-    s.push_str("Подсказки: Tab — автодополнение команд/подкоманд/ID; ↑/↓ — история команд (до 2000).\n");
-    s
-}
 
 // ---------------------------------------------------------------------------
 // search / web — поиск по web-index.db
@@ -259,7 +214,7 @@ fn cmd_stats(state: &mut ShellState) -> CmdResult {
 fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
     if args.is_empty() {
         return CmdResult::Done(
-            "nlm: укажите подкоманду (list | notes | artifacts | source | account | ask | sync)".into(),
+            "nlm: укажите подкоманду (list | notes | notes-sync | artifacts | source | account | ask | sync)".into(),
         );
     }
     let sub = args[0].as_str();
@@ -290,13 +245,53 @@ fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
                 Ok(s) => s,
                 Err(e) => return CmdResult::Done(format!("❌ {e}")),
             };
-            match s.notes(nb) {
-                Ok(v) => {
-                    let out = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into());
+            match s.list_notes_structured(nb) {
+                Ok(notes) => {
+                    let mut out = format!("📝 {} заметок в {nb} (без mind maps):\n\n", notes.len());
+                    for (i, n) in notes.iter().enumerate() {
+                        let preview: String = n
+                            .text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect();
+                        out.push_str(&format!("{}. {} — {}\n", i + 1, n.title, preview));
+                    }
+                    if notes.is_empty() {
+                        out.push_str("(заметок нет — mind maps не считаются)\n");
+                    }
+                    out.push_str("\nсинхронизировать в poler_notes: `nlm notes-sync <NB_ID>`\n");
                     state.set_output(out.clone());
                     CmdResult::Done(out)
                 }
                 Err(e) => CmdResult::Done(format!("❌ nlm notes: {e}")),
+            }
+        }
+        // M5: двусторонняя синхронизация заметок облако ↔ локально
+        "notes-sync" | "nsync" => {
+            let nb = match rest.first().cloned().or_else(|| state.active_notebook_id.clone()) {
+                Some(id) => id,
+                None => {
+                    return CmdResult::Done(
+                        "nlm notes-sync <NB_ID> — не указан ID (или выберите ноутбук в TUI)".into(),
+                    )
+                }
+            };
+            match state.with_nlm_notes(|sess, conn| {
+                crate::google::nlm_notes_sync::sync_notebook_notes(sess, conn, &nb)
+            }) {
+                Ok(rep) => {
+                    let mut out = format!("🔄 Синк заметок ноутбука {nb}: {}\n", rep.summary());
+                    for e in &rep.errors {
+                        out.push_str(&format!("  ⚠ {e}\n"));
+                    }
+                    out.push_str("Заметки теперь одинаковы в TUI, poler_notes и NotebookLM.\n");
+                    state.set_output(out.clone());
+                    CmdResult::Done(out)
+                }
+                Err(e) => CmdResult::Done(format!("❌ nlm notes-sync: {e}")),
             }
         }
         "artifacts" => {

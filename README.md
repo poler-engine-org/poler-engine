@@ -1,5 +1,9 @@
 # POLER-Engine
 
+[![CI](https://github.com/Kotokvit/poler-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kotokvit/poler-engine/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust 1.98](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](Cargo.toml)
+
 **AI-Native Topographical, Resonant and Graph Search Engine** — поисково-аналитический
 движок на Rust, спроектированный для вытеснения `grep`/`ripgrep` и слепого векторного
 RAG из архитектуры LLM-агентов.
@@ -50,6 +54,162 @@ poler> nlm ask <NB_ID> "новый вопрос"   # пара попадёт в 
 | 3 | **Chunk Fragmentation** | Нарезка по 500 токенов рвёт причинно-следственные связи | **Semantic Boundary Chunking**: границы окон = заголовки сцен / границы функций |
 | 4 | **BM25 / TF-IDF Fail** | Редкий токен считается «важным», а суть выражена базовыми словами | Формула информационной плотности **ε** на локальной энтропии |
 | 5 | **Temporal Blindness** | Устаревший код смешивается с актуальным, эпохи T-24 и T-0 в одной куче | **Temporal Metric Tagging**: теги `Т-23` на сценах, узлах графа и фильтр `--metric` |
+
+## v0.17.4: MCP over HTTP — удалённый агент в блокнотах владельца без передачи пароля
+
+`--mcp` работал только поверх stdio — то есть для агента, сидящего на той же
+машине, что и движок. v0.17.4 добавляет второй транспорт: тот же набор из
+семи инструментов (`poler_nlm` в том числе), но по HTTP с Bearer-токеном —
+**удалённый агент получает доступ к блокнотам NotebookLM владельца, не
+получая ни пароль, ни куки Google**. Движок на машине владельца ходит в
+NotebookLM своим персистентным профилем; наружу (через туннель) уходит
+только JSON-RPC-ответ по предъявленному токену.
+
+```bash
+# 1. на машине владельца (токен напечатается при старте; или задай сам):
+poler-engine --mcp-http 127.0.0.1:8765 --mcp-token <секрет>
+
+# 2. публичный туннель без аккаунта (напечатает https://….trycloudflare.com):
+cloudflared tunnel --url http://127.0.0.1:8765
+
+# 3. удалённый агент подключается обычным HTTP:
+curl -X POST https://<туннель>/mcp \
+  -H "Authorization: Bearer <секрет>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"poler_nlm","arguments":{"action":"notebooks"}}}'
+```
+
+| Параметр | Значение |
+|---|---|
+| CLI | `--mcp-http [BIND]` (по умолчанию `127.0.0.1:8765`; можно просто порт `8765`), `--mcp-token <T>` |
+| Токен | `--mcp-token` → env `POLER_MCP_TOKEN` → автогенерация (32 hex из `/dev/urandom`) |
+| Транспорт | Streamable HTTP: `POST /` и `POST /mcp`, одно сообщение или batch-массив; ответ `application/json` |
+| Auth | `Authorization: Bearer <T>` или `X-Poler-Token: <T>`; сравнение за постоянное время |
+| Эндпоинты | `GET /health` — smoke-проба туннеля без токена; `GET /mcp` → 405; `OPTIONS` → 204 (CORS-preflight) |
+| Реализация | Ручной HTTP/1.1 поверх `std::net` — ноль новых зависимостей; keep-alive, `Expect: 100-continue`, поток на соединение, лимит 16 соединений |
+
+**Модель безопасности**: токен — единственный секрет, который покидает машину
+владельца (и то — по приватному каналу в чате/мессенджере). Куки Google
+остаются в `~/.cache/poler-engine/google-profile/`, наружу отдаются только
+результаты вызовов инструментов. NLM-чат занимает до 90 с — акцептор не
+блокируется (каждое соединение — свой поток). Утечка токена = доступ к
+инструментам движка (чтение блокнотов, чат), но НЕ к аккаунту Google;
+отзыв = Ctrl+C и рестарт с новым токеном.
+
+**Реализация** (`src/mcp_http.rs`, ~700 строк, 20 тестов): рудиментарный
+HTTP/1.1-парсер (CRLF/LF-заголовки, Content-Length, лимиты 16 КБ заголовков /
+8 МБ тела, slow-loris-защита через idle-таймаут), маршрутизатор запросов,
+JSON-RPC-слой поверх общего `McpServer::dispatch()` (выделен из stdio-цикла
+`mcp.rs` — поведение `--mcp` не изменено ни на бит), генератор токена с
+fallback-PRNG splitmix64, если `/dev/urandom` недоступен. E2E-прогон curl-ом:
+401 без токена / с неверным, 200 initialize/tools/list/tools/call, batch
+с уведомлением, 202 на чистое уведомление, -32700/-32600/-32601, keep-alive
+из двух запросов в одном соединении.
+
+## v0.17.3: Companion Bridge — официальный NotebookLM API рядом с batchexecute
+
+v0.17.1–v0.17.3 соединяют poler-engine с **официальным Pre-GA NotebookLM
+Enterprise API** (Discovery Engine `v1alpha`) — не заменяя
+реверс-инжиниренный batchexecute-клиент v0.13.0, а достроив **сменный мост**
+поверх обоих. Разведка API подтвердила исходную гипотезу: официальный API силён
+там, где batchexecute слаб (пакетное создание источников, upload файлов,
+аудио-обзоры, удаление), и слаб там, где batchexecute силён (чтение контента,
+заметки, артефакты, чат — endpoints отсутствуют или возвращают пустые данные).
+Мост маршрутизирует каждую операцию к сильнейшему провайдеру и молча падает
+назад при отказе.
+
+### Архитектура HybridProvider (`src/google/companion.rs`, ~2000 строк)
+
+| Компонент | Роль |
+|---|---|
+| `SourceContentProvider` trait | единый контракт: 13 операций (`Op` enum) для всех провайдеров |
+| `GcpEnterpriseProvider` | официальный Pre-GA API: Discovery Engine `v1alpha`, ureq + Bearer (scope `cloud-platform`), 9 операций — M2 ✓ |
+| `CdpBatchexecuteProvider` | потребительский протокол v0.13.0: чтение контента, заметки, артефакты, чат |
+| `HybridProvider` | routing: primary по `supports(op)`, fallback на `NotSupported`/`NotConfigured` — M3 ✓ |
+
+Routing policy: режим `Auto` (по умолчанию) ведёт GCP-first для 9
+enterprise-операций и CDP-first для 4 операций чтения; `GcpOnly`/`CdpOnly`
+принудительно фиксируют провайдер (fallback off). Серверные ошибки
+(`Http`/`Transport`/`Parse`) **не** переключают провайдера — это разные
+данные, а не сбой транспорта.
+
+```
+$POLER_GCP_PROJECT_NUMBER   # GCP-проект с включённым Discovery Engine API
+$POLER_GCP_REGION           # us | eu | global (default: us)
+$POLER_GCP_LOCATION         # (default: global)
+$POLER_COMPANION_MODE       # auto | gcp | cdp (default: auto)
+```
+
+Milestone-разбивка: **v0.17.1** — M1 skeleton (trait-контракт, 10 URL-билдеров
+с `sources:uploadFile` media-конвенцией `/upload/v1alpha/...`, 24 теста);
+**v0.17.3** — M2 реальные вызовы (9 операций, refresh-токены из
+`oauth::ensure_gcp_fresh`), M3 HybridProvider routing + fallback (8 тестов
+routing-политики), M4 TUI Enter-handler. v0.17.2 намеренно пропущен
+(reserved).
+
+### M4: Enter на источнике в TUI
+
+Клавиша Enter в панели Sources больше не «ничего не делает» — источник
+маппится в `SourceKind` → `EnterAction`:
+
+| Тип источника | Enter-действие |
+|---|---|
+| `File` | `$EDITOR` на локальном файле (fallback `nano`) |
+| `Url` | открыть в браузере пользователя (`xdg-open`) |
+| `Repo` | открыть `https://github.com/{value}` в браузере |
+| NLM-контент | `FallbackFetch` → `get_source_content` через HybridProvider |
+
+### Горизонт: Zero-Storage Streaming Archives (SA1–SA7)
+
+`docs/future-streaming-archives.md` фиксирует следующий рывок — потоковое
+чтение петабайтных архивов (Common Crawl `.tar.zst`, Hugging Face `.zip`)
+**через HTTP Range без скачивания на диск**: топологическая адресация
+zip central-directory (O(δ) ≈ 64 КБ для 50 ГБ архива), streaming ε + IIR
+резонанс, SimHash-дедуп с Bloom-фильтром (m=2²⁰, k=7), importance sampling
+батчей `P(d→batch) ∝ exp(λ₁·ψ + λ₂·H − λ₃·Redundancy)` — десятки МБ RAM на
+корпуса интернета. Четыре потребителя: обучение локальных LLM, RAG-батчи для
+готовых моделей, TUI discovery, параллельный поиск по N архивам (rayon).
+
+---
+
+## v0.17.0: TUI Redesign + Pure-Rust Git Clone & LFS — без системного git
+
+Два релиза в одном: полный редизайн терминального интерфейса в стиле MiMo
+Code и закрытие последних заглушек v0.16.0 — `gix clone` и Git LFS теперь
+работают на чистом Rust, без системного `git` и `git-lfs` в `$PATH`.
+
+### TUI Redesign (M1–M4, M6)
+
+- **4-панельный дашборд**: Output (главный поток), Notes, Sources, Help —
+  переключение фокуса, resize, scroll в каждой панели.
+- **Мышь**: клики по панелям, drag-select текста, clipboard через `arboard`
+  (копирование выделенного в системный буфер).
+- **Notes/Sources CRUD**: заметки и источники живут в `poler-shell.db`
+  (`src/notes/mod.rs`, `src/sources/mod.rs`) — создаются, редактируются,
+  удаляются прямо из TUI.
+- **Help 2.0**: `src/shell/help.rs` — палитра `?` с 11 пресетами сценариев
+  (от «первый запрос» до «Pure-Rust git clone + LFS»), детальная справка по
+  каждой команде.
+
+### M5: Pure-Rust Git Clone & LFS
+
+`gix clone <URL> <PATH> [--depth N] [--branch B]` — настоящий clone через
+`gix::clone::PrepareFetch` (shallow-depth, checkout в worktree), без
+вызова системного git. `gix lfs list|fetch <PATH>` — Pure-Rust LFS-клиент:
+детект pointer-файлов (`version https://git-lfs/...`), batch-запрос
+`POST /objects/batch`, скачивание блобов в `.git/lfs/objects/<oid[:2]>/...`,
+авторизация `Bearer $POLER_GIT_TOKEN`.
+
+### Метрики релиза
+
+| Метрика | v0.16.0 | v0.17.0 |
+|---|---|---|
+| Тесты | 413 | 486 (+24: clone/lfs, notes/sources, help) |
+| Бинарник | 8.4 МБ | 12 МБ (+3 МБ: `blocking-network-client` gix) |
+| Rust-файлов | 51 | 57 (+notes, sources, help, mouse, clone, lfs) |
+| Web GUI (Next.js) | ~1.2 ГБ | удалён (M6) |
+
+---
 
 ## v0.16.0: Unified VCS & Data Mesh — нативные адаптеры GitHub/GitLab/Gitea + Pure-Rust git (gix)
 
@@ -1165,6 +1325,37 @@ poler-engine [OPTIONS] --query <QUERY> <PATH>
     --nlm-chat <NB> <Q>     вопрос к модели ноутбука ПО ЕГО ИСТОЧНИКАМ
     --nlm-media <URL>       скачать медиа профильным Chromium → ~/.cache/poler-engine/nlm/
     --nlm-shot <URL>        скриншот страницы NotebookLM → PNG
+    --nlm-sync [NB]         v0.14: залить ВСЕ ноутбуки в web-index.db (nlm:// URL)
+    --web <URL>             v0.8: отрендерить страницу через Chromium CDP
+    --web-search <Q>        v0.9+: поиск по web-index.db (BM25+PageRank+фразы)
+    --web-db <PATH>         путь к индексу [default: ./web-index.db]
+    --web-stats             статистика индекса: страницы, ссылки, PageRank
+    --crawl <URL>           краулер: BFS от URL (robots.txt + sitemap + SimHash-дедуп)
+    --crawl-depth <N>       глубина краула [default: 2]
+    --crawl-max <N>         лимит страниц [default: 25]
+    --crawl-delay-ms <N>    задержка между запросами [default: 1000]
+    --cross-site            разрешить краулу переходы на другие домены
+    --cdp-port <N>          порт CDP Chromium [default: 9222]
+    --web-wait-ms <N>       ожидание рендера страницы [default: 1200]
+    --headless              headless-режим Chromium
+    --no-sandbox            отключить sandbox Chromium (для root/CI)
+    --remote-debugging-port <N>  явный порт отладки Chromium
+    --mcp                   v0.10: MCP-сервер (stdio JSON-RPC 2.0) для LLM-агентов
+    --mcp-http [BIND]      v0.17.4: MCP-сервер по HTTP (Streamable HTTP) для
+                           УДАЛЁННОГО агента: POST / или /mcp,
+                           Authorization: Bearer <токен> [default: 127.0.0.1:8765]
+    --mcp-token <TOKEN>    токен для --mcp-http (или env POLER_MCP_TOKEN;
+                           без него — автогенерация при старте)
+    --shell                 v0.15+: poler-shell REPL
+    --tui                   v0.17: 4-панельный TUI (MiMo Code-style)
+    --psi-eta <N>           POLER[Ψ]: шаг ψ-потока [default: 0.05]
+    --psi-gamma <N>         POLER[Ψ]: наклон потенциала [default: 0.5]
+    --psi-rho <N>           POLER[Ψ]: вес резонанса [default: 0.9]
+    --psi-depth <N>         POLER[Ψ]: глубина [default: 8]
+    --poler-eta <N>         POLER-цикл: learning rate [default: 0.01]
+    --poler-gamma <N>       POLER-цикл: γ [default: 0.1]
+    --poler-mix <N>         POLER-цикл: микс [default: 0.1]
+    --poler-dissipator <N>  POLER-цикл: диссипатор [default: 0.02]
 -v, --verbose               статистика прогона в stderr
 ```
 

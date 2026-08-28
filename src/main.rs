@@ -115,8 +115,22 @@ struct Cli {
     /// инструмент LLM-агентов поверх stdio JSON-RPC.
     /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search /
     /// poler_gmail / poler_drive.
-    #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact"])]
+    #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact", "mcp_http", "mcp_token"])]
     mcp: bool,
+
+    /// MCP-СЕРВЕР ПО HTTP (Streamable HTTP): тот же набор инструментов,
+    /// что и --mcp, но для УДАЛЁННОГО агента — через туннель (например
+    /// `cloudflared tunnel --url http://127.0.0.1:8765`). POST / или /mcp,
+    /// заголовок Authorization: Bearer <токен>. Пароли/куки Google наружу
+    /// не выходят: движок ходит в NotebookLM своим профилем.
+    /// BIND = «127.0.0.1:8765» (по умолчанию) или просто порт «8765».
+    #[arg(long = "mcp-http", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["mcp", "shell", "tui", "web_search", "crawl", "web_stats", "impact", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    mcp_http: Option<String>,
+
+    /// Токен доступа для --mcp-http (или env POLER_MCP_TOKEN; без него
+    /// генерируется при старте и печатается в stderr).
+    #[arg(long = "mcp-token", value_name = "TOKEN", requires = "mcp_http")]
+    mcp_token: Option<String>,
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
 
@@ -795,6 +809,18 @@ fn main() -> ExitCode {
         return ExitCode::from(code as u8);
     }
 
+    // ---------- MCP-сервер по HTTP: удалённый агент через туннель ----------
+    if let Some(bind) = cli.mcp_http.clone() {
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let token = cli
+            .mcp_token
+            .clone()
+            .or_else(|| std::env::var("POLER_MCP_TOKEN").ok())
+            .unwrap_or_else(poler_engine::mcp_http::generate_token);
+        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db);
+        return ExitCode::from(code as u8);
+    }
+
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
     if cli.shell {
         let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
@@ -1071,7 +1097,15 @@ fn main() -> ExitCode {
     }
 
     let Some(path_arg) = cli.path.clone() else {
-        eprintln!("poler-engine: укажите PATH, --web-search <QUERY> или --crawl с seed URL");
+        // Интерактивный терминал (и stdin, и stdout — TTY) → сразу TUI-дашборд.
+        // Если хоть один поток пайп/редирект — честная справка (скрипты, CI, docker).
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout());
+        if interactive {
+            let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+            return poler_engine::shell::run_tui(db_path);
+        }
+        eprintln!("poler-engine: укажите PATH, --tui, --web-search <QUERY> или --crawl с seed URL");
         return ExitCode::from(2);
     };
 

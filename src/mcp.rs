@@ -57,13 +57,20 @@ pub struct McpServer {
     db_path: PathBuf,
 }
 
-/// Запуск MCP-сервера. Возвращает код процесса (0 = чистый EOF stdin).
+impl McpServer {
+    /// Конструктор для альтернативных транспортов (mcp_http: Streamable HTTP).
+    pub fn new(cdp_port: u16, wait_ms: u64, db_path: PathBuf) -> Self {
+        Self {
+            cdp_port,
+            wait_ms,
+            db_path,
+        }
+    }
+}
+
+/// Запуск MCP-сервера (stdio). Возвращает код процесса (0 = чистый EOF stdin).
 pub fn run(cdp_port: u16, wait_ms: u64, db_path: PathBuf) -> i32 {
-    let server = McpServer {
-        cdp_port,
-        wait_ms,
-        db_path,
-    };
+    let server = McpServer::new(cdp_port, wait_ms, db_path);
     eprintln!(
         "poler-mcp: stdio JSON-RPC, db={:?}, cdp_port={}, wait_ms={}",
         server.db_path, server.cdp_port, server.wait_ms
@@ -100,14 +107,16 @@ fn write_line(out: &mut impl Write, v: &Value) -> std::io::Result<()> {
 }
 
 impl McpServer {
-    fn handle(&self, out: &mut impl Write, msg: Value) {
+    /// Диспетчер одного JSON-RPC-сообщения: возвращает ответ (None —
+    /// уведомление без id, ответ не нужен). Общий для stdio и HTTP.
+    pub fn dispatch(&self, msg: &Value) -> Option<Value> {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id").cloned();
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         // уведомления (без id) не требуют ответа
         let Some(id) = id else {
-            return;
+            return None;
         };
 
         let result: Result<Value, (i64, String)> = match method {
@@ -121,14 +130,19 @@ impl McpServer {
             _ => Err((-32601, format!("method not found: {method}"))),
         };
 
-        let resp = match result {
+        Some(match result {
             Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
             Err((code, message)) => json!({
                 "jsonrpc": "2.0", "id": id,
                 "error": {"code": code, "message": message}
             }),
-        };
-        let _ = write_line(out, &resp);
+        })
+    }
+
+    fn handle(&self, out: &mut impl Write, msg: Value) {
+        if let Some(resp) = self.dispatch(&msg) {
+            let _ = write_line(out, &resp);
+        }
     }
 
     fn handle_initialize(&self, params: &Value) -> Value {

@@ -300,9 +300,18 @@ fn parse_projects(body: &Value) -> Vec<RepoId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Env-var тесты гоняются между потоками тест-раннера — сериализуем
+    /// (та же схема, что в vcs/gitea.rs).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn adapter_from_env_no_token() {
+        let _g = env_lock();
         std::env::remove_var("GITLAB_TOKEN");
         std::env::remove_var("GL_TOKEN");
         let a = GitlabAdapter::from_env().unwrap();
@@ -342,8 +351,7 @@ mod tests {
 
     #[test]
     fn host_from_env_adds_protocol() {
-        // NOTE: env-var тесты ломаются при параллельном выполнении (race condition).
-        // Запускать только через `cargo test -- --test-threads=1`.
+        let _g = env_lock();
         std::env::set_var("GITLAB_HOST", "gitlab.corp.org");
         let a = GitlabAdapter::from_env().unwrap();
         assert_eq!(a.host, "https://gitlab.corp.org");
@@ -353,7 +361,7 @@ mod tests {
 
     #[test]
     fn host_with_explicit_protocol_preserved() {
-        // NOTE: env-var тесты ломаются при параллельном выполнении (race condition).
+        let _g = env_lock();
         std::env::set_var("GITLAB_HOST", "http://localhost:8080");
         let a = GitlabAdapter::from_env().unwrap();
         assert_eq!(a.host, "http://localhost:8080");

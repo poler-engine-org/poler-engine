@@ -46,6 +46,12 @@ pub const RPC_GET_NOTES: &str = "cFji9";
 pub const RPC_LIST_ARTIFACTS: &str = "gArtLc";
 /// Аккаунт сессии (GET_OR_CREATE_ACCOUNT).
 pub const RPC_ACCOUNT: &str = "ZwVcOc";
+/// Создать заметку (CREATE_NOTE; тот же id, что SAVE_MIND_MAP — различаются параметрами).
+pub const RPC_CREATE_NOTE: &str = "CYK0Xb";
+/// Обновить содержимое/заголовок заметки (UPDATE_NOTE).
+pub const RPC_UPDATE_NOTE: &str = "cYAfTb";
+/// Удалить заметку (DELETE_NOTE; тот же id, что DELETE_MIND_MAP).
+pub const RPC_DELETE_NOTE: &str = "AH0mwd";
 
 /// Запасной `bl` (сборка фронтенда), если `WIZ_global_data.cfb2h` пуст —
 /// то же значение, что использует расширение NLMTools.
@@ -242,13 +248,28 @@ fn artifact_status(raw: Option<&Value>) -> String {
     .to_string()
 }
 
-/// Источник из строки `[key, title, metadata]`.
+/// Источник из строки `[[id], title, metadata, …]` — реальный формат NLM
+/// (одинаковый в `wXbhsf` и `rLM1Ne`; подтверждено gemini-notebook-mcp-cli:
+/// `src[0]` — список, id лежит в `src[0][0]`). Legacy-фикстуры с голым
+/// id в `row[0]` тоже принимаются.
+///
+/// ⚠ Раньше парсер ожидал `row[0]`-строку: `.as_str()` на вложенном списке
+/// возвращал `None` — и ВСЕ источники молча отбрасывались (sources: 0
+/// в sync, пустая панель Sources в TUI).
 fn parse_source_meta(row: &Value) -> Option<SourceMeta> {
-    let id = at(row, 0).as_str()?.to_string();
-    let title = at(row, 1).as_str()?.to_string();
-    if id.is_empty() || title.is_empty() {
+    // id: реальный формат — `[[id], …]`; legacy — голая строка.
+    let id = at(row, 0)
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| at(at(row, 0), 0).as_str().map(str::to_string))?;
+    if id.is_empty() {
         return None;
     }
+    let title = at(row, 1)
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Untitled")
+        .to_string();
     let m = at(row, 2);
     let type_raw = at(m, 4);
     Some(SourceMeta {
@@ -302,6 +323,98 @@ pub fn parse_notebooks(data: &Value) -> Vec<Notebook> {
     rows.as_array()
         .map(|rows| rows.iter().filter_map(parse_notebook).collect())
         .unwrap_or_default()
+}
+
+/// Распарсить паспорт одного ноутбука (из `GET_PROJECT` / `rLM1Ne`).
+pub fn parse_single_notebook(data: &Value) -> Option<Notebook> {
+    if let Some(nb) = parse_notebook(data) {
+        return Some(nb);
+    }
+    if let Some(arr) = data.as_array() {
+        for elem in arr {
+            if let Some(nb) = parse_notebook(elem) {
+                return Some(nb);
+            }
+        }
+    }
+    None
+}
+
+/// Заметка NotebookLM (только заметки; mind maps отфильтрованы).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NlmNote {
+    pub id: String,
+    pub title: String,
+    pub text: String,
+}
+
+/// Mind map хранится в том же сторе, что заметки: контент — JSON
+/// с ключами `children`/`nodes`. Такие элементы в заметки не попадают.
+fn is_mind_map_json(content: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(content) else {
+        return false;
+    };
+    v.is_object() && (v.get("children").is_some() || v.get("nodes").is_some())
+}
+
+/// Ответ `GET_NOTES` (cFji9) → заметки без mind maps и удалённых.
+///
+/// Формат: `[[[note_id, [note_id, text, meta, None, title], status], …], ts]`
+/// (удалённые: `status == 2` или `data == null`).
+pub fn parse_nlm_notes(data: &Value) -> Vec<NlmNote> {
+    // bare vs wrapped: data = [items_array, metadata] vs data = items_array
+    let items = if at(data, 0).is_array() && at(at(data, 0), 0).is_array() {
+        at(data, 0)
+    } else {
+        data
+    };
+    let Some(arr) = items.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(id) = at(item, 0).as_str() else { continue };
+        if id.is_empty() {
+            continue;
+        }
+        let inner = at(item, 1);
+        // удалённые: status==2 или data==null
+        if at(item, 2).as_i64() == Some(2) || inner.is_null() {
+            continue;
+        }
+        let Some(text) = at(inner, 1).as_str() else {
+            continue;
+        };
+        if text.is_empty() || is_mind_map_json(text) {
+            continue;
+        }
+        let title = at(inner, 4)
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Заметка NLM")
+            .to_string();
+        out.push(NlmNote {
+            id: id.to_string(),
+            title,
+            text: text.to_string(),
+        });
+    }
+    out
+}
+
+/// Ответ `CREATE_NOTE` (CYK0Xb) → id новой заметки.
+pub fn parse_created_note_id(data: &Value) -> Option<String> {
+    // [[note_id, …]] | [note_id, …] | "note_id"
+    let first = at(data, 0);
+    if let Some(id) = first.as_str() {
+        return Some(id.to_string());
+    }
+    if first.is_array() {
+        if let Some(id) = at(first, 0).as_str() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// Артефакт из строки `[id, title, type, sourceIds, status, …]`.
@@ -617,7 +730,18 @@ impl NlmSession {
 
     /// Паспорт ноутбука (raw-JSON — схема богаче, чем в парсере).
     pub fn get_project(&mut self, notebook_id: &str) -> Result<Value, String> {
-        self.rpc(RPC_GET_PROJECT, &serde_json::json!([notebook_id, null, [2]]), Some(notebook_id))
+        // Формат gemini-notebook-mcp-cli: [nb_id, null, [2], null, 0]
+        self.rpc(
+            RPC_GET_PROJECT,
+            &serde_json::json!([notebook_id, null, [2], null, 0]),
+            Some(notebook_id),
+        )
+    }
+
+    /// Загрузить структурированный паспорт ноутбука со всеми источниками (RPC GET_PROJECT / rLM1Ne).
+    pub fn get_notebook(&mut self, notebook_id: &str) -> Result<Notebook, String> {
+        let data = self.get_project(notebook_id)?;
+        parse_single_notebook(&data).ok_or_else(|| format!("Не удалось распарсить паспорт ноутбука {notebook_id}"))
     }
 
     /// Контент источника: текст и/или URL картинок слайдов.
@@ -633,6 +757,52 @@ impl NlmSession {
     /// Заметки ноутбука (raw-JSON).
     pub fn notes(&mut self, notebook_id: &str) -> Result<Value, String> {
         self.rpc(RPC_GET_NOTES, &serde_json::json!([notebook_id]), Some(notebook_id))
+    }
+
+    /// Заметки ноутбука (структурно; без mind maps и удалённых).
+    pub fn list_notes_structured(&mut self, notebook_id: &str) -> Result<Vec<NlmNote>, String> {
+        let data = self.notes(notebook_id)?;
+        Ok(parse_nlm_notes(&data))
+    }
+
+    /// Создать заметку в NLM: CREATE_NOTE + UPDATE_NOTE с контентом
+    /// (двухшаговый протокол, как в NLMTools). Возвращает id новой заметки.
+    pub fn create_note(
+        &mut self,
+        notebook_id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<String, String> {
+        let title = if title.trim().is_empty() { "New Note" } else { title };
+        // RPC-формат CREATE_NOTE: [notebook_id, "", [1], null, title]
+        let data = self.rpc(
+            RPC_CREATE_NOTE,
+            &serde_json::json!([notebook_id, "", [1], null, title]),
+            Some(notebook_id),
+        )?;
+        let note_id = parse_created_note_id(&data)
+            .ok_or_else(|| "CREATE_NOTE: не найден id новой заметки".to_string())?;
+        if !content.is_empty() {
+            self.update_note(notebook_id, &note_id, content, title)?;
+        }
+        Ok(note_id)
+    }
+
+    /// Обновить содержимое/заголовок заметки (RPC UPDATE_NOTE / cYAfTb).
+    pub fn update_note(
+        &mut self,
+        notebook_id: &str,
+        note_id: &str,
+        content: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        // RPC-формат UPDATE_NOTE: [notebook_id, note_id, [[[content, title, [], 0]]]]
+        self.rpc(
+            RPC_UPDATE_NOTE,
+            &serde_json::json!([notebook_id, note_id, [[[content, title, [], 0]]]]),
+            Some(notebook_id),
+        )?;
+        Ok(())
     }
 
     /// Studio-объекты ноутбука: аудио, отчёты, квизы, миндмэпы.
@@ -770,16 +940,24 @@ impl NlmSession {
         }
 
         // 3) дождаться ответа: вопрос появился в тексте → текст стабилизировался
-        let probe = |s: &mut CdpSession, q: &str| -> Result<(usize, bool), String> {
+        //    И модель закончила думать: пока на странице «Обработка…»/кнопка
+        //    stop — стабильность НЕ засчитывается (иначе ответ срезается
+        //    посреди генерации: текст во время раздумья Gemini не меняется).
+        let probe = |s: &mut CdpSession, q: &str| -> Result<(usize, bool, bool), String> {
             let raw = s.eval_async_string(&format!(
-                "(async()=>JSON.stringify({{n:document.body.innerText.length,\
-                  has:document.body.innerText.includes({q})}}))()",
+                "(async()=>{{const t=document.body.innerText;\
+                  const busy=/Обработка|Обробк|Processing|Thinking|Генераци|Generating/i.test(t)\
+                    || [...document.querySelectorAll('button')].some(b=>\
+                         /^stop$/i.test((b.getAttribute('aria-label')||'').trim())\
+                         && b.getClientRects().length>0);\
+                  return JSON.stringify({{n:t.length,has:t.includes({q}),busy}})}})()",
                 q = serde_json::json!(q)
             ))?;
             let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
             Ok((
                 v.get("n").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
                 v.get("has").and_then(|h| h.as_bool()).unwrap_or(false),
+                v.get("busy").and_then(|b| b.as_bool()).unwrap_or(false),
             ))
         };
 
@@ -787,17 +965,22 @@ impl NlmSession {
         // фаза 1: вопрос отрисовался (до 20 с)
         let phase1 = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20));
         while std::time::Instant::now() < phase1 {
-            if let Ok((_, true)) = probe(&mut self.session, question) {
+            if let Ok((_, true, _)) = probe(&mut self.session, question) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(700));
         }
-        // фаза 2: длина текста стабильна 3 poll-а подряд (стриминг ответа кончился)
+        // фаза 2: длина текста стабильна 3 poll-а подряд И не «Обработка…»
         let mut last_len = 0usize;
         let mut stable = 0u32;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1200));
-            if let Ok((n, _)) = probe(&mut self.session, question) {
+            if let Ok((n, _, busy)) = probe(&mut self.session, question) {
+                if busy {
+                    // модель ещё думает — стабильность не считаем, ждём дальше
+                    stable = 0;
+                    continue;
+                }
                 if n == last_len && n > 0 {
                     stable += 1;
                     if stable >= 3 {
@@ -810,12 +993,13 @@ impl NlmSession {
             }
         }
 
-        // 4) ответ = текст после последнего вхождения вопроса
+        // 4) ответ = текст после последнего вхождения вопроса, без UI-мусора
         let text = self.session.eval_async_string("(async()=>document.body.innerText)()")?;
         let answer = match text.rfind(question.trim()) {
             Some(i) => text[i + question.trim().len()..].trim().to_string(),
             None => text.trim().to_string(),
         };
+        let answer = clean_chat_answer(&answer);
         if answer.is_empty() {
             return Err(
                 "ответ пуст — вопрос не отправился или ноутбук не ответил за таймаут \
@@ -825,6 +1009,76 @@ impl NlmSession {
         }
         Ok(answer)
     }
+}
+
+/// Убрать UI-мусор NotebookLM из сырого innerText ответа чата:
+/// футер-дисклеймер, кнопки-действия (keep_pin / copy_all / thumb_up / …),
+/// сгенерированные вопросы-подсказки, промо-баннер и ярлыки интерфейса
+/// (Thoughts / expand_more / close / docs / «(324)» / stop / arrow_forward) —
+/// остаётся только текст ответа модели.
+fn clean_chat_answer(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    // футер-дисклеймер и хвост страницы после него
+    for marker in [
+        "Gemini Notebook может ошибаться",
+        "Gemini может ошибаться",
+        "Gemini может допускать ошибки",
+        "можете попросить создать диаграммы",
+    ] {
+        if let Some(i) = t.find(marker) {
+            t.truncate(i);
+        }
+    }
+    // кнопки-действия под ответом: всё от ПЕРВОЙ такой строки — UI-хром
+    // (за ними идут вопросы-подсказки, промо, сайдбар — всё не-ответ)
+    for marker in [
+        "\nkeep_pin",
+        "\ncopy_all",
+        "\nthumb_up",
+        "\nthumb_down",
+        "\nСохранить в заметке",
+        "\narrow_forward",
+        "\nСохранить заметку",
+    ] {
+        if let Some(i) = t.find(marker) {
+            t.truncate(i);
+        }
+    }
+    // верхние строки-ярлыки UI — срезаем, пока первая строка мусорная
+    let junk_line = |f: &str| -> bool {
+        let f = f.trim();
+        f.is_empty()
+            || matches!(
+                f,
+                "Thoughts" | "expand_more" | "🪄" | "close" | "stop" | "docs"
+                    | "keep_pin" | "copy_all" | "thumb_up" | "thumb_down" | "arrow_forward"
+            )
+            || f.starts_with("Gemini Notebook теперь")
+            || f.starts_with("Хотите проанализировать")
+            || f.starts_with("Хотите создать")
+            || (f.starts_with('(') && f.ends_with(')') && f[1..f.len() - 1].chars().all(|c| c.is_ascii_digit()))
+            // ярлык-иконка действия (одна строка = только иконка/токен кнопки)
+            || matches!(f, "Сохранить в заметке" | "Сохранить заметку")
+    };
+    let mut lines: Vec<&str> = t.lines().collect();
+    while lines.first().is_some_and(|l| junk_line(l)) {
+        lines.remove(0);
+    }
+    // и хвостовые ярлыки после ответа (сайдбар может идти ниже по DOM)
+    while lines.last().is_some_and(|l| junk_line(l)) {
+        lines.pop();
+    }
+    // цитатные чипы NotebookLM: строки из 1-2 голых цифр (сноски «1» «2»)
+    // — не текст ответа; «1.» / «1)» (списки) НЕ трогаем
+    let lines: Vec<String> = lines
+        .iter()
+        .filter(|l| {
+            let s = l.trim();
+            !(s.len() <= 2 && s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty())
+        })
+        .map(|l| l.trim_start_matches('\u{a0}').to_string())
+        .collect();
+    lines.join("\n").trim().to_string()
 }
 
 /// Минимальный %-encode для path/query компонентов.
@@ -965,6 +1219,62 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn clean_chat_answer_strips_footer_and_labels() {
+        // живой кейс из туннеля: ответ окружён UI-мусором NotebookLM
+        let raw = "Thoughts\nexpand_more\n🪄\nGemini Notebook теперь ещё умнее. Хотите проанализировать данные?\nclose\ndocs\n(324)\nstop\n\nPOLER — это резонансная архитектура поиска.\nОна состоит из трёх компонентов.\n\nGemini Notebook может ошибаться. Обязательно проверяйте ответы.\nОбработка…";
+        let cleaned = clean_chat_answer(raw);
+        assert_eq!(
+            cleaned,
+            "POLER — это резонансная архитектура поиска.\nОна состоит из трёх компонентов."
+        );
+    }
+
+    #[test]
+    fn clean_chat_answer_keeps_clean_text() {
+        assert_eq!(clean_chat_answer("Просто ответ"), "Просто ответ");
+        assert_eq!(clean_chat_answer("  \n Ответ \n "), "Ответ");
+        // «(324)» в середине текста — НЕ мусор, срезаем только сверху/снизу
+        assert_eq!(
+            clean_chat_answer("Ответ (важно) и текст"),
+            "Ответ (важно) и текст"
+        );
+    }
+
+    #[test]
+    fn clean_chat_answer_stops_at_first_footer_marker() {
+        let raw = "Ответ модели\nGemini может ошибаться\nхвост страницы";
+        assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
+
+    #[test]
+    fn clean_chat_answer_trailing_sidebar_labels() {
+        let raw = "Ответ модели\ndocs\n(12)\nstop";
+        assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
+
+    #[test]
+    fn clean_chat_answer_action_buttons_and_suggestions() {
+        // живой кейс: после ответа — кнопки-действия, вопросы-подсказки, промо
+        let raw = "Ответ модели\nkeep_pin\nСохранить в заметке\ncopy_all\nthumb_up\nthumb_down\n\nКак вывести K?\nЧто такое патч?\n\n🪄\nGemini Notebook теперь ещё умнее. Хотите создать документ?\nclose\ndocs\n(324)\narrow_forward";
+        assert_eq!(clean_chat_answer(raw), "Ответ модели");
+    }
+
+    #[test]
+    fn clean_chat_answer_strips_citation_chips() {
+        // чипы-сноски «1» «2» на отдельных строках — удаляются,
+        // «1.» (список) — остаётся
+        let raw = "Первое утверждение\n1\n2\n.\nВторое утверждение\n3\n";
+        let cleaned = clean_chat_answer(raw);
+        assert!(cleaned.contains("Первое утверждение"));
+        assert!(cleaned.contains("Второе утверждение"));
+        assert!(!cleaned.contains("\n1\n"));
+        assert!(!cleaned.contains("\n3\n"));
+        let listed = clean_chat_answer("1. пункт списка\n2. второй пункт");
+        assert!(listed.contains("1. пункт списка"));
+        assert!(listed.contains("2. второй пункт"));
+    }
+
+    #[test]
     fn base64_decode_roundtrip_with_cdp_encoder() {
         // вектор из тестов cdp.rs: "foobar" ↔ "Zm9vYmFy"
         assert_eq!(crate::web::cdp::base64_decode("Zm9vYmFy").unwrap(), b"foobar");
@@ -1014,14 +1324,15 @@ mod tests {
     #[test]
     fn notebooks_parse_with_sources_and_dates() {
         // схема: [title, sources, id, emoji, _, meta[perm,_,_,_,_,updated,_,_,created]]
+        // источники — реальный формат NLM: [[id], title, metadata] (id вложен в список)
         let data = json!([[
             [
                 "Касіопея",
                 [
-                    ["s-1", "Роман повний текст", [
+                    [["s-1"], "Роман повний текст", [
                         null, null, [1735689600, 0], [null, [1700000000, 0]], 4
                     ]],
-                    ["s-2", "Відео розбір", [
+                    [["s-2"], "Відео розбір", [
                         null, null, null, null, 9,
                         ["https://youtu.be/abc", "abc", "Канал"]
                     ]]
@@ -1058,6 +1369,68 @@ mod tests {
         let nbs = parse_notebooks(&data);
         assert_eq!(nbs.len(), 1);
         assert_eq!(nbs[0].title, "T");
+    }
+
+    #[test]
+    fn source_meta_legacy_bare_id_still_parses() {
+        // старый формат фикстур: id голой строкой — не ломаем обратную совместимость
+        // (обёртка [[rows]] — как в реальном wXbhsf)
+        let data = json!([[[
+            "T",
+            [["s-legacy", "Старый формат", [null, null, null, null, 4]]],
+            "id-1", "", null, null
+        ]]]);
+        let nbs = parse_notebooks(&data);
+        assert_eq!(nbs[0].sources.len(), 1);
+        assert_eq!(nbs[0].sources[0].id, "s-legacy");
+        assert_eq!(nbs[0].sources[0].title, "Старый формат");
+    }
+
+    #[test]
+    fn source_meta_without_title_gets_untitled() {
+        // реальный NLM иногда присылает пустой title — не теряем источник
+        let data = json!([[[
+            "T",
+            [[["s-x"], "", [null, null, null, null, 3]]],
+            "id-1", "", null, null
+        ]]]);
+        let nbs = parse_notebooks(&data);
+        assert_eq!(nbs[0].sources.len(), 1);
+        assert_eq!(nbs[0].sources[0].title, "Untitled");
+        assert_eq!(nbs[0].sources[0].kind, "PDF");
+    }
+
+    #[test]
+    fn single_notebook_parse_rlm1ne_wrapper() {
+        // GET_PROJECT (rLM1Ne): данные обёрнуты внешним массивом,
+        // источники — вложенный id (gemini-notebook-mcp-cli:
+        // notebook_data[1], src[0][0] = id, src[2] = metadata, src[2][4] = тип)
+        let data = json!([
+            [
+                "Касиопея (Відлуння Глибокого Яру)",
+                [
+                    [["fce0e1bf-e499-481b-ba2f-f1e73f136ade"], "NotebookLM Help", [
+                        null, null, [1735689600, 0], null, 5,
+                        null, null, ["https://support.google.com/notebooklm"]
+                    ]],
+                    [["src-2"], "Роман", [null, null, null, null, 4]]
+                ],
+                "704f2610-c02b-4ec1-9fc7-a3b72dde2af1", "🌌", null,
+                [1, null, null, null, null, [1735689600, 0]]
+            ]
+        ]);
+        let nb = parse_single_notebook(&data).expect("паспорт должен парситься");
+        assert_eq!(nb.id, "704f2610-c02b-4ec1-9fc7-a3b72dde2af1");
+        assert_eq!(nb.title, "Касиопея (Відлуння Глибокого Яру)");
+        assert_eq!(nb.sources.len(), 2);
+        assert_eq!(nb.sources[0].id, "fce0e1bf-e499-481b-ba2f-f1e73f136ade");
+        assert_eq!(nb.sources[0].title, "NotebookLM Help");
+        assert_eq!(nb.sources[0].kind, "Веб-страница");
+        assert_eq!(
+            nb.sources[0].url.as_deref(),
+            Some("https://support.google.com/notebooklm")
+        );
+        assert_eq!(nb.sources[1].kind, "Текст");
     }
 
     #[test]
@@ -1171,5 +1544,67 @@ mod tests {
         let md2 = format_source_content(&sc, "nb-1");
         assert!(md2.contains("# Источник: Doc"));
         assert!(md2.contains("## Медиа (1)"));
+    }
+
+    // ------- M5: заметки (GET_NOTES / CREATE_NOTE / UPDATE_NOTE) -------
+
+    #[test]
+    fn parse_nlm_notes_wrapped_filters_mind_maps_and_deleted() {
+        // wrapped: [items, ts]; item = [id, [id, text, meta, null, title], status]
+        let data = json!([
+            [
+                ["n-1", ["n-1", "Текст заметки", null, null, "Моя заметка"], 1],
+                ["n-2", ["n-2", "{\"children\":[{\"title\":\"мм\"}]}", null, null, "Mind map"], 1],
+                ["n-3", ["n-3", "удалённая", null, null, "Del"], 2],
+                ["n-4", null, 1],
+                ["n-5", ["n-5", "", null, null, "Пустая"], 1]
+            ],
+            1735689600000u64
+        ]);
+        let notes = parse_nlm_notes(&data);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, "n-1");
+        assert_eq!(notes[0].title, "Моя заметка");
+        assert_eq!(notes[0].text, "Текст заметки");
+    }
+
+    #[test]
+    fn parse_nlm_notes_bare_and_default_title() {
+        // bare: data = items без обёртки; title пустой → дефолт
+        let data = json!([
+            ["n-9", ["n-9", "Контент", null, null, ""], 1]
+        ]);
+        let notes = parse_nlm_notes(&data);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Заметка NLM");
+    }
+
+    #[test]
+    fn parse_nlm_notes_mind_map_nodes_key_filtered() {
+        // mind map c ключом "nodes" (вторая форма) — тоже фильтруется
+        let data = json!([
+            [["m-1", ["m-1", "{\"nodes\":{}}", null, null, "MM"], 1]]
+        ]);
+        assert!(parse_nlm_notes(&data).is_empty());
+    }
+
+    #[test]
+    fn parse_created_note_id_variants() {
+        // [[id, …]] — основная форма ответа CREATE_NOTE
+        assert_eq!(parse_created_note_id(&json!([["nb-note-77", 1, 2]])), Some("nb-note-77".into()));
+        // [id, …]
+        assert_eq!(parse_created_note_id(&json!(["nb-note-78", 1])), Some("nb-note-78".into()));
+        // мусор
+        assert_eq!(parse_created_note_id(&json!([null, 2])), None);
+        assert_eq!(parse_created_note_id(&json!([])), None);
+    }
+
+    #[test]
+    fn is_mind_map_json_discriminator() {
+        assert!(is_mind_map_json(r#"{"children":[]}"#));
+        assert!(is_mind_map_json(r#"{"nodes":{"a":1}}"#));
+        assert!(!is_mind_map_json("обычный текст"));
+        assert!(!is_mind_map_json(r#"{"title":"нет ключей"}"#));
+        assert!(!is_mind_map_json("[1,2,3]"));
     }
 }

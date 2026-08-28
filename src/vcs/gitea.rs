@@ -267,9 +267,19 @@ fn parse_repos(body: &Value) -> Vec<RepoId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Тесты мутируют process-env параллельно — сериализуем их,
+    /// иначе GITEA_HOST устанавливается одним тестом, пока другой
+    /// проверяет ошибку «без хоста» (гонка, флaky-красный CI).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn adapter_from_env_fails_without_host() {
+        let _g = env_lock();
         std::env::remove_var("GITEA_HOST");
         std::env::remove_var("GITEA_TOKEN");
         let res = GiteaAdapter::from_env();
@@ -279,6 +289,7 @@ mod tests {
 
     #[test]
     fn adapter_from_env_with_host() {
+        let _g = env_lock();
         std::env::set_var("GITEA_HOST", "gitea.com");
         std::env::remove_var("GITEA_TOKEN");
         let a = GiteaAdapter::from_env().unwrap();
@@ -290,6 +301,7 @@ mod tests {
 
     #[test]
     fn adapter_from_env_localhost_uses_http() {
+        let _g = env_lock();
         std::env::set_var("GITEA_HOST", "localhost:3000");
         let a = GiteaAdapter::from_env().unwrap();
         assert_eq!(a.host, "http://localhost:3000");
@@ -298,6 +310,7 @@ mod tests {
 
     #[test]
     fn adapter_from_env_with_protocol_preserved() {
+        let _g = env_lock();
         std::env::set_var("GITEA_HOST", "http://192.168.1.10:3000");
         let a = GiteaAdapter::from_env().unwrap();
         assert_eq!(a.host, "http://192.168.1.10:3000");
@@ -394,6 +407,7 @@ mod tests {
 
     #[test]
     fn from_env_token_priority_gitea_first() {
+        let _g = env_lock();
         std::env::set_var("GITEA_HOST", "gitea.com");
         std::env::set_var("GITEA_TOKEN", "gt-token");
         std::env::set_var("GT_TOKEN", "gt-token-2");

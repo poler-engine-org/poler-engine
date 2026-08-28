@@ -19,7 +19,7 @@ static CMD_HINTS: &[(&str, &str)] = &[
     ("search", "search \"<query>\" [--top N]"),
     ("web", "web \"<query>\" [--top N]"),
     ("stats", "stats"),
-    ("nlm", "nlm list|notes|artifacts|source|account|ask|sync"),
+    ("nlm", "nlm list|notes|notes-sync|artifacts|source|account|ask|sync"),
     ("sync", "sync (синк NLM) | sync vcs [gh|gl|gt] <OWNER>"),
     ("crawl", "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]"),
     ("impact", "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]"),
