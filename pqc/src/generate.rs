@@ -78,6 +78,7 @@ use pqw::checksum::fnv1a64;
 use pqw::lexicon::Lexicon;
 use pqw::stream::tokenize;
 
+use crate::archetype_lattice::DEFAULT_BRIDGE_EPS;
 use crate::error::Result;
 use crate::gyro_lattice::{QuantizedGyroCurriculum, SIN_LUT, TransportMode};
 use crate::rng::Rng;
@@ -253,6 +254,13 @@ pub struct GeneratorConfig {
     /// Анти-заикание: координата исключается из лотереи на `N` шагов
     /// после эмиссии (`0` — выключено).
     pub repeat_veto: usize,
+    /// Архетипический мост RQ18: связывать вопрос с памятью через
+    /// нелинейное `a ⊗_ε lattice` (уровень концептуального прыжка
+    /// в лотерее речи).
+    pub bridge: bool,
+    /// Порог энергетического гейта моста `ε ∈ (0, 1]`
+    /// (default [`crate::archetype_lattice::DEFAULT_BRIDGE_EPS`]).
+    pub bridge_eps: f64,
 }
 
 impl Default for GeneratorConfig {
@@ -265,6 +273,8 @@ impl Default for GeneratorConfig {
             free: false,
             morphemes: false,
             repeat_veto: 1,
+            bridge: true,
+            bridge_eps: DEFAULT_BRIDGE_EPS,
         }
     }
 }
@@ -278,6 +288,10 @@ pub enum TicketSource {
     Flow,
     /// Восходящее русло — возврат к предыдущей мысли.
     Backtrack,
+    /// Архетипический мост RQ18: концептуальный прыжок через
+    /// `a ⊗_ε lattice` — структурный изоморфизм там, где прямых
+    /// русел J нет (метафора, глубокая аналогия).
+    Archetype,
     /// Кинетическая дуга вне кольца — внутренний голос.
     Kinetic,
 }
@@ -314,6 +328,17 @@ pub struct GenerationReport {
     pub ignited: usize,
     /// Ворота сняты автоматически (нулевая кинетика после слушания).
     pub auto_free: bool,
+    /// Мост `⊗_ε`: энергия пересечения архетипа промпта с памятью
+    /// (`0.0`, если мост выключен или промпт пуст).
+    pub bridge_energy: f64,
+    /// Мост: дуг пересечения (согласие + конфликт).
+    pub bridge_co: usize,
+    /// Мост: согласных полюсов (структурный резонанс).
+    pub bridge_resonance: usize,
+    /// Мост: встречных полюсов (аннигиляция — открытые вопросы).
+    pub bridge_conflict: usize,
+    /// Мост: гейт открыт `E ≥ ε` — изоморфизм найден.
+    pub bridge_resonant: bool,
     /// Перещёлкиваний решётки за фазу мышления.
     pub think_moved: usize,
     /// θ-сдвиг за фазу мышления.
@@ -352,6 +377,9 @@ pub struct L5Generator<'a> {
     /// Смежность русел: `adj[c] = [(сосед, +1 — русло c→сосед,
     /// −1 — русело сосед→c)]`. Строится один раз из каналов J.
     adj: Vec<Vec<(u32, i8)>>,
+    /// Речевые билеты архетипического моста RQ18: `(дуга, вес)` —
+    /// согласие 2, конфликт 3. Пуст, если гейт заперт или мост выключен.
+    bridge: Vec<(u32, u32)>,
     /// Плотные билеты: нисходящие (вперёд по речи).
     down: Vec<u32>,
     /// Плотные билеты: восходящие (возврат).
@@ -381,6 +409,7 @@ impl<'a> L5Generator<'a> {
             rng: Rng::seed_from_u64(cfg.seed),
             ring: VecDeque::with_capacity(window + 1),
             adj,
+            bridge: Vec::new(),
             down: vec![0u32; d],
             up: vec![0u32; d],
             candidates: Vec::new(),
@@ -396,6 +425,11 @@ impl<'a> L5Generator<'a> {
             prompt_arcs: 0,
             ignited: 0,
             auto_free: false,
+            bridge_energy: 0.0,
+            bridge_co: 0,
+            bridge_resonance: 0,
+            bridge_conflict: 0,
+            bridge_resonant: false,
             think_moved: 0,
             think_theta_shift: 0.0,
             steps: Vec::new(),
@@ -438,6 +472,22 @@ impl<'a> L5Generator<'a> {
                     self.ring.push_back(c);
                 }
             }
+        }
+
+        // ---- Фаза A2: архетипический мост (RQ18) ----
+        // Нелинейная интерференция `a ⊗_ε lattice` ДО мышления: момент
+        // внимания на дугах пересечения разгоняет волну к структурному
+        // изоморфизму — мышление потечёт к мосту. Билеты (согласие 2,
+        // конфликт 3) ждут своей очереди в лотерее речи.
+        if self.cfg.bridge {
+            let arch = self.qc.prompt_archetype(prompt);
+            let brep = self.qc.archetype_bridge(&arch, self.cfg.bridge_eps)?;
+            report.bridge_energy = brep.energy;
+            report.bridge_co = brep.co_support;
+            report.bridge_resonance = brep.resonance;
+            report.bridge_conflict = brep.conflict;
+            report.bridge_resonant = brep.resonant;
+            self.bridge = brep.tickets;
         }
 
         // ---- Фаза B: мышление ----
@@ -630,7 +680,32 @@ impl<'a> L5Generator<'a> {
             return Some((coord, TicketSource::Backtrack, total_up as usize));
         }
 
-        // Уровень 3: кинетические дуги вне кольца — внутренний голос.
+        // Уровень 3: архетипический мост RQ18 — концептуальный прыжок.
+        // Прямые русла иссякли: если вопрос структурно изоморфен памяти
+        // (E ≥ ε), лотерея прыгает на дуги продукта a ⊗_ε lattice —
+        // метафора там, где русл J нет. Конфликт кричит весом 3,
+        // согласие говорит весом 2, прозрачная память (фон метафоры)
+        // шепчет весом 1.
+        if !self.bridge.is_empty() {
+            self.candidates.clear();
+            let mut total: u64 = 0;
+            for &(c, w) in self.bridge.iter() {
+                if self.ring.contains(&c) || self.veto.contains(&c) {
+                    continue;
+                }
+                self.candidates.push((c, w));
+                total += w as u64;
+            }
+            if total > 0 {
+                let pick = self.draw(total);
+                let coord = self.pick_candidate(pick);
+                self.candidates.clear();
+                return Some((coord, TicketSource::Archetype, total as usize));
+            }
+            self.candidates.clear();
+        }
+
+        // Уровень 4: кинетические дуги вне кольца — внутренний голос.
         self.candidates.clear();
         let ring = &self.ring;
         let veto = &self.veto;
@@ -901,6 +976,155 @@ mod tests {
         assert_eq!(c.repeat_veto, 1);
         assert!(!c.free);
         assert!(!c.morphemes);
+        assert!(c.bridge, "мост включён по умолчанию (ТЗ RQ18)");
+        assert_eq!(c.bridge_eps, DEFAULT_BRIDGE_EPS);
+    }
+
+    // ===================== Архетипический мост (RQ18) =====================
+
+    #[test]
+    fn bridge_disabled_reports_zero_stats() {
+        // --no-bridge: статистика моста нулевая, речь работает как в RQ17.
+        let mut qc = trained_engine();
+        let cfg = GeneratorConfig {
+            bridge: false,
+            max_tokens: 8,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        assert_eq!(rep.bridge_energy, 0.0);
+        assert_eq!(rep.bridge_co, 0);
+        assert!(!rep.bridge_resonant);
+        assert!(!rep.steps.is_empty());
+    }
+
+    #[test]
+    fn bridge_stats_deterministic_by_seed() {
+        // Одинаковый промпт + одинаковый сид — бит-в-бит одинаковая
+        // статистика моста (путь внимания без ГПСЧ).
+        let run = |seed: u64| {
+            let mut qc = trained_engine();
+            let cfg = GeneratorConfig {
+                seed,
+                max_tokens: 10,
+                ..GeneratorConfig::default()
+            };
+            let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+            gen.generate("квант фаза решётка").unwrap()
+        };
+        let a = run(7);
+        let b = run(7);
+        assert_eq!(a.bridge_energy, b.bridge_energy);
+        assert_eq!(a.bridge_co, b.bridge_co);
+        assert_eq!(a.bridge_resonance, b.bridge_resonance);
+        assert_eq!(a.bridge_conflict, b.bridge_conflict);
+        assert_eq!(a.bridge_resonant, b.bridge_resonant);
+        assert_eq!(a.text, b.text);
+    }
+
+    #[test]
+    fn bridge_resonates_on_known_prompt() {
+        // Знакомый вопрос структурно изоморфен памяти: гейт открыт,
+        // пересечение непусто. (Промпт из слов корпуса.)
+        let mut qc = trained_engine();
+        let cfg = GeneratorConfig {
+            max_tokens: 8,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("квант фаза").unwrap();
+        assert!(rep.bridge_resonant, "E={}", rep.bridge_energy);
+        assert!(rep.bridge_co > 0);
+        assert_eq!(rep.bridge_co, rep.bridge_resonance + rep.bridge_conflict);
+        // Энергия в [0, 1], порог дефолтный 0.5.
+        assert!(rep.bridge_energy >= DEFAULT_BRIDGE_EPS);
+        assert!(rep.bridge_energy <= 1.0);
+    }
+
+    #[test]
+    fn bridge_silent_on_unknown_prompt() {
+        // Чужой вопрос: архетип промпта ортогонален памяти — E = 0,
+        // мост молчит (нет ложных ассоциаций). Речь при этом может
+        // идти свободным потоком J.
+        let mut qc = trained_engine();
+        let cfg = GeneratorConfig {
+            max_tokens: 8,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("зукбар шлёп").unwrap();
+        assert!(!rep.bridge_resonant);
+        assert_eq!(rep.bridge_energy, 0.0);
+        assert_eq!(rep.bridge_co, 0);
+    }
+
+    #[test]
+    fn archetype_jump_on_channel_free_memory() {
+        // Концептуальный прыжок RQ18, детерминированный. Палиндромный
+        // корпус: все слова кристаллизованы (born-шаг от свидетельства),
+        // но встречные потоки ЗАКРЫЛИ все русла J — прямой речи не
+        // существует. Единственный путь — архетипический мост: лотерея
+        // прыгает на прозрачную структуру продукта (метафора без русл).
+        let mut qc = QuantizedGyroCurriculum::new(128, 0.05, 42, 4).unwrap();
+        for _ in 0..2 {
+            qc.ingest("alpha beta gamma delta epsilon", 0).unwrap();
+            qc.ingest("epsilon delta gamma beta alpha", 0).unwrap();
+        }
+        assert!(qc.nnz() >= 4, "полюса кристаллизованы");
+        assert_eq!(qc.channel_count(), 0, "палиндром закрыл все русла");
+        let cfg = GeneratorConfig {
+            max_tokens: 4,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("alpha").unwrap();
+        // Мост резонирует: вопрос «alpha» изоморфен памяти (E = 1).
+        assert!(rep.bridge_resonant, "E={}", rep.bridge_energy);
+        assert_eq!(rep.bridge_co, 1);
+        // Первое слово — прыжок моста: Flow/Backtrack мертвы (русл нет),
+        // лотерея падает на уровень Archetype и говорит из продукта.
+        let first = rep
+            .steps
+            .first()
+            .expect("мост обязан говорить, когда русл нет");
+        assert_eq!(first.source, TicketSource::Archetype);
+        assert!(["beta", "gamma", "delta", "epsilon"].contains(&first.token.as_str()));
+        // Все эмиссии — из памяти (лексикон корпуса).
+        for step in &rep.steps {
+            assert!(
+                ["alpha", "beta", "gamma", "delta", "epsilon"]
+                    .contains(&step.token.as_str()),
+                "чужое слово: {}",
+                step.token
+            );
+        }
+    }
+
+    #[test]
+    fn archetype_jump_respects_veto_and_ring() {
+        // Билеты моста исключают кольцо и veto: мост не заикается и
+        // не повторяет контекст — только НОВЫЕ дуги продукта.
+        let mut qc = QuantizedGyroCurriculum::new(128, 0.05, 42, 4).unwrap();
+        for _ in 0..2 {
+            qc.ingest("alpha beta gamma delta epsilon", 0).unwrap();
+            qc.ingest("epsilon delta gamma beta alpha", 0).unwrap();
+        }
+        let cfg = GeneratorConfig {
+            max_tokens: 8,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("alpha").unwrap();
+        // Промпт-координата никогда не эмитируется (она в кольце).
+        let coord_alpha = (fnv1a64("alpha".as_bytes()) % 128) as u32;
+        for step in &rep.steps {
+            assert_ne!(step.coord, coord_alpha, "мост повторил промпт");
+        }
+        // Анти-заикание: соседние эмиссии различны.
+        for w in rep.steps.windows(2) {
+            assert_ne!(w[0].coord, w[1].coord);
+        }
     }
 
     #[test]

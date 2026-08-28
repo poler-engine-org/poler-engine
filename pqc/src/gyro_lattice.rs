@@ -110,6 +110,7 @@ use pqw::stream::tokenize;
 use pqw::trit_bloch::{counts, p_at, theta_lut, trit_at, TritCounts};
 use pqw::writer::PqwWriter;
 
+use crate::archetype_lattice::archetype_product_packed4;
 use crate::bloch_stream::born_step_packed4_sparse;
 use crate::error::{PqcError, Result};
 use crate::generate::LexiconBuilder;
@@ -956,6 +957,35 @@ pub struct QuantizedGyroReport {
     pub elapsed: std::time::Duration,
 }
 
+/// Отчёт архетипического моста (RQ18): `c = a ⊗_ε lattice`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BridgeReport {
+    /// Ненулевых тритов архетипа промпта.
+    pub nnz_prompt: usize,
+    /// Ненулевых тритов решётки (носитель памяти).
+    pub nnz_lattice: usize,
+    /// Дуг пересечения (оба полюса).
+    pub co_support: usize,
+    /// Согласных полюсов пересечения (резонанс).
+    pub resonance: usize,
+    /// Встречных полюсов (аннигиляция — открытый вопрос).
+    pub conflict: usize,
+    /// Прозрачных дуг продукта: память сквозь незнание вопроса —
+    /// ландшафт метафоры за пределами пересечения.
+    pub transparent: usize,
+    /// Энергия пересечения `E = co / min(nnz)`.
+    pub energy: f64,
+    /// Гейт открыт: `E ≥ ε` — структурный изоморфизм найден.
+    pub resonant: bool,
+    /// Зажиганий момента мостом (внимание на пересечении).
+    pub ignited: usize,
+    /// Кинетических дуг всего после моста.
+    pub kinetic: usize,
+    /// Речевые билеты моста: `(дуга, вес)` — конфликт 3, согласие 2,
+    /// прозрачный проход 1 (интерсекция громче фона метафоры).
+    pub tickets: Vec<(u32, u32)>,
+}
+
 /// Слитый движок RQ16: решётка фаз + гироскоп J + 2-битный момент.
 ///
 /// Вся кинетика — тритовые решётки Packed4 с плотной индексацией;
@@ -1402,6 +1432,118 @@ impl QuantizedGyroCurriculum {
     }
 
     // ===================== Путь L5-генерации (RQ17) =====================
+
+    /// Архетип промпта (RQ18): TF-IDF свидетельство → тритовые полюса.
+    ///
+    /// Чистая сенсорная кодировка: дуга со свидетельством `|s| ≥ ε`
+    /// LENS получает полюс `sign(s)`; суперпозиция — незнание. Без
+    /// ГПСЧ, без мутаций состояния — промпт есть вход, а не знание.
+    /// Возвращает packed4-решётку `⌈d/4⌉` байт.
+    pub fn prompt_archetype(&self, text: &str) -> Vec<u8> {
+        let (pre_arcs, _) = tfidf_arcs(self.d_pol, self.docs, |i| {
+            self.doc_freq[i as usize]
+        }, text);
+        let mut arch = vec![0u8; self.lattice.len()];
+        for (i, s) in pre_arcs {
+            if (s as f32).abs() < self.epsilon {
+                continue; // ε-ворота LENS: слабое свидетельство — фон
+            }
+            let code: u8 = if s > 0.0 { 1 } else { 2 };
+            let x = i as usize;
+            arch[x / 4] |= code << (2 * (x % 4));
+        }
+        arch
+    }
+
+    /// Архетипический мост (RQ18): `c = a ⊗_ε lattice` — нелинейная
+    /// интерференция архетипа промпта с памятью кристалла.
+    ///
+    /// **Внимание, а не знание**: мост зажигает момент на дугах
+    /// пересечения (гистерезис RQ16 + кинетика внимания), но фазы
+    /// решётки не трогает — память меняется только born-шагом от
+    /// реального свидетельства. Билеты моста — три этажа речи:
+    /// конфликт полюсов кричит весом 3 (аннигиляция в продукте —
+    /// открытый вопрос, требующий слова), согласие резонирует весом 2,
+    /// прозрачный проход памяти сквозь незнание вопроса — вес 1,
+    /// ландшафт метафоры за пределами пересечения.
+    ///
+    /// Гейт `E ≥ eps`: при ортогональных архетипах (E < eps) мост
+    /// молчит — билеты пусты, момент не трогается, ложных ассоциаций
+    /// не существует.
+    pub fn archetype_bridge(&mut self, arch: &[u8], eps: f64) -> Result<BridgeReport> {
+        let d = self.d_pol as usize;
+        let mut prod = vec![0u8; self.lattice.len()];
+        let stats = archetype_product_packed4(arch, &self.lattice, d, eps, &mut prod)?;
+        if !stats.resonant {
+            return Ok(BridgeReport {
+                nnz_prompt: stats.nnz_a,
+                nnz_lattice: stats.nnz_b,
+                co_support: stats.co_support,
+                resonance: stats.resonance,
+                conflict: stats.conflict,
+                transparent: 0,
+                energy: stats.energy,
+                resonant: false,
+                ignited: 0,
+                kinetic: self.momentum.kinetic_len(),
+                tickets: Vec::new(),
+            });
+        }
+
+        // Кинетика пересечения: момент внимания на дугах клина a ∧ l.
+        // Направление — к полюсу ПРОМПТА: резонанс даёт инерцию
+        // согласованного полюса, конфликт — вызов памяти (толчок к
+        // полюсу вопроса). Без ГПСЧ: полюса читаются детерминированно,
+        // мост воспроизводим.
+        let mut ignited = 0usize;
+        let mut tickets: Vec<(u32, u32)> = Vec::new();
+        let mut transparent = 0usize;
+        for i in 0..d {
+            let ca = trit_at(arch, i);
+            let cl = trit_at(&self.lattice, i);
+            if ca != Trit::Zero && cl != Trit::Zero {
+                // Пересечение: согласие — резонанс, встречные — конфликт.
+                let target = if ca == cl { ca.sign() } else { 0.0 };
+                let p_emp = cl.sign();
+                let g = p_emp - target;
+                if let MomentumEvent::Ignited = self.momentum.push(i as u32, g) {
+                    ignited += 1;
+                }
+                // Внимание к полюсу промпта: зажигание push-ем (конфликт),
+                // инерция согласованного полюса (резонанс, g = 0) или
+                // восстановление после срыва — всегда sign(a_i).
+                let want: i8 = if ca == Trit::Pos { 1 } else { -1 };
+                if self.momentum.at(i as u32) == 0 {
+                    self.momentum.set_kinetic(i as u32, want);
+                }
+                // Билеты пересечения: согласие говорит (2), конфликт
+                // кричит (3) — даже аннигилировав в продукте, напряжённая
+                // связь требует слова.
+                let weight = if ca == cl { 2 } else { 3 };
+                tickets.push((i as u32, weight));
+            } else if trit_at(&prod, i) != Trit::Zero {
+                // Прозрачный проход: память сквозь незнание вопроса —
+                // ландшафт метафоры (вес 1, тише пересечения).
+                transparent += 1;
+                tickets.push((i as u32, 1));
+            }
+        }
+        self.ignited_total += ignited as u64;
+
+        Ok(BridgeReport {
+            nnz_prompt: stats.nnz_a,
+            nnz_lattice: stats.nnz_b,
+            co_support: stats.co_support,
+            resonance: stats.resonance,
+            conflict: stats.conflict,
+            transparent,
+            energy: stats.energy,
+            resonant: true,
+            ignited,
+            kinetic: self.momentum.kinetic_len(),
+            tickets,
+        })
+    }
 
     /// Слушание промпта БЕЗ born-кристаллизации: токены входят в
     /// кольцо гироскопа (каналы вопроса копятся), TF-IDF свидетельство
@@ -2495,5 +2637,171 @@ mod tests {
         let h = reader.header();
         assert_eq!(h.hyper.gamma, 0.0);
         assert!((h.hyper.eta - 0.6).abs() < 1e-6);
+    }
+
+    // ===================== Архетипический мост (RQ18) =====================
+
+    /// Обученный движок: фазы кристаллизованы born-шагом.
+    fn rq18_engine() -> QuantizedGyroCurriculum {
+        let mut qc = QuantizedGyroCurriculum::new(128, 0.05, 42, 4).unwrap();
+        for _ in 0..3 {
+            qc.ingest(sample_text(), 0).unwrap();
+        }
+        qc
+    }
+
+    #[test]
+    fn bridge_resonates_with_known_prompt() {
+        // Знакомый вопрос: архетип промпта структурно изоморфен памяти —
+        // гейт открыт, пересечение непусто, момент внимания зажжён.
+        let mut qc = rq18_engine();
+        let arch = qc.prompt_archetype("phase lattice");
+        let nnz_arch = {
+            let mut n = 0;
+            for i in 0..qc.d_pol() as usize {
+                if trit_at(&arch, i) != Trit::Zero {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert!(nnz_arch > 0, "архетип промпта пуст");
+        let rep = qc.archetype_bridge(&arch, 0.5).unwrap();
+        assert!(rep.resonant, "E={}", rep.energy);
+        assert!(rep.co_support > 0);
+        assert_eq!(rep.co_support, rep.resonance + rep.conflict);
+        // Билеты: пересечение (веса 2/3) + прозрачный фон метафоры (вес 1).
+        assert_eq!(rep.tickets.len(), rep.co_support + rep.transparent);
+        assert!(rep.tickets.iter().all(|&(_, w)| w == 1 || w == 2 || w == 3));
+        // Прозрачный фон: полюса памяти вне вопроса.
+        assert_eq!(rep.transparent, rep.nnz_lattice - rep.co_support);
+    }
+
+    #[test]
+    fn bridge_never_touches_lattice_phases() {
+        // ГЛАВНЫЙ инвариант: мост — внимание, а не знание. Фазы решётки
+        // бит-в-бит неизменны (память меняет только born-шаг от
+        // свидетельства; McWeeny-дисциплина не нарушена).
+        let mut qc = rq18_engine();
+        let before = qc.lattice().to_vec();
+        let arch = qc.prompt_archetype("phase lattice born");
+        let _ = qc.archetype_bridge(&arch, 0.25).unwrap();
+        assert_eq!(qc.lattice(), before.as_slice(), "мост тронул фазы!");
+    }
+
+    #[test]
+    fn bridge_silent_on_orthogonal_prompt() {
+        // Чужой вопрос (нет общих дуг с носителем памяти): E = 0 < ε —
+        // мост молчит, билеты пусты, момент нетронут. Ложных
+        // ассоциаций не существует (ТЗ п.3).
+        let mut qc = rq18_engine();
+        // Ортогональный архетип: полюса на дугах, ЗАВЕДОМО свободных
+        // (решётка обучена на 8 словах — дуги вне носителя).
+        let zeros: Vec<usize> = (0..qc.d_pol() as usize)
+            .filter(|&i| qc.trit_at(i as u32) == Trit::Zero)
+            .collect();
+        assert!(zeros.len() >= 2, "носитель занял всю решётку?");
+        let mut arch = vec![0u8; qc.lattice_bytes()];
+        set_trit(&mut arch, zeros[0], Trit::Pos);
+        set_trit(&mut arch, zeros[1], Trit::Neg);
+        let before_kinetic = qc.momentum_kinetic();
+        let rep = qc.archetype_bridge(&arch, 0.5).unwrap();
+        assert!(!rep.resonant);
+        assert_eq!(rep.energy, 0.0);
+        assert!(rep.tickets.is_empty());
+        assert_eq!(qc.momentum_kinetic(), before_kinetic);
+        // …но архетип = сама решётка резонирует (E = 1): молчание —
+        // от ортогональности, не от бага.
+        let arch2 = qc.lattice().to_vec();
+        assert!(qc.nnz() > 0);
+        let rep2 = qc.archetype_bridge(&arch2, 0.5).unwrap();
+        assert!(rep2.resonant, "самопересечение обязано резонировать");
+    }
+
+    #[test]
+    fn bridge_ignites_attention_on_intersection() {
+        // Мост зажигает момент на дугах пересечения: волна мышления
+        // потечёт к структурному изоморфизму (внимание, не знание).
+        let mut qc = rq18_engine();
+        // Архетип = сама решётка: пересечение = весь носитель.
+        let arch = qc.lattice().to_vec();
+        let rep = qc.archetype_bridge(&arch, 0.5).unwrap();
+        assert!(rep.resonant);
+        assert_eq!(rep.energy, 1.0);
+        assert!(rep.kinetic >= rep.co_support, "пересечение кинетично");
+        // Каждая дуга пересечения либо зажглась, либо уже была
+        // кинетичной (инерция внимания).
+        let mut kinetic_on_bridge = 0;
+        for &(c, _) in &rep.tickets {
+            if qc.momentum_at(c) != 0 {
+                kinetic_on_bridge += 1;
+            }
+        }
+        assert_eq!(kinetic_on_bridge, rep.tickets.len());
+    }
+
+    #[test]
+    fn bridge_conflict_pushes_toward_prompt_pole() {
+        // Конфликт (промпт-полюс против памяти): момент дует к полюсу
+        // промпта — вопрос бросает вызов памяти, связь кричит.
+        let mut qc = QuantizedGyroCurriculum::new(64, 0.05, 1, 4).unwrap();
+        // Кристаллизуем один токен: сильное свидетельство → полюс.
+        qc.ingest("phase phase phase", 0).unwrap();
+        let c0 = coord_of("phase", 64);
+        let pole = qc.trit_at(c0);
+        assert_ne!(pole, Trit::Zero, "фаза обязана кристаллизоваться");
+        // Архетип промпта — ВСТРЕЧНЫЙ полюс на той же дуге.
+        let opposite = if pole == Trit::Pos { Trit::Neg } else { Trit::Pos };
+        let mut arch = vec![0u8; qc.lattice_bytes()];
+        set_trit(&mut arch, c0 as usize, opposite);
+        let rep = qc.archetype_bridge(&arch, 0.5).unwrap();
+        assert!(rep.resonant);
+        assert_eq!(rep.conflict, 1);
+        assert_eq!(rep.resonance, 0);
+        assert_eq!(rep.transparent, 0, "в памяти только одна дуга");
+        // Момент к полюсу промпта (m = sign(opposite): +1 толкает p
+        // вверх к Pos, −1 — вниз к Neg).
+        let expect_m: i8 = if opposite == Trit::Pos { 1 } else { -1 };
+        assert_eq!(qc.momentum_at(c0), expect_m);
+        // Билет конфликта кричит весом 3 (аннигиляция в продукте —
+        // открытый вопрос, требующий слова).
+        assert!(rep.tickets.contains(&(c0, 3)));
+    }
+
+    /// Координата токена в решётке d_pol.
+    fn coord_of(token: &str, d: u32) -> u32 {
+        (fnv1a64(token.as_bytes()) % d as u64) as u32
+    }
+
+    #[test]
+    fn prompt_archetype_poles_follow_evidence_sign() {
+        // Архетип промпта: полюс = знак TF-IDF свидетельства после
+        // ε-ворот; дуга без свидетельства — суперпозиция (ноль).
+        let qc = rq18_engine();
+        let arch = qc.prompt_archetype("phase");
+        let c = coord_of("phase", qc.d_pol());
+        // Токен встречался в корпусе — свидетельство есть, полюс ненулевой.
+        assert_ne!(trit_at(&arch, c as usize), Trit::Zero);
+        // Чистая решётка: почти все дуги — суперпозиция.
+        let zeros = (0..qc.d_pol() as usize)
+            .filter(|&i| trit_at(&arch, i) == Trit::Zero)
+            .count();
+        assert!(zeros >= qc.d_pol() as usize - 4);
+    }
+
+    #[test]
+    fn bridge_deterministic_same_prompt() {
+        // Мост воспроизводим: одинаковый промпт — бит-в-бит одинаковые
+        // билеты и статистика (никакого ГПСЧ в пути внимания).
+        let build = || {
+            let mut qc = rq18_engine();
+            let arch = qc.prompt_archetype("phase lattice crystal");
+            let rep = qc.archetype_bridge(&arch, 0.5).unwrap();
+            (rep, arch)
+        };
+        let (a, arch_a) = build();
+        let (b, arch_b) = build();
+        assert_eq!(arch_a, arch_b);
+        assert_eq!(a, b);
     }
 }

@@ -86,6 +86,7 @@
 
 pub mod ansatz;
 pub mod archetype;
+pub mod archetype_lattice;
 pub mod bloch_stream;
 pub mod born;
 pub mod coherence;

@@ -155,7 +155,18 @@ GENERATE/ASK/CHAT OPTIONS (RQ17: L5-генерация — первые слов
     --repeat-veto <N>         анти-заикание: запрет повтора координаты на N
                               шагов (default 1; 0 — выключено)
     --no-learn                ask: без перещёлкивания фаз born-шагом
+    --no-bridge               выключить архетипический мост ⊗_ε (RQ18)
+    --bridge-eps <F>          порог гейта моста ∈ (0,1] (default 0.5)
     --json                    машинно-читаемый отчёт (zero-dep JSON)
+
+ARCHETYPE OPTIONS (RQ18: нелинейная алгебра a ⊗_ε b — мышление
+архетипами; c = Π_Λ(R + ε·(a∧b)), гейт E = co/min(nnz) ≥ ε):
+    --brain <F>               мозг A (контейнер v2/v3/v4, Packed4)
+    --with <F>                мозг B: произведение двух мозгов —
+                              структурный изоморфизм знаний
+    --prompt <T>              архетип промпта как сомножитель B
+    --eps <F>                 порог гейта ∈ (0,1] (default 0.5)
+    --json                    машинно-читаемый отчёт
 
 INSPECT OPTIONS (дополнительно):
     --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
@@ -203,6 +214,7 @@ fn main() {
         Some("step") => cmd_generate(&args[1..], true),
         Some("ask") => cmd_ask(&args[1..], false),
         Some("chat") => cmd_ask(&args[1..], true),
+        Some("archetype") => cmd_archetype(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -4090,6 +4102,7 @@ fn cmd_train(args: &[String]) -> i32 {
 // RQ17: L5-ГЕНЕРАЦИЯ — первые слова и рассуждение
 // ============================================================================
 
+use pqc::archetype_lattice::{archetype_product_packed4, DEFAULT_BRIDGE_EPS};
 use pqc::generate::{GenerationReport, GeneratorConfig, L5Generator};
 use pqc::gyro_lattice::QuantizedGyroCurriculum;
 
@@ -4106,6 +4119,8 @@ struct GenConfig {
     free: bool,
     morphemes: bool,
     repeat_veto: usize,
+    bridge: bool,
+    bridge_eps: f64,
     learn: bool,
     json: bool,
     /// Позиционный вопрос (ask/chat).
@@ -4113,7 +4128,7 @@ struct GenConfig {
 }
 
 impl Default for GenConfig {
-    fn default() -> GenConfig {
+    fn default() -> Self {
         GenConfig {
             brain: None,
             corpus: None,
@@ -4126,6 +4141,8 @@ impl Default for GenConfig {
             free: false,
             morphemes: false,
             repeat_veto: 1,
+            bridge: true,
+            bridge_eps: DEFAULT_BRIDGE_EPS,
             learn: true,
             json: false,
             question: None,
@@ -4180,6 +4197,16 @@ fn parse_gen_args(args: &[String], cfg: &mut GenConfig) -> Result<(), String> {
                 cfg.repeat_veto = val("--repeat-veto")?
                     .parse()
                     .map_err(|_| "bad --repeat-veto".to_string())?
+            }
+            "--no-bridge" => cfg.bridge = false,
+            "--bridge-eps" => {
+                cfg.bridge_eps = val("--bridge-eps")?
+                    .parse()
+                    .map_err(|_| "bad --bridge-eps".to_string())?;
+                if !cfg.bridge_eps.is_finite() || cfg.bridge_eps <= 0.0 || cfg.bridge_eps > 1.0
+                {
+                    return Err("--bridge-eps: порог гейта ∈ (0, 1]".to_string());
+                }
             }
             "--no-learn" => cfg.learn = false,
             "--json" => cfg.json = true,
@@ -4276,6 +4303,16 @@ fn generation_json_pairs(
         ("prompt_arcs".into(), Json::num(rep.prompt_arcs as f64)),
         ("ignited".into(), Json::num(rep.ignited as f64)),
         ("auto_free".into(), Json::Bool(rep.auto_free)),
+        (
+            "bridge".into(),
+            Json::Obj(vec![
+                ("energy".into(), Json::num(rep.bridge_energy)),
+                ("co_support".into(), Json::num(rep.bridge_co as f64)),
+                ("resonance".into(), Json::num(rep.bridge_resonance as f64)),
+                ("conflict".into(), Json::num(rep.bridge_conflict as f64)),
+                ("resonant".into(), Json::Bool(rep.bridge_resonant)),
+            ]),
+        ),
         ("think_moved".into(), Json::num(rep.think_moved as f64)),
         ("think_theta_shift".into(), Json::num(rep.think_theta_shift)),
         (
@@ -4292,6 +4329,7 @@ fn generation_json_pairs(
                                 Json::str(match s.source {
                                     pqc::generate::TicketSource::Flow => "flow",
                                     pqc::generate::TicketSource::Backtrack => "backtrack",
+                                    pqc::generate::TicketSource::Archetype => "archetype",
                                     pqc::generate::TicketSource::Kinetic => "kinetic",
                                 }),
                             ),
@@ -4335,6 +4373,7 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
             let src = match s.source {
                 pqc::generate::TicketSource::Flow => "русло вперёд",
                 pqc::generate::TicketSource::Backtrack => "возврат по руслу",
+                pqc::generate::TicketSource::Archetype => "архетипический мост (⊗_ε)",
                 pqc::generate::TicketSource::Kinetic => "кинетика (внутренний голос)",
             };
             println!("квант авторегрессии:");
@@ -4364,6 +4403,7 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
         let src = match s.source {
             pqc::generate::TicketSource::Flow => "→",
             pqc::generate::TicketSource::Backtrack => "←",
+            pqc::generate::TicketSource::Archetype => "⊗",
             pqc::generate::TicketSource::Kinetic => "∘",
         };
         println!(
@@ -4394,6 +4434,188 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
         if rep.cycled { "вырожденный" } else { "нет" },
         rep.elapsed.as_secs_f64() * 1000.0
     );
+}
+
+/// `pqc archetype`: нелинейная алгебра архетипов RQ18 — интроспекция
+/// оператора `a ⊗_ε b`. Произведение мозга с промптом (`--prompt`)
+/// или с другим мозгом (`--with`): структурный изоморфизм, резонанс,
+/// конфликт, энергия пересечения.
+fn cmd_archetype(args: &[String]) -> i32 {
+    let mut brain: Option<String> = None;
+    let mut with: Option<String> = None;
+    let mut prompt = String::new();
+    let mut eps = DEFAULT_BRIDGE_EPS;
+    let mut json = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].clone();
+        let mut val = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match a.as_str() {
+            "--brain" => brain = Some(val("--brain").unwrap_or_default()),
+            "--with" => with = Some(val("--with").unwrap_or_default()),
+            "--prompt" => prompt = val("--prompt").unwrap_or_default(),
+            "--eps" => match val("--eps").map_err(|_| ()).and_then(|v| v.parse::<f64>().map_err(|_| ())) {
+                Ok(e) if e.is_finite() && e > 0.0 && e <= 1.0 => eps = e,
+                _ => return arch_usage_err("--eps: порог гейта ∈ (0, 1]"),
+            },
+            "--json" => json = true,
+            _ if !a.starts_with("--") && prompt.is_empty() => prompt = a,
+            _ => return arch_usage_err(&format!("неизвестная опция: {a}")),
+        }
+        i += 1;
+    }
+    let err = |m: &str| -> i32 {
+        eprintln!("pqc archetype: {m}");
+        2
+    };
+    let Some(path) = brain else {
+        return err("нужен --brain F (контейнер-мозг v2/v3/v4)");
+    };
+    if with.is_some() && !prompt.is_empty() {
+        return err("--with и --prompt взаимно исключают друг друга");
+    }
+    // Мозг A.
+    let src = match load(&path) {
+        Ok(s) => s,
+        Err(e) => return err(&format!("{path}: {e}")),
+    };
+    let reader = match pqw::PqwReader::from_bytes(src.as_slice()) {
+        Ok(r) => r,
+        Err(e) => return err(&format!("{path}: {e}")),
+    };
+    if reader.encoding() != pqw::phase::TritEncoding::Packed4 {
+        return err(&format!("{path}: нужен контейнер v2/v3/v4 (Packed4)"));
+    }
+    let window = reader
+        .gyro()
+        .map(|g| g.window().max(1) as usize)
+        .unwrap_or(GEN_INLINE_WINDOW);
+    let engine_eps = reader.hyperparams().epsilon_threshold;
+    let mut engine = match QuantizedGyroCurriculum::new(
+        reader.d_pol(),
+        engine_eps,
+        42,
+        window,
+    ) {
+        Ok(e) => e,
+        Err(e) => return err(&e.to_string()),
+    };
+    if let Err(e) = engine.resume_from_reader(&reader) {
+        return err(&format!("{path}: {e}"));
+    }
+    let d = engine.d_pol() as usize;
+    let lattice = engine.lattice().to_vec();
+    let nnz_a = engine.nnz();
+
+    // Сомножитель B: архетип второго мозга или промпта.
+    let (name_b, arch_b) = if let Some(p2) = &with {
+        let src2 = match load(p2) {
+            Ok(s) => s,
+            Err(e) => return err(&format!("{p2}: {e}")),
+        };
+        let r2 = match pqw::PqwReader::from_bytes(src2.as_slice()) {
+            Ok(r) => r,
+            Err(e) => return err(&format!("{p2}: {e}")),
+        };
+        if r2.encoding() != pqw::phase::TritEncoding::Packed4 {
+            return err(&format!("{p2}: нужен контейнер v2/v3/v4 (Packed4)"));
+        }
+        if r2.d_pol() != engine.d_pol() {
+            return err(&format!(
+                "размерности решёток различаются: {path} d_pol={}, {p2} d_pol={} \
+                 (⊗_ε требует общее фазовое пространство)",
+                engine.d_pol(),
+                r2.d_pol()
+            ));
+        }
+        // Чистые фазы второго мозга — без поднятия его русел.
+        let mut other = vec![0u8; lattice.len()];
+        for i in 0..d {
+            let t = pqw::trit_bloch::trit_at(&r2.phase_bytes(), i);
+            let code = pqw::phase::pack_trit2(t);
+            other[i / 4] |= code << (2 * (i % 4));
+        }
+        (format!("мозг {p2}"), other)
+    } else {
+        (format!("промпт «{prompt}»"), engine.prompt_archetype(&prompt))
+    };
+
+    // c = a ⊗_ε b — ядро RQ18.
+    let mut prod = vec![0u8; lattice.len()];
+    let st = match archetype_product_packed4(&lattice, &arch_b, d, eps, &mut prod) {
+        Ok(s) => s,
+        Err(e) => return err(&e.to_string()),
+    };
+    let nnz_prod = st.resonant.then_some(st.nnz_out);
+
+    if json {
+        let obj = Json::Obj(vec![
+            (
+                "brain".into(),
+                Json::Obj(vec![
+                    ("path".into(), Json::str(&path)),
+                    ("d_pol".into(), Json::num(d as f64)),
+                    ("nnz".into(), Json::num(nnz_a as f64)),
+                ]),
+            ),
+            (
+                "operand".into(),
+                Json::Obj(vec![
+                    ("name".into(), Json::str(&name_b)),
+                    ("nnz".into(), Json::num(st.nnz_b as f64)),
+                ]),
+            ),
+            (
+                "product".into(),
+                Json::Obj(vec![
+                    ("nnz".into(), Json::num(st.nnz_out as f64)),
+                    ("co_support".into(), Json::num(st.co_support as f64)),
+                    ("resonance".into(), Json::num(st.resonance as f64)),
+                    ("conflict".into(), Json::num(st.conflict as f64)),
+                    ("energy".into(), Json::num(st.energy)),
+                    ("resonant".into(), Json::Bool(st.resonant)),
+                ]),
+            ),
+            ("eps".into(), Json::num(eps)),
+        ]);
+        println!("{}", obj.to_string());
+        return 0;
+    }
+
+    println!("POLER Quantum Core — Archetype Algebra (RQ18): c = a ⊗_ε b");
+    println!("мозг A   : {path} (d_pol={d}, носитель {nnz_a} дуг)");
+    println!("мозг B   : {name_b} (носитель {} дуг)", st.nnz_b);
+    println!(
+        "гейт ε   : {eps} — энергия E = co/min(nnz) = {:.3} → {}",
+        st.energy,
+        if st.resonant { "РЕЗОНАНС (изоморфизм найден)" } else { "ЗАПЕРТ (архетипы ортогональны)" }
+    );
+    println!(
+        "пересечение: {} дуг — согласие {} (конструктивная интерференция), \
+         конфликт {} (аннигиляция в суперпозицию)",
+        st.co_support, st.resonance, st.conflict
+    );
+    match nnz_prod {
+        Some(n) => println!(
+            "продукт  : {n} дуг — новый устойчивый смысл (Π_Λ-проекция, \
+             идемпотентен: c ⊗_ε c = c)"
+        ),
+        None => println!(
+            "продукт  : Zero — ложных ассоциаций не существует (E < ε)"
+        ),
+    }
+    0
+}
+
+fn arch_usage_err(msg: &str) -> i32 {
+    eprintln!("pqc archetype: {msg}");
+    eprintln!("см. pqc --help: ARCHETYPE OPTIONS");
+    2
 }
 
 /// `pqc generate` / `pqc step`: генерация из промпта (без записи памяти).
@@ -4427,6 +4649,8 @@ fn cmd_generate(args: &[String], step_mode: bool) -> i32 {
         free: cfg.free,
         morphemes: cfg.morphemes,
         repeat_veto: cfg.repeat_veto,
+        bridge: cfg.bridge,
+        bridge_eps: cfg.bridge_eps,
     };
     let mut gen = match L5Generator::new(engine, gcfg) {
         Ok(g) => g,
@@ -4466,6 +4690,22 @@ fn cmd_generate(args: &[String], step_mode: bool) -> i32 {
             rep.think_theta_shift,
             if rep.auto_free { " [ворота сняты: нулевая кинетика]" } else { "" }
         );
+        if cfg.bridge {
+            if rep.bridge_resonant {
+                println!(
+                    "мост ⊗_ε  : энергия {:.3} ≥ {} — резонанс: пересечение {} дуг \
+                     (согласие {}, конфликт {})",
+                    rep.bridge_energy, cfg.bridge_eps, rep.bridge_co,
+                    rep.bridge_resonance, rep.bridge_conflict
+                );
+            } else {
+                println!(
+                    "мост ⊗_ε  : энергия {:.3} < {} — архетипы ортогональны, \
+                     мост молчит (нет ложных ассоциаций)",
+                    rep.bridge_energy, cfg.bridge_eps
+                );
+            }
+        }
         if !step_mode {
             println!("{kind}:");
         }
@@ -4536,6 +4776,8 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
             free: cfg.free,
             morphemes: cfg.morphemes,
             repeat_veto: cfg.repeat_veto,
+            bridge: cfg.bridge,
+            bridge_eps: cfg.bridge_eps,
         };
         let report = {
             let mut gen = match L5Generator::new(&mut engine, gcfg) {
