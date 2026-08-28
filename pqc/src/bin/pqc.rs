@@ -40,6 +40,11 @@ USAGE:
     pqc decrypt <C.pqt> --key <ARCH.pqw> [--out <PLAIN>]      RQ13: m = p* ⊕ (a ⊗_ε p*) точно
     pqc inspect <file> [options]
     pqc train (--corpus DIR | --stdin) [options]              накопительное обучение
+    pqc generate (--brain F | --corpus TEXT | --corpus-file F) [opts]
+                              RQ17: L5-генерация — Born-блуждание по руслам J
+    pqc step (--brain F | --corpus TEXT) [--prompt T] [opts]  RQ17: один квант авторегрессии
+    pqc ask «вопрос» --brain F [opts]                          RQ17: диалог с памятью
+    pqc chat --brain F [opts]                                  RQ17: REPL-диалог (сохранение на выходе)
 
 ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию, файл 285;
                           --f32 — исследовательская схема RQ12):
@@ -129,6 +134,29 @@ TRAIN OPTIONS (RQ8: плотный LENS-граф; RQ15: --quantized — решё
     --dt <H>                  RQ16: шаг Δt транспорта L5 (default 0.6;
                               только с --quantized --gyro)
 
+GENERATE/ASK/CHAT OPTIONS (RQ17: L5-генерация — первые слова и рассуждение):
+    --brain <F>               контейнер-мозг .pqw v3/v4 (train --quantized
+                              --gyro); v4 несёт лексикон — без него мозг
+                              не знает слов (морфемы AOT: --morphemes)
+    --corpus <TEXT>           быстрое обучение на лету (inline текст) —
+                              движок живёт в памяти, контейнер не нужен
+    --corpus-file <F>         то же из файла (абзацы — документы)
+    --prompt <T>              промпт-зерно (default: свободная речь —
+                              затравка из лексикона)
+    --think <N>               шагов мышления (транспорт L5) после слушания
+                              (default 4)
+    --max-tokens <N>          потолок эмиссий (default 64; pqc step = 1)
+    --window <N>              кольцо контекста речи (default 8)
+    --seed <S>                сид Born-лотереи (default 42)
+    --free                    чистый поток J без моментных ворот (auto при
+                              нулевой кинетике)
+    --morphemes               AOT-фолбэк: координаты вне лексикона — морфемы
+                              синтаксиса (fn/let/mut/…)
+    --repeat-veto <N>         анти-заикание: запрет повтора координаты на N
+                              шагов (default 1; 0 — выключено)
+    --no-learn                ask: без перещёлкивания фаз born-шагом
+    --json                    машинно-читаемый отчёт (zero-dep JSON)
+
 INSPECT OPTIONS (дополнительно):
     --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
                               RQ11: моды печатаются с невязками Ritz (инвариантность
@@ -171,6 +199,10 @@ fn main() {
         Some("decrypt") => cmd_decrypt(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("train") => cmd_train(&args[1..]),
+        Some("generate") => cmd_generate(&args[1..], false),
+        Some("step") => cmd_generate(&args[1..], true),
+        Some("ask") => cmd_ask(&args[1..], false),
+        Some("chat") => cmd_ask(&args[1..], true),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -1118,15 +1150,17 @@ fn cmd_inspect(args: &[String]) -> i32 {
     let mut d_pol: u32 = 0;
 
     match kind {
-        FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3 => match try_pqw_reader(data) {
-            Ok(Some(r)) => {
-                d_pol = r.d_pol();
-                arcs = reader_arcs(&r);
-                reader = Some(r);
+        FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3 | FileKind::PqwV4 => {
+            match try_pqw_reader(data) {
+                Ok(Some(r)) => {
+                    d_pol = r.d_pol();
+                    arcs = reader_arcs(&r);
+                    reader = Some(r);
+                }
+                Ok(None) => parse_error = Some("file shorter than the 128-byte header".into()),
+                Err(e) => parse_error = Some(e),
             }
-            Ok(None) => parse_error = Some("file shorter than the 128-byte header".into()),
-            Err(e) => parse_error = Some(e),
-        },
+        }
         FileKind::RawPacked4 { d_pol: d } => {
             d_pol = cfg.raw_dim.unwrap_or(d);
             if d_pol as usize > size * 4 {
@@ -2828,6 +2862,15 @@ impl Trainer {
             Trainer::QuantizedGyro(q) => q.resume_from_reader(reader),
         }
     }
+
+    /// Слов в лексиконе кристалла (RQ17): None — движок без лексикона
+    /// (плотный/квантованный пути RQ8/RQ15).
+    fn lexicon_len(&self) -> Option<usize> {
+        match self {
+            Trainer::Dense(_) | Trainer::Quantized(_) => None,
+            Trainer::QuantizedGyro(q) => Some(q.lexicon_len()),
+        }
+    }
 }
 
 /// Снапшот НАКОПЛЕННОЙ памяти: .pqw-контейнер + raw Packed4-отпечаток.
@@ -3989,7 +4032,14 @@ fn cmd_train(args: &[String]) -> i32 {
         }
         if let Some(p) = &cfg.out {
             let fmt = if gyro_pairs > 0 {
-                "POLER_Q3 Packed4 + гироскоп J = A − Aᵀ"
+                // RQ17: чекпоинт v4 (фазы + русла + лексикон), если слова
+                // усвоены; иначе v3 как в RQ16.
+                match trainer.lexicon_len() {
+                    Some(n) if n > 0 => {
+                        "POLER_Q4 Packed4 + гироскоп J + лексикон LEXI"
+                    }
+                    _ => "POLER_Q3 Packed4 + гироскоп J = A − Aᵀ",
+                }
             } else {
                 "POLER_Q2 Packed4"
             };
@@ -4032,6 +4082,571 @@ fn cmd_train(args: &[String]) -> i32 {
             elapsed,
             total_blocks as f64 / elapsed.max(1e-9)
         );
+    }
+    0
+}
+
+// ============================================================================
+// RQ17: L5-ГЕНЕРАЦИЯ — первые слова и рассуждение
+// ============================================================================
+
+use pqc::generate::{GenerationReport, GeneratorConfig, L5Generator};
+use pqc::gyro_lattice::QuantizedGyroCurriculum;
+
+/// Общая конфигурация команд генерации.
+struct GenConfig {
+    brain: Option<String>,
+    corpus: Option<String>,
+    corpus_file: Option<String>,
+    prompt: String,
+    think: usize,
+    max_tokens: usize,
+    window: usize,
+    seed: u64,
+    free: bool,
+    morphemes: bool,
+    repeat_veto: usize,
+    learn: bool,
+    json: bool,
+    /// Позиционный вопрос (ask/chat).
+    question: Option<String>,
+}
+
+impl Default for GenConfig {
+    fn default() -> GenConfig {
+        GenConfig {
+            brain: None,
+            corpus: None,
+            corpus_file: None,
+            prompt: String::new(),
+            think: 4,
+            max_tokens: 64,
+            window: 8,
+            seed: 42,
+            free: false,
+            morphemes: false,
+            repeat_veto: 1,
+            learn: true,
+            json: false,
+            question: None,
+        }
+    }
+}
+
+fn gen_usage_err(msg: &str) -> i32 {
+    eprintln!("pqc generate/ask: {msg}\n(см. pqc --help: GENERATE/ASK/CHAT OPTIONS)");
+    2
+}
+
+/// Разбор общих опций генерации (generate/step/ask/chat).
+fn parse_gen_args(args: &[String], cfg: &mut GenConfig) -> Result<(), String> {
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].clone();
+        let mut val = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+        match a.as_str() {
+            "--brain" => cfg.brain = Some(val("--brain")?),
+            "--corpus" => cfg.corpus = Some(val("--corpus")?),
+            "--corpus-file" => cfg.corpus_file = Some(val("--corpus-file")?),
+            "--prompt" => cfg.prompt = val("--prompt")?,
+            "--think" => {
+                cfg.think = val("--think")?
+                    .parse()
+                    .map_err(|_| "bad --think".to_string())?
+            }
+            "--max-tokens" => {
+                cfg.max_tokens = val("--max-tokens")?
+                    .parse()
+                    .map_err(|_| "bad --max-tokens".to_string())?
+            }
+            "--window" => {
+                cfg.window = val("--window")?
+                    .parse()
+                    .map_err(|_| "bad --window".to_string())?
+            }
+            "--seed" => {
+                cfg.seed = val("--seed")?
+                    .parse()
+                    .map_err(|_| "bad --seed".to_string())?
+            }
+            "--free" => cfg.free = true,
+            "--morphemes" => cfg.morphemes = true,
+            "--repeat-veto" => {
+                cfg.repeat_veto = val("--repeat-veto")?
+                    .parse()
+                    .map_err(|_| "bad --repeat-veto".to_string())?
+            }
+            "--no-learn" => cfg.learn = false,
+            "--json" => cfg.json = true,
+            _ if !a.starts_with("--") && cfg.question.is_none() => {
+                cfg.question = Some(a);
+            }
+            _ => return Err(format!("неизвестная опция: {a}")),
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Источник движка: мозг из файла или обучение на лету.
+enum BrainSource {
+    /// Загруженный контейнер (путь для обратной записи памяти диалога).
+    File { path: String, engine: QuantizedGyroCurriculum },
+    /// Движок, обученный на лету (без контейнера).
+    Inline(QuantizedGyroCurriculum),
+}
+
+/// Размерность/пороги по умолчанию для обучения на лету.
+const GEN_INLINE_DIM: u32 = 1024;
+const GEN_INLINE_EPSILON: f32 = 0.05;
+const GEN_INLINE_WINDOW: usize = 8;
+
+fn load_gen_engine(cfg: &GenConfig) -> Result<BrainSource, String> {
+    if let Some(path) = &cfg.brain {
+        let src = load(path)?;
+        let reader = pqw::PqwReader::from_bytes(src.as_slice())
+            .map_err(|e| format!("--brain {path}: {e}"))?;
+        if reader.encoding() != pqw::phase::TritEncoding::Packed4 {
+            return Err(format!(
+                "--brain {path}: нужен контейнер v2/v3/v4 (Packed4); \
+                 обучите pqc train --quantized --gyro"
+            ));
+        }
+        let window = reader
+            .gyro()
+            .map(|g| g.window().max(1) as usize)
+            .unwrap_or(GEN_INLINE_WINDOW);
+        let eps = reader.hyperparams().epsilon_threshold;
+        let mut engine = QuantizedGyroCurriculum::new(reader.d_pol(), eps, cfg.seed, window)
+            .map_err(|e| e.to_string())?;
+        engine
+            .resume_from_reader(&reader)
+            .map_err(|e| format!("--brain {path}: {e}"))?;
+        if engine.lexicon_len() == 0 {
+            eprintln!(
+                "pqc: предупреждение: мозг {path} без лексикона (v3 от v0.6.0) — \
+                 слов нет; перезапустите обучение pqc train --quantized --gyro \
+                 (v0.7.0+) или включите --morphemes"
+            );
+        }
+        return Ok(BrainSource::File {
+            path: path.clone(),
+            engine,
+        });
+    }
+    // Обучение на лету: inline текст или файл (абзацы — документы).
+    let text = if let Some(t) = &cfg.corpus {
+        t.clone()
+    } else if let Some(p) = &cfg.corpus_file {
+        std::fs::read_to_string(p).map_err(|e| format!("--corpus-file {p}: {e}"))?
+    } else {
+        return Err(
+            "нужен --brain F (контейнер-мозг) или --corpus TEXT / --corpus-file F \
+             (обучение на лету)"
+                .to_string(),
+        );
+    };
+    let mut engine = QuantizedGyroCurriculum::new(
+        GEN_INLINE_DIM,
+        GEN_INLINE_EPSILON,
+        cfg.seed,
+        GEN_INLINE_WINDOW,
+    )
+    .map_err(|e| e.to_string())?;
+    for para in text.split("\n\n").filter(|p| !p.trim().is_empty()) {
+        engine
+            .ingest(para, 1)
+            .map_err(|e| format!("corpus ingest: {e}"))?;
+    }
+    Ok(BrainSource::Inline(engine))
+}
+
+/// JSON-отчёт генерации (машинно-читаемый протокол RQ17).
+fn generation_json_pairs(
+    rep: &GenerationReport,
+    learned: Option<&Json>,
+) -> Vec<(String, Json)> {
+    let mut obj = vec![
+        ("prompt_tokens".into(), Json::num(rep.prompt_tokens as f64)),
+        ("prompt_arcs".into(), Json::num(rep.prompt_arcs as f64)),
+        ("ignited".into(), Json::num(rep.ignited as f64)),
+        ("auto_free".into(), Json::Bool(rep.auto_free)),
+        ("think_moved".into(), Json::num(rep.think_moved as f64)),
+        ("think_theta_shift".into(), Json::num(rep.think_theta_shift)),
+        (
+            "steps".into(),
+            Json::Arr(
+                rep.steps
+                    .iter()
+                    .map(|s| {
+                        Json::Obj(vec![
+                            ("coord".into(), Json::num(s.coord as f64)),
+                            ("token".into(), Json::str(&s.token)),
+                            (
+                                "source".into(),
+                                Json::str(match s.source {
+                                    pqc::generate::TicketSource::Flow => "flow",
+                                    pqc::generate::TicketSource::Backtrack => "backtrack",
+                                    pqc::generate::TicketSource::Kinetic => "kinetic",
+                                }),
+                            ),
+                            ("tickets".into(), Json::num(s.tickets as f64)),
+                            ("born_bit".into(), Json::Bool(s.born_bit)),
+                            ("moved".into(), Json::num(s.moved as f64)),
+                            ("theta_shift".into(), Json::num(s.theta_shift)),
+                            ("morpheme".into(), Json::Bool(s.morpheme)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("text".into(), Json::str(&rep.text)),
+        ("tokens".into(), Json::num(rep.steps.len() as f64)),
+        (
+            "morpheme_tokens".into(),
+            {
+                let n = rep.steps.iter().filter(|s| s.morpheme).count();
+                Json::num(n as f64)
+            },
+        ),
+        ("skipped_unseen".into(), Json::num(rep.skipped_unseen as f64)),
+        ("converged".into(), Json::Bool(rep.converged)),
+        ("cycled".into(), Json::Bool(rep.cycled)),
+        (
+            "elapsed_us".into(),
+            Json::num(rep.elapsed.as_micros() as f64),
+        ),
+    ];
+    if let Some(l) = learned {
+        obj.push(("memory".into(), l.clone()));
+    }
+    obj
+}
+
+/// Печать человеческого отчёта генерации.
+fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
+    if step_mode {
+        if let Some(s) = rep.steps.first() {
+            let src = match s.source {
+                pqc::generate::TicketSource::Flow => "русло вперёд",
+                pqc::generate::TicketSource::Backtrack => "возврат по руслу",
+                pqc::generate::TicketSource::Kinetic => "кинетика (внутренний голос)",
+            };
+            println!("квант авторегрессии:");
+            println!(
+                "  лотерея : {} билетов ({src}), выпала координата {}",
+                s.tickets, s.coord
+            );
+            println!(
+                "  декод   : {} → «{}»{}",
+                s.coord,
+                s.token,
+                if s.morpheme { " (AOT-морфема)" } else { "" }
+            );
+            println!(
+                "  born    : бит {} (полюс {}), транспорт: {} перещёлкиваний, θ-сдвиг {:.3}",
+                if s.born_bit { 1 } else { 0 },
+                if s.born_bit { "−1" } else { "+1" },
+                s.moved,
+                s.theta_shift
+            );
+        } else {
+            println!("квант авторегрессии: волна иссякла (сходимость ĤΨ = 0)");
+        }
+        return;
+    }
+    for (k, s) in rep.steps.iter().enumerate() {
+        let src = match s.source {
+            pqc::generate::TicketSource::Flow => "→",
+            pqc::generate::TicketSource::Backtrack => "←",
+            pqc::generate::TicketSource::Kinetic => "∘",
+        };
+        println!(
+            "  #{:<3} [ {:<5} ] «{}» {} (билетов {:>3}, born {}, moved {:>2})",
+            k + 1,
+            s.coord,
+            s.token,
+            src,
+            s.tickets,
+            if s.born_bit { 1 } else { 0 },
+            s.moved
+        );
+    }
+    if rep.steps.is_empty() {
+        println!("  (молчание: живых русел из промпта нет)");
+    }
+    let morphemes = rep.steps.iter().filter(|s| s.morpheme).count();
+    println!(
+        "\nтекст    : {}",
+        if rep.text.is_empty() { "—" } else { &rep.text }
+    );
+    println!(
+        "статистика: слов {} (морфем {}), пропусков {}, сходимость: {}, цикл: {}, {:.1} мс",
+        rep.steps.len(),
+        morphemes,
+        rep.skipped_unseen,
+        if rep.converged { "да (ĤΨ = 0)" } else { "нет" },
+        if rep.cycled { "вырожденный" } else { "нет" },
+        rep.elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+/// `pqc generate` / `pqc step`: генерация из промпта (без записи памяти).
+fn cmd_generate(args: &[String], step_mode: bool) -> i32 {
+    let mut cfg = GenConfig::default();
+    if step_mode {
+        cfg.max_tokens = 1;
+        cfg.think = 1;
+    }
+    if let Err(e) = parse_gen_args(args, &mut cfg) {
+        return gen_usage_err(&e);
+    }
+    let prompt = if cfg.prompt.is_empty() {
+        cfg.question.clone().unwrap_or_default()
+    } else {
+        cfg.prompt.clone()
+    };
+    let mut source = match load_gen_engine(&cfg) {
+        Ok(s) => s,
+        Err(e) => return gen_usage_err(&e),
+    };
+    let engine = match &mut source {
+        BrainSource::File { engine, .. } => engine,
+        BrainSource::Inline(engine) => engine,
+    };
+    let gcfg = GeneratorConfig {
+        think_steps: cfg.think,
+        max_tokens: if step_mode { 1 } else { cfg.max_tokens },
+        window: cfg.window,
+        seed: cfg.seed,
+        free: cfg.free,
+        morphemes: cfg.morphemes,
+        repeat_veto: cfg.repeat_veto,
+    };
+    let mut gen = match L5Generator::new(engine, gcfg) {
+        Ok(g) => g,
+        Err(e) => return gen_usage_err(&e.to_string()),
+    };
+    let rep = match gen.generate(&prompt) {
+        Ok(r) => r,
+        Err(e) => return gen_usage_err(&e.to_string()),
+    };
+    if cfg.json {
+        println!(
+            "{}",
+            Json::Obj(generation_json_pairs(&rep, None)).to_string()
+        );
+    } else {
+        let kind = if step_mode { "квант" } else { "речь" };
+        let src_desc = if cfg.brain.is_some() {
+            format!("brain {}", cfg.brain.as_deref().unwrap_or("?"))
+        } else {
+            "corpus (inline)".to_string()
+        };
+        println!(
+            "POLER Quantum Core — L5 Generator (RQ17): Born-блуждание по руслам J"
+        );
+        println!("источник : {src_desc}");
+        println!(
+            "промпт   : «{}» ({} токенов, дуг {}, зажиганий {})",
+            if prompt.is_empty() { "— свободная речь" } else { &prompt },
+            rep.prompt_tokens,
+            rep.prompt_arcs,
+            rep.ignited
+        );
+        println!(
+            "мышление : {} шагов, перещёлкиваний {}, θ-сдвиг {:.3}{}",
+            cfg.think,
+            rep.think_moved,
+            rep.think_theta_shift,
+            if rep.auto_free { " [ворота сняты: нулевая кинетика]" } else { "" }
+        );
+        if !step_mode {
+            println!("{kind}:");
+        }
+        print_generation_human(&rep, step_mode);
+    }
+    0
+}
+
+/// `pqc ask` / `pqc chat`: диалог с памятью — вопрос и ответ
+/// перещёлкивают фазы решётки через born-шаг, мозг дописывается.
+fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
+    let mut cfg = GenConfig::default();
+    if let Err(e) = parse_gen_args(args, &mut cfg) {
+        return gen_usage_err(&e);
+    }
+    if cfg.brain.is_none() {
+        return gen_usage_err(
+            "ask/chat требует --brain F: память диалога живёт в контейнере-мозге",
+        );
+    }
+    let question = match cfg.question.clone().or(Some(cfg.prompt.clone())) {
+        Some(q) if !q.is_empty() => q,
+        _ if !chat_mode => {
+            return gen_usage_err("нужен вопрос: pqc ask \"что такое энтропия?\" --brain F")
+        }
+        _ => String::new(),
+    };
+
+    let (path, mut engine) = match load_gen_engine(&cfg) {
+        Ok(BrainSource::File { path, engine }) => (path, engine),
+        Ok(_) => return gen_usage_err("ask/chat: только --brain"),
+        Err(e) => return gen_usage_err(&e),
+    };
+
+    if !cfg.json {
+        println!(
+            "POLER Quantum Core — L5 Dialog (RQ17): диалог с памятью, H^Ψ = 0"
+        );
+        println!("мозг     : {path} (d_pol={}, каналы J={}, лексикон {} слов)", engine.d_pol(), engine.channel_count(), engine.lexicon_len());
+        if chat_mode {
+            println!("режим    : REPL — вводите вопросы, Ctrl-D завершает и сохраняет");
+        }
+    }
+
+    // Цикл вопросов: одношаговый ask или многошаговый chat.
+    let mut current_question = question;
+    let mut first = true;
+    loop {
+        if chat_mode && current_question.is_empty() {
+            print!("вопрос > ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+                break; // EOF — выход с сохранением
+            }
+            current_question = line.trim().to_string();
+            if current_question.is_empty() {
+                continue;
+            }
+        }
+
+        let gcfg = GeneratorConfig {
+            think_steps: cfg.think,
+            max_tokens: cfg.max_tokens,
+            window: cfg.window,
+            seed: cfg.seed,
+            free: cfg.free,
+            morphemes: cfg.morphemes,
+            repeat_veto: cfg.repeat_veto,
+        };
+        let report = {
+            let mut gen = match L5Generator::new(&mut engine, gcfg) {
+                Ok(g) => g,
+                Err(e) => return gen_usage_err(&e.to_string()),
+            };
+            match gen.generate(&current_question) {
+                Ok(r) => r,
+                Err(e) => return gen_usage_err(&e.to_string()),
+            }
+        };
+
+        // Память диалога: вопрос + ответ перещёлкивают фазы born-шагом —
+        // модель обогащается на лету (мнение кристаллизуется, русла
+        // вопроса↔ответа копятся).
+        let mut memory_json = None;
+        let mut learned_desc = String::new();
+        if cfg.learn {
+            let dialog = format!("{current_question} {}", report.text);
+            match engine.ingest(&dialog, 1) {
+                Ok(rep) => {
+                    learned_desc = format!(
+                        "+{} дуг born, +{} каналов, лексикон {} слов",
+                        rep.moved,
+                        rep.channels,
+                        engine.lexicon_len()
+                    );
+                    memory_json = Some(Json::Obj(vec![
+                        ("ingested".into(), Json::Bool(true)),
+                        ("born_moved".into(), Json::num(rep.moved as f64)),
+                        ("channels".into(), Json::num(rep.channels as f64)),
+                        ("lexicon".into(), Json::num(engine.lexicon_len() as f64)),
+                    ]));
+                }
+                Err(e) => {
+                    eprintln!("pqc ask: память диалога: {e}");
+                }
+            }
+        }
+
+        if cfg.json {
+            let mut j = if first {
+                vec![
+                    (
+                        "brain".into(),
+                        Json::Obj(vec![
+                            ("path".into(), Json::str(&path)),
+                            ("d_pol".into(), Json::num(engine.d_pol() as f64)),
+                            ("channels".into(), Json::num(engine.channel_count() as f64)),
+                            ("lexicon".into(), Json::num(engine.lexicon_len() as f64)),
+                        ]),
+                    ),
+                    ("question".into(), Json::str(&current_question)),
+                ]
+            } else {
+                vec![("question".into(), Json::str(&current_question))]
+            };
+            j.extend(generation_json_pairs(&report, memory_json.as_ref()));
+            println!("{}", Json::Obj(j).to_string());
+        } else {
+            println!(
+                "\nвопрос : {}",
+                if current_question.is_empty() { "— свободная речь" } else { &current_question }
+            );
+            println!(
+                "ответ  : {}",
+                if report.text.is_empty() {
+                    if engine.lexicon_len() == 0 {
+                        "(молчание: мозг без лексикона — перезапустите обучение v0.7.0+)"
+                    } else {
+                        "(молчание: живых русел из вопроса нет)"
+                    }
+                } else {
+                    &report.text
+                }
+            );
+            if cfg.learn && !learned_desc.is_empty() {
+                println!("память : {learned_desc}");
+            }
+        }
+
+        first = false;
+        if !chat_mode {
+            break;
+        }
+        current_question = String::new();
+    }
+
+    // Обратная запись мозга: контейнер v4 (фазы + русла + лексикон).
+    if cfg.learn {
+        match engine.checkpoint() {
+            Ok(bytes) => match std::fs::write(&path, &bytes) {
+                Ok(()) => {
+                    if !cfg.json {
+                        println!(
+                            "\nсохранено: {path} → v4 контейнер ({} Б: фазы + русла J + лексикон {} слов)",
+                            bytes.len(),
+                            engine.lexicon_len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("pqc ask: запись мозга {path}: {e}");
+                    return 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("pqc ask: чекпоинт: {e}");
+                return 1;
+            }
+        }
     }
     0
 }

@@ -856,11 +856,13 @@ fn train_quantized_gyro_runs_and_reports() {
     );
     assert_eq!(mem.get("doc_freq").unwrap().as_f64().unwrap(), 2048.0);
 
-    // Контейнер v3: фазы Packed4 + топологическая секция GYRO.
+    // Контейнер v4 (RQ17): фазы Packed4 + секция GYRO + лексикон LEXI.
     let raw = fs::read(&out).unwrap();
-    assert_eq!(&raw[..8], b"POLER_Q3", "слияние пишет контейнер v3");
+    assert_eq!(&raw[..8], b"POLER_Q4", "слияние пишет контейнер v4");
     let reader = pqw::PqwReader::from_bytes(&raw).unwrap();
     assert!(reader.gyro().is_some(), "секция GYRO на месте");
+    assert!(reader.lexicon().is_some(), "лексикон LEXI на месте");
+    assert!(reader.lexicon().unwrap().len() >= 1, "слова корпуса усвоены");
     assert_eq!(reader.gyro().unwrap().pairs().len() >= 1, true);
 
     // RQ14-совместимость: pqc bloch читает v3-чекпоинт слияния.

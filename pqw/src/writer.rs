@@ -9,9 +9,10 @@ use crate::checksum::fnv1a64;
 use crate::error::{PqwError, Result};
 use crate::gyro::GyroData;
 use crate::header::{
-    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3, HEADER_SIZE,
-    OFF_CHECKSUM, OFF_RESERVED,
+    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3,
+    FORMAT_VERSION_V4, HEADER_SIZE, OFF_CHECKSUM, OFF_RESERVED,
 };
+use crate::lexicon::Lexicon;
 use crate::mcweeny;
 use crate::phase::{nearest_trit, pack_trit2, quantize, PhaseByte, Trit};
 use crate::sha256::sha256_trunc24;
@@ -349,6 +350,91 @@ impl PqwWriter {
     /// Запись упакованного контейнера v2 в файл.
     pub fn write_packed_to(&self, path: impl AsRef<Path>) -> Result<()> {
         let bytes = self.to_bytes_packed()?;
+        let mut file = std::fs::File::create(path.as_ref())?;
+        file.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Сборка контейнера v4: v3 (фазы + гироскоп) + секция лексикона
+    /// `LEXI` сразу за гироскопной (magic `POLER_Q4`, флаг LEXICON).
+    ///
+    /// Смещение лексикона выводимо: `topology_offset + topology_len`;
+    /// отдельного поля в заголовке не требуется. Digest покрывает
+    /// фазы + гироскоп + лексикон целиком.
+    fn build_v4(&self, gyro: &GyroData, lexicon: &Lexicon) -> Result<(Vec<u8>, Vec<u8>)> {
+        if !self.hyper.is_finite() {
+            return Err(PqwError::BadValue(self.hyper.eta));
+        }
+        let d = self.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+        let mut phases = vec![0u8; packed_len];
+        let mut nonzero: u64 = 0;
+        for (&i, &p) in self.entries.iter() {
+            let t = nearest_trit(p);
+            if t == Trit::Zero {
+                continue;
+            }
+            nonzero += 1;
+            let i = i as usize;
+            phases[i / 4] |= pack_trit2(t) << (2 * (i % 4));
+        }
+        let index16 = self.uses_index16();
+        let gyro_bytes = gyro.encode(index16)?;
+        let lexi_bytes = lexicon.encode(self.d_pol);
+        let mut payload = Vec::with_capacity(phases.len() + gyro_bytes.len() + lexi_bytes.len());
+        payload.extend_from_slice(&phases);
+        payload.extend_from_slice(&gyro_bytes);
+        payload.extend_from_slice(&lexi_bytes);
+        let header = Header {
+            format_version: FORMAT_VERSION_V4,
+            d_pol: self.d_pol,
+            hyper: self.hyper,
+            mcweeny_residual: 0.0,
+            payload_digest: sha256_trunc24(&payload),
+            topology_offset: (HEADER_SIZE + packed_len) as u64,
+            topology_len: gyro_bytes.len() as u64,
+            phase_offset: HEADER_SIZE as u64,
+            phase_len: packed_len as u64,
+            nnz: nonzero,
+            flags: Flags::v4(index16),
+        };
+        // reserved-слово = счётчик тактов гироскопа + пересчёт checksum.
+        let mut hb = header.to_bytes();
+        hb[OFF_RESERVED..OFF_RESERVED + 8].copy_from_slice(&gyro.ticks().to_le_bytes());
+        let checksum = fnv1a64(&hb[..OFF_CHECKSUM]);
+        hb[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        Ok((hb.to_vec(), payload))
+    }
+
+    /// Дописать контейнер v4 (фазы + гироскоп + лексикон) в буфер.
+    ///
+    /// Гироскоп обязан содержать хотя бы одну пару, лексикон — хотя бы
+    /// одну запись (LENS: пустые — это v2/v3-контейнеры без секций).
+    pub fn write_v4(&self, out: &mut Vec<u8>, gyro: &GyroData, lexicon: &Lexicon) -> Result<()> {
+        let (hb, payload) = self.build_v4(gyro, lexicon)?;
+        out.reserve(HEADER_SIZE + payload.len());
+        out.extend_from_slice(&hb);
+        out.extend_from_slice(&payload);
+        Ok(())
+    }
+
+    /// Сериализация в память в формате v4 (фазы + гироскоп + лексикон).
+    pub fn to_bytes_v4(&self, gyro: &GyroData, lexicon: &Lexicon) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(
+            HEADER_SIZE + self.estimated_size_packed() + 64 + lexicon.len() * 10,
+        );
+        self.write_v4(&mut out, gyro, lexicon)?;
+        Ok(out)
+    }
+
+    /// Запись контейнера v4 в файл.
+    pub fn write_v4_to(
+        &self,
+        path: impl AsRef<Path>,
+        gyro: &GyroData,
+        lexicon: &Lexicon,
+    ) -> Result<()> {
+        let bytes = self.to_bytes_v4(gyro, lexicon)?;
         let mut file = std::fs::File::create(path.as_ref())?;
         file.write_all(&bytes)?;
         Ok(())

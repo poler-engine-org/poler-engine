@@ -85,6 +85,23 @@ pub fn unfurl_to_string(p_state: &[f64]) -> Result<String> {
         .map_err(|_| PqcError::BadPhase(0.0))
 }
 
+/// Морфема AOT-кристалла по индексу `0..256` (детерминированный
+/// фолбэк L5-генерации: координаты вне лексикона говорят синтаксисом).
+///
+/// Слот 0 пуст (нет кристалла) — `None`. Сырой u32 хранит ≤ 4 ASCII
+/// байтов младшими разрядами вперёд.
+pub fn morpheme_at(index: usize) -> Option<String> {
+    let raw = *MORPHEME_CRYSTALS.get(index)?;
+    if raw == 0 {
+        return None;
+    }
+    let bytes = raw.to_le_bytes();
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(4);
+    std::str::from_utf8(&bytes[..len])
+        .ok()
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

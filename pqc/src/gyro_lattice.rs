@@ -112,6 +112,7 @@ use pqw::writer::PqwWriter;
 
 use crate::bloch_stream::born_step_packed4_sparse;
 use crate::error::{PqcError, Result};
+use crate::generate::LexiconBuilder;
 use crate::rng::Rng;
 use crate::stream_engine::tfidf_arcs;
 
@@ -651,6 +652,29 @@ impl MomentumLattice {
         self.kinetic = 0;
     }
 
+    /// Обход кинетических дуг: `f(дуга, m)` — линейный скан Packed4,
+    /// нулевые байты пропускаются целиком.
+    ///
+    /// Путь L5-генерации (RQ17): внутренний голос — кинетика вне
+    /// контекста речи.
+    pub fn for_each_kinetic(&self, mut f: impl FnMut(u32, i8)) {
+        for (byte_idx, &byte) in self.trits.iter().enumerate() {
+            if byte == 0 {
+                continue;
+            }
+            for k in 0..4u32 {
+                let m: i8 = match (byte >> (2 * k)) & 0b11 {
+                    1 => 1,
+                    2 => -1,
+                    _ => 0,
+                };
+                if m != 0 {
+                    f(byte_idx as u32 * 4 + k, m);
+                }
+            }
+        }
+    }
+
     #[inline]
     fn at_idx(&self, arc: usize) -> i8 {
         match (self.trits[arc / 4] >> (2 * (arc % 4))) & 0b11 {
@@ -953,6 +977,9 @@ pub struct QuantizedGyroCurriculum {
     lattice: Vec<u8>,
     momentum: MomentumLattice,
     gyro: TritGyro,
+    /// Лексикон кристалла (RQ17): доминантный токен на координату —
+    /// обратная карта кодировщика, путь генерации речи.
+    lexicon: LexiconBuilder,
     /// Плотная TF-IDF статистика (HashMap нет нигде).
     doc_freq: Vec<u32>,
     docs: u64,
@@ -993,6 +1020,7 @@ impl QuantizedGyroCurriculum {
             lattice: vec![0u8; d.div_ceil(4)],
             momentum: MomentumLattice::new(d_pol),
             gyro: TritGyro::new(d_pol, window)?,
+            lexicon: LexiconBuilder::new(d_pol),
             doc_freq: vec![0u32; d],
             docs: 0,
             ingests: 0,
@@ -1199,6 +1227,10 @@ impl QuantizedGyroCurriculum {
         // 0. Сенсорный поток гироскопа: токены в порядке появления —
         //    каналы J накапливаются ДО свидетельства (как у RQ10).
         self.gyro.observe_text(text);
+        // 0b. Лексикон кристалла (RQ17): каждое слово чанка становится
+        //     кандидатом доминанты своей координаты — мозг учится ГОВОРИТЬ
+        //     теми же словами, которыми учится думать.
+        self.lexicon.observe_text(text);
 
         // 1. TF-IDF свидетельство чанка (общий энкодер с RQ8/RQ15).
         let (pre_arcs, tokens) = tfidf_arcs(self.d_pol, self.docs, |i| {
@@ -1343,6 +1375,16 @@ impl QuantizedGyroCurriculum {
     /// `p ← Π_Λ(e^{Δt·J} p)` — транспорт по каналам с моментными
     /// воротами, Π_Λ-проекция, транспортное зажигание момента.
     pub fn reasoning_step(&mut self) -> Result<PrecessStats> {
+        self.reasoning_step_mode(TransportMode::Gated)
+    }
+
+    /// Шаг рассуждения с явным режимом моментных ворот: Gated —
+    /// движется только кинетическая пара (режим POLER), Free — чистый
+    /// оператор `Π_Λ(e^{Δt·J} p)` без ворот.
+    ///
+    /// Путь L5-генерации (RQ17): сессия речи без отклика момента
+    /// (промпт не зажёг кинетики) обязана течь свободным потоком J.
+    pub fn reasoning_step_mode(&mut self, mode: TransportMode) -> Result<PrecessStats> {
         let d = self.d_pol as usize;
         let stats = precess_step_packed4(
             &mut self.lattice,
@@ -1350,7 +1392,7 @@ impl QuantizedGyroCurriculum {
             &self.gyro,
             &mut self.momentum,
             self.dt,
-            TransportMode::Gated,
+            mode,
             &mut self.scratch,
         )?;
         self.reasoning_steps_total += 1;
@@ -1359,9 +1401,109 @@ impl QuantizedGyroCurriculum {
         Ok(stats)
     }
 
-    /// Чекпоинт: контейнер v3 — фазовая решётка бит-в-бит (нулевое
-    /// переквантование) + топологическая секция GYRO из каналов J
-    /// (`v2`, если каналов ещё нет). γ-слот заголовка = 0: трение
+    // ===================== Путь L5-генерации (RQ17) =====================
+
+    /// Слушание промпта БЕЗ born-кристаллизации: токены входят в
+    /// кольцо гироскопа (каналы вопроса копятся), TF-IDF свидетельство
+    /// зажигает момент на дугах вопроса.
+    ///
+    /// Два уровня кинетики: (1) гистерезис RQ16 — градиент `g = p_emp −
+    /// target` зажигает `m = −sign(g)` при `|g| ≥ τ_ign` (несогласие
+    /// толкает); (2) кинетика внимания — ВСЕ дуги свидетельства
+    /// принудительно кинетичны (`m = −sign(g)` при g ≠ 0, иначе
+    /// `m = sign(p_emp)` — инерция измеренного полюса): вопрос
+    /// разгоняет свои понятия и при полном согласии, иначе сойдедшийся
+    /// кристалл (все полюса, sin = 0 на руслах) на знакомый вопрос
+    /// отвечал бы молчанием — вниманию не нужно несогласие.
+    ///
+    /// Вопрос — вход, а не знание: фазы не кристаллизуются (born-шаг
+    /// доходит до вопросительных слов только в фазе памяти диалога,
+    /// см. [`crate::generate`]). Возвращает
+    /// `(дуги после ε-ворот, зажиганий, токенов)`.
+    pub fn listen_ignite(&mut self, text: &str) -> (usize, usize, usize) {
+        // 0. Сенсорный поток: каналы вопроса.
+        self.gyro.observe_text(text);
+        // 1. TF-IDF свидетельство промпта (статистика корпуса как есть).
+        let (pre_arcs, tokens) = tfidf_arcs(self.d_pol, self.docs, |i| {
+            self.doc_freq[i as usize]
+        }, text);
+        // 2. ε-ворота LENS.
+        let evidence: Vec<(u32, f64)> = pre_arcs
+            .iter()
+            .copied()
+            .filter(|&(_, s)| (s as f32).abs() >= self.epsilon)
+            .collect();
+        // 3. Кинетика вопроса: гистерезис + внимание.
+        let mut ignited = 0usize;
+        for &(i, t) in &evidence {
+            let p = p_at(&self.lattice, i as usize);
+            let p_emp = self.measure_coord(p);
+            let g = p_emp - t;
+            if let MomentumEvent::Ignited = self.momentum.push(i, g) {
+                ignited += 1;
+            }
+            // Кинетика внимания: дуга вопроса обязана быть кинетичной.
+            if self.momentum.at(i) == 0 {
+                let dir: i8 = if g > 0.0 {
+                    -1
+                } else if g < 0.0 {
+                    1
+                } else {
+                    // Полное согласие: инерция измеренного полюса.
+                    if p_emp >= 0.0 { 1 } else { -1 }
+                };
+                self.momentum.set_kinetic(i, dir);
+            }
+        }
+        self.ignited_total += ignited as u64;
+        (evidence.len(), ignited, tokens)
+    }
+
+    /// Сенсорное событие генерации: эмиссия слова наблюдается
+    /// гироскопом (авторегрессия замкнута — речь оставляет след
+    /// в руслах J).
+    pub fn observe_event(&mut self, coord: u32, sign: i8) {
+        self.gyro.observe(coord, sign);
+    }
+
+    /// Моментная обратная связь генерации: градиент Born-измерения
+    /// `g = p_emp − p` обновляет момент дуги (правило гистерезиса
+    /// RQ16 — зажигание/инерция/срыв).
+    pub fn momentum_feedback(&mut self, arc: u32, grad: f64) -> MomentumEvent {
+        self.momentum.push(arc, grad)
+    }
+
+    /// Код трита фазы (0/1/2) — индекс [`SIN_LUT`] для фазового
+    /// контраста пары (путь Born-лотереи генерации).
+    pub fn phase_code(&self, i: u32) -> u8 {
+        let x = i as usize;
+        (self.lattice[x / 4] >> (2 * (x % 4))) & 0b11
+    }
+
+    /// Слово координаты из лексикона (доминантный токен, RQ17).
+    pub fn lexicon_token(&self, coord: u32) -> Option<&str> {
+        self.lexicon.token_of(coord)
+    }
+
+    /// Координат со словом в лексиконе.
+    pub fn lexicon_len(&self) -> usize {
+        self.lexicon.len()
+    }
+
+    /// N-я непустая координата лексикона (затравка свободной речи).
+    pub fn lexicon_coord_at(&self, n: usize) -> Option<u32> {
+        self.lexicon.coord_at(n)
+    }
+
+    /// Обход кинетических дуг (`m ≠ 0`): `f(дуга, m)`.
+    pub fn for_each_kinetic_arc(&self, f: impl FnMut(u32, i8)) {
+        self.momentum.for_each_kinetic(f);
+    }
+
+    /// Чекпоинт: контейнер v4 при непустом лексиконе (фазовая
+    /// решётка бит-в-бит + секция GYRO из каналов J + секция LEXI
+    /// со словарём), v3 — если каналы есть, но слов ещё нет, v2 —
+    /// если каналов нет. γ-слот заголовка = 0: трение
     /// заменено порогами насыщающего момента, инерция не затухает.
     pub fn checkpoint(&self) -> Result<Vec<u8>> {
         let mut w = PqwWriter::new(self.d_pol)?
@@ -1378,22 +1520,30 @@ impl QuantizedGyroCurriculum {
             }
         }
         let mut buf = Vec::with_capacity(pqw::HEADER_SIZE + self.lattice.len());
-        match self.gyro.gyro_data() {
-            Some(data) => {
+        // RQ17: непустой лексикон при живых каналах — контейнер v4
+        // (обратная карта кодировщика переживает рестарт вместе с
+        // фазами и руслами). Нет каналов или словаря — v3/v2 как раньше.
+        match (self.gyro.gyro_data(), self.lexicon.finish()) {
+            (Some(data), Some(lex)) => {
+                w.write_v4(&mut buf, &data, &lex)?;
+            }
+            (Some(data), None) => {
                 w.write_v3(&mut buf, &data)?;
             }
-            None => {
+            (None, _) => {
                 w.write_packed_trits(&mut buf)?;
             }
         }
         Ok(buf)
     }
 
-    /// Resume: фазовая решётка бит-в-бит + каналы J из секции v3.
+    /// Resume: фазовая решётка бит-в-бит + каналы J из секции v3/v4
+    /// + лексикон из секции LEXI (v4).
     ///
     /// Момент и TF-IDF статистика стартуют с нуля («мнение пережило
     /// рестарт, инерция — нет»); каналы циркуляции поднимаются из
-    /// топологической секции, счётчик тактов — из заголовка секции.
+    /// топологической секции, счётчик тактов — из заголовка секции,
+    /// лексикон вливается в строитель (доминанты продолжают жить).
     /// v2-контейнер (без секции) поднимает только фазы. Возвращает
     /// число ненулевых тритов поднятой решётки.
     pub fn resume_from_reader(&mut self, reader: &PqwReader) -> Result<usize> {
@@ -1405,7 +1555,7 @@ impl QuantizedGyroCurriculum {
         }
         if reader.encoding() != pqw::phase::TritEncoding::Packed4 {
             return Err(PqcError::Unsupported {
-                what: "quantized gyro curriculum requires Packed4 container (v2/v3)",
+                what: "quantized gyro curriculum requires Packed4 container (v2/v3/v4)",
             });
         }
         let phase = reader.phase_bytes();
@@ -1432,6 +1582,9 @@ impl QuantizedGyroCurriculum {
             None => {
                 self.gyro.reset();
             }
+        }
+        if let Some(lex) = reader.lexicon() {
+            self.lexicon.absorb(&lex);
         }
         Ok(self.nnz())
     }
@@ -2199,20 +2352,24 @@ mod tests {
 
     #[test]
     fn engine_checkpoint_v3_and_resume_bit_exact() {
-        // Чекпоинт = контейнер v3: фазы бит-в-бит + секция GYRO;
-        // resume поднимает и то и другое, повторный прогон того же
-        // корпуса не двигает ни одного трита.
+        // Чекпоинт = контейнер v4 (RQ17: лексикон непуст): фазы
+        // бит-в-бит + секция GYRO + секция LEXI; resume поднимает всё
+        // тройку, повторный прогон того же корпуса не двигает ни
+        // одного трита.
         let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 4).unwrap();
         qc.ingest(sample_text(), 0).unwrap();
         qc.ingest(sample_text(), 0).unwrap();
         let nnz = qc.nnz();
         let channels = qc.channel_count();
         assert!(channels >= 1);
+        assert!(qc.lexicon_len() >= 1, "слова корпуса в лексиконе");
 
         let ckpt = qc.checkpoint().unwrap();
-        assert_eq!(&ckpt[..8], b"POLER_Q3", "контейнер v3 с гироскопом");
+        assert_eq!(&ckpt[..8], b"POLER_Q4", "контейнер v4 с лексиконом");
         let reader = PqwReader::from_bytes(&ckpt).unwrap();
         assert!(reader.gyro().is_some());
+        assert!(reader.lexicon().is_some(), "словарь переживает рестарт");
+        assert_eq!(reader.lexicon().unwrap().len(), qc.lexicon_len());
         let phase_len = (256usize).div_ceil(4);
         assert_eq!(ckpt[pqw::HEADER_SIZE..pqw::HEADER_SIZE + phase_len].to_vec(), qc.lattice().to_vec());
 

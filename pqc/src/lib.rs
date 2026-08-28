@@ -94,6 +94,7 @@ pub mod crypto;
 pub mod entangle;
 pub mod error;
 pub mod gates;
+pub mod generate;
 pub mod gyro;
 pub mod gyro_lattice;
 pub mod inspect;
@@ -121,6 +122,10 @@ pub use crypto::{
 pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;
+pub use generate::{
+    BornStep, GenerationReport, GeneratorConfig, L5Generator, LexiconBuilder, TicketSource,
+    LEXICON_TOKEN_MAX,
+};
 pub use gyro::{precess_step, resonant_modes_from_pairs, GyroMode, Gyroscope};
 pub use gyro_lattice::{
     precess_step_packed4, EngineMemory, MomentumEvent, MomentumLattice, PrecessScratch,
@@ -145,5 +150,7 @@ pub use stream::{StreamReport, ZeroStoragePipeline};
 pub use stream_engine::{
     fock_residual, strip_html, FockResidual, Forget, StreamChunkReport, StreamEngine,
 };
+
+pub use syntax_unfolder::{is_stationary, morpheme_at, unfurl, unfurl_to_string, MAX_OUT, TRIT_THRESHOLD};
 
 pub mod syntax_unfolder;

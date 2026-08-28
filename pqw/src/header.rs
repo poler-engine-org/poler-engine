@@ -25,12 +25,17 @@ pub const MAGIC_V2: [u8; 8] = *b"POLER_Q2";
 /// Магические байты контейнера v3 (Packed4 + гироскопная топология
 /// `J = A − Aᵀ` в топологической секции).
 pub const MAGIC_V3: [u8; 8] = *b"POLER_Q3";
+/// Магические байты контейнера v4 (v3 + секция лексикона `LEXI`:
+/// координата → доминантный токен, обратная карта кодировщика).
+pub const MAGIC_V4: [u8; 8] = *b"POLER_Q4";
 /// Версия формата v1, поддерживаемая этой сборкой.
 pub const FORMAT_VERSION: u32 = 1;
 /// Версия формата v2 (Packed4, magic `POLER_Q2`).
 pub const FORMAT_VERSION_V2: u32 = 2;
 /// Версия формата v3 (Packed4 + гироскоп, magic `POLER_Q3`).
 pub const FORMAT_VERSION_V3: u32 = 3;
+/// Версия формата v4 (v3 + лексикон, magic `POLER_Q4`).
+pub const FORMAT_VERSION_V4: u32 = 4;
 /// Размер фиксированного заголовка.
 pub const HEADER_SIZE: usize = 0x80;
 
@@ -106,6 +111,9 @@ impl Flags {
     pub const CURVATURE: u64 = 1 << 1;
     /// v3: топологическая секция несёт гироскоп `J = A − Aᵀ` (RQ10).
     pub const GYRO: u64 = 1 << 2;
+    /// v4: за гироскопной секцией следует лексикон `LEXI` — обратная
+    /// карта кодировщика (координата → доминантный токен, RQ17).
+    pub const LEXICON: u64 = 1 << 3;
 
     /// Флаги для записи: CURVATURE всегда; INDEX16 по выбору писателя.
     pub fn new(index16: bool) -> Flags {
@@ -157,9 +165,19 @@ impl Flags {
         Flags(Self::GYRO | if index16 { Self::INDEX16 } else { 0 })
     }
 
+    /// Флаги для записи v4: GYRO + LEXICON; INDEX16 — по выбору писателя.
+    pub fn v4(index16: bool) -> Flags {
+        Flags(Self::v3(index16).0 | Self::LEXICON)
+    }
+
     /// Гироскопная топология присутствует? (v3)
     pub fn gyro(self) -> bool {
         self.0 & Self::GYRO != 0
+    }
+
+    /// Секция лексикона присутствует? (v4)
+    pub fn lexicon(self) -> bool {
+        self.0 & Self::LEXICON != 0
     }
 
     /// Проверка флагов контейнера v3: GYRO обязан быть установлен,
@@ -169,6 +187,19 @@ impl Flags {
             return Err(PqwError::ReservedBits { value: v });
         }
         if v & Self::GYRO == 0 {
+            return Err(PqwError::UnsupportedFlags(v));
+        }
+        Ok(Flags(v))
+    }
+
+    /// Проверка флагов контейнера v4: GYRO и LEXICON обязаны быть
+    /// установлены, допускается INDEX16 (ширина индексов пар гироскопа
+    /// и координат лексикона). CURVATURE и прочие биты запрещены.
+    pub fn validate_v4(v: u64) -> Result<Flags> {
+        if v & !(Self::INDEX16 | Self::GYRO | Self::LEXICON) != 0 {
+            return Err(PqwError::ReservedBits { value: v });
+        }
+        if v & (Self::GYRO | Self::LEXICON) != Self::GYRO | Self::LEXICON {
             return Err(PqwError::UnsupportedFlags(v));
         }
         Ok(Flags(v))
@@ -259,14 +290,20 @@ impl Header {
         self.format_version == FORMAT_VERSION_V3
     }
 
+    /// Это контейнер v4 с секцией лексикона `LEXI`?
+    pub fn is_lexicon(&self) -> bool {
+        self.format_version == FORMAT_VERSION_V4
+    }
+
     /// Сериализация в 128 байт; checksum вычисляется последним.
     /// Magic выбирается по версии: v1 → `POLER_QW`, v2 → `POLER_Q2`,
-    /// v3 → `POLER_Q3`.
+    /// v3 → `POLER_Q3`, v4 → `POLER_Q4`.
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut b = [0u8; HEADER_SIZE];
         let magic = match self.format_version {
             FORMAT_VERSION_V2 => MAGIC_V2,
             FORMAT_VERSION_V3 => MAGIC_V3,
+            FORMAT_VERSION_V4 => MAGIC_V4,
             _ => MAGIC,
         };
         b[..8].copy_from_slice(&magic);
@@ -292,11 +329,12 @@ impl Header {
 
     /// Разбор и проверка: magic → version → checksum → flags/reserved → d_pol.
     ///
-    /// Поддержаны все три поколения: `POLER_QW` (v1, кривизна),
-    /// `POLER_Q2` (v2, упакованные триты) и `POLER_Q3` (v3, гироскоп);
-    /// пара magic ↔ версия перекрёстно проверяется. В v3 reserved-слово
-    /// (0x70) хранит счётчик тактов гироскопа — проверка «reserved = 0»
-    /// для v3 отключена.
+    /// Поддержаны все четыре поколения: `POLER_QW` (v1, кривизна),
+    /// `POLER_Q2` (v2, упакованные триты), `POLER_Q3` (v3, гироскоп)
+    /// и `POLER_Q4` (v4, гироскоп + лексикон); пара magic ↔ версия
+    /// перекрёстно проверяется. В v3/v4 reserved-слово (0x70) хранит
+    /// счётчик тактов гироскопа — проверка «reserved = 0» для них
+    /// отключена.
     pub fn from_bytes(data: &[u8]) -> Result<Header> {
         if data.len() < HEADER_SIZE {
             return Err(PqwError::Truncated {
@@ -306,14 +344,15 @@ impl Header {
         }
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&data[..8]);
-        if magic != MAGIC && magic != MAGIC_V2 && magic != MAGIC_V3 {
+        if magic != MAGIC && magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4 {
             return Err(PqwError::BadMagic(magic));
         }
         let version = get_u32(data, OFF_VERSION);
         let expected = match magic {
             MAGIC => FORMAT_VERSION,
             MAGIC_V2 => FORMAT_VERSION_V2,
-            _ => FORMAT_VERSION_V3,
+            MAGIC_V3 => FORMAT_VERSION_V3,
+            _ => FORMAT_VERSION_V4,
         };
         if version != expected {
             return Err(PqwError::UnsupportedVersion(version));
@@ -326,10 +365,14 @@ impl Header {
         let flags = match version {
             FORMAT_VERSION_V2 => Flags::validate_v2(get_u64(data, OFF_FLAGS))?,
             FORMAT_VERSION_V3 => Flags::validate_v3(get_u64(data, OFF_FLAGS))?,
+            FORMAT_VERSION_V4 => Flags::validate_v4(get_u64(data, OFF_FLAGS))?,
             _ => Flags::validate(get_u64(data, OFF_FLAGS))?,
         };
         let reserved = get_u64(data, OFF_RESERVED);
-        if version != FORMAT_VERSION_V3 && reserved != 0 {
+        if version != FORMAT_VERSION_V3
+            && version != FORMAT_VERSION_V4
+            && reserved != 0
+        {
             return Err(PqwError::ReservedBits { value: reserved });
         }
         let d_pol = get_u32(data, OFF_D_POL);

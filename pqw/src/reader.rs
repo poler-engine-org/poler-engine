@@ -18,13 +18,19 @@
 //! * **v3** (`POLER_Q3`): Packed4-фазы + гироскопная топология
 //!   `J = A − Aᵀ` в топологической секции (RQ10) — верхний треугольник
 //!   квантованных весов + счётчик тактов в reserved-слове заголовка.
-//!   Доступ — [`PqwReader::gyro`].
+//!   Доступ — [`PqwReader::gyro`];
+//! * **v4** (`POLER_Q4`): v3 + секция лексикона `LEXI` сразу за
+//!   гироскопной (RQ17) — обратная карта кодировщика (координата →
+//!   доминантный токен). Смещение секции выводимо:
+//!   `topology_offset + topology_len`, до конца файла. Доступ —
+//!   [`PqwReader::lexicon`]; digest покрывает фазы + гироскоп + лексикон.
 
 use std::borrow::Cow;
 
 use crate::error::{PqwError, Result};
 use crate::gyro::GyroSection;
 use crate::header::{Header, HEADER_SIZE, OFF_RESERVED};
+use crate::lexicon::Lexicon;
 use crate::mcweeny;
 use crate::phase::{packed_trit_at, PhaseByte, Trit, TritEncoding};
 use crate::sha256::sha256_trunc24;
@@ -66,6 +72,9 @@ impl<'a> PqwReader<'a> {
         let header = Header::from_bytes(data)?;
 
         if header.is_packed() {
+            if header.is_lexicon() {
+                return Self::validate_v4(header, data);
+            }
             if header.is_gyro() {
                 return Self::validate_gyro(header, data);
             }
@@ -234,6 +243,60 @@ impl<'a> PqwReader<'a> {
             header: header.clone(),
             data,
         })
+    }
+
+    /// Валидация контейнера v4 (v3 + лексикон `LEXI` за гироскопом):
+    /// фазы и гироскопная секция — по правилам v3, затем секция
+    /// лексикона от `topology_offset + topology_len` до конца файла.
+    ///
+    /// Проверяются и структура секции (magic/версия/d_pol/записи),
+    /// и перекрёстная пара: reserved-слово заголовка = счётчику тактов
+    /// гироскопной секции (как в v3).
+    fn validate_v4(header: Header, data: &'a [u8]) -> Result<PqwReader<'a>> {
+        // Фазы — по правилам v2/v3.
+        let reader = Self::validate_packed_v3_phases(&header, data)?;
+
+        let d = header.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+        let topo_off = header.topology_offset as usize;
+        let topo_len = header.topology_len as usize;
+        if topo_off != HEADER_SIZE + packed_len {
+            return Err(PqwError::Layout(
+                "v4: gyro section must follow the phase blocks",
+            ));
+        }
+        let gyro_end = topo_off + topo_len;
+        if data.len() < gyro_end {
+            return Err(PqwError::Truncated {
+                need: gyro_end,
+                have: data.len(),
+            });
+        }
+        // Гироскопная секция валидируется срезом ровно своей длины;
+        // за ней обязан идти лексикон (флаг LEXICON = контейнер v4).
+        let section = GyroSection::decode(
+            &data[topo_off..gyro_end],
+            header.d_pol,
+            header.flags.index16(),
+        )?;
+
+        // Секция лексикона — от конца гироскопа до EOF, без хвостов.
+        let lexi = Lexicon::decode(&data[gyro_end..], header.d_pol)?;
+        if lexi.is_empty() {
+            return Err(PqwError::Layout(
+                "v4: lexicon section requires at least one entry",
+            ));
+        }
+
+        // Перекрёстная проверка: счётчик тактов в reserved-слове.
+        let ticks_reserved =
+            u64::from_le_bytes(data[OFF_RESERVED..OFF_RESERVED + 8].try_into().unwrap());
+        if ticks_reserved != section.ticks() {
+            return Err(PqwError::Layout(
+                "v4: reserved tick counter disagrees with the gyro section",
+            ));
+        }
+        Ok(reader)
     }
 
     /// Валидация контейнера v2 (Packed4): плотные триты без топологии.
@@ -460,18 +523,32 @@ impl<'a> PqwReader<'a> {
         }
     }
 
-    /// Гироскопная топология v3: пары `J = A − Aᵀ` + счётчик тактов.
+    /// Гироскопная топология v3/v4: пары `J = A − Aᵀ` + счётчик тактов.
     ///
-    /// `None` для контейнеров v1/v2 (топологическая секция пуста).
+    /// `None` для контейнеров v1/v2 (топологической секции нет).
     /// Ошибка невозможна после `from_bytes` (секция уже провалидирована).
     pub fn gyro(&self) -> Option<GyroSection> {
-        if !self.header.is_gyro() {
+        if !self.header.flags.gyro() {
             return None;
         }
         let a = self.header.topology_offset as usize;
         let b = a + self.header.topology_len as usize;
         GyroSection::decode(&self.data[a..b], self.header.d_pol, self.header.flags.index16())
             .ok()
+    }
+
+    /// Секция лексикона v4: обратная карта кодировщика
+    /// (координата → доминантный токен).
+    ///
+    /// `None` для контейнеров v1/v2/v3 (лексикона нет — мозолю v3
+    /// дообучение не знает слов). Ошибка невозможна после `from_bytes`.
+    pub fn lexicon(&self) -> Option<Lexicon> {
+        if !self.header.is_lexicon() {
+            return None;
+        }
+        let a =
+            self.header.topology_offset as usize + self.header.topology_len as usize;
+        Lexicon::decode(&self.data[a..], self.header.d_pol).ok()
     }
 
     /// McWeeny-очистка хранимых дуг: `steps` итераций `p ← purify_p(p)`.

@@ -44,6 +44,7 @@ pub mod checksum;
 pub mod error;
 pub mod gyro;
 pub mod header;
+pub mod lexicon;
 pub mod mcweeny;
 #[cfg(unix)]
 pub mod mmap;
@@ -58,9 +59,10 @@ pub mod writer;
 pub use error::{PqwError, Result};
 pub use gyro::{GyroData, GyroPair, GyroSection, GYRO_HEADER_SIZE, GYRO_MAGIC, GYRO_SECTION_VERSION};
 pub use header::{
-    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3, HEADER_SIZE,
-    MAGIC, MAGIC_V2, MAGIC_V3,
+    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3,
+    FORMAT_VERSION_V4, HEADER_SIZE, MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4,
 };
+pub use lexicon::{Lexicon, LEXI_HEADER_SIZE, LEXI_MAGIC, LEXI_MAX_TOKEN, LEXI_SECTION_VERSION};
 pub use phase::{
     nearest_trit, pack_quad, pack_trit2, unpack_quad, unpack_trit2, PhaseByte, Trit, TritEncoding,
     QUANT_EPS, SIGMA_MAX,
