@@ -244,3 +244,94 @@ fn inspect_usage_error_without_file() {
     let out = pqc_bin().arg("inspect").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+// ── RQ10: контейнер v3 (POLER_Q3) — гироскоп J = A − Aᵀ и моды Im(P) ──
+
+fn v3_bytes() -> Vec<u8> {
+    let mut w = PqwWriter::new(64).unwrap();
+    w = w.hyperparams(0.25, 0.5, 1.0, 0.05);
+    w.add_phase(1, 0.9).unwrap();
+    w.add_phase(4, -0.8).unwrap();
+    w.add_phase(9, -0.7).unwrap();
+    let gyro = pqw::gyro::GyroData::new(
+        128,
+        5_000,
+        vec![(1, 4, 3.5), (4, 9, -2.0), (9, 12, 1.0)],
+        64,
+    )
+    .unwrap();
+    w.to_bytes_v3(&gyro).unwrap()
+}
+
+#[test]
+fn inspect_detects_v3_and_prints_gyro() {
+    let path = tmp("v3");
+    std::fs::write(&path, v3_bytes()).unwrap();
+    let out = pqc_bin().arg("inspect").arg(&path).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("pqw-v3"), "{text}");
+    assert!(text.contains("POLER_Q3"), "{text}");
+    assert!(text.contains("GYRO"), "{text}");
+    assert!(text.contains("J = A − Aᵀ"), "{text}");
+    // Метрики секции.
+    assert!(text.contains("window"), "{text}");
+    assert!(text.contains("ticks"), "{text}");
+    assert!(text.contains("5000"), "{text}");
+    // Моды Im(P) с фазовыми углами.
+    assert!(text.contains("моды Im(P)"), "{text}");
+    assert!(text.contains("λ1"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn inspect_v3_json_gyro_modes() {
+    let path = tmp("v3_json");
+    std::fs::write(&path, v3_bytes()).unwrap();
+    let out = pqc_bin()
+        .arg("inspect")
+        .arg(&path)
+        .arg("--json")
+        .arg("--modes")
+        .arg("2")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let doc = Json::parse(&text).unwrap();
+    assert!(doc.get("gyro").is_some());
+    let g = doc.get("gyro").unwrap();
+    assert_eq!(g.get("window").and_then(Json::as_f64), Some(128.0));
+    assert_eq!(g.get("ticks").and_then(Json::as_f64), Some(5000.0));
+    assert_eq!(g.get("pairs").and_then(Json::as_f64), Some(3.0));
+    let modes = g.get("modes").unwrap().as_arr().unwrap();
+    assert!(!modes.is_empty());
+    let m1 = modes[0].get("lambda").and_then(Json::as_f64).unwrap();
+    assert!(m1 > 0.0);
+    // λ_max ≥ max|J_ij| = 3.5 (кососимметричная J нормальна: сингулярные
+    // числа = |собственные значения|; тест-вектор (e_i+e_j)/√2 даёт ‖Jx‖=|w|).
+    assert!(m1 >= 3.5, "λ1 = {m1} < max веса пары 3.5");
+    // Фазовый портрет Im(P): у дуги 1 есть p̂ и θ.
+    let u = modes[0].get("u").unwrap().as_arr().unwrap();
+    let first = &u[0];
+    assert!(first.get("p").is_some(), "фазовый портрет Im(P) обязателен");
+    assert!(first.get("theta").is_some());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn inspect_v3_modes_option_validation() {
+    let path = tmp("v3_bad_modes");
+    std::fs::write(&path, v3_bytes()).unwrap();
+    for bad in ["0", "abc", "65"] {
+        let out = pqc_bin()
+            .arg("inspect")
+            .arg(&path)
+            .arg("--modes")
+            .arg(bad)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--modes {bad} должно отклоняться");
+    }
+    std::fs::remove_file(&path).ok();
+}

@@ -22,10 +22,15 @@ use crate::phase::TritEncoding;
 pub const MAGIC: [u8; 8] = *b"POLER_QW";
 /// Магические байты контейнера v2 (упакованные триты, 4 дуги на байт).
 pub const MAGIC_V2: [u8; 8] = *b"POLER_Q2";
+/// Магические байты контейнера v3 (Packed4 + гироскопная топология
+/// `J = A − Aᵀ` в топологической секции).
+pub const MAGIC_V3: [u8; 8] = *b"POLER_Q3";
 /// Версия формата v1, поддерживаемая этой сборкой.
 pub const FORMAT_VERSION: u32 = 1;
 /// Версия формата v2 (Packed4, magic `POLER_Q2`).
 pub const FORMAT_VERSION_V2: u32 = 2;
+/// Версия формата v3 (Packed4 + гироскоп, magic `POLER_Q3`).
+pub const FORMAT_VERSION_V3: u32 = 3;
 /// Размер фиксированного заголовка.
 pub const HEADER_SIZE: usize = 0x80;
 
@@ -95,9 +100,12 @@ impl Flags {
     }
 
     /// Топология хранит u16-индексы (допустимо при `d_pol ≤ 65536`).
+    /// v3: то же для индексов пар гироскопа.
     pub const INDEX16: u64 = 1 << 0;
     /// Фазовые блоки содержат 6-битную кривизну. v1: бит обязан быть установлен.
     pub const CURVATURE: u64 = 1 << 1;
+    /// v3: топологическая секция несёт гироскоп `J = A − Aᵀ` (RQ10).
+    pub const GYRO: u64 = 1 << 2;
 
     /// Флаги для записи: CURVATURE всегда; INDEX16 по выбору писателя.
     pub fn new(index16: bool) -> Flags {
@@ -141,6 +149,29 @@ impl Flags {
             return Err(PqwError::ReservedBits { value: v });
         }
         Ok(Flags(0))
+    }
+
+    /// Флаги для записи v3: GYRO всегда; INDEX16 — по выбору писателя
+    /// (u16-индексы пар гироскопа при `d_pol ≤ 65536`).
+    pub fn v3(index16: bool) -> Flags {
+        Flags(Self::GYRO | if index16 { Self::INDEX16 } else { 0 })
+    }
+
+    /// Гироскопная топология присутствует? (v3)
+    pub fn gyro(self) -> bool {
+        self.0 & Self::GYRO != 0
+    }
+
+    /// Проверка флагов контейнера v3: GYRO обязан быть установлен,
+    /// допускается INDEX16 (ширина индексов пар гироскопа), кривизны нет.
+    pub fn validate_v3(v: u64) -> Result<Flags> {
+        if v & !(Self::INDEX16 | Self::GYRO) != 0 {
+            return Err(PqwError::ReservedBits { value: v });
+        }
+        if v & Self::GYRO == 0 {
+            return Err(PqwError::UnsupportedFlags(v));
+        }
+        Ok(Flags(v))
     }
 
     /// Сырые биты.
@@ -209,28 +240,34 @@ fn get_f64(buf: &[u8], off: usize) -> f64 {
 
 impl Header {
     /// Кодировка фазовых блоков этого контейнера
-    /// (v1 → [`TritEncoding::Curved`], v2 → [`TritEncoding::Packed4`]).
+    /// (v1 → [`TritEncoding::Curved`], v2/v3 → [`TritEncoding::Packed4`]).
     pub fn encoding(&self) -> TritEncoding {
-        if self.format_version == FORMAT_VERSION_V2 {
+        if self.format_version >= FORMAT_VERSION_V2 {
             TritEncoding::Packed4
         } else {
             TritEncoding::Curved
         }
     }
 
-    /// Это контейнер v2 с упакованными тритами?
+    /// Это контейнер с упакованными тритами (v2 или v3)?
     pub fn is_packed(&self) -> bool {
-        self.format_version == FORMAT_VERSION_V2
+        self.format_version >= FORMAT_VERSION_V2
+    }
+
+    /// Это контейнер v3 с гироскопной топологией `J = A − Aᵀ`?
+    pub fn is_gyro(&self) -> bool {
+        self.format_version == FORMAT_VERSION_V3
     }
 
     /// Сериализация в 128 байт; checksum вычисляется последним.
-    /// Magic выбирается по версии: v1 → `POLER_QW`, v2 → `POLER_Q2`.
+    /// Magic выбирается по версии: v1 → `POLER_QW`, v2 → `POLER_Q2`,
+    /// v3 → `POLER_Q3`.
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut b = [0u8; HEADER_SIZE];
-        let magic = if self.format_version == FORMAT_VERSION_V2 {
-            MAGIC_V2
-        } else {
-            MAGIC
+        let magic = match self.format_version {
+            FORMAT_VERSION_V2 => MAGIC_V2,
+            FORMAT_VERSION_V3 => MAGIC_V3,
+            _ => MAGIC,
         };
         b[..8].copy_from_slice(&magic);
         put_u32(&mut b, OFF_VERSION, self.format_version);
@@ -255,9 +292,11 @@ impl Header {
 
     /// Разбор и проверка: magic → version → checksum → flags/reserved → d_pol.
     ///
-    /// Поддержаны оба поколения: `POLER_QW` (v1, кривизна) и
-    /// `POLER_Q2` (v2, упакованные триты); пара magic ↔ версия
-    /// перекрёстно проверяется.
+    /// Поддержаны все три поколения: `POLER_QW` (v1, кривизна),
+    /// `POLER_Q2` (v2, упакованные триты) и `POLER_Q3` (v3, гироскоп);
+    /// пара magic ↔ версия перекрёстно проверяется. В v3 reserved-слово
+    /// (0x70) хранит счётчик тактов гироскопа — проверка «reserved = 0»
+    /// для v3 отключена.
     pub fn from_bytes(data: &[u8]) -> Result<Header> {
         if data.len() < HEADER_SIZE {
             return Err(PqwError::Truncated {
@@ -267,14 +306,14 @@ impl Header {
         }
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&data[..8]);
-        if magic != MAGIC && magic != MAGIC_V2 {
+        if magic != MAGIC && magic != MAGIC_V2 && magic != MAGIC_V3 {
             return Err(PqwError::BadMagic(magic));
         }
         let version = get_u32(data, OFF_VERSION);
-        let expected = if magic == MAGIC {
-            FORMAT_VERSION
-        } else {
-            FORMAT_VERSION_V2
+        let expected = match magic {
+            MAGIC => FORMAT_VERSION,
+            MAGIC_V2 => FORMAT_VERSION_V2,
+            _ => FORMAT_VERSION_V3,
         };
         if version != expected {
             return Err(PqwError::UnsupportedVersion(version));
@@ -284,13 +323,13 @@ impl Header {
         if expected != actual {
             return Err(PqwError::CorruptHeader { expected, actual });
         }
-        let flags = if version == FORMAT_VERSION_V2 {
-            Flags::validate_v2(get_u64(data, OFF_FLAGS))?
-        } else {
-            Flags::validate(get_u64(data, OFF_FLAGS))?
+        let flags = match version {
+            FORMAT_VERSION_V2 => Flags::validate_v2(get_u64(data, OFF_FLAGS))?,
+            FORMAT_VERSION_V3 => Flags::validate_v3(get_u64(data, OFF_FLAGS))?,
+            _ => Flags::validate(get_u64(data, OFF_FLAGS))?,
         };
         let reserved = get_u64(data, OFF_RESERVED);
-        if reserved != 0 {
+        if version != FORMAT_VERSION_V3 && reserved != 0 {
             return Err(PqwError::ReservedBits { value: reserved });
         }
         let d_pol = get_u32(data, OFF_D_POL);
@@ -436,6 +475,88 @@ mod tests {
         assert!(matches!(
             Header::from_bytes(&b),
             Err(PqwError::UnsupportedVersion(1))
+        ));
+    }
+
+    fn sample_v3() -> Header {
+        Header {
+            format_version: FORMAT_VERSION_V3,
+            d_pol: 512,
+            hyper: HyperParams {
+                eta: 0.25,
+                gamma: 0.5,
+                rho: 0.99,
+                epsilon_threshold: 0.05,
+            },
+            mcweeny_residual: 0.0,
+            payload_digest: [9u8; 24],
+            topology_offset: (HEADER_SIZE + 128) as u64,
+            topology_len: 47, // 32 служебных + 3 пары × 5 B
+            phase_offset: HEADER_SIZE as u64,
+            phase_len: 128,
+            nnz: 64,
+            flags: Flags::v3(true),
+        }
+    }
+
+    #[test]
+    fn v3_header_roundtrip_and_magic() {
+        let h = sample_v3();
+        let b = h.to_bytes();
+        assert_eq!(&b[..8], b"POLER_Q3");
+        let h2 = Header::from_bytes(&b).unwrap();
+        assert_eq!(h2, h);
+        assert!(h2.is_gyro());
+        assert!(h2.is_packed());
+        assert_eq!(h2.encoding(), TritEncoding::Packed4);
+        assert!(h2.flags.gyro());
+        assert!(h2.flags.index16());
+    }
+
+    #[test]
+    fn v3_reserved_holds_ticks() {
+        // В v3 reserved-слово = счётчик тактов: ненулевое значение легально.
+        let mut b = sample_v3().to_bytes();
+        b[OFF_RESERVED..OFF_RESERVED + 8].copy_from_slice(&123_456u64.to_le_bytes());
+        let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+        b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(Header::from_bytes(&b).is_ok());
+    }
+
+    #[test]
+    fn v3_requires_gyro_flag() {
+        // GYRO сброшен → UnsupportedFlags (после пересчёта checksum).
+        let mut b = sample_v3().to_bytes();
+        b[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+        b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&b),
+            Err(PqwError::UnsupportedFlags(_))
+        ));
+    }
+
+    #[test]
+    fn v3_rejects_curvature_and_stray_bits() {
+        for bad in [Flags::CURVATURE, 1 << 3, Flags::GYRO | (1 << 9)] {
+            let mut b = sample_v3().to_bytes();
+            b[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&bad.to_le_bytes());
+            let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+            b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+            assert!(Header::from_bytes(&b).is_err(), "flags {bad}");
+        }
+    }
+
+    #[test]
+    fn v3_magic_version_cross_check() {
+        // POLER_Q3 с version = 2 — рассинхрон пары.
+        let mut b = sample_v3().to_bytes();
+        b[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_le_bytes());
+        let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+        b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&b),
+            Err(PqwError::UnsupportedVersion(2))
         ));
     }
 }

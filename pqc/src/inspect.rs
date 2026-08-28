@@ -48,7 +48,7 @@ use crate::json::Json;
 use pqw::mcweeny::idempotency_residual;
 use pqw::phase::{unpack_quad, Trit};
 use pqw::sha256::sha256;
-use pqw::{PqwReader, HEADER_SIZE, MAGIC, MAGIC_V2};
+use pqw::{PqwReader, HEADER_SIZE, MAGIC, MAGIC_V2, MAGIC_V3};
 
 /// Порог χ² против равномерного для df = 255 (p ≈ 0.001): ~352.
 const CHI2_UNIFORM_BAND: f64 = 352.0;
@@ -70,6 +70,8 @@ pub enum FileKind {
     PqwV1,
     /// Контейнер v2: magic `POLER_Q2`, Packed4-триты.
     PqwV2,
+    /// Контейнер v3: magic `POLER_Q3`, Packed4 + гироскоп `J = A − Aᵀ`.
+    PqwV3,
     /// Кандидат в сырые Packed4-пакеты (без заголовка); `d_pol = 4 × len`.
     RawPacked4 { d_pol: u32 },
     /// Неизвестный формат — универсальная разведка.
@@ -82,6 +84,7 @@ impl FileKind {
         match self {
             FileKind::PqwV1 => "pqw-v1 (POLER_QW, curved)",
             FileKind::PqwV2 => "pqw-v2 (POLER_Q2, Packed4)",
+            FileKind::PqwV3 => "pqw-v3 (POLER_Q3, Packed4 + gyro J = A − Aᵀ)",
             FileKind::RawPacked4 { .. } => "raw-packed4 (candidate)",
             FileKind::Opaque => "opaque",
         }
@@ -89,7 +92,10 @@ impl FileKind {
 
     /// Это один из контейнеров POLER?
     pub fn is_pqw(self) -> bool {
-        matches!(self, FileKind::PqwV1 | FileKind::PqwV2)
+        matches!(
+            self,
+            FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3
+        )
     }
 }
 
@@ -101,6 +107,9 @@ pub fn detect_kind(data: &[u8]) -> FileKind {
         }
         if data[..8] == MAGIC_V2 {
             return FileKind::PqwV2;
+        }
+        if data[..8] == MAGIC_V3 {
+            return FileKind::PqwV3;
         }
     }
     if !data.is_empty() && packed4_valid(data) && printable_ratio(data) < 0.85 {
@@ -411,10 +420,10 @@ pub fn header_rows(data: &[u8], reader: &PqwReader) -> Vec<FieldRow> {
             offset: 0x00,
             size: 8,
             name: "magic",
-            value: if h.is_packed() {
-                "POLER_Q2".into()
-            } else {
-                "POLER_QW".into()
+            value: match h.format_version {
+                2 => "POLER_Q2".into(),
+                3 => "POLER_Q3".into(),
+                _ => "POLER_QW".into(),
             },
             note: "сигнатура контейнера",
         },
@@ -423,7 +432,7 @@ pub fn header_rows(data: &[u8], reader: &PqwReader) -> Vec<FieldRow> {
             size: 4,
             name: "format_version",
             value: format!("{}", h.format_version),
-            note: "1 = curved, 2 = Packed4",
+            note: "1 = curved, 2 = Packed4, 3 = Packed4 + гироскоп",
         },
         FieldRow {
             offset: 0x0C,
@@ -479,14 +488,22 @@ pub fn header_rows(data: &[u8], reader: &PqwReader) -> Vec<FieldRow> {
             size: 8,
             name: "topology_offset",
             value: format!("0x{:x}", h.topology_offset),
-            note: "начало CSR-топологии",
+            note: if h.is_gyro() {
+                "начало гироскопной секции J = A − Aᵀ"
+            } else {
+                "начало CSR-топологии"
+            },
         },
         FieldRow {
             offset: 0x48,
             size: 8,
             name: "topology_len",
             value: format!("{}", h.topology_len),
-            note: "байтов топологии (v2: 0)",
+            note: if h.is_gyro() {
+                "байтов гироскопной секции"
+            } else {
+                "байтов топологии (v2: 0)"
+            },
         },
         FieldRow {
             offset: 0x50,
@@ -514,7 +531,9 @@ pub fn header_rows(data: &[u8], reader: &PqwReader) -> Vec<FieldRow> {
             size: 8,
             name: "flags",
             value: format!("0x{:x}", h.flags.bits()),
-            note: if h.is_packed() {
+            note: if h.is_gyro() {
+                "бит0 INDEX16 пар, бит2 GYRO"
+            } else if h.is_packed() {
                 "v2: обязан быть 0"
             } else {
                 "бит0 INDEX16, бит1 CURVATURE"
@@ -524,8 +543,21 @@ pub fn header_rows(data: &[u8], reader: &PqwReader) -> Vec<FieldRow> {
             offset: 0x70,
             size: 8,
             name: "reserved",
-            value: "0".into(),
-            note: "обязан быть нулём",
+            value: if h.is_gyro() {
+                // v3: счётчик тактов гироскопа (зеркалит секцию).
+                format!("{}", {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&data[0x70..0x78]);
+                    u64::from_le_bytes(b)
+                })
+            } else {
+                "0".into()
+            },
+            note: if h.is_gyro() {
+                "v3: счётчик тактов t гироскопа"
+            } else {
+                "обязан быть нулём"
+            },
         },
         FieldRow {
             offset: 0x78,
@@ -731,10 +763,11 @@ pub fn report_json(
     arcs: &[DecodedArc],
     d_pol: u32,
     recon: &CryptoRecon,
+    gyro: Option<Json>,
 ) -> Json {
     let indices: Vec<u32> = arcs.iter().map(|a| a.index).collect();
     let stats = graph_stats(&indices, d_pol);
-    Json::Obj(vec![
+    let mut pairs: Vec<(String, Json)> = vec![
         ("file".into(), Json::str(path)),
         ("size".into(), Json::Num(data.len() as f64)),
         ("sha256".into(), Json::str(sha256_hex(data))),
@@ -766,7 +799,11 @@ pub fn report_json(
         ("born_entropy_bits".into(), Json::num(born_entropy(arcs))),
         ("qcm_theory".into(), Json::num(qcm_theory(arcs, d_pol))),
         ("crypto".into(), recon.to_json()),
-    ])
+    ];
+    if let Some(g) = gyro {
+        pairs.push(("gyro".into(), g));
+    }
+    Json::Obj(pairs)
 }
 
 /// Верхняя граница данных без заголовка (для raw-пакетов).

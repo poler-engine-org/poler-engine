@@ -5,8 +5,13 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
+use crate::checksum::fnv1a64;
 use crate::error::{PqwError, Result};
-use crate::header::{Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, HEADER_SIZE};
+use crate::gyro::GyroData;
+use crate::header::{
+    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3, HEADER_SIZE,
+    OFF_CHECKSUM, OFF_RESERVED,
+};
 use crate::mcweeny;
 use crate::phase::{nearest_trit, pack_trit2, quantize, PhaseByte, Trit};
 use crate::sha256::sha256_trunc24;
@@ -203,6 +208,58 @@ impl PqwWriter {
         Ok((header, phases))
     }
 
+    /// Сборка контейнера v3: Packed4-фазы + гироскопная топология
+    /// `J = A − Aᵀ` в топологической секции (magic `POLER_Q3`).
+    ///
+    /// Фазы занимают `[0x80, 0x80 + ceil(d/4))`, гироскопная секция
+    /// следует сразу за ними (`topology_offset`), reserved-слово заголовка
+    /// хранит счётчик тактов `t`, digest покрывает фазы + гироскоп.
+    ///
+    /// Возвращает готовые байты заголовка (с тактами в reserved и
+    /// пересчитанной checksum) и payload.
+    fn build_v3(&self, gyro: &GyroData) -> Result<(Vec<u8>, Vec<u8>)> {
+        if !self.hyper.is_finite() {
+            return Err(PqwError::BadValue(self.hyper.eta));
+        }
+        let d = self.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+        let mut phases = vec![0u8; packed_len];
+        let mut nonzero: u64 = 0;
+        for (&i, &p) in self.entries.iter() {
+            let t = nearest_trit(p);
+            if t == Trit::Zero {
+                continue;
+            }
+            nonzero += 1;
+            let i = i as usize;
+            phases[i / 4] |= pack_trit2(t) << (2 * (i % 4));
+        }
+        let index16 = self.uses_index16();
+        let gyro_bytes = gyro.encode(index16)?;
+        let mut payload = Vec::with_capacity(phases.len() + gyro_bytes.len());
+        payload.extend_from_slice(&phases);
+        payload.extend_from_slice(&gyro_bytes);
+        let header = Header {
+            format_version: FORMAT_VERSION_V3,
+            d_pol: self.d_pol,
+            hyper: self.hyper,
+            mcweeny_residual: 0.0,
+            payload_digest: sha256_trunc24(&payload),
+            topology_offset: (HEADER_SIZE + packed_len) as u64,
+            topology_len: gyro_bytes.len() as u64,
+            phase_offset: HEADER_SIZE as u64,
+            phase_len: packed_len as u64,
+            nnz: nonzero,
+            flags: Flags::v3(index16),
+        };
+        // reserved-слово = счётчик тактов гироскопа + пересчёт checksum.
+        let mut hb = header.to_bytes();
+        hb[OFF_RESERVED..OFF_RESERVED + 8].copy_from_slice(&gyro.ticks().to_le_bytes());
+        let checksum = fnv1a64(&hb[..OFF_CHECKSUM]);
+        hb[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        Ok((hb.to_vec(), payload))
+    }
+
     /// Сериализация в память. Детерминизм: одинаковый набор дуг → идентичные байты.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(HEADER_SIZE + self.estimated_size());
@@ -257,6 +314,33 @@ impl PqwWriter {
     /// Запись в файл.
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<()> {
         let bytes = self.to_bytes()?;
+        let mut file = std::fs::File::create(path.as_ref())?;
+        file.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Дописать контейнер v3 (Packed4 + гироскоп) в чужой буфер.
+    ///
+    /// Гироскоп обязан содержать хотя бы одну пару (LENS: пустая
+    /// циркуляция — это v2-контейнер без топологии).
+    pub fn write_v3(&self, out: &mut Vec<u8>, gyro: &GyroData) -> Result<()> {
+        let (hb, payload) = self.build_v3(gyro)?;
+        out.reserve(HEADER_SIZE + payload.len());
+        out.extend_from_slice(&hb);
+        out.extend_from_slice(&payload);
+        Ok(())
+    }
+
+    /// Сериализация в память в формате v3 (Packed4 + гироскоп).
+    pub fn to_bytes_v3(&self, gyro: &GyroData) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(HEADER_SIZE + self.estimated_size_packed() + 32);
+        self.write_v3(&mut out, gyro)?;
+        Ok(out)
+    }
+
+    /// Запись контейнера v3 в файл.
+    pub fn write_v3_to(&self, path: impl AsRef<Path>, gyro: &GyroData) -> Result<()> {
+        let bytes = self.to_bytes_v3(gyro)?;
         let mut file = std::fs::File::create(path.as_ref())?;
         file.write_all(&bytes)?;
         Ok(())

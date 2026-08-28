@@ -91,6 +91,7 @@ pub mod complex;
 pub mod entangle;
 pub mod error;
 pub mod gates;
+pub mod gyro;
 pub mod inspect;
 pub mod json;
 pub mod learn;
@@ -110,6 +111,7 @@ pub use complex::Cx;
 pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;
+pub use gyro::{precess_step, resonant_modes_from_pairs, GyroMode, Gyroscope};
 pub use inspect::{
     arcs_csr_text, arcs_dot, ascii_matrix, ascii_strings, born_entropy, crypto_recon, detect_kind,
     graph_stats, header_rows, hex_dump, qcm_theory, raw_arcs, raw_packed4_arcs, reader_arcs,

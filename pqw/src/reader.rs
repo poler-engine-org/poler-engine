@@ -6,7 +6,7 @@
 //! Digest payload проверяется отдельно и лениво — [`PqwReader::verify_payload`]:
 //! «мгновенный холодный старт» не должен упираться в хеширование гигабайтов.
 //!
-//! ## Два поколения формата
+//! ## Три поколения формата
 //!
 //! * **v1** (`POLER_QW`): разрежённая LENS-топология + байты кривизны;
 //! * **v2** (`POLER_Q2`): плотный массив упакованных тритов (4 дуги на байт),
@@ -14,12 +14,17 @@
 //!   явный `Zero` семантически равен отсутствующей дуге (честная монета,
 //!   λ = ½), поэтому v1- и v2-контейнеры одного тритового состояния
 //!   дают идентичную квантовую семантику. Сырой плотный вид v2 отдаёт
-//!   [`PqwReader::iter_packed_trits`].
+//!   [`PqwReader::iter_packed_trits`];
+//! * **v3** (`POLER_Q3`): Packed4-фазы + гироскопная топология
+//!   `J = A − Aᵀ` в топологической секции (RQ10) — верхний треугольник
+//!   квантованных весов + счётчик тактов в reserved-слове заголовка.
+//!   Доступ — [`PqwReader::gyro`].
 
 use std::borrow::Cow;
 
 use crate::error::{PqwError, Result};
-use crate::header::{Header, HEADER_SIZE};
+use crate::gyro::GyroSection;
+use crate::header::{Header, HEADER_SIZE, OFF_RESERVED};
 use crate::mcweeny;
 use crate::phase::{packed_trit_at, PhaseByte, Trit, TritEncoding};
 use crate::sha256::sha256_trunc24;
@@ -60,6 +65,9 @@ impl<'a> PqwReader<'a> {
         let header = Header::from_bytes(data)?;
 
         if header.is_packed() {
+            if header.is_gyro() {
+                return Self::validate_gyro(header, data);
+            }
             return Self::validate_packed(header, data);
         }
 
@@ -111,6 +119,120 @@ impl<'a> PqwReader<'a> {
         }
 
         Ok(PqwReader { header, data })
+    }
+
+    /// Валидация контейнера v3 (Packed4 + гироскопная топология):
+    /// фазы как в v2, затем гироскопная секция `J = A − Aᵀ`.
+    ///
+    /// Сверяется и структура секции (magic/версия/длины/индексы/сортировка),
+    /// и перекрёстная пара: reserved-слово заголовка = счётчику тактов секции.
+    fn validate_gyro(header: Header, data: &'a [u8]) -> Result<PqwReader<'a>> {
+        // Фазы — по правилам v2.
+        let reader = Self::validate_packed_v3_phases(&header, data)?;
+
+        // Гироскопная секция: ровно topology_len байтов после фаз,
+        // никаких хвостовых данных.
+        let d = header.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+        let topo_off = header.topology_offset as usize;
+        let topo_len = header.topology_len as usize;
+        if topo_off != HEADER_SIZE + packed_len {
+            return Err(PqwError::Layout(
+                "v3: gyro section must follow the phase blocks",
+            ));
+        }
+        let expected_len = topo_off + topo_len;
+        if data.len() < expected_len {
+            return Err(PqwError::Truncated {
+                need: expected_len,
+                have: data.len(),
+            });
+        }
+        if data.len() > expected_len {
+            return Err(PqwError::Layout(
+                "v3: trailing bytes after the gyro section",
+            ));
+        }
+        let section = GyroSection::decode(
+            &data[topo_off..expected_len],
+            header.d_pol,
+            header.flags.index16(),
+        )?;
+
+        // Перекрёстная проверка: счётчик тактов в reserved-слове.
+        let ticks_reserved = u64::from_le_bytes(
+            data[OFF_RESERVED..OFF_RESERVED + 8].try_into().unwrap(),
+        );
+        if ticks_reserved != section.ticks() {
+            return Err(PqwError::Layout(
+                "v3: reserved tick counter disagrees with the gyro section",
+            ));
+        }
+        Ok(reader)
+    }
+
+    /// Фазовая часть v3 (те же правила, что и v2, но без ограничения
+    /// «topology обязана быть пустой»: за фазами приходит гироскоп).
+    fn validate_packed_v3_phases(header: &Header, data: &'a [u8]) -> Result<PqwReader<'a>> {
+        let d = header.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+
+        if header.phase_offset != HEADER_SIZE as u64 {
+            return Err(PqwError::Layout(
+                "v3 container: phases must start at 0x80",
+            ));
+        }
+        if header.phase_len != packed_len as u64 {
+            return Err(PqwError::InconsistentTopology {
+                field: "phase_len",
+                expected: packed_len as u64,
+                actual: header.phase_len,
+            });
+        }
+        if header.nnz > u64::from(header.d_pol) {
+            return Err(PqwError::Layout("nnz exceeds d_pol"));
+        }
+        let expected_len = HEADER_SIZE + packed_len;
+        if data.len() < expected_len {
+            return Err(PqwError::Truncated {
+                need: expected_len,
+                have: data.len(),
+            });
+        }
+
+        // Семантическая валидация тритов: коды 0b11 запрещены, пары
+        // за пределами d_pol — Zero, nnz сходится с пересчётом.
+        let packed = &data[HEADER_SIZE..expected_len];
+        let mut nonzero: u64 = 0;
+        for (bi, &b) in packed.iter().enumerate() {
+            let mut bits = b;
+            for j in 0..4 {
+                match bits & 0b11 {
+                    0 => {}
+                    1 | 2 => {
+                        if bi * 4 + j >= d {
+                            return Err(PqwError::Layout(
+                                "padding pair beyond d_pol must be zero",
+                            ));
+                        }
+                        nonzero += 1;
+                    }
+                    _ => return Err(PqwError::ReservedTrit(b)),
+                }
+                bits >>= 2;
+            }
+        }
+        if nonzero != header.nnz {
+            return Err(PqwError::InconsistentTopology {
+                field: "nnz",
+                expected: nonzero,
+                actual: header.nnz,
+            });
+        }
+        Ok(PqwReader {
+            header: header.clone(),
+            data,
+        })
     }
 
     /// Валидация контейнера v2 (Packed4): плотные триты без топологии.
@@ -292,13 +414,27 @@ impl<'a> PqwReader<'a> {
     }
 
     /// Ленивая проверка целостности payload: SHA-256 (24 байта) поверх
-    /// топологии + фазовых блоков.
+    /// топологии + фазовых блоков (+ гироскопной секции в v3).
     pub fn verify_payload(&self) -> Result<()> {
         if sha256_trunc24(&self.data[HEADER_SIZE..]) == self.header.payload_digest {
             Ok(())
         } else {
             Err(PqwError::CorruptPayload)
         }
+    }
+
+    /// Гироскопная топология v3: пары `J = A − Aᵀ` + счётчик тактов.
+    ///
+    /// `None` для контейнеров v1/v2 (топологическая секция пуста).
+    /// Ошибка невозможна после `from_bytes` (секция уже провалидирована).
+    pub fn gyro(&self) -> Option<GyroSection> {
+        if !self.header.is_gyro() {
+            return None;
+        }
+        let a = self.header.topology_offset as usize;
+        let b = a + self.header.topology_len as usize;
+        GyroSection::decode(&self.data[a..b], self.header.d_pol, self.header.flags.index16())
+            .ok()
     }
 
     /// McWeeny-очистка хранимых дуг: `steps` итераций `p ← purify_p(p)`.

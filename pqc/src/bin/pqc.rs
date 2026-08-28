@@ -21,6 +21,7 @@ use pqc::inspect::{
     graph_stats, header_rows, hex_dump, qcm_theory, raw_arcs, reader_arcs, report_json,
     try_pqw_reader, CryptoRecon, DecodedArc, FileKind, ARCS_PREVIEW, MATRIX_D_MAX,
 };
+use pqc::json::Json;
 use pqc::{Ansatz, LoadOptions, Rng, DEFAULT_MAX_SV_QUBITS, MAX_QUBITS};
 use pqw::{PqwReader, PqwWriter};
 
@@ -83,7 +84,14 @@ TRAIN OPTIONS (RQ8: плотный LENS-граф, накопительная п�
     --curriculum [SCHEDULE]   RQ9: фазовая сборка — уровни с растущим чанком;
                               default 10:1:512:8K,128:2:1024:32K,
                               1024:4:4096:256K + LENS-уровень из --block/--steps
-                              формат уровня BLOCK[:STEPS[:SHOTS[:BUDGET]]]]
+                              формат уровня BLOCK[:STEPS[:SHOTS[:BUDGET]]]
+    --gyro [W]                RQ10: гироскоп памяти J = A − Aᵀ — направленная
+                              циркуляция смысла в топологической секции v3;
+                              окно W токенов (default 256), O(W)/токен — без O(N²)
+    --gyro-budget <N>         RQ10: потолок сырых направленных пар (default 65536)
+
+INSPECT OPTIONS (дополнительно):
+    --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
 
 OPTIONS (run/demo):
     --shots <N>               Born-выстрелов (default 1024)
@@ -925,6 +933,7 @@ fn cmd_inspect(args: &[String]) -> i32 {
         strings: bool,
         raw_dim: Option<u32>,
         json: bool,
+        modes: usize, // RQ10: число резонансных мод гироскопа
     }
     let mut cfg = InspectConfig {
         hex_limit: Some(512),
@@ -935,6 +944,7 @@ fn cmd_inspect(args: &[String]) -> i32 {
         strings: false,
         raw_dim: None,
         json: false,
+        modes: 8,
     };
     let mut file: Option<String> = None;
 
@@ -996,6 +1006,16 @@ fn cmd_inspect(args: &[String]) -> i32 {
                 }
             }
             "--json" => cfg.json = true,
+            "--modes" => {
+                let v = val!("--modes");
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 && n <= 64 => cfg.modes = n,
+                    _ => {
+                        eprintln!("pqc inspect: bad --modes: {v} (1..=64)\n\n{USAGE}");
+                        return 2;
+                    }
+                }
+            }
             "--all" => {
                 cfg.hex_limit = Some(usize::MAX);
                 cfg.decode = Some(usize::MAX);
@@ -1039,7 +1059,7 @@ fn cmd_inspect(args: &[String]) -> i32 {
     let mut d_pol: u32 = 0;
 
     match kind {
-        FileKind::PqwV1 | FileKind::PqwV2 => match try_pqw_reader(data) {
+        FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3 => match try_pqw_reader(data) {
             Ok(Some(r)) => {
                 d_pol = r.d_pol();
                 arcs = reader_arcs(&r);
@@ -1079,11 +1099,67 @@ fn cmd_inspect(args: &[String]) -> i32 {
 
     let recon: CryptoRecon = crypto_recon(data);
 
+    // ── RQ10: гироскопная топология v3 — J = A − Aᵀ + моды Im(P) ──
+    let gyro_section = reader.as_ref().and_then(|r| r.gyro());
+    let gyro_modes = gyro_section.as_ref().map(|g| {
+        let pairs: Vec<(u32, u32, f64)> = g
+            .pairs()
+            .iter()
+            .map(|p| (p.i, p.j, p.weight))
+            .collect();
+        pqc::gyro::resonant_modes_from_pairs(&pairs, cfg.modes)
+    });
+    let gyro_json: Option<Json> = gyro_section.as_ref().map(|g| {
+        let mut obj = vec![
+            ("present".into(), Json::Bool(true)),
+            ("window".into(), Json::num(g.window() as f64)),
+            ("ticks".into(), Json::num(g.ticks() as f64)),
+            ("pairs".into(), Json::num(g.pairs().len() as f64)),
+            ("scale".into(), Json::num(g.scale() as f64)),
+            ("index16".into(), Json::Bool(g.index16())),
+        ];
+        if let Some(modes) = &gyro_modes {
+            // Фазовый портрет Im(P): p̂ и θ = arccos(p̂) дуг моды —
+            // из фазовой секции контейнера.
+            let phase: std::collections::HashMap<u32, f64> =
+                arcs.iter().map(|a| (a.index, a.p_hat)).collect();
+            let comp = |v: &[(u32, f64)]| -> Json {
+                Json::Arr(
+                    v.iter()
+                        .map(|&(n, c)| {
+                            let mut fields = vec![
+                                ("idx".into(), Json::num(f64::from(n))),
+                                ("comp".into(), Json::num(c)),
+                            ];
+                            if let Some(&p) = phase.get(&n) {
+                                fields.push(("p".into(), Json::num(p)));
+                                fields.push(("theta".into(), Json::num(p.acos())));
+                            }
+                            Json::Obj(fields)
+                        })
+                        .collect(),
+                )
+            };
+            let modes_json: Vec<Json> = modes
+                .iter()
+                .map(|m| {
+                    Json::Obj(vec![
+                        ("lambda".into(), Json::num(m.lambda)),
+                        ("u".into(), comp(&m.u)),
+                        ("v".into(), comp(&m.v)),
+                    ])
+                })
+                .collect();
+            obj.push(("modes".into(), Json::Arr(modes_json)));
+        }
+        Json::Obj(obj)
+    });
+
     // ── JSON-режим: единый объект и выход ──
     if cfg.json {
         println!(
             "{}",
-            report_json(&file, data, kind, &arcs, d_pol, &recon).to_string()
+            report_json(&file, data, kind, &arcs, d_pol, &recon, gyro_json).to_string()
         );
         return 0;
     }
@@ -1114,6 +1190,72 @@ fn cmd_inspect(args: &[String]) -> i32 {
             born_entropy(&arcs),
             qcm_theory(&arcs, d_pol)
         );
+    }
+
+    // ── RQ10: гироскоп J = A − Aᵀ (топологическая секция v3) ──
+    if let Some(g) = &gyro_section {
+        let h = reader.as_ref().map(|r| r.header()).unwrap();
+        println!("\nGYRO (J = A − Aᵀ, кососимметричный резонансный оператор)");
+        println!(
+            "  window     : {} токенов направленного контекста",
+            g.window()
+        );
+        println!("  ticks      : {} наблюдённых событий потока", g.ticks());
+        println!(
+            "  pairs      : {} хранимых пар (верхний треугольник, ε-ворота)",
+            g.pairs().len()
+        );
+        println!(
+            "  section    : {} B @ 0x{:x} (5 B/пара, веса i8, scale {:.4})",
+            h.topology_len, h.topology_offset, g.scale()
+        );
+        // Превью главных русел циркуляции.
+        let mut top: Vec<&pqw::GyroPair> = g.pairs().iter().collect();
+        top.sort_by(|a, b| b.weight.abs().total_cmp(&a.weight.abs()));
+        let preview = top.len().min(8);
+        if preview > 0 {
+            println!("  top flow   : (src → dst, вес — направление потока смысла)");
+            for p in &top[..preview] {
+                println!("               {:>5} → {:<5} {:+.4}", p.i, p.j, p.weight);
+            }
+        }
+        // Резонансные моды: Im(P) — фазовые векторы смысла.
+        if let Some(modes) = &gyro_modes {
+            if !modes.is_empty() {
+                println!("\n  моды Im(P): плоскости вращения (u, v), λ = угловая скорость;");
+                println!("               θ = arccos(p̂) — фазовый угол дуги (вектор смысла)");
+                let phase: std::collections::HashMap<u32, f64> =
+                    arcs.iter().map(|a| (a.index, a.p_hat)).collect();
+                for (k, m) in modes.iter().enumerate() {
+                    println!(
+                        "  λ{} = {:.4}:",
+                        k + 1,
+                        m.lambda
+                    );
+                    for (label, vec) in [("u", &m.u), ("v", &m.v)] {
+                        let shown = vec.len().min(6);
+                        if shown == 0 {
+                            continue;
+                        }
+                        let comps: Vec<String> = vec[..shown]
+                            .iter()
+                            .map(|&(n, c)| {
+                                match phase.get(&n) {
+                                    Some(&p) => format!(
+                                        "{n}({:+.2}|p{:+.1}|θ{:.2}π)",
+                                        c,
+                                        p,
+                                        p.acos() / std::f64::consts::PI
+                                    ),
+                                    None => format!("{n}({c:+.2})"),
+                                }
+                            })
+                            .collect();
+                        println!("    {label}      : {}", comps.join("  "));
+                    }
+                }
+            }
+        }
     }
 
     println!("\nCRYPTO RECON");
@@ -1485,6 +1627,10 @@ struct TrainConfig {
     resume: Option<String>,
     /// RQ9: фазовая сборка — расписание уровней с растущим чанком.
     curriculum: Option<Vec<TrainStage>>,
+    /// RQ10: окно гироскопа J = A − Aᵀ (None — гироскоп выключен).
+    gyro: Option<usize>,
+    /// RQ10: бюджет сырых направленных пар гироскопа.
+    gyro_budget: usize,
 }
 
 /// Один уровень фазовой сборки (RQ9): размер чанка, шаги Born-петли,
@@ -1538,6 +1684,8 @@ impl Default for TrainConfig {
             every: 25,
             resume: None,
             curriculum: None,
+            gyro: None,
+            gyro_budget: 65_536,
         }
     }
 }
@@ -1651,7 +1799,7 @@ struct TrainStats {
     last_loss: f64,
     last_qcm_gap: f64,
     blocks_since_snapshot: usize,
-    snapshot: (usize, u64, usize),
+    snapshot: (usize, u64, usize, usize),
 }
 
 fn train_usage_err(msg: &str) -> i32 {
@@ -1696,12 +1844,19 @@ fn collect_corpus(root: &Path, files: &mut Vec<std::path::PathBuf>, total: &mut 
 }
 
 /// Снапшот НАКОПЛЕННОЙ памяти: .pqw-контейнер + raw Packed4-отпечаток.
+///
+/// RQ10: при включённом гироскопе и живой циркуляции пишется контейнер
+/// v3 (POLER_Q3): фазы Packed4 + топологическая секция J = A − Aᵀ.
+/// Отпечаток --fingerprint — только фазовые блоки (сравнимость мониторинга).
+///
+/// Возвращает (байты контейнера, nnz фаз, support, пар гироскопа).
 fn train_snapshot(
     engine: &pqc::stream_engine::StreamEngine,
     cfg: &TrainConfig,
-) -> Result<(usize, u64, usize), String> {
+) -> Result<(usize, u64, usize, usize), String> {
     let model = engine.model();
     let mut buf = Vec::new();
+    let mut gyro_pairs = 0usize;
     {
         let rho = if cfg.decay { 0.0 } else { 1.0 };
         let w = PqwWriter::new(engine.d_pol())
@@ -1710,19 +1865,34 @@ fn train_snapshot(
         let mut w = w;
         let state_f32: Vec<f32> = model.iter().map(|&p| p as f32).collect();
         w.add_state(&state_f32).map_err(|e| e.to_string())?;
-        w.write_packed_trits(&mut buf).map_err(|e| e.to_string())?;
+        // v3 с гироскопом (если циркуляция пережила ε-ворота), иначе v2.
+        let gyro_data = engine
+            .gyro()
+            .and_then(|g| g.gyro_data(cfg.epsilon as f64, engine.d_pol()));
+        match &gyro_data {
+            Some(data) => {
+                gyro_pairs = data.pairs().len();
+                w.write_v3(&mut buf, data).map_err(|e| e.to_string())?;
+            }
+            None => {
+                w.write_packed_trits(&mut buf).map_err(|e| e.to_string())?;
+            }
+        }
     }
-    let nnz = PqwReader::from_bytes(&buf)
-        .map_err(|e| e.to_string())?
-        .nnz();
+    let phase_len = (engine.d_pol() as usize).div_ceil(4);
+    let reader = PqwReader::from_bytes(&buf).map_err(|e| e.to_string())?;
+    let nnz = reader.nnz();
     if let Some(p) = &cfg.out {
         std::fs::write(p, &buf).map_err(|e| format!("--out: {e}"))?;
     }
     if let Some(p) = &cfg.fingerprint {
-        let payload = &buf[pqw::HEADER_SIZE.min(buf.len())..];
+        // Только фазовые блоки: размер и семантика отпечатка неизменны
+        // при любом формате контейнера (v2/v3).
+        let end = (pqw::HEADER_SIZE + phase_len).min(buf.len());
+        let payload = &buf[pqw::HEADER_SIZE.min(buf.len())..end];
         std::fs::write(p, payload).map_err(|e| format!("--fingerprint: {e}"))?;
     }
-    Ok((buf.len(), nnz, engine.model_arcs().len()))
+    Ok((buf.len(), nnz, engine.model_arcs().len(), gyro_pairs))
 }
 
 fn cmd_train(args: &[String]) -> i32 {
@@ -1838,6 +2008,31 @@ fn cmd_train(args: &[String]) -> i32 {
                     _ => cfg.curriculum = Some(Vec::new()),
                 }
             }
+            "--gyro" => {
+                // RQ10: окно направленного контекста (default 256);
+                // значение опционально — как у --curriculum.
+                let next = args.get(i + 1).map(|s| s.as_str());
+                match next {
+                    Some(s) if !s.starts_with("--") => match s.parse::<usize>() {
+                        Ok(w) if w > 0 => {
+                            i += 1;
+                            cfg.gyro = Some(w);
+                        }
+                        _ => {
+                            return train_usage_err("--gyro: окно должно быть > 0")
+                        }
+                    },
+                    _ => cfg.gyro = Some(256),
+                }
+            }
+            "--gyro-budget" => {
+                match val("--gyro-budget")
+                    .and_then(|v| parse_num::<usize>(&v, "--gyro-budget"))
+                {
+                    Ok(v) if v >= 16 => cfg.gyro_budget = v,
+                    _ => return train_usage_err("--gyro-budget должен быть ≥ 16"),
+                }
+            }
             other => return train_usage_err(&format!("unknown option {other}")),
         }
         i += 1;
@@ -1917,6 +2112,10 @@ fn cmd_train(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // RQ10: гироскоп памяти J = A − Aᵀ — уровень 4 поверх любого расписания.
+    if let Some(window) = cfg.gyro {
+        engine = engine.with_gyro(window, cfg.gyro_budget);
+    }
 
     // RQ9: resume — поднять накопленную память из .pqw-чекпоинта.
     let mut resumed_nnz: Option<usize> = None;
@@ -1982,6 +2181,12 @@ fn cmd_train(args: &[String]) -> i32 {
                 n
             );
         }
+        if let Some(w) = cfg.gyro {
+            println!(
+                "gyro      : J = A − Aᵀ, окно {w} токенов, бюджет {} пар — топологическая секция v3",
+                cfg.gyro_budget
+            );
+        }
         println!(
             "policy    : forget={:?}, snapshot every {} блоков",
             forget, cfg.snapshot_every
@@ -1997,7 +2202,7 @@ fn cmd_train(args: &[String]) -> i32 {
         last_loss: 0.0,
         last_qcm_gap: 0.0,
         blocks_since_snapshot: 0,
-        snapshot: (0usize, 0u64, 0usize),
+        snapshot: (0usize, 0u64, 0usize, 0usize),
     };
 
     // Начальный снапшот: нулевой (или поднятый из чекпоинта) отпечаток.
@@ -2220,7 +2425,7 @@ fn cmd_train(args: &[String]) -> i32 {
         }
     }
     let elapsed = t0.elapsed().as_secs_f64();
-    let (container_bytes, nnz_lens, support) = st.snapshot;
+    let (container_bytes, nnz_lens, support, gyro_pairs) = st.snapshot;
     let density = nnz_lens as f64 / cfg.dim as f64 * 100.0;
     let total_tokens = st.total_tokens;
     let total_blocks = st.total_blocks;
@@ -2268,6 +2473,33 @@ fn cmd_train(args: &[String]) -> i32 {
                 Json::num((elapsed * 100.0).round() / 100.0),
             ),
         ];
+        // RQ10: гироскоп J = A − Aᵀ — статистика реляционной памяти.
+        if let Some(window) = cfg.gyro {
+            if let Some(g) = engine.gyro() {
+                let section_bytes = container_bytes
+                    .saturating_sub(pqw::HEADER_SIZE + (cfg.dim as usize).div_ceil(4));
+                let lambda_top = g
+                    .resonant_modes(cfg.epsilon as f64, 1)
+                    .first()
+                    .map(|m| m.lambda)
+                    .unwrap_or(0.0);
+                pairs.push((
+                    "gyro".into(),
+                    Json::Obj(vec![
+                        ("window".into(), Json::num(window as f64)),
+                        ("budget".into(), Json::num(cfg.gyro_budget as f64)),
+                        ("ticks".into(), Json::num(g.ticks() as f64)),
+                        ("pairs_raw".into(), Json::num(g.raw_pairs() as f64)),
+                        ("pairs_stored".into(), Json::num(gyro_pairs as f64)),
+                        ("section_bytes".into(), Json::num(section_bytes as f64)),
+                        (
+                            "lambda_top".into(),
+                            Json::num((lambda_top * 1e6).round() / 1e6),
+                        ),
+                    ]),
+                ));
+            }
+        }
         if let Some(p) = &cfg.resume {
             pairs.push(("resume_path".into(), Json::str(p.clone())));
             if let Some(n) = resumed_nnz {
@@ -2330,7 +2562,38 @@ fn cmd_train(args: &[String]) -> i32 {
             total_blocks, total_tokens, no_hits, last_loss, last_qcm_gap
         );
         if let Some(p) = &cfg.out {
-            println!("checkpoint: {p} ({container_bytes} B, POLER_Q2 Packed4)");
+            let fmt = if gyro_pairs > 0 {
+                "POLER_Q3 Packed4 + гироскоп J = A − Aᵀ"
+            } else {
+                "POLER_Q2 Packed4"
+            };
+            println!("checkpoint: {p} ({container_bytes} B, {fmt})");
+        }
+        if let (Some(_), Some(g)) = (cfg.gyro, engine.gyro()) {
+            let section_bytes = container_bytes
+                .saturating_sub(pqw::HEADER_SIZE + (cfg.dim as usize).div_ceil(4));
+            println!(
+                "gyro      : {} тактов, {} сырых пар → {} хранимых, секция {} B ({} Б/пара)",
+                g.ticks(),
+                g.raw_pairs(),
+                gyro_pairs,
+                section_bytes,
+                if gyro_pairs > 0 {
+                    section_bytes / gyro_pairs
+                } else {
+                    0
+                }
+            );
+            let lambda_top = g
+                .resonant_modes(cfg.epsilon as f64, 1)
+                .first()
+                .map(|m| m.lambda)
+                .unwrap_or(0.0);
+            if lambda_top > 0.0 {
+                println!(
+                    "моды Im(P): λ_max = {lambda_top:.4} — главная плоскость вращения смысла"
+                );
+            }
         }
         if let Some(p) = &cfg.fingerprint {
             let bytes = cfg.dim as usize / 4;

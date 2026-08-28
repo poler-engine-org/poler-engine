@@ -88,6 +88,7 @@ use pqw::{PqwReader, PqwWriter};
 
 use crate::ansatz::{Ansatz, PhaseAnsatz};
 use crate::coherence::{coherence, CoherenceReport};
+use crate::gyro::Gyroscope;
 use crate::learn::{ActiveInference, ActiveStepReport};
 use crate::rng::Rng;
 
@@ -193,6 +194,8 @@ pub struct StreamEngine {
     rng: Rng,
     qcm_shots: u64,
     forget: Forget,
+    // RQ10: гироскоп памяти J = A − Aᵀ (уровень 4 фазовой сборки).
+    gyro: Option<Gyroscope>,
 }
 
 impl StreamEngine {
@@ -230,6 +233,7 @@ impl StreamEngine {
             rng: Rng::seed_from_u64(qcm_seed),
             qcm_shots: 256,
             forget: Forget::Hold,
+            gyro: None,
         };
         engine.learner = engine.build_learner();
         Ok(engine)
@@ -286,6 +290,28 @@ impl StreamEngine {
         self
     }
 
+    /// RQ10: включить гироскоп памяти `J = A − Aᵀ` (builder).
+    ///
+    /// Окно `window ≥ 1` — дальность направленного контекста в токенах
+    /// (стоимость O(window) на токен, O(N²) не возникает никогда);
+    /// `budget ≥ 16` — потолок сырых направленных пар в RAM между
+    /// прореживаниями. Токены подаются в порядке появления: полярность —
+    /// из хеша, как в TF-IDF-кодировщике.
+    pub fn with_gyro(mut self, window: usize, budget: usize) -> StreamEngine {
+        self.gyro = Some(Gyroscope::new(window, budget));
+        self
+    }
+
+    /// Гироскоп памяти (если включён).
+    pub fn gyro(&self) -> Option<&Gyroscope> {
+        self.gyro.as_ref()
+    }
+
+    /// Мутабельный доступ к гироскопу (если включён).
+    pub fn gyro_mut(&mut self) -> Option<&mut Gyroscope> {
+        self.gyro.as_mut()
+    }
+
     /// Размерность состояния.
     pub fn d_pol(&self) -> u32 {
         self.d_pol
@@ -335,6 +361,8 @@ impl StreamEngine {
                 actual: reader.d_pol() as usize,
             });
         }
+        // RQ10: реляционная память поднимается даже при пустых фазах.
+        self.resume_gyro_from_reader(reader)?;
         let arcs: Vec<(u32, f64)> = reader.decoded().collect();
         let n = arcs.len();
         if n == 0 {
@@ -346,6 +374,28 @@ impl StreamEngine {
             self.model[i as usize] = p;
         }
         Ok(n)
+    }
+
+    /// RQ10: resume гироскопа из v3-контейнера. Контейнер хранит
+    /// квантованную консолидированную циркуляцию `J` + счётчик тактов —
+    /// реляционная память переживает рестарт. Возвращает число впитанных
+    /// пар (0, если секции нет или гироскоп не включён).
+    ///
+    /// Вызывается автоматически из [`StreamEngine::resume_from_reader`]
+    /// при включённом гироскопе.
+    pub fn resume_gyro_from_reader(&mut self, reader: &PqwReader) -> crate::Result<usize> {
+        let Some(section) = reader.gyro() else {
+            return Ok(0);
+        };
+        let Some(g) = self.gyro.as_mut() else {
+            return Ok(0);
+        };
+        let pairs: Vec<(u32, u32, f64)> = section
+            .pairs()
+            .iter()
+            .map(|p| (p.i, p.j, p.weight))
+            .collect();
+        Ok(g.absorb(&pairs, section.ticks()))
     }
 
     /// Движок обучающей петли (для диагностики расписания η).
@@ -369,6 +419,18 @@ impl StreamEngine {
     pub fn ingest(&mut self, text: &str, extra_steps: usize) -> crate::Result<StreamChunkReport> {
         let t0 = Instant::now();
         let d = self.d_pol as usize;
+
+        // 0. RQ10: гироскоп памяти — токены в порядке появления.
+        //    Полярность — из хеша (тот же поток, что TF-IDF-кодировщик):
+        //    направленная циркуляция смысла J = A − Aᵀ, O(window)/токен.
+        if let Some(g) = self.gyro.as_mut() {
+            for token in tokenize(text) {
+                let h = fnv1a64(token.as_bytes());
+                let coord = (h % self.d_pol as u64) as u32;
+                let sign = if (h >> 63) & 1 == 1 { 1.0 } else { -1.0 };
+                g.observe(coord, sign);
+            }
+        }
 
         // 1. TF-IDF ε-плотность чанка (N включает текущий документ).
         let (state, tokens) = self.encode_chunk(text);
@@ -1128,6 +1190,82 @@ mod tests {
         let reader = PqwReader::from_bytes(&full).unwrap();
         let mut other = StreamEngine::new(512, 0.05, 1).unwrap();
         assert!(other.resume_from_reader(&reader).is_err());
+    }
+
+    #[test]
+    fn gyro_accumulates_during_ingest() {
+        // Гироскоп видит токены в порядке появления: повтор
+        // «alpha beta gamma …» накапливает направленную циркуляцию.
+        let mut e = StreamEngine::new(512, 0.05, 11)
+            .unwrap()
+            .with_gyro(8, 4096);
+        let text = "alpha beta gamma alpha beta gamma alpha beta gamma";
+        e.ingest(text, 0).unwrap();
+        let g = e.gyro().expect("гироскоп включён");
+        assert!(g.ticks() >= 9, "такты = токенам, а не блокам");
+        assert!(g.raw_pairs() > 0, "направленные пары накоплены");
+        // Моды извлекаются прямо из движка.
+        assert!(!g.resonant_modes(0.05, 4).is_empty());
+
+        // Без --gyro гироскопа нет: прежнее поведение не изменилось.
+        let mut plain = StreamEngine::new(512, 0.05, 11).unwrap();
+        plain.ingest(text, 0).unwrap();
+        assert!(plain.gyro().is_none());
+    }
+
+    #[test]
+    fn gyro_resume_chain_survives_restart() {
+        // Сессия 1: учимся с гироскопом, пишем v3-контейнер (фазы + J).
+        let mut a = StreamEngine::new(512, 0.05, 3)
+            .unwrap()
+            .with_gyro(8, 4096);
+        let text = "resonance operator memory gyroscope resonance operator memory";
+        for _ in 0..3 {
+            a.ingest(text, 1).unwrap();
+        }
+        let gyro = a.gyro().unwrap();
+        let data = gyro
+            .gyro_data(0.05, 512)
+            .expect("после трёх повторов циркуляция обязана выжить");
+        assert!(data.ticks() > 0);
+        assert!(!data.pairs().is_empty());
+
+        let mut v3 = Vec::new();
+        {
+            let mut w = PqwWriter::new(512).unwrap();
+            let state: Vec<f32> = a.model().iter().map(|&p| p as f32).collect();
+            w.add_state(&state).unwrap();
+            w.write_v3(&mut v3, &data).unwrap();
+        }
+        let reader = PqwReader::from_bytes(&v3).unwrap();
+        assert!(reader.header().is_gyro());
+        assert_eq!(reader.gyro().unwrap().pairs().len(), data.pairs().len());
+
+        // Сессия 2: resume с гироскопом — и фазы, и циркуляция подняты.
+        let mut b = StreamEngine::new(512, 0.05, 3)
+            .unwrap()
+            .with_gyro(8, 4096);
+        let lifted_arcs = b.resume_from_reader(&reader).unwrap();
+        assert_eq!(lifted_arcs, reader.nnz() as usize);
+        let g2 = b.gyro().unwrap();
+        assert_eq!(g2.ticks(), data.ticks(), "счётчик тактов пережил рестарт");
+        let pairs2 = g2.skew_pairs(0.05);
+        let pairs1 = data.pairs().to_vec();
+        assert_eq!(pairs2.len(), pairs1.len());
+        // Деквантованные веса в пределах полкванта решётки.
+        for (p, q) in pairs2.iter().zip(pairs1.iter()) {
+            assert!((p.2 - q.2).abs() <= data.scale() as f64 / 254.0 + 1e-12);
+        }
+
+        // Обучение продолжается поверх поднятой циркуляции: такты растут.
+        b.ingest(text, 1).unwrap();
+        assert!(b.gyro().unwrap().ticks() > data.ticks());
+
+        // Без --gyro v3-контейнер читается как обычные фазы (секция игнорируется).
+        let mut c = StreamEngine::new(512, 0.05, 3).unwrap();
+        let lifted = c.resume_from_reader(&reader).unwrap();
+        assert_eq!(lifted, reader.nnz() as usize);
+        assert!(c.gyro().is_none());
     }
 }
 

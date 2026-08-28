@@ -42,6 +42,7 @@
 
 pub mod checksum;
 pub mod error;
+pub mod gyro;
 pub mod header;
 pub mod mcweeny;
 #[cfg(unix)]
@@ -54,8 +55,10 @@ pub mod topology;
 pub mod writer;
 
 pub use error::{PqwError, Result};
+pub use gyro::{GyroData, GyroPair, GyroSection, GYRO_HEADER_SIZE, GYRO_MAGIC, GYRO_SECTION_VERSION};
 pub use header::{
-    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, HEADER_SIZE, MAGIC, MAGIC_V2,
+    Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3, HEADER_SIZE,
+    MAGIC, MAGIC_V2, MAGIC_V3,
 };
 pub use phase::{
     nearest_trit, pack_quad, pack_trit2, unpack_quad, unpack_trit2, PhaseByte, Trit, TritEncoding,

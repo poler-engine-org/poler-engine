@@ -369,3 +369,213 @@ fn train_curriculum_rejects_bad_schedule() {
         );
     }
 }
+
+// ── RQ10: гироскоп J = A − Aᵀ и контейнер v3 ──────────────────────────
+
+#[test]
+fn train_gyro_writes_v3_container() {
+    let dir = tmp_dir("gyro_v3");
+    write_corpus(&dir);
+    let out = dir.join("state.pqw");
+    let fp = dir.join("fingerprint.bin");
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--steps",
+            "1",
+            "--shots",
+            "300",
+            "--out",
+            out.to_str().unwrap(),
+            "--fingerprint",
+            fp.to_str().unwrap(),
+            "--gyro",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let text = String::from_utf8_lossy(&st.stdout).to_string();
+    assert!(text.contains("J = A − Aᵀ"), "{text}");
+    assert!(text.contains("POLER_Q3"), "{text}");
+
+    // Контейнер — валидный v3 с гироскопной секцией.
+    let raw = fs::read(&out).unwrap();
+    assert_eq!(&raw[..8], b"POLER_Q3");
+    let reader = pqw::PqwReader::from_bytes(&raw).unwrap();
+    assert!(reader.header().is_gyro());
+    let g = reader.gyro().expect("секция гироскопа обязана быть");
+    assert!(g.pairs().len() > 0, "циркуляция после корпуса обязана выжить");
+    assert!(g.ticks() > 0);
+    // Фазы читаются как в v2: nnz контейнера = дугам.
+    assert_eq!(reader.nnz() as usize, reader.decoded().count());
+
+    // Отпечаток — только фазовые блоки: размер d/4 неизменен.
+    assert_eq!(fs::metadata(&fp).unwrap().len(), 512 / 4);
+}
+
+#[test]
+fn train_gyro_json_stats() {
+    let dir = tmp_dir("gyro_json");
+    write_corpus(&dir);
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "256",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "200",
+            "--steps",
+            "1",
+            "--gyro",
+            "128",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let text = String::from_utf8_lossy(&st.stdout).to_string();
+    assert!(text.contains("\"gyro\""), "{text}");
+    assert!(text.contains("\"pairs_stored\""), "{text}");
+    assert!(text.contains("\"lambda_top\""), "{text}");
+}
+
+#[test]
+fn train_gyro_resume_grows_ticks() {
+    // Сессия 1 → v3; сессия 2 (resume) продолжает счётчик тактов.
+    let dir = tmp_dir("gyro_resume");
+    write_corpus(&dir);
+    let out1 = dir.join("s1.pqw");
+    let out2 = dir.join("s2.pqw");
+
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--steps",
+            "1",
+            "--shots",
+            "300",
+            "--out",
+            out1.to_str().unwrap(),
+            "--gyro",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let j1 = pqc::json::Json::parse(
+        String::from_utf8_lossy(&st.stdout).trim(),
+    )
+    .unwrap();
+    let g1 = j1.get("gyro").unwrap();
+    let ticks1 = g1.get("ticks").unwrap().as_f64().unwrap();
+    let pairs1 = g1.get("pairs_stored").unwrap().as_f64().unwrap();
+    assert!(ticks1 > 0.0);
+    assert!(pairs1 > 0.0);
+
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "512",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--steps",
+            "1",
+            "--shots",
+            "300",
+            "--out",
+            out2.to_str().unwrap(),
+            "--resume",
+            out1.to_str().unwrap(),
+            "--gyro",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let j2 = pqc::json::Json::parse(
+        String::from_utf8_lossy(&st.stdout).trim(),
+    )
+    .unwrap();
+    let g2 = j2.get("gyro").unwrap();
+    let ticks2 = g2.get("ticks").unwrap().as_f64().unwrap();
+    // Такты второй сессии = поднятое + новое: строго больше первой.
+    assert!(
+        ticks2 > ticks1,
+        "такты {ticks2} должны расти поверх {ticks1}"
+    );
+    assert!(g2.get("pairs_stored").unwrap().as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn train_gyro_rejects_bad_args() {
+    for bad in [
+        vec!["train", "--stdin", "--gyro", "0"],
+        vec!["train", "--stdin", "--gyro", "abc"],
+        vec!["train", "--stdin", "--gyro-budget", "8"],
+    ] {
+        let st = Command::new(bin_path()).args(&bad).output().unwrap();
+        assert_eq!(
+            st.status.code(),
+            Some(2),
+            "аргументы {bad:?} должны отклоняться"
+        );
+    }
+}
+
+#[test]
+fn train_without_gyro_stays_v2() {
+    // Регресс: без --gyro контейнер остаётся POLER_Q2 (флаг не включён).
+    let dir = tmp_dir("no_gyro");
+    write_corpus(&dir);
+    let out = dir.join("state.pqw");
+    let st = Command::new(bin_path())
+        .args([
+            "train",
+            "--corpus",
+            dir.to_str().unwrap(),
+            "--dim",
+            "256",
+            "--epsilon",
+            "0.05",
+            "--block",
+            "512",
+            "--shots",
+            "200",
+            "--steps",
+            "1",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let raw = fs::read(&out).unwrap();
+    assert_eq!(&raw[..8], b"POLER_Q2");
+}
