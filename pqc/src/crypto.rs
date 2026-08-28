@@ -136,8 +136,9 @@ impl CipherKey {
             return Err("индексы русел J выходят за d_pol ключа".into());
         }
         let k_max = (d_pol / 32).clamp(1, MAX_MODES);
-        // Геометрия (моды + позиции + помеха) для выбранного K.
-        let mut geometry: Option<(Vec<(Vec<f64>, Vec<f64>)>, Vec<u32>, f64)> = None;
+        // Геометрия (моды + позиции + помеха) для выбранного K
+        // (отложенная инициализация: обе ветки ниже присваивают).
+        let geometry: Option<(Vec<(Vec<f64>, Vec<f64>)>, Vec<u32>, f64)>;
         let k = if k_hint > 0 {
             geometry = calibration_geometry(&raw, k_hint, d_pol);
             if geometry.is_none() {
