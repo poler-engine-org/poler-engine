@@ -34,8 +34,22 @@ USAGE:
     pqc stream (--url URL | --file PATH | --text TEXT | --stdin) [options]
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
     pqc precess <file> [options]                              RQ11: петля архетипа поверх чекпоинта
+    pqc encrypt <IN> --key <ARCH.pqw> --out <C.pqc> [opts]    RQ12: m -> p* (алгебра архетипа)
+    pqc decrypt <C.pqc> --key <ARCH.pqw> [--out <PLAIN>]      RQ12: m = p* ⊕ (a ⊗_ε p*)
     pqc inspect <file> [options]
     pqc train (--corpus DIR | --stdin) [options]              накопительное обучение
+
+ENCRYPT/DECRYPT OPTIONS (RQ12: крипто-схема алгебры архетипа, файл 285):
+    --key <F>                 контейнер-ключ .pqw v3 с гироскопом J
+                              (precess --out / train --gyro)
+    --out <F>                 encrypt: файл шифртекста .pqc (обязателен);
+                              decrypt: файл открытого текста (без — stdout)
+    --modes <N>               число мод проектора (default: авто-калибровка
+                              по помехе проекции; 1..=8)
+    --seed <S>                семя IV xoshiro256++ (default: энтропия)
+    --text <T>                encrypt: сообщение из строки вместо файла
+    --stdin                   encrypt: сообщение из stdin
+    --json                    машинно-читаемый отчёт
 
 INSPECT OPTIONS (чтение бинарников, графов и крипто-разведка):
     --hex <N|all>             hex-дамп первых N байтов (default 512)
@@ -128,6 +142,8 @@ fn main() {
         Some("stream") => cmd_stream(&args[1..]),
         Some("unfurl") => cmd_unfurl(&args[1..]),
         Some("precess") => cmd_precess(&args[1..]),
+        Some("encrypt") => cmd_encrypt(&args[1..]),
+        Some("decrypt") => cmd_decrypt(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("train") => cmd_train(&args[1..]),
         _ => {
@@ -1929,6 +1945,292 @@ fn cmd_precess(args: &[String]) -> i32 {
         }
     }
 
+    0
+}
+
+// pqc encrypt / decrypt — RQ12: крипто-схема алгебры архетипа (файл 285).
+//
+// Уравнение: p* = a ⊗_ε p* ⊕ m, восстановление m = p* ⊕ (a ⊗_ε p*).
+// Ключ — контейнер v3 с гироскопом J (готовый `precess --out`):
+// из русел J детерминированно берутся плотные моды Im(P), проектор
+// a = Σ (u uᵀ + v vᵀ) идемпотентен (RQ11: ортонормальность ≡
+// идемпотентность), сообщение — паттерн δ = (I−a)(ε·b) в дополнении
+// подпространства мод, ключевой поток — a·p₀ (проекция фаз ключа).
+
+struct CryptoConfig {
+    key: Option<String>,
+    out: Option<String>,
+    modes: usize,
+    seed: Option<u64>,
+    text: Option<String>,
+    stdin: bool,
+    json: bool,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        CryptoConfig {
+            key: None,
+            out: None,
+            modes: 0,
+            seed: None,
+            text: None,
+            stdin: false,
+            json: false,
+        }
+    }
+}
+
+/// Общий парсер флагов encrypt/decrypt.
+fn parse_crypto_args(cmd: &str, args: &[String]) -> Result<(Option<String>, CryptoConfig), i32> {
+    let mut cfg = CryptoConfig::default();
+    let mut file: Option<String> = None;
+    let mut i = 0usize;
+    macro_rules! val {
+        ($name:literal) => {{
+            i += 1;
+            if i >= args.len() {
+                eprintln!("pqc {cmd}: {} требует значение\n\n{USAGE}", $name);
+                return Err(2);
+            }
+            args[i].clone()
+        }};
+    }
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => cfg.key = Some(val!("--key")),
+            "--out" => cfg.out = Some(val!("--out")),
+            "--modes" => {
+                let v = val!("--modes");
+                match v.parse::<usize>() {
+                    Ok(k) if k <= pqc::MAX_MODES => cfg.modes = k,
+                    _ => {
+                        eprintln!("pqc {cmd}: bad --modes: {v} (1..={})", pqc::MAX_MODES);
+                        return Err(2);
+                    }
+                }
+            }
+            "--seed" => {
+                let v = val!("--seed");
+                match v.parse::<u64>() {
+                    Ok(sd) => cfg.seed = Some(sd),
+                    _ => {
+                        eprintln!("pqc {cmd}: bad --seed: {v} (u64)");
+                        return Err(2);
+                    }
+                }
+            }
+            "--text" => cfg.text = Some(val!("--text")),
+            "--stdin" => cfg.stdin = true,
+            "--json" => cfg.json = true,
+            other if !other.starts_with("--") => {
+                if file.replace(other.to_string()).is_some() {
+                    eprintln!("pqc {cmd}: файл задан дважды\n\n{USAGE}");
+                    return Err(2);
+                }
+            }
+            other => {
+                eprintln!("pqc {cmd}: неизвестный флаг {other}\n\n{USAGE}");
+                return Err(2);
+            }
+        }
+        i += 1;
+    }
+    Ok((file, cfg))
+}
+
+/// Загрузка ключа-архетипа.
+fn load_cipher_key(path: &str, modes: usize) -> Result<pqc::CipherKey, i32> {
+    let raw = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pqc crypto: ошибка чтения ключа {path}: {e}");
+            return Err(1);
+        }
+    };
+    let reader = match PqwReader::from_bytes(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc crypto: ошибка парсинга ключа {path}: {e}");
+            return Err(1);
+        }
+    };
+    match pqc::CipherKey::from_reader(&reader, modes) {
+        Ok(k) => Ok(k),
+        Err(e) => {
+            eprintln!("pqc crypto: {e}");
+            Err(1)
+        }
+    }
+}
+
+fn cmd_encrypt(args: &[String]) -> i32 {
+    let (file, cfg) = match parse_crypto_args("encrypt", args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let Some(key_path) = &cfg.key else {
+        eprintln!("pqc encrypt: требуется --key <ARCH.pqw> (контейнер v3 с гироскопом)");
+        return 2;
+    };
+    let Some(out_path) = &cfg.out else {
+        eprintln!("pqc encrypt: требуется --out <CIPHER.pqc>");
+        return 2;
+    };
+    // Сообщение: --text | --stdin | файл.
+    let msg: Vec<u8> = if let Some(text) = &cfg.text {
+        text.clone().into_bytes()
+    } else if cfg.stdin {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if std::io::stdin().read_to_end(&mut buf).is_err() {
+            eprintln!("pqc encrypt: ошибка чтения stdin");
+            return 1;
+        }
+        buf
+    } else if let Some(path) = &file {
+        match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("pqc encrypt: ошибка чтения {path}: {e}");
+                return 1;
+            }
+        }
+    } else {
+        eprintln!("pqc encrypt: нужен вход: файл, --text или --stdin");
+        return 2;
+    };
+
+    let key = match load_cipher_key(key_path, cfg.modes) {
+        Ok(k) => k,
+        Err(c) => return c,
+    };
+    let mut rng = match cfg.seed {
+        Some(s) => pqc::Rng::seed_from_u64(s),
+        None => pqc::Rng::from_entropy(),
+    };
+    let t0 = std::time::Instant::now();
+    let (cipher, rep) = match pqc::encrypt(&key, &msg, &mut rng) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc encrypt: {e}");
+            return 1;
+        }
+    };
+    let dt = t0.elapsed();
+    if let Err(e) = std::fs::write(out_path, &cipher) {
+        eprintln!("pqc encrypt: ошибка записи {out_path}: {e}");
+        return 1;
+    }
+
+    if cfg.json {
+        let obj = pqc::Json::Obj(vec![
+            ("key".into(), pqc::Json::str(key_path)),
+            ("out".into(), pqc::Json::str(out_path)),
+            ("msg_len".into(), pqc::Json::num(rep.msg_len as f64)),
+            ("out_len".into(), pqc::Json::num(rep.out_len as f64)),
+            ("blocks".into(), pqc::Json::num(rep.blocks as f64)),
+            ("d_pol".into(), pqc::Json::num(key.d_pol as f64)),
+            ("k_modes".into(), pqc::Json::num(rep.k_modes as f64)),
+            ("raw_pairs".into(), pqc::Json::num(key.raw_pairs as f64)),
+            ("interference_max".into(), pqc::Json::num(rep.interference_max)),
+            ("margin_min".into(), pqc::Json::num(rep.margin_min)),
+            ("ritz_max".into(), pqc::Json::num(key.ritz_max)),
+            ("ortho_max".into(), pqc::Json::num(key.ortho_max)),
+            ("digest".into(), pqc::Json::str(&rep.digest_hex)),
+            ("seconds".into(), pqc::Json::num(dt.as_secs_f64())),
+        ]);
+        println!("{}", obj.to_string());
+    } else {
+        println!("POLER Quantum Core — Encrypt: крипто-схема алгебры архетипа (RQ12)");
+        println!("key       : {key_path} (d_pol={}, русел J={}, мод K={})", key.d_pol, key.raw_pairs, key.k_modes);
+        println!("            Ritz {:.1e} | орто {:.1e} (идемпотентность a ⊗ a = a)", key.ritz_max, key.ortho_max);
+        println!("message   : {} B → {} блоков", rep.msg_len, rep.blocks);
+        println!("cipher    : {out_path} ({} B, расширение ×{:.1})", rep.out_len, rep.out_len as f64 / (rep.msg_len.max(1)) as f64);
+        println!("помеха    : max |a·(ε·b)| = {:.4} (порог ε/2 = {:.4})", rep.interference_max, pqc::crypto::DECODE_THRESHOLD);
+        println!("запас     : min |δ̂ − ε/2| = {:.4}", rep.margin_min);
+        println!("digest    : sha256-24 = {}", rep.digest_hex);
+        println!("время     : {:.3} с", dt.as_secs_f64());
+        println!("уравнение : p* = a ⊗_ε p* ⊕ m — коллапс за 1 такт (a идемпотентен)");
+    }
+    0
+}
+
+fn cmd_decrypt(args: &[String]) -> i32 {
+    let (file, cfg) = match parse_crypto_args("decrypt", args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let Some(key_path) = &cfg.key else {
+        eprintln!("pqc decrypt: требуется --key <ARCH.pqw>");
+        return 2;
+    };
+    let Some(cipher_path) = &file else {
+        eprintln!("pqc decrypt: требуется путь к шифртексту .pqc");
+        return 2;
+    };
+    let cipher = match std::fs::read(cipher_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pqc decrypt: ошибка чтения {cipher_path}: {e}");
+            return 1;
+        }
+    };
+    let key = match load_cipher_key(key_path, cfg.modes) {
+        Ok(k) => k,
+        Err(c) => return c,
+    };
+    let t0 = std::time::Instant::now();
+    let (msg, rep) = match pqc::decrypt(&key, &cipher) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc decrypt: {e}");
+            return 1;
+        }
+    };
+    let dt = t0.elapsed();
+    match &cfg.out {
+        Some(out_path) => {
+            if let Err(e) = std::fs::write(out_path, &msg) {
+                eprintln!("pqc decrypt: ошибка записи {out_path}: {e}");
+                return 1;
+            }
+        }
+        None => {
+            // stdout: как текст (бинарный поток теряется — используйте --out).
+            match String::from_utf8(msg.clone()) {
+                Ok(text) => print!("{text}"),
+                Err(_) => {
+                    eprintln!("pqc decrypt: бинарное сообщение — запишите через --out");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    if cfg.json {
+        let obj = pqc::Json::Obj(vec![
+            ("key".into(), pqc::Json::str(key_path)),
+            ("cipher".into(), pqc::Json::str(cipher_path)),
+            ("blocks".into(), pqc::Json::num(rep.blocks as f64)),
+            ("msg_len".into(), pqc::Json::num(rep.msg_len as f64)),
+            ("margin_min".into(), pqc::Json::num(rep.margin_min)),
+            ("margin_mean".into(), pqc::Json::num(rep.margin_mean)),
+            ("seconds".into(), pqc::Json::num(dt.as_secs_f64())),
+        ]);
+        println!("{}", obj.to_string());
+    } else {
+        println!("POLER Quantum Core — Decrypt: m = p* ⊕ (a ⊗_ε p*) (RQ12)");
+        println!("cipher    : {cipher_path} ({} блоков)", rep.blocks);
+        println!(
+            "message   : {} B → {}",
+            rep.msg_len,
+            cfg.out.as_deref().unwrap_or("<stdout>")
+        );
+        println!("запас     : min {:.4} | средний {:.4} (порог ε/2 = {:.4})",
+            rep.margin_min, rep.margin_mean, pqc::crypto::DECODE_THRESHOLD);
+        println!("время     : {:.3} с", dt.as_secs_f64());
+    }
     0
 }
 

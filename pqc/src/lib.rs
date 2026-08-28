@@ -89,6 +89,7 @@ pub mod archetype;
 pub mod born;
 pub mod coherence;
 pub mod complex;
+pub mod crypto;
 pub mod entangle;
 pub mod error;
 pub mod gates;
@@ -110,6 +111,9 @@ pub use archetype::{precess_to_fixpoint, PrecessReport, TracePoint};
 pub use born::BornSampler;
 pub use coherence::{binary_entropy, coherence, CoherenceReport};
 pub use complex::Cx;
+pub use crypto::{
+    cipher_distance, decrypt, encrypt, CipherKey, DecryptReport, EncryptReport, MAX_MODES,
+};
 pub use entangle::{Entanglement, Entangler};
 pub use error::{PqcError, Result};
 pub use gates::Gate;

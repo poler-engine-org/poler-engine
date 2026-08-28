@@ -336,8 +336,85 @@ impl Gyroscope {
 /// Подпространство — только дуги, входящие в пары: размер задачи
 /// `O(число пар)`, а не `O(d_pol)`; полная матрица не материализуется.
 pub fn resonant_modes_from_pairs(pairs: &[(u32, u32, f64)], k: usize) -> Vec<GyroMode> {
+    let (nodes, modes) = dense_modes_local(pairs, k);
+    modes
+        .into_iter()
+        .map(|(lambda, u, v, ritz_residual, ortho_residual)| {
+            let su = sparsify(&nodes, &u);
+            let sv = sparsify(&nodes, &v);
+            // Захват: доля массы плоскости в ≤12 компонентах на вектор.
+            let capture = (su.iter().map(|&(_, c)| c * c).sum::<f64>()
+                + sv.iter().map(|&(_, c)| c * c).sum::<f64>())
+                / 2.0;
+            GyroMode {
+                lambda,
+                u: su,
+                v: sv,
+                ritz_residual,
+                ortho_residual,
+                capture,
+            }
+        })
+        .collect()
+}
+
+/// Плотная мода гироскопа в **полном** пространстве `d_pol` (RQ12:
+/// крипто-проектор алгебры архетипа). Вне дуг русел компоненты 0.
+#[derive(Clone, Debug)]
+pub struct DenseMode {
+    /// Угловая скорость моды (собственная пара ±iλ J).
+    pub lambda: f64,
+    /// Полный вектор u плоскости (d_pol компонент).
+    pub u: Vec<f64>,
+    /// Полный вектор v плоскости (d_pol компонент).
+    pub v: Vec<f64>,
+    /// Ritz-невязка инвариантности плоскости.
+    pub ritz_residual: f64,
+    /// Невязка ортонормальности ≡ невязка идемпотентности A² = A.
+    pub ortho_residual: f64,
+}
+
+/// Плотные моды в полном пространстве: для крипто-схемы RQ12, где
+/// проектор `a = Σ (u uᵀ + v vᵀ)` обязан быть точным идемпотентом
+/// (прореженные моды теряют массу — захват 56–75% — и идемпотентность
+/// разрушается). Детерминизм тот же, что у `resonant_modes_from_pairs`.
+pub fn resonant_modes_dense_from_pairs(
+    pairs: &[(u32, u32, f64)],
+    k: usize,
+    d_pol: usize,
+) -> Vec<DenseMode> {
+    let (nodes, modes) = dense_modes_local(pairs, k);
+    modes
+        .into_iter()
+        .map(|(lambda, u, v, ritz_residual, ortho_residual)| {
+            let embed = |local: &[f64]| -> Vec<f64> {
+                let mut full = vec![0.0_f64; d_pol];
+                for (li, &node) in nodes.iter().enumerate() {
+                    if (node as usize) < d_pol {
+                        full[node as usize] = local[li];
+                    }
+                }
+                full
+            };
+            DenseMode {
+                lambda,
+                u: embed(&u),
+                v: embed(&v),
+                ritz_residual,
+                ortho_residual,
+            }
+        })
+        .collect()
+}
+
+/// Ядро степенной итерации на −J² с дефляцией: локальное подпространство
+/// дуг пар + плотные (u, v) в локальных индексах.
+fn dense_modes_local(
+    pairs: &[(u32, u32, f64)],
+    k: usize,
+) -> (Vec<u32>, Vec<(f64, Vec<f64>, Vec<f64>, f64, f64)>) {
     if pairs.is_empty() || k == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Локальное подпространство.
@@ -525,25 +602,7 @@ pub fn resonant_modes_from_pairs(pairs: &[(u32, u32, f64)], k: usize) -> Vec<Gyr
         modes.push((lambda, u, v, ritz, ortho));
     }
 
-    modes
-        .into_iter()
-        .map(|(lambda, u, v, ritz_residual, ortho_residual)| {
-            let su = sparsify(&nodes, &u);
-            let sv = sparsify(&nodes, &v);
-            // Захват: доля массы плоскости в ≤12 компонентах на вектор.
-            let capture = (su.iter().map(|&(_, c)| c * c).sum::<f64>()
-                + sv.iter().map(|&(_, c)| c * c).sum::<f64>())
-                / 2.0;
-            GyroMode {
-                lambda,
-                u: su,
-                v: sv,
-                ritz_residual,
-                ortho_residual,
-                capture,
-            }
-        })
-        .collect()
+    (nodes, modes)
 }
 
 /// Sparse-представление вектора моды: доминирующие компоненты

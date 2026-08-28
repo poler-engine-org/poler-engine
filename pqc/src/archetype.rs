@@ -119,7 +119,7 @@ fn torque_residual(pairs: &[(u32, u32, f64)], thetas: &[f64]) -> f64 {
 /// Проекция сбрасывает накопленное вращение (θ → [0, π]) — это и есть
 /// диссипативная половина петли: прецессия исследует орбиту, очистка
 /// стягивает на многообразие идемпотентности.
-fn purify_thetas(thetas: &mut [f64]) {
+pub(crate) fn purify_thetas(thetas: &mut [f64]) {
     for t in thetas.iter_mut() {
         let p = purify_p(t.cos().clamp(-1.0, 1.0));
         *t = p.clamp(-1.0, 1.0).acos();
