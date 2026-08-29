@@ -32,6 +32,16 @@ auth-companion на виртуальном дисплее и транслиру�
 | `auth-preview.js` | CDP-релей: screencast → JPEG-кадры (WS/SSE/polling), ввод → `Input.dispatch*`, навигация (Назад/Вперёд/Обновить/goto — только http/https), статус companion; **подхватывает живой браузер `gcp-setup.js`** (файл `gcp-live.json`: экран + цифра подтверждения в превью) |
 | `gcp-setup.js` | автономная настройка GCP-проекта через живую сессию Google: фазы `token → probe → brand → client → user` (Drive/Gmail API, consent screen, OAuth-клиент Desktop → `client_secret.json` 0600, test user). Цифра подтверждения Google извлекается из DOM и печатается в лог + превью; **одна попытка, таймаут 61 мин, никаких перезапусков** |
 | `gcp-setup-daemon.py` | double-fork-обёртка `gcp-setup.js` (PPID→1, переживает bash-сессии песочницы) |
+| `gcp-cdp-machinery.js` | переиспользуемый CDP-модуль: свой WebSocket-клиент (без playwright), `launchChromium`/`connectPageRetry`/`evalRetry`, лог; общая база для всех gcp-скриптов |
+| `gcp-newclient.js` | создание OAuth-клиента Desktop через консоль GCP (когда brand-через-API недоступен): навигация по консоли, форма «Create OAuth client», выгрузка `client_secret.json` (0600) |
+| `gcp-branding-audience.js` | финальные штрихи consent screen через консоль: App name «POLER Engine» (branding) + test user (audience), терпеливые reload-ретраи |
+| `gcp-secret.js` | выгрузка client_secret из консоли GCP (DOM + shadow DOM + clipboard), сохранение в `~/.config/poler-engine/client_secret.json` (0600) |
+| `gcp-e2e-oauth.js` | **end-to-end тест OAuth-клиента POLER**: аккаунт → consent «Разрешить» → auth-code на loopback → token exchange → refresh-тест → userinfo; проверяет ровно путь `poler-engine --google-auth`; токены не печатаются |
+| `gcp-e2e-daemon.py` | double-fork-обёртка `gcp-e2e-oauth.js` (PPID→1, лог `logs/gcp-e2e.log`) |
+| `gcp-e2e-retry.js` | реанимация зависшего consent после Google Error 500: навигация живого браузера на тот же auth-URL (loopback-ловушка e2e остаётся ждать код) |
+| `gcp-e2e-enter-code.js` | ввод Защитного кода (ootp-челлендж) в форму + атомарный клик «Далее» одним eval |
+| `gcp-e2e-probe.js` | чтение текущего состояния страницы живого браузера e2e (URL/title/body) — отладка |
+| `gcp-verify-state.js` | API-проверка настройки GCP по refresh-токену: проект, brand (applicationTitle), статусы Drive/Gmail API — факты без секретов |
 | `app/` | Next.js-пульт: `src/app/page.js` (скринкаст + ввод + кнопки), `next.config.mjs` (`/api/*` → релей) |
 | `security-audit.py` | 29 проверок безопасности (артефакты, сеть, утечки через HTTP, логи, статический анализ, процессы) |
 | `test-relay-ws.js` | smoke-тест WS-канала релея |
@@ -88,6 +98,26 @@ node dev-stand/test-relay-ws.js       # проверка потока кадро
 python3 dev-stand/gcp-setup-daemon.py verification-506705 all   # фон (PPID→1)
 tail -f logs/gcp-setup.log                                     # мониторинг
 node dev-stand/gcp-setup.js verification-506705 probe           # одна фаза
+```
+
+## gcp-e2e: end-to-end тест OAuth-клиента
+
+Полная проверка того пути, которым будет ходить `poler-engine --google-auth`:
+loopback-редирект → consent «Разрешить» → authorization code → **token
+exchange** → **refresh-тест** → userinfo. Секреты читаются только из
+`~/.config/poler-engine/` (0600), в лог попадают длины и хвосты, не значения.
+
+Подтверждение Google (цифра на телефоне / Защитный код с устройства) — единственный
+ручной шаг: e2e-цикл сам кликает аккаунт и «Разрешить», а код владельца вводится
+`gcp-e2e-enter-code.js`. Если consent упал в Error 500 (бывает на
+challenge-завершении), `gcp-e2e-retry.js` переоткрывает auth-URL в том же
+браузере — повторный заход после подтверждения личности проходит без челленджа.
+
+```bash
+python3 dev-stand/gcp-e2e-daemon.py          # фон: E2E от начала до конца
+tail -f logs/gcp-e2e.log                     # 🔢 цифра / код → вводит владелец
+node dev-stand/gcp-e2e-retry.js <cdp> <port> # реанимация после Error 500
+node dev-stand/gcp-verify-state.js           # факт-чек настройки по API
 ```
 
 ## Известные ограничения
