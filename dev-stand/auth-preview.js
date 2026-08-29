@@ -43,6 +43,9 @@ const STATE_PATH = process.env.POLER_STATE_FILE ||
 // Только ФАКТ существования снапшота (не содержимое — релей куки не читает)
 const SESSION_PATH = process.env.POLER_SESSION_FILE ||
   path.join(os.homedir(), '.config', 'poler-engine', 'google_session.json');
+// живой браузер gcp-setup.js: cdp_port для скринкаста + статус в превью
+const GCP_LIVE_PATH = process.env.POLER_GCP_LIVE_FILE ||
+  path.join(os.homedir(), '.config', 'poler-engine', 'gcp-live.json');
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const PAGE_HTML = path.join(__dirname, 'auth-preview.html');
 
@@ -676,6 +679,23 @@ function shortUrl(u) {
 }
 
 async function pollCompanion() {
+  // живой браузер gcp-setup.js (настройка GCP через движок) — цепляем его экран
+  // в превью, чтобы владелец видел цифру подтверждения своими глазами
+  try {
+    const raw = JSON.parse(fs.readFileSync(GCP_LIVE_PATH, 'utf8'));
+    const fresh = raw && raw.cdp_port && raw.ts && (Date.now() - Date.parse(raw.ts)) < 7200e3;
+    let alive = false;
+    if (fresh && raw.pid) { try { process.kill(raw.pid, 0); alive = true; } catch (_) {} }
+    if (alive) {
+      const next = { state: 'waiting', detail: raw.detail || 'настройка GCP: окно Google', cdp_port: raw.cdp_port, gcp: true };
+      const changed = next.state !== companionState.state || next.detail !== companionState.detail;
+      companionState = next;
+      if (changed) broadcast({ t: 'state', s: next });
+      cdpPort = raw.cdp_port;
+      ensureSession();
+      return;
+    }
+  } catch (_) { /* нет файла — обычный режим companion */ }
   let st = null;
   try { st = await httpGetJson(COMPANION_PORT, '/status', 1500); } catch (_) {}
   if (!st) {

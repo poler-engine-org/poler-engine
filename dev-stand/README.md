@@ -29,7 +29,9 @@ auth-companion на виртуальном дисплее и транслиру�
 | `auth-stack.sh` | `start \| stop \| status` — управление всем стеком |
 | `auth-stack-daemon.py` | double-fork-демон: удерживает оркестратор живым |
 | `auth-dev-orchestrator.js` | супервизор: Xvfb :99 → relay :3100 → companion :8765 → next :3000; авто-подъём умерших компонентов; **при захваченной сессии окно не поднимает** (`google_session.json` существует → companion не стартует) |
-| `auth-preview.js` | CDP-релей: screencast → JPEG-кадры (WS/SSE/polling), ввод → `Input.dispatch*`, навигация (Назад/Вперёд/Обновить/goto — только http/https), статус companion |
+| `auth-preview.js` | CDP-релей: screencast → JPEG-кадры (WS/SSE/polling), ввод → `Input.dispatch*`, навигация (Назад/Вперёд/Обновить/goto — только http/https), статус companion; **подхватывает живой браузер `gcp-setup.js`** (файл `gcp-live.json`: экран + цифра подтверждения в превью) |
+| `gcp-setup.js` | автономная настройка GCP-проекта через живую сессию Google: фазы `token → probe → brand → client → user` (Drive/Gmail API, consent screen, OAuth-клиент Desktop → `client_secret.json` 0600, test user). Цифра подтверждения Google извлекается из DOM и печатается в лог + превью; **одна попытка, таймаут 61 мин, никаких перезапусков** |
+| `gcp-setup-daemon.py` | double-fork-обёртка `gcp-setup.js` (PPID→1, переживает bash-сессии песочницы) |
 | `app/` | Next.js-пульт: `src/app/page.js` (скринкаст + ввод + кнопки), `next.config.mjs` (`/api/*` → релей) |
 | `security-audit.py` | 29 проверок безопасности (артефакты, сеть, утечки через HTTP, логи, статический анализ, процессы) |
 | `test-relay-ws.js` | smoke-тест WS-канала релея |
@@ -64,6 +66,29 @@ node dev-stand/test-relay-ws.js       # проверка потока кадро
   поднимется заново (не дать превью «слететь»), лимит 6 рестартов / 10 мин.
 * **Аудит-скрипт не печатает секреты**: значения кук ищутся в логах/HTML/API
   по вхождению подстрок, в отчёт попадают только факты «найдено/не найдено».
+
+## gcp-setup: настройка GCP без «фарминга» цифр
+
+Скрипт открывает OAuth-consent gcloud SDK в headless Chromium на изолированном
+профиле движка. Если Google требует подтвердить вход с телефона:
+
+* цифра извлекается из DOM и пишется в лог (`🔢 ЦИФРА НА ЭКРАНЕ`) и в
+  `~/.config/poler-engine/gcp-live.json` → превью показывает её владельцу;
+* скрипт ждёт до 61 минуты, **не перезапуская браузер** (каждый рестарт =
+  новая цифра);
+* после подтверждения сам кликает «Разрешить» и ловит authorization code
+  на loopback-редиректе.
+
+Креды gcloud SDK не хранятся в коде: env `GC_ID`/`GC_SEC` или
+`~/.config/poler-engine/gcp-oauth.json` (0600). Полученный в конце
+`client_secret.json` (секрет OAuth-клиента POLER) пишется рядом, тоже 0600,
+и в репозиторий не попадает.
+
+```bash
+python3 dev-stand/gcp-setup-daemon.py verification-506705 all   # фон (PPID→1)
+tail -f logs/gcp-setup.log                                     # мониторинг
+node dev-stand/gcp-setup.js verification-506705 probe           # одна фаза
+```
 
 ## Известные ограничения
 
