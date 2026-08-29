@@ -90,7 +90,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
             }
         }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.17.5 — Security Hardening: confirmation gate [y/N]+--yes+--dry-run для write-операций, cookie-import только по явному согласию, shutdown headless-браузера при выходе, JSONL audit-лог)",
+            "poler-engine {} (poler-shell v0.17.6 — Auth Companion: --auth-ui изолированное окно логина Google + снапшот google_session.json; + Security Hardening: confirmation gate, cookie-import по согласию, shutdown headless, audit-лог)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -1877,8 +1877,9 @@ mod tests {
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("0.17.5"));
+                assert!(out.contains("0.17.6"));
                 assert!(out.contains("poler-shell"));
+                assert!(out.contains("Auth Companion"));
             }
             _ => panic!(),
         }
@@ -1891,7 +1892,7 @@ mod tests {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("0.17.5")),
+            CmdResult::Done(out) => assert!(out.contains("0.17.6")),
             _ => panic!(),
         }
     }

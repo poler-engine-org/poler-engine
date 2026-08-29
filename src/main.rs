@@ -185,8 +185,17 @@ struct Cli {
     /// браузера хоста (~/.config/chromium) в профиль движка. Спрашивает
     /// [y/N], пишет audit-запись. По умолчанию перенос куков ЗАПРЕЩЁН
     /// (раньше sync_host_chromium_profile тянул их молча).
-    #[arg(long = "import-browser-session", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    #[arg(long = "import-browser-session", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui"])]
     import_browser_session: bool,
+
+    /// v0.17.6: интерактивное окно авторизации Google (Auth Companion).
+    /// Node.js-мост поднимает Chromium с ИЗОЛИРОВАННЫМ профилем движка
+    /// (~/.cache/poler-engine/google-profile): логин и 2FA вводишь сам,
+    /// движок получает только итоговые куки сессии (google_session.json,
+    /// 0600) и закрывает окно за собой. Хост-браузер не трогается,
+    /// все эндпоинты — строго 127.0.0.1.
+    #[arg(long = "auth-ui", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "import_browser_session"])]
+    auth_ui: bool,
 
     // ---------- NotebookLM через RPC-протокол NLMTools (v0.13.0) ----------
 
@@ -853,6 +862,17 @@ fn run(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("poler-engine import-browser-session: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    // ---------- v0.17.6: Auth Companion — изолированное окно логина ----------
+    if cli.auth_ui {
+        return match poler_engine::google::auth_ui::run_auth_ui() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("poler-engine auth-ui: {e}");
                 ExitCode::from(2)
             }
         };

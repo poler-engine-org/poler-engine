@@ -1,4 +1,4 @@
-//! # poler-shell TUI v0.17.5 — MiMo Code-style 4-pane Dashboard + Companion Bridge (M2+M3+M4)
+//! # poler-shell TUI v0.17.6 — MiMo Code-style 4-pane Dashboard + Companion Bridge (M2+M3+M4)
 //!
 //! Полная переработка TUI: 4-панельный layout с поддержкой мыши,
 //! drag-select, встроенным редактором заметок (tui-textarea) и
@@ -15,7 +15,7 @@
 //! │              │ • ↑/↓ history • Tab completion     │ SOURCES CRUD │
 //! │              │ • Enter — выполнить              │ • list/add/rm│
 //! ├──────────────┴──────────────────────────────────┴──────────────┤
-//! │ poler-shell 0.17.5  db:web-index.db  fmt:md  top:10  F2:Chat   │
+//! │ poler-shell 0.17.6  db:web-index.db  fmt:md  top:10  F2:Chat   │
 //! └────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -123,7 +123,7 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
     let mut input_history: Vec<String> = Vec::new();
     let mut input_history_idx: Option<usize> = None;
     let mut output_lines: Vec<String> = vec![
-        "poler-shell TUI Dashboard v0.17.5 — MiMo Code-style + Companion Bridge + Security Hardening".into(),
+        "poler-shell TUI Dashboard v0.17.6 — MiMo Code-style + Companion Bridge + Auth Companion".into(),
         "  ↑↓ — история ввода; Enter — выполнить; Tab — сменить фокус; Esc — выход".into(),
         "  Ctrl+N — новая заметка; Ctrl+S — сохранить AI-ответ; ? — палитра".into(),
         "  Drag мышью по Chat panel → Ctrl+Y → буфер (OSC 52 + системный)".into(),

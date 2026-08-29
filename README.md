@@ -14,6 +14,89 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.17.6: Auth Companion — интерактивное окно авторизации с изоляцией
+
+Локальный легковесный мост между владельцем и движком: `poler-engine --auth-ui`
+поднимает **отдельное окно Chromium с изолированным профилем движка**, в котором
+владелец сам вводит логин/пароль и проходит 2FA. Движок (и тем более ИИ-агент)
+не видит ни форм ввода, ни хост-браузера — только итоговые куки сессии через
+защищённый интерфейс.
+
+```
+poler-engine --auth-ui
+  └─ spawn: node scripts/auth-companion.js     (zero-dependency, Node ≥ 18)
+       ├─ Chromium: userDataDir = ~/.cache/poler-engine/google-profile
+       │            (НЕ головной браузер; логин и 2FA — руками владельца)
+       ├─ CDP поллинг (127.0.0.1:случайный порт): Storage.getCookies
+       │            до полного ядра сессии: SID HSID SSID APISID SAPISID
+       ├─ снапшот → ~/.config/poler-engine/google_session.json (0600)
+       ├─ статус-сервер 127.0.0.1: GET /status, POST /shutdown
+       └─ автозакрытие окна (CDP Browser.close) — куки флэшатся на диск
+```
+
+### Гарантии безопасности
+
+* **No Host Snooping** — `~/.config/chromium`, `~/.config/google-chrome` и
+  другие браузерные профили хоста не читаются и не пишутся никогда; companion
+  отказывается стартовать, если `POLER_GOOGLE_PROFILE` указывает туда.
+* **Localhost Only** — статус-сервер и DevTools-порт слушают строго
+  `127.0.0.1` (`--remote-debugging-address=127.0.0.1`); окно логина
+  запускается БЕЗ `--disable-web-security` и по умолчанию БЕЗ `--no-sandbox`
+  (opt-in `POLER_CHROME_NO_SANDBOX=1` — только для контейнеров).
+* **Auto-termination** — после подтверждения входа окно закрывается сам
+  (`Browser.close` → SIGTERM → SIGKILL по эскалации); Ctrl+C тоже прибирает
+  браузер. Висячих процессов и открытых CDP-портов не остаётся.
+* **Audit-trail** — `security.auth_companion` в `~/.config/poler-engine/audit.log`
+  (только коды/счётчики, без значений кук).
+
+### Файлы и exit-коды
+
+| артефакт | назначение |
+|---|---|
+| `~/.cache/poler-engine/google-profile/` | изолированный профиль (куки живут тут) |
+| `~/.config/poler-engine/google_session.json` | снапшот сессии, 0600 (значения кук — только тут) |
+| `~/.config/poler-engine/auth-companion.state.json` | transient-состояние (state/port/счётчик) |
+| `scripts/auth-companion.js` | сам companion (self-test: `node scripts/auth-companion.js --self-test`) |
+
+| код | смысл |
+|---|---|
+| 0 | авторизация зафиксирована |
+| 2 | окно закрыто до завершения входа |
+| 3 | таймаут (`POLER_AUTH_TIMEOUT_SECS`, default 600) |
+| 4 | preflight: нет Node≥18/Chromium, профиль занят, запрещённый путь |
+| 130 | прервано сигналом |
+
+### Почему сессия пишется в google_session.json, а не в google_tokens.json
+
+`google_tokens.json` — строго типизированное OAuth-хранилище
+(`access_token`/`refresh_token` для Gmail/Drive, выдаются consent-флоу
+`--google-auth`). Браузерная сессия — другой класс креденшелов: компаньон
+пишет снапшот в отдельный `google_session.json`, а «синхронизация хранилища
+профиля» происходит сама собой — куки уже лежат в изолированном профиле,
+который читают `--google-fetch` / `--nlm-*`. OAuth-токены companion выдать не
+может (нужен consent-экран Google) — они по-прежнему только через
+`poler-engine --google-auth`.
+
+```bash
+# окно входа (можно сразу целевой сервис):
+poler-engine --auth-ui
+POLER_AUTH_TIMEOUT_SECS=900 poler-engine --auth-ui
+
+# после успешного входа:
+poler-engine --nlm-account          # проверка сессии NotebookLM
+poler-engine --nlm-notebooks        # ноутбуки уже доступны
+poler-engine --google-status        # OAuth-токены — отдельная история
+
+# отладка без запуска браузера:
+node scripts/auth-companion.js --print-plan   # JSON-план запуска
+node scripts/auth-companion.js --self-test    # 19 встроенных тестов
+```
+
+Диагностика: если профиль уже занят открытым окном `--google-browse`,
+companion откажется стартовать (код 4) — закройте то окно: профиль один.
+
+---
+
 ## v0.17.5: Security Hardening — ручной контроль над аккаунтными операциями
 
 Аудит безопасности выявил четыре слабых места в работе движка с аккаунтом

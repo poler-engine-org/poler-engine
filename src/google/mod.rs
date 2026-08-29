@@ -12,6 +12,8 @@
 //!    выделенным `--user-data-dir`, владелец логинится там **один раз
 //!    своими руками**, куки живут месяцами. Дальше `--google-fetch`
 //!    читает уже авторизованную сессию headless-ом через тот же профиль.
+//!    v0.17.6: `--auth-ui` — то же окно, но с автодетекцией входа и
+//!    снапшотом сессии (см. [`auth_ui`]).
 //!
 //! HTTPS-клиент — сам Chromium: [`GoogleHttp`] выполняет `fetch()` в
 //! контексте страницы через CDP `Runtime.evaluate` + `awaitPromise`.
@@ -21,6 +23,7 @@
 
 pub mod api;
 pub mod audit;
+pub mod auth_ui;
 pub mod companion;
 pub mod confirm;
 pub mod nlm;
