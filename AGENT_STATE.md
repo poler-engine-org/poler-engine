@@ -6,7 +6,7 @@
 updated_utc: 2026-08-29T18:45:00Z
 repo: poler-engine
 branch: main
-commit: (см. git log -1; сессия: gcp-setup в dev-stand)
+commit: 3eb568f
 tag: v0.17.6
 pushed: true
 tests: secret-scan-commit PASS (26 подстрок: куки+токен+gcloud-secret, 15 файлов); security-audit 27/2/0 (сессия выше); Rust-код не тронут
