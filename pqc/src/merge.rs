@@ -109,6 +109,7 @@ use pqw::trit_bloch::trit_at;
 use pqw::{PqwReader, PqwWriter};
 
 use crate::archetype_lattice::{archetype_energy, nonzero_lanes};
+use crate::gyro_lattice::{QuantizedGyroCurriculum, TransportMode};
 
 // ============================================================================
 // 1. Слияние фазовых решёток: c = a ⊗_ε b (таблица без гейта)
@@ -649,6 +650,174 @@ pub fn merge_brains(
         brain_bytes: buf.len(),
     };
     Ok((buf, report))
+}
+
+// ============================================================================
+// 5. RQ21: сеттлинг слияния — консолидация волной
+// ============================================================================
+
+/// Потолок тактов сеттлинга (`--settle N`: ТЗ держит 2–4, потолок
+/// щедрее — стационар обычно раньше).
+pub const SETTLE_TICKS_MAX: usize = 16;
+
+/// Конфигурация сеттлинга.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettleConfig {
+    /// Тактов авторегрессионного рассуждения `Π_Λ(e^{Δt·J} p)` поверх
+    /// слитых русел: 2–4 по ТЗ RQ21, допустимо 1..=16.
+    pub ticks: usize,
+}
+
+impl Default for SettleConfig {
+    fn default() -> Self {
+        // Середина ТЗ-коридора 2–4: два такта волне течь, третий —
+        // родиться руслам повторного свидетельства.
+        SettleConfig { ticks: 3 }
+    }
+}
+
+/// Отчёт сеттлинга: как волна консолидировала слияние.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettleReport {
+    /// Запрошено тактов.
+    pub ticks_requested: usize,
+    /// Выполнено (ранний выход на стационаре).
+    pub ticks_run: usize,
+    /// Перещёлкиваний решётки по тактам (индекс = такт − 1).
+    pub moved_per_tick: Vec<usize>,
+    /// Суммарный θ-сдвиг волны.
+    pub theta_shift_total: f64,
+    /// Русел до сеттлинга.
+    pub channels_before: usize,
+    /// Русел после.
+    pub channels_after: usize,
+    /// Прирост русел (`after − before`): отрицателен, только если
+    /// волна перезаписала направление чьего-то русла.
+    pub channels_grown: i64,
+    /// Событий born-консолидации: сколько раз кинетический фронт
+    /// волны наблюдался гироскопом.
+    pub observed_events: usize,
+    /// Всего перещёлкиваний фаз за сеттлинг.
+    pub lattice_flips: usize,
+    /// Стационар `ĤΨ = 0` достигнут: такт без перещёлкиваний —
+    /// волна успокоилась на слиянии.
+    pub stationary: bool,
+    /// Размер контейнера после сеттлинга, байт.
+    pub brain_bytes: usize,
+}
+
+/// Сеттлинг слияния (RQ21): `N` тактов авторегрессионного рассуждения
+/// `Π_Λ(e^{Δt·J} p)` поверх слитых русел — волна течёт сквозь оба
+/// домена сразу, и русла из разных мозгов прорастают общими связями.
+///
+/// ## Физика такта
+///
+/// ```text
+///   1. Транспорт: Π_Λ(e^{Δt·J} p) свободным потоком — фазы движутся
+///      по руслам слияния; контраст живёт на конфликтах ⊗_ε
+///      (аннигиляционные Zero с полюсным соседом): волна течёт
+///      именно через открытые вопросы слияния.
+///
+///   2. Born-консолидация: кинетический фронт волны (дуги с m ≠ 0,
+///      по возрастанию координат — детерминизм) наблюдается
+///      гироскопом как сенсорное свидетельство. Пара, увиденная
+///      дважды за соседние такты, насыщается — общее русло двух
+///      доменов открывается: знание срослось.
+///
+///   3. Стационар: такт без перещёлкиваний — ĤΨ = 0, волна
+///      успокоилась; сеттлинг завершается досрочно.
+/// ```
+///
+/// ## Детерминизм
+///
+/// Ни одного ГПСЧ: транспорт целочислен, порядок консолидации —
+/// по возрастанию координат, сид движка не потребляется
+/// (Born-измерения фаз нет). `settle(X)` даёт побитово одинаковые
+/// байты при одинаковых входах.
+pub fn settle_brain(
+    bytes: &[u8],
+    cfg: &SettleConfig,
+) -> Result<(Vec<u8>, SettleReport), String> {
+    if cfg.ticks == 0 || cfg.ticks > SETTLE_TICKS_MAX {
+        return Err(format!(
+            "--settle: такты 1..={SETTLE_TICKS_MAX} (ТЗ RQ21: 2–4)"
+        ));
+    }
+    let reader = PqwReader::from_bytes(bytes).map_err(|e| format!("сеттлинг: {e}"))?;
+    if reader.encoding() != pqw::phase::TritEncoding::Packed4 {
+        return Err(
+            "сеттлинг: нужен контейнер v2/v3/v4 (Packed4), а не v1 с кривизной".into(),
+        );
+    }
+    let window = reader
+        .gyro()
+        .map(|g| g.window().max(1) as usize)
+        .unwrap_or(DEFAULT_WINDOW);
+    let eps = reader.hyperparams().epsilon_threshold;
+    let mut engine =
+        QuantizedGyroCurriculum::new(reader.d_pol(), eps, 42, window)
+            .map_err(|e| e.to_string())?;
+    // Гиперпараметры контейнера переживают сеттлинг (η вернулся в
+    // чекпоинт, как был записан мозгом).
+    engine.set_eta(reader.hyperparams().eta as f64);
+    engine
+        .resume_from_reader(&reader)
+        .map_err(|e| format!("сеттлинг resume: {e}"))?;
+
+    let channels_before = engine.channel_count();
+    let mut moved_per_tick: Vec<usize> = Vec::with_capacity(cfg.ticks);
+    let mut theta_total = 0.0_f64;
+    let mut observed = 0usize;
+    let mut flips = 0usize;
+    let mut stationary = false;
+    for _ in 0..cfg.ticks {
+        // Такт 1: транспорт волной по слитым руслам.
+        let stats = engine
+            .reasoning_step_mode(TransportMode::Free)
+            .map_err(|e| format!("сеттлинг транспорт: {e}"))?;
+        moved_per_tick.push(stats.moved);
+        theta_total += stats.theta_shift;
+        flips += stats.moved;
+
+        // Такт 2: born-консолидация — кинетический фронт волны
+        // становится сенсорным свидетельством. Каждый такт —
+        // независимая траектория: кольцо контекста чисто, но
+        // свидетельства русел копятся сквозь такты — пара, пройденная
+        // дважды в одном направлении, насыщается в общее русло
+        // (гистерезис двух свидетелей). Порядок — по возрастанию
+        // координат (линейный скан кинетики уже упорядочен).
+        engine.reset_context_ring();
+        let mut events: Vec<(u32, i8)> = Vec::new();
+        engine.for_each_kinetic_arc(|arc, m| events.push((arc, m)));
+        for (arc, m) in events {
+            engine.observe_event(arc, m);
+            observed += 1;
+        }
+
+        // Такт 3: стационар ĤΨ = 0 — такт без перещёлкиваний.
+        if stats.moved == 0 {
+            stationary = true;
+            break;
+        }
+    }
+    let channels_after = engine.channel_count();
+    let out = engine
+        .checkpoint()
+        .map_err(|e| format!("сеттлинг чекпоинт: {e}"))?;
+    let report = SettleReport {
+        ticks_requested: cfg.ticks,
+        ticks_run: moved_per_tick.len(),
+        moved_per_tick,
+        theta_shift_total: theta_total,
+        channels_before,
+        channels_after,
+        channels_grown: channels_after as i64 - channels_before as i64,
+        observed_events: observed,
+        lattice_flips: flips,
+        stationary,
+        brain_bytes: out.len(),
+    };
+    Ok((out, report))
 }
 
 // ============================================================================
@@ -1355,5 +1524,175 @@ mod tests {
         // Русла слияния плотнее каждой половины.
         assert!(report.channels_merged > report.channels_a);
         assert!(report.channels_merged > report.channels_b);
+    }
+
+    // ===================== RQ21: сеттлинг слияния =====================
+
+    /// Два v4-мозга с рукотворными конфликтами ⊗_ε: координаты 0 и 3
+    /// аннигилируют в Zero, русла (0,1) и (3,4) переживают слияние.
+    /// Волна сеттлинга обязана течь сквозь открытые вопросы (Zero с
+    /// полюсным соседом) и прорастить общее русло (0,3).
+    fn conflicting_pair_brains() -> (Vec<u8>, Vec<u8>) {
+        let lex = Lexicon::new(
+            vec![
+                (0, "спор".to_string()),
+                (1, "полюс".to_string()),
+                (3, "вопрос".to_string()),
+                (4, "ответ".to_string()),
+            ],
+            8,
+        )
+        .unwrap();
+        let mk = |p0: f32, p3: f32| -> Vec<u8> {
+            let mut ww = pqw::PqwWriter::new(8).unwrap().hyperparams(0.6, 0.0, 1.0, 0.05);
+            if p0 != 0.0 {
+                ww.add_phase(0, p0).unwrap();
+            }
+            if p3 != 0.0 {
+                ww.add_phase(3, p3).unwrap();
+            }
+            // Полюса-соседи: согласие обоих мозгов (резонанс ⊗_ε) —
+            // русла переживают слияние, волне есть куда течь.
+            ww.add_phase(1, 1.0).unwrap();
+            ww.add_phase(4, 1.0).unwrap();
+            let gyro = GyroData::new(8, 100, vec![(0, 1, 1.0), (3, 4, 1.0)], 8).unwrap();
+            let mut buf = Vec::new();
+            ww.write_v4(&mut buf, &gyro, &lex).unwrap();
+            buf
+        };
+        (mk(1.0, 1.0), mk(-1.0, -1.0))
+    }
+
+    #[test]
+    fn settle_grows_cross_domain_channels() {
+        // ТЗ RQ21 п.1: 2–4 такта Π_Λ(e^{Δt·J} p) — русла разных
+        // доменов прорастают общими связями, система приходит к
+        // стационару ĤΨ = 0. Полностью детерминированная конструкция.
+        let (a, b) = conflicting_pair_brains();
+        let (merged, mrep) = merge_brains(&a, &b, &MergeConfig::default()).unwrap();
+        assert_eq!(mrep.conflict, 2, "координаты 0 и 3 — конфликты ⊗_ε");
+        assert_eq!(mrep.channels_merged, 2, "русьла (0,1) и (3,4) пережили");
+        assert_eq!(mrep.nnz_merged, 2, "конфликты аннигилировали в Zero");
+
+        let (settled, srep) = settle_brain(&merged, &SettleConfig { ticks: 3 }).unwrap();
+
+        // Волна текла ровно два такта: конфликтные Zero заполнились
+        // полюсами, второй такт — покой (стационар ĤΨ = 0).
+        assert_eq!(srep.ticks_requested, 3);
+        assert_eq!(srep.moved_per_tick, vec![2, 0], "такт 1: два флипа, такт 2: покой");
+        assert_eq!(srep.ticks_run, 2, "ранний выход на стационаре");
+        assert!(srep.stationary, "ĤΨ = 0 достигнут");
+        assert_eq!(srep.lattice_flips, 2);
+
+        // Общее русло проросло: пара (0, 3) кинетического фронта
+        // увидена дважды в одном направлении — гистерезис насытил
+        // канал. Знание двух мозгов срослось.
+        assert_eq!(srep.channels_before, 2);
+        assert_eq!(srep.channels_after, 3, "русьла (0,1), (3,4) + проросшее (0,3)");
+        assert_eq!(srep.channels_grown, 1);
+        assert_eq!(srep.observed_events, 4, "фронт из 2 дуг × 2 такта");
+
+        // Проросшее русло живёт в контейнере: (0, 3, +1).
+        let reader = PqwReader::from_bytes(&settled).unwrap();
+        let pairs = reader.gyro().unwrap().pairs().to_vec();
+        assert!(
+            pairs.iter().any(|p| p.i == 0 && p.j == 3 && p.weight > 0.0),
+            "русьло (0,3) не проросло: {pairs:?}"
+        );
+        // Словарь пережил сеттлинг бит-в-бит по доминантам.
+        assert_eq!(reader.lexicon().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn settle_deterministic_bitwise() {
+        // Ни одного ГПСЧ: сеттлинг одинаковых байтов одинаков.
+        let (a, b) = conflicting_pair_brains();
+        let (merged, _) = merge_brains(&a, &b, &MergeConfig::default()).unwrap();
+        let (s1, r1) = settle_brain(&merged, &SettleConfig { ticks: 4 }).unwrap();
+        let (s2, r2) = settle_brain(&merged, &SettleConfig { ticks: 4 }).unwrap();
+        assert_eq!(s1, s2, "байты контейнера побитово равны");
+        assert_eq!(r1, r2, "отчёты равны (elapsed нет в отчёте сеттлинга)");
+    }
+
+    #[test]
+    fn settle_stationary_v2_container() {
+        // v2-мозг (только фазы, русел нет): транспорту не по чему течь —
+        // честный стационар на первом такте, контейнер остаётся v2.
+        let mut w = pqw::PqwWriter::new(16).unwrap();
+        w.add_phase(2, 1.0).unwrap();
+        w.add_phase(7, -1.0).unwrap();
+        let mut v2 = Vec::new();
+        w.write_packed_trits(&mut v2).unwrap();
+
+        let (out, rep) = settle_brain(&v2, &SettleConfig { ticks: 3 }).unwrap();
+        assert!(rep.stationary);
+        assert_eq!(rep.ticks_run, 1);
+        assert_eq!(rep.moved_per_tick, vec![0]);
+        assert_eq!(rep.channels_before, 0);
+        assert_eq!(rep.channels_after, 0);
+        assert_eq!(rep.observed_events, 0);
+        assert_eq!(&out[..8], b"POLER_Q2", "v2 деградация не сжижается");
+        // Фазы не тронуты покоем.
+        assert_eq!(
+            PqwReader::from_bytes(&out).unwrap().phase_bytes(),
+            PqwReader::from_bytes(&v2).unwrap().phase_bytes()
+        );
+    }
+
+    #[test]
+    fn settle_after_merge_keeps_knowledge_and_speech() {
+        // Полный конвейер RQ20+RQ21: обучение → слияние → сеттлинг →
+        // вопрос на стыке доменов. Сеттлинг не теряет знание: словарь
+        // и речь живы, контейнер валиден.
+        let bytes_a = brain_from_text(PHYSICS, 512, 2);
+        let bytes_b = brain_from_text(PYTHON, 512, 2);
+        let (merged, mrep) = merge_brains(&bytes_a, &bytes_b, &MergeConfig::default()).unwrap();
+        let (settled, srep) = settle_brain(&merged, &SettleConfig::default()).unwrap();
+
+        assert_eq!(srep.ticks_run, srep.moved_per_tick.len());
+        assert_eq!(
+            srep.channels_after as i64,
+            srep.channels_before as i64 + srep.channels_grown,
+            "закон сохранения русел"
+        );
+        let reader = PqwReader::from_bytes(&settled).unwrap();
+        assert_eq!(&settled[..8], b"POLER_Q4", "слитый и осевший мозг — v4");
+        // Словарь слияния не уже словаря до сеттлинга (доминанты живы).
+        assert!(reader.lexicon().unwrap().len() >= mrep.lexicon_merged);
+        // Гиперпараметры пережили сеттлинг.
+        assert_eq!(reader.hyperparams().eta, PqwReader::from_bytes(&merged).unwrap().hyperparams().eta);
+
+        // Мульти-доменная речь после сеттлинга.
+        let answer = ask_brain(
+            &settled,
+            "как моделировать квантовую запутанность на языке программирования",
+            42,
+        );
+        assert!(!answer.is_empty(), "сеттлинг заглушил речь");
+    }
+
+    #[test]
+    fn settle_ticks_validation() {
+        let (a, b) = conflicting_pair_brains();
+        let (merged, _) = merge_brains(&a, &b, &MergeConfig::default()).unwrap();
+        for bad in [0usize, SETTLE_TICKS_MAX + 1, 100] {
+            let err = settle_brain(&merged, &SettleConfig { ticks: bad }).unwrap_err();
+            assert!(err.contains("--settle"), "тело ошибки: {err}");
+        }
+        // Границы коридора валидны (ТЗ 2–4, потолок щедрее).
+        for good in [1usize, 2, 4, SETTLE_TICKS_MAX] {
+            assert!(settle_brain(&merged, &SettleConfig { ticks: good }).is_ok());
+        }
+    }
+
+    #[test]
+    fn settle_curved_v1_rejected() {
+        let v1 = pqw::PqwWriter::new(16)
+            .unwrap()
+            .add_phase(1, 0.9)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        assert!(settle_brain(&v1, &SettleConfig::default()).is_err());
     }
 }

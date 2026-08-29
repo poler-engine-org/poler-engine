@@ -161,3 +161,7 @@ pub use stream_engine::{
 pub use syntax_unfolder::{is_stationary, morpheme_at, unfurl, unfurl_to_string, MAX_OUT, TRIT_THRESHOLD};
 
 pub mod syntax_unfolder;
+
+// RQ21: грамматические мосты — синтаксическая связность речи L5.
+pub mod syntax_bridge;
+pub use syntax_bridge::{is_cyrillic_token, syntax_class, SyntaxChain, SyntaxClass, BRIDGE_RUN};

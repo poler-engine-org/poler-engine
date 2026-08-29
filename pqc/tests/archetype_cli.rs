@@ -345,7 +345,8 @@ fn generate_bridge_json_and_eps() {
     for key in ["energy", "co_support", "resonance", "conflict", "resonant"] {
         assert!(bridge.get(key).is_some(), "bridge.{key}");
     }
-    // Источник archetype легитимен в steps.
+    // Источник archetype легитимен в steps (RQ21 добавил bridge —
+    // грамматические мосты включены в CLI по умолчанию).
     if let Some(steps) = v.get("steps").and_then(Json::as_arr) {
         for s in steps {
             let src = s
@@ -353,7 +354,7 @@ fn generate_bridge_json_and_eps() {
                 .and_then(Json::as_str)
                 .expect("source — строка");
             assert!(
-                ["flow", "backtrack", "archetype", "kinetic"].contains(&src),
+                ["flow", "backtrack", "archetype", "kinetic", "bridge"].contains(&src),
                 "источник {src}"
             );
         }

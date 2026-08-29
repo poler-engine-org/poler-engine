@@ -48,6 +48,7 @@ USAGE:
     pqc archetype (--brain F [--prompt T|--with F]) [opts]     RQ18: мозг ⊗_ε промпт/мозг
     pqc learn «ТЕМА» --brain F [opts]                          RQ19: интернет-ингест (TLS 1.3 zero-dep)
     pqc merge A.pqw B.pqw --out M.pqw [opts]                  RQ20: слияние мозгов ⊗_ε → v4
+                                                              RQ21: --settle — консолидация волной
 
 ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию, файл 285;
                           --f32 — исследовательская схема RQ12):
@@ -160,6 +161,10 @@ GENERATE/ASK/CHAT OPTIONS (RQ17: L5-генерация — первые слов
     --no-learn                ask: без перещёлкивания фаз born-шагом
     --no-bridge               выключить архетипический мост ⊗_ε (RQ18)
     --bridge-eps <F>          порог гейта моста ∈ (0,1] (default 0.5)
+    --no-syntax               RQ21: выключить грамматические мосты —
+                              чистая ассоциативная топология RQ17
+                              (по умолчанию синтаксис ВКЛЮЧЁН:
+                              взвешивание цепочек + коннекторы)
     --json                    машинно-читаемый отчёт (zero-dep JSON)
 
 ARCHETYPE OPTIONS (RQ18: нелинейная алгебра a ⊗_ε b — мышление
@@ -194,11 +199,19 @@ LEARN OPTIONS (RQ19: pqc learn \"ТЕМА\" — целенаправленный
 MERGE OPTIONS (RQ20: pqc merge — архетипическое слияние мозгов;
               фазы c = a ⊗_ε b (таблица без гейта — объединение
               знаний), русла J = Π_Λ(J_A + J_B) с кососимметричностью,
-              консолидация LEXI; born-консолидация в контейнер):
+              консолидация LEXI; born-консолидация в контейнер;
+              RQ21: --settle — консолидация слияния волной):
     --out <F>                контейнер слитого мозга (обязателен)
     --eps <F>                порог диагностики изоморфизма ∈ (0,1]
                               (default 0.5; гейт НЕ заперт — слияние
                               объединяет даже ортогональные домены)
+    --settle [N]             RQ21: сеттлинг — N тактов (default 3,
+                              ТЗ 2–4, максимум 16) авторегрессионного
+                              рассуждения Π_Λ(e^{Δt·J} p) поверх слитых
+                              русел: русла доменов прорастают общими
+                              связями (гистерезис двух траекторий
+                              волны), система оседает к стационару
+                              ĤΨ = 0 (ранний выход на покое)
     --ask <ВОПРОС>           проверка мульти-доменного мышления сразу
                               после слияния (без записи в мозг)
     --seed <S>               сид Born-лотереи --ask (default 42)
@@ -4160,6 +4173,9 @@ struct GenConfig {
     repeat_veto: usize,
     bridge: bool,
     bridge_eps: f64,
+    /// RQ21: грамматические мосты (включены по умолчанию в CLI —
+    /// качество речи; `--no-syntax` возвращает чистую топологию RQ17).
+    syntax: bool,
     learn: bool,
     json: bool,
     /// Позиционный вопрос (ask/chat).
@@ -4182,6 +4198,7 @@ impl Default for GenConfig {
             repeat_veto: 1,
             bridge: true,
             bridge_eps: DEFAULT_BRIDGE_EPS,
+            syntax: true,
             learn: true,
             json: false,
             question: None,
@@ -4238,6 +4255,7 @@ fn parse_gen_args(args: &[String], cfg: &mut GenConfig) -> Result<(), String> {
                     .map_err(|_| "bad --repeat-veto".to_string())?
             }
             "--no-bridge" => cfg.bridge = false,
+            "--no-syntax" => cfg.syntax = false,
             "--bridge-eps" => {
                 cfg.bridge_eps = val("--bridge-eps")?
                     .parse()
@@ -4370,6 +4388,7 @@ fn generation_json_pairs(
                                     pqc::generate::TicketSource::Backtrack => "backtrack",
                                     pqc::generate::TicketSource::Archetype => "archetype",
                                     pqc::generate::TicketSource::Kinetic => "kinetic",
+                                    pqc::generate::TicketSource::Bridge => "bridge",
                                 }),
                             ),
                             ("tickets".into(), Json::num(s.tickets as f64)),
@@ -4391,6 +4410,8 @@ fn generation_json_pairs(
                 Json::num(n as f64)
             },
         ),
+        ("bridge_tokens".into(), Json::num(rep.bridges as f64)),
+        ("syntax_run_max".into(), Json::num(rep.syntax_run_max as f64)),
         ("skipped_unseen".into(), Json::num(rep.skipped_unseen as f64)),
         ("converged".into(), Json::Bool(rep.converged)),
         ("cycled".into(), Json::Bool(rep.cycled)),
@@ -4414,6 +4435,7 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
                 pqc::generate::TicketSource::Backtrack => "возврат по руслу",
                 pqc::generate::TicketSource::Archetype => "архетипический мост (⊗_ε)",
                 pqc::generate::TicketSource::Kinetic => "кинетика (внутренний голос)",
+                pqc::generate::TicketSource::Bridge => "грамматический мост (синтаксис)",
             };
             println!("квант авторегрессии:");
             println!(
@@ -4444,6 +4466,7 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
             pqc::generate::TicketSource::Backtrack => "←",
             pqc::generate::TicketSource::Archetype => "⊗",
             pqc::generate::TicketSource::Kinetic => "∘",
+            pqc::generate::TicketSource::Bridge => "≡",
         };
         println!(
             "  #{:<3} [ {:<5} ] «{}» {} (билетов {:>3}, born {}, moved {:>2})",
@@ -4465,9 +4488,11 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
         if rep.text.is_empty() { "—" } else { &rep.text }
     );
     println!(
-        "статистика: слов {} (морфем {}), пропусков {}, сходимость: {}, цикл: {}, {:.1} мс",
+        "статистика: слов {} (морфем {}, мостов {}), пик облака {}, пропусков {}, сходимость: {}, цикл: {}, {:.1} мс",
         rep.steps.len(),
         morphemes,
+        rep.bridges,
+        rep.syntax_run_max,
         rep.skipped_unseen,
         if rep.converged { "да (ĤΨ = 0)" } else { "нет" },
         if rep.cycled { "вырожденный" } else { "нет" },
@@ -4939,6 +4964,7 @@ fn merge_ask(merged: &[u8], question: &str, seed: u64) -> Result<String, String>
         max_tokens: 24,
         window: engine.gyro_window(),
         seed,
+        syntax: true,
         ..GeneratorConfig::default()
     };
     let mut gen = L5Generator::new(&mut engine, gcfg).map_err(|e| e.to_string())?;
@@ -4951,6 +4977,7 @@ fn cmd_merge(args: &[String]) -> i32 {
     let mut eps = DEFAULT_BRIDGE_EPS;
     let mut ask: Option<String> = None;
     let mut seed = 42u64;
+    let mut settle: Option<usize> = None;
     let mut json = false;
     let mut i = 0usize;
     while i < args.len() {
@@ -4973,6 +5000,26 @@ fn cmd_merge(args: &[String]) -> i32 {
                 Ok(e) if e.is_finite() && e > 0.0 && e <= 1.0 => eps = e,
                 _ => return merge_usage_err("--eps: порог диагностики изоморфизма ∈ (0, 1]"),
             },
+            "--settle" => {
+                // Значение опционально: --settle → 3 такта (ТЗ 2–4),
+                // --settle N → явно (следующий аргумент — число не-флаг).
+                let explicit = args.get(i + 1).filter(|v| !v.starts_with("--"));
+                match explicit {
+                    Some(v) => match v.parse::<usize>() {
+                        Ok(n) if (1..=pqc::merge::SETTLE_TICKS_MAX).contains(&n) => {
+                            settle = Some(n);
+                            i += 1;
+                        }
+                        _ => {
+                            return merge_usage_err(&format!(
+                                "--settle: целое 1..={} (ТЗ RQ21: 2–4)",
+                                pqc::merge::SETTLE_TICKS_MAX
+                            ))
+                        }
+                    },
+                    None => settle = Some(3),
+                }
+            }
             "--ask" => match val("--ask") {
                 Ok(v) => ask = Some(v),
                 Err(e) => return merge_usage_err(&e),
@@ -5016,6 +5063,19 @@ fn cmd_merge(args: &[String]) -> i32 {
             Ok(x) => x,
             Err(e) => return err(&e),
         };
+
+    // RQ21: сеттлинг — консолидация волной. 2–4 такта авторегрессии
+    // Π_Λ(e^{Δt·J} p) поверх слитых русел: русла доменов прорастают
+    // общими связями, система оседает к стационару ĤΨ = 0.
+    let (merged, settle_report) = match settle {
+        Some(ticks) => {
+            match pqc::merge::settle_brain(&merged, &pqc::merge::SettleConfig { ticks }) {
+                Ok((bytes, srep)) => (bytes, Some(srep)),
+                Err(e) => return err(&e),
+            }
+        }
+        None => (merged, None),
+    };
     if let Err(e) = std::fs::write(&out_path, &merged) {
         return err(&format!("запись {out_path}: {e}"));
     }
@@ -5095,6 +5155,31 @@ fn cmd_merge(args: &[String]) -> i32 {
             ),
             ("eps".into(), Json::num(eps)),
         ];
+        if let Some(srep) = &settle_report {
+            j.push((
+                "settle".into(),
+                Json::Obj(vec![
+                    ("ticks_requested".into(), Json::num(srep.ticks_requested as f64)),
+                    ("ticks_run".into(), Json::num(srep.ticks_run as f64)),
+                    (
+                        "moved_per_tick".into(),
+                        Json::Arr(
+                            srep.moved_per_tick
+                                .iter()
+                                .map(|m| Json::num(*m as f64))
+                                .collect(),
+                        ),
+                    ),
+                    ("theta_shift_total".into(), Json::num(srep.theta_shift_total)),
+                    ("channels_before".into(), Json::num(srep.channels_before as f64)),
+                    ("channels_after".into(), Json::num(srep.channels_after as f64)),
+                    ("channels_grown".into(), Json::num(srep.channels_grown as f64)),
+                    ("observed_events".into(), Json::num(srep.observed_events as f64)),
+                    ("lattice_flips".into(), Json::num(srep.lattice_flips as f64)),
+                    ("stationary".into(), Json::Bool(srep.stationary)),
+                ]),
+            ));
+        }
         if let Some((q, text)) = &answer {
             j.push((
                 "ask".into(),
@@ -5146,6 +5231,19 @@ fn cmd_merge(args: &[String]) -> i32 {
         "лексикон: {} слов (коллизий доминант {} — победа мозга A), окно W={}, тактов {}",
         report.lexicon_merged, report.lexicon_collisions, report.window, report.ticks_merged
     );
+    if let Some(srep) = &settle_report {
+        println!(
+            "сеттлинг: {} такта Π_Λ(e^{{Δt·J}} p) — флипы {:?}, русла {} → {} (проросло {:+}), \
+             свидетельств волны {}, стационар ĤΨ = 0: {}",
+            srep.ticks_run,
+            srep.moved_per_tick,
+            srep.channels_before,
+            srep.channels_after,
+            srep.channels_grown,
+            srep.observed_events,
+            if srep.stationary { "достигнут" } else { "не достигнут (потолок тактов)" }
+        );
+    }
     println!(
         "сохранено: {out_path} → v{} контейнер ({} Б)",
         report.container, report.brain_bytes
@@ -5202,6 +5300,7 @@ fn cmd_generate(args: &[String], step_mode: bool) -> i32 {
         repeat_veto: cfg.repeat_veto,
         bridge: cfg.bridge,
         bridge_eps: cfg.bridge_eps,
+        syntax: cfg.syntax,
     };
     let mut gen = match L5Generator::new(engine, gcfg) {
         Ok(g) => g,
@@ -5329,6 +5428,7 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
             repeat_veto: cfg.repeat_veto,
             bridge: cfg.bridge,
             bridge_eps: cfg.bridge_eps,
+            syntax: cfg.syntax,
         };
         let report = {
             let mut gen = match L5Generator::new(&mut engine, gcfg) {

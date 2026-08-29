@@ -82,6 +82,7 @@ use crate::archetype_lattice::DEFAULT_BRIDGE_EPS;
 use crate::error::Result;
 use crate::gyro_lattice::{QuantizedGyroCurriculum, SIN_LUT, TransportMode};
 use crate::rng::Rng;
+use crate::syntax_bridge::{is_cyrillic_token, syntax_class, SyntaxChain, SyntaxClass};
 use crate::syntax_unfolder::morpheme_at;
 
 /// Потолок длины токена для лексикона: прогоны длиннее — шум
@@ -261,6 +262,12 @@ pub struct GeneratorConfig {
     /// Порог энергетического гейта моста `ε ∈ (0, 1]`
     /// (default [`crate::archetype_lattice::DEFAULT_BRIDGE_EPS`]).
     pub bridge_eps: f64,
+    /// Грамматические мосты RQ21: взвешивание синтаксических
+    /// цепочек лотереи (союзы/предлоги/связки) + вставка
+    /// детерминированных коннекторов в зияющие облака слов.
+    /// Выключено по умолчанию — чистая ассоциативная топология RQ17
+    /// (CLI включает: `--no-syntax` снимает).
+    pub syntax: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -275,6 +282,7 @@ impl Default for GeneratorConfig {
             repeat_veto: 1,
             bridge: true,
             bridge_eps: DEFAULT_BRIDGE_EPS,
+            syntax: false,
         }
     }
 }
@@ -294,6 +302,11 @@ pub enum TicketSource {
     Archetype,
     /// Кинетическая дуга вне кольца — внутренний голос.
     Kinetic,
+    /// Грамматический мост RQ21: детерминированный коннектор
+    /// синтаксиса (союз/предлог/связка из встроенной таблицы
+    /// RU/EN) — вставлен между знаменательными словами, чтобы
+    /// облако ассоциаций становилось предложением.
+    Bridge,
 }
 
 /// Одна эмиссия (квант речи).
@@ -353,6 +366,11 @@ pub struct GenerationReport {
     pub converged: bool,
     /// Вырожденный цикл (волна вибрирует между двумя координатами).
     pub cycled: bool,
+    /// Вставлено грамматических мостов RQ21 (коннекторы синтаксиса).
+    pub bridges: usize,
+    /// Пик облака знаменательных слов (телеметрия связности;
+    /// с синтаксисом не превышает [`crate::syntax_bridge::BRIDGE_RUN`]).
+    pub syntax_run_max: usize,
     /// Сквозная задержка.
     pub elapsed: std::time::Duration,
 }
@@ -388,6 +406,12 @@ pub struct L5Generator<'a> {
     candidates: Vec<(u32, u32)>,
     /// Анти-заикание: последние эмитированные координаты.
     veto: VecDeque<u32>,
+    /// Синтаксическая цепочка RQ21: класс последней эмиссии и длина
+    /// облака знаменательных слов (взвешивание лотареи + мосты).
+    chain: SyntaxChain,
+    /// Алфавит речи (кириллица ↔ латиница) по последнему слову —
+    /// таблица мостов RU/EN.
+    script_cyrillic: Option<bool>,
 }
 
 impl<'a> L5Generator<'a> {
@@ -414,6 +438,8 @@ impl<'a> L5Generator<'a> {
             up: vec![0u32; d],
             candidates: Vec::new(),
             veto: VecDeque::with_capacity(cfg.repeat_veto + 1),
+            chain: SyntaxChain::new(),
+            script_cyrillic: None,
         })
     }
 
@@ -437,6 +463,8 @@ impl<'a> L5Generator<'a> {
             skipped_unseen: 0,
             converged: false,
             cycled: false,
+            bridges: 0,
+            syntax_run_max: 0,
             elapsed: std::time::Duration::ZERO,
         };
 
@@ -454,6 +482,10 @@ impl<'a> L5Generator<'a> {
         let window = self.cfg.window.max(1);
         let mut seen_ring: Vec<u32> = Vec::with_capacity(window);
         for token in tokenize(prompt) {
+            // Алфавит речи (RQ21): таблица мостов следует за промптом.
+            if self.script_cyrillic.is_none() {
+                self.script_cyrillic = Some(is_cyrillic_token(&token));
+            }
             let coord =
                 (fnv1a64(token.as_bytes()) % self.qc.d_pol() as u64) as u32;
             if !seen_ring.contains(&coord) {
@@ -470,6 +502,13 @@ impl<'a> L5Generator<'a> {
                 let pick = (self.rng.next_u64() % n as u64) as usize;
                 if let Some(c) = self.qc.lexicon_coord_at(pick) {
                     self.ring.push_back(c);
+                    // Алфавит затравки задаёт таблицу мостов свободной речи.
+                    if self.script_cyrillic.is_none() {
+                        self.script_cyrillic = self
+                            .qc
+                            .lexicon_token(c)
+                            .map(is_cyrillic_token);
+                    }
                 }
             }
         }
@@ -559,6 +598,68 @@ impl<'a> L5Generator<'a> {
             };
             consecutive_unseen = 0;
 
+            // ---- RQ21: грамматический мост ----
+            // Облако знаменательных слов зияет, и голос лотереи — снова
+            // знаменательный: перед ним вставляется коннектор синтаксиса
+            // (союз/предлог/связка), выбранный детерминированно по цепи.
+            // Мост — полноценный квант речи: Born-измерение, момент,
+            // сенсорное событие (коннектор входит в кольцо гироскопа и
+            // лексикон — грамматика прорастает в решётку). Мост — не
+            // последнее слово: за ним всегда следует выбранное слово
+            // (бюджет эмиссий проверен с запасом).
+            if self.cfg.syntax
+                && self.chain.bridge_due()
+                && syntax_class(&token) == SyntaxClass::Content
+                && report.steps.len() + 2 <= self.cfg.max_tokens
+            {
+                let cyr = self.script_cyrillic.unwrap_or(true);
+                let (btoken, bclass) = self.chain.next_bridge(cyr);
+                let bcoord =
+                    (fnv1a64(btoken.as_bytes()) % self.qc.d_pol() as u64) as u32;
+                let bp = self.qc.p_at(bcoord);
+                let bbit = if bp > 0.0 {
+                    false
+                } else if bp < 0.0 {
+                    true
+                } else {
+                    self.rng.next_f64() < 0.5
+                };
+                let bp_emp = if bbit { -1.0 } else { 1.0 };
+                self.qc.momentum_feedback(bcoord, bp_emp - bp);
+                let bsign: i8 = if bbit { -1 } else { 1 };
+                self.qc.observe_event(bcoord, bsign);
+                self.qc.observe_lexicon(btoken);
+                let bstats = self.qc.reasoning_step_mode(if free {
+                    TransportMode::Free
+                } else {
+                    TransportMode::Gated
+                })?;
+                self.push_ring(bcoord);
+                if !report.text.is_empty() {
+                    report.text.push(' ');
+                }
+                report.text.push_str(btoken);
+                report.steps.push(BornStep {
+                    coord: bcoord,
+                    token: btoken.to_string(),
+                    source: TicketSource::Bridge,
+                    tickets: 0,
+                    born_bit: bbit,
+                    moved: bstats.moved,
+                    theta_shift: bstats.theta_shift,
+                    morpheme: false,
+                });
+                report.bridges += 1;
+                self.chain.push(bclass);
+                self.script_cyrillic = Some(is_cyrillic_token(btoken));
+                if self.cfg.repeat_veto > 0 {
+                    self.veto.push_back(bcoord);
+                    while self.veto.len() > self.cfg.repeat_veto {
+                        self.veto.pop_front();
+                    }
+                }
+            }
+
             // Born-измерение фазы координаты: полюса детерминированы,
             // суперпозиция честной монетой. Измерение — физический акт:
             // градиент p_emp − p зажигает момент (инерция речи).
@@ -601,6 +702,18 @@ impl<'a> L5Generator<'a> {
                 morpheme,
             });
 
+            // RQ21: цепочка синтаксиса поглощает эмиссию (морфемы AOT —
+            // знаменательные: это кодовый скелет, не коннекторы).
+            let class = if morpheme {
+                SyntaxClass::Content
+            } else {
+                syntax_class(&report.steps.last().unwrap().token)
+            };
+            self.chain.push(class);
+            self.script_cyrillic = Some(is_cyrillic_token(
+                report.steps.last().unwrap().token.as_str(),
+            ));
+
             // Анти-заикание.
             if self.cfg.repeat_veto > 0 {
                 self.veto.push_back(coord);
@@ -610,8 +723,22 @@ impl<'a> L5Generator<'a> {
             }
         }
 
+        report.syntax_run_max = self.chain.max_run();
         report.elapsed = t0.elapsed();
         Ok(report)
+    }
+
+    /// Синтаксический множитель билета координаты (RQ21): класс слова
+    /// из лексикона × состояние цепочки. Синтаксис выключен или
+    /// координата вне лексикона — множитель 1 (чистая топология RQ17).
+    fn syntax_boost(&self, coord: u32) -> u32 {
+        if !self.cfg.syntax {
+            return 1;
+        }
+        match self.qc.lexicon_token(coord) {
+            Some(t) => self.chain.ticket_boost(syntax_class(t)),
+            None => 1,
+        }
     }
 
     /// Born-лотерея одного шага: каскад источников билетов.
@@ -630,6 +757,9 @@ impl<'a> L5Generator<'a> {
     fn born_lottery(&mut self) -> Option<(u32, TicketSource, usize)> {
         // Уровень 1+2: русла из кольца контекста. Внимание = членство
         // в кольце (моментные ворота — домен транспорта, не речи).
+        // RQ21: вес каждого русла умножается на синтаксический
+        // множитель цепочки (`syntax_boost`) — топология остаётся
+        // источником смысла, грамматика лишь перераспределяет шансы.
         let (mut total_down, mut total_up) = (0u64, 0u64);
         self.candidates.clear();
         for &c in self.ring.iter() {
@@ -642,7 +772,7 @@ impl<'a> L5Generator<'a> {
                 let k = (dir as i32) * (SIN_LUT[ci][cj] as i32);
                 // Крутящий момент русла: 0 — устоявшаяся связь, ±1 —
                 // напряжённая (суперпозиция на одном из концов).
-                let w = 1 + k.unsigned_abs();
+                let w = (1 + k.unsigned_abs()) * self.syntax_boost(n);
                 if dir > 0 {
                     if self.down[n as usize] == 0 {
                         self.candidates.push((n, 0));
@@ -685,7 +815,8 @@ impl<'a> L5Generator<'a> {
         // (E ≥ ε), лотерея прыгает на дуги продукта a ⊗_ε lattice —
         // метафора там, где русл J нет. Конфликт кричит весом 3,
         // согласие говорит весом 2, прозрачная память (фон метафоры)
-        // шепчет весом 1.
+        // шепчет весом 1. RQ21: билеты моста несут синтаксический
+        // множитель наравне с руслами.
         if !self.bridge.is_empty() {
             self.candidates.clear();
             let mut total: u64 = 0;
@@ -693,6 +824,7 @@ impl<'a> L5Generator<'a> {
                 if self.ring.contains(&c) || self.veto.contains(&c) {
                     continue;
                 }
+                let w = w * self.syntax_boost(c);
                 self.candidates.push((c, w));
                 total += w as u64;
             }
@@ -706,18 +838,32 @@ impl<'a> L5Generator<'a> {
         }
 
         // Уровень 4: кинетические дуги вне кольца — внутренний голос.
+        // RQ21: синтаксический множитель применяется и к кинетике
+        // (поля взяты явно — замыкание живёт в мире disjoint captures).
         self.candidates.clear();
         let ring = &self.ring;
         let veto = &self.veto;
+        let syntax = self.cfg.syntax;
+        let chain = &self.chain;
+        let lexicon = &self.qc;
         self.qc.for_each_kinetic_arc(|arc, _m| {
             if ring.contains(&arc) || veto.contains(&arc) {
                 return;
             }
-            // Одна координата — один билет за уровень.
-            if let Some(slot) = self.candidates.iter_mut().find(|s| s.0 == arc) {
-                slot.1 += 1;
+            // Одна координата — один билет за уровень (с множителем).
+            let w = if syntax {
+                let class = lexicon
+                    .lexicon_token(arc)
+                    .map(syntax_class)
+                    .unwrap_or(SyntaxClass::Content);
+                chain.ticket_boost(class)
             } else {
-                self.candidates.push((arc, 1));
+                1
+            };
+            if let Some(slot) = self.candidates.iter_mut().find(|s| s.0 == arc) {
+                slot.1 += w;
+            } else {
+                self.candidates.push((arc, w));
             }
         });
         let total: u64 = self.candidates.iter().map(|s| s.1 as u64).sum();
@@ -778,6 +924,7 @@ impl<'a> L5Generator<'a> {
 mod tests {
     use super::*;
     use crate::gyro_lattice::QuantizedGyroCurriculum;
+    use crate::syntax_bridge::BRIDGE_RUN;
 
     /// Микрокорпус с выраженным порядком слов: «квант» предшествует
     /// «фазе», «фаза» — «решётке». Русла дают нисходящий поток.
@@ -1143,5 +1290,256 @@ mod tests {
         assert!(m.starts_with("fn"));
         assert!(morpheme_at(0).is_none(), "слот 0 пуст");
         assert!(morpheme_at(256).is_none(), "вне таблицы — None");
+    }
+
+    // ===================== Грамматические мосты (RQ21) =====================
+
+    /// Корпус-цепочка из знаменательных слов БЕЗ служебных: облака
+    /// обязаны зиять, и синтаксису есть что соединять.
+    const SYNTAX_CORPUS: &str = "квант фаза решётка момент импульс кристалл \
+                                  память русло трит шаг волна полюс заряд спин \
+                                  энергия фотон поле гармоника \
+                                  решётка кристалл импульс волна русло заряд \
+                                  фотон полюс момент спин фаза трит память шаг \
+                                  энергия поле гармоника квант";
+
+    /// Корпус-цепочка латиницей: таблица мостов обязана переключиться
+    /// на английский синтаксис.
+    const SYNTAX_CORPUS_EN: &str = "photon energy lattice momentum crystal \
+                                     memory channel trit step wave pole charge \
+                                     spin field harmonic \
+                                     lattice crystal momentum wave channel charge \
+                                     photon pole momentum spin energy field trit memory";
+
+    /// Максимальный пробег знаменательных слов в тексте отчёта.
+    /// Терминальный пробег (речь уже закончилась — бюджет/сходимость)
+    /// не считается: мост обязан разрывать облако только там, где речь
+    /// продолжается (хвостовой коннектор без слова запрещён).
+    fn max_content_run(rep: &GenerationReport) -> usize {
+        let classes: Vec<SyntaxClass> = rep
+            .steps
+            .iter()
+            .map(|s| {
+                if s.morpheme {
+                    SyntaxClass::Content
+                } else {
+                    syntax_class(&s.token)
+                }
+            })
+            .collect();
+        let last_is_content = classes.last() == Some(&SyntaxClass::Content);
+        // Отрезаем терминальный пробег до первого служебного с конца.
+        let mid = if last_is_content {
+            let cut = classes
+                .iter()
+                .rposition(|c| *c != SyntaxClass::Content)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            &classes[..cut]
+        } else {
+            &classes[..]
+        };
+        let mut run = 0usize;
+        let mut max = 0usize;
+        for c in mid {
+            if *c == SyntaxClass::Content {
+                run += 1;
+                max = max.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        max
+    }
+
+    #[test]
+    fn syntax_off_by_default_keeps_r17_topology() {
+        // Библиотечный дефолт — чистая топология RQ17: мосты выключены,
+        // обратная совместимость контракта генерации.
+        let c = GeneratorConfig::default();
+        assert!(!c.syntax, "библиотечный дефолт RQ21: syntax = false");
+
+        let mut qc = trained_engine();
+        let cfg = GeneratorConfig {
+            max_tokens: 16,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        assert_eq!(rep.bridges, 0, "мосты выключены — вставок нет");
+        for step in &rep.steps {
+            assert_ne!(step.source, TicketSource::Bridge);
+            // Корпус без служебных слов — их не может быть и в речи.
+            assert_ne!(syntax_class(&step.token), SyntaxClass::Conjunction);
+        }
+    }
+
+    #[test]
+    fn syntax_bridges_break_content_clouds() {
+        // ТЗ RQ21: генерация из ассоциативного облака переходит в
+        // выстроенные предложения — облако не длиннее BRIDGE_RUN,
+        // между облаками — коннекторы русской таблицы.
+        let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 8).unwrap();
+        for _ in 0..3 {
+            qc.ingest(SYNTAX_CORPUS, 1).unwrap();
+        }
+        let cfg = GeneratorConfig {
+            syntax: true,
+            max_tokens: 40,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("квант").unwrap();
+
+        assert!(rep.steps.len() >= 6, "речь обязана разойтись: {rep:?}");
+        assert!(rep.bridges >= 1, "мосты обязаны вставляться: {rep:?}");
+        assert_eq!(
+            rep.bridges,
+            rep.steps
+                .iter()
+                .filter(|s| s.source == TicketSource::Bridge)
+                .count(),
+            "счётчик мостов совпадает с шагами Bridge"
+        );
+        // Инвариант связности: облако знаменательных слов не длиннее
+        // BRIDGE_RUN — предложение склеено коннекторами.
+        assert!(
+            max_content_run(&rep) <= BRIDGE_RUN,
+            "облако прорвалось: run={}, text={}",
+            max_content_run(&rep),
+            rep.text
+        );
+        // Пик цепи ≤ BRIDGE_RUN + 1: терминальному облаку мост не нужен
+        // (за ним речи уже нет — хвостовой коннектор запрещён).
+        assert!(rep.syntax_run_max <= BRIDGE_RUN + 1);
+        // Мосты — слова русской таблицы (кириллица), не латиница.
+        for step in rep.steps.iter().filter(|s| s.source == TicketSource::Bridge) {
+            assert!(is_cyrillic_token(&step.token), "мост {step:?} не русский");
+            assert_ne!(syntax_class(&step.token), SyntaxClass::Content);
+        }
+        // Мост не может быть последним словом (за ним следует выбранное).
+        if let Some(last) = rep.steps.last() {
+            if last.source == TicketSource::Bridge {
+                assert!(
+                    rep.converged || rep.cycled,
+                    "хвостовой мост без причины: {rep:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_english_table_for_latin_speech() {
+        // Латинский промпт и лексикон — мосты из английской таблицы.
+        let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 8).unwrap();
+        for _ in 0..3 {
+            qc.ingest(SYNTAX_CORPUS_EN, 1).unwrap();
+        }
+        let cfg = GeneratorConfig {
+            syntax: true,
+            max_tokens: 40,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("photon").unwrap();
+
+        assert!(rep.steps.len() >= 6, "EN-речь обязана разойтись");
+        assert!(rep.bridges >= 1, "мосты обязаны вставляться: {rep:?}");
+        assert!(max_content_run(&rep) <= BRIDGE_RUN);
+        const EN_BRIDGES: [&str; 8] = ["and", "but", "or", "in", "on", "is", "when", "so"];
+        for step in rep.steps.iter().filter(|s| s.source == TicketSource::Bridge) {
+            assert!(
+                EN_BRIDGES.contains(&step.token.as_str()),
+                "мост не из EN-таблицы: {step:?}"
+            );
+            assert!(!is_cyrillic_token(&step.token));
+        }
+    }
+
+    #[test]
+    fn syntax_speech_is_deterministic_by_seed() {
+        let run = |seed: u64| {
+            let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 8).unwrap();
+            for _ in 0..3 {
+                qc.ingest(SYNTAX_CORPUS, 1).unwrap();
+            }
+            let cfg = GeneratorConfig {
+                syntax: true,
+                seed,
+                max_tokens: 32,
+                ..GeneratorConfig::default()
+            };
+            let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+            gen.generate("квант").unwrap()
+        };
+        let a = run(7);
+        let b = run(7);
+        assert_eq!(a.text, b.text);
+        assert_eq!(a.bridges, b.bridges);
+        assert_eq!(a.steps.len(), b.steps.len());
+    }
+
+    #[test]
+    fn syntax_grows_grammar_into_lattice() {
+        // Грамматика прорастает в решётку: произнесённые коннекторы
+        // становятся словами лексикона (мост → координата → лотерея).
+        let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 8).unwrap();
+        for _ in 0..3 {
+            qc.ingest(SYNTAX_CORPUS, 1).unwrap();
+        }
+        let lex_before = qc.lexicon_len();
+        let cfg = GeneratorConfig {
+            syntax: true,
+            max_tokens: 40,
+            ..GeneratorConfig::default()
+        };
+        let rep = {
+            let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+            gen.generate("квант").unwrap()
+        };
+        assert!(rep.bridges >= 1);
+
+        // Каждый произнесённый мост стал доминантом своей координаты.
+        let d = qc.d_pol() as u64;
+        for step in rep.steps.iter().filter(|s| s.source == TicketSource::Bridge) {
+            let coord = (fnv1a64(step.token.as_bytes()) % d) as u32;
+            assert_eq!(
+                qc.lexicon_token(coord),
+                Some(step.token.as_str()),
+                "мост «{}» не пророс в лексикон",
+                step.token
+            );
+        }
+        assert!(qc.lexicon_len() > lex_before, "словарь вырос от речи");
+    }
+
+    #[test]
+    fn syntax_respects_max_tokens_with_bridge_headroom() {
+        // Мост не съедает последнее место: за мостом всегда следует
+        // слово — бюджета хватает с запасом (шагов не больше потолка).
+        let trained = || {
+            let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 8).unwrap();
+            for _ in 0..3 {
+                qc.ingest(SYNTAX_CORPUS, 1).unwrap();
+            }
+            qc
+        };
+        for ceiling in [6usize, 8, 12, 24] {
+            let mut qc = trained();
+            let cfg = GeneratorConfig {
+                syntax: true,
+                max_tokens: ceiling,
+                ..GeneratorConfig::default()
+            };
+            let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+            let rep = gen.generate("квант").unwrap();
+            assert!(rep.steps.len() <= ceiling, "потолок {ceiling} пробит");
+            let bridges = rep
+                .steps
+                .iter()
+                .filter(|s| s.source == TicketSource::Bridge)
+                .count();
+            assert!(bridges <= rep.bridges);
+        }
     }
 }
