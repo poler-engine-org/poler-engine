@@ -153,7 +153,7 @@ pub fn archetype_energy(co_support: usize, nnz_a: usize, nnz_b: usize) -> f64 {
 /// Лейн `k` занимает биты `2k..2k+1`; коды `1` (Pos) и `2` (Neg)
 /// имеют хотя бы один установленный бит, `0` (Zero) — нет.
 #[inline]
-fn nonzero_lanes(x: u8) -> u8 {
+pub(crate) fn nonzero_lanes(x: u8) -> u8 {
     (x | (x >> 1)) & 0b0101_0101
 }
 

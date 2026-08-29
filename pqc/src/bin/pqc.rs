@@ -47,6 +47,7 @@ USAGE:
     pqc chat --brain F [opts]                                  RQ17: REPL-диалог (сохранение на выходе)
     pqc archetype (--brain F [--prompt T|--with F]) [opts]     RQ18: мозг ⊗_ε промпт/мозг
     pqc learn «ТЕМА» --brain F [opts]                          RQ19: интернет-ингест (TLS 1.3 zero-dep)
+    pqc merge A.pqw B.pqw --out M.pqw [opts]                  RQ20: слияние мозгов ⊗_ε → v4
 
 ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию, файл 285;
                           --f32 — исследовательская схема RQ12):
@@ -190,6 +191,19 @@ LEARN OPTIONS (RQ19: pqc learn \"ТЕМА\" — целенаправленный
                               без сети (тема = заголовок)
     --json                    машинно-читаемый отчёт (zero-dep JSON)
 
+MERGE OPTIONS (RQ20: pqc merge — архетипическое слияние мозгов;
+              фазы c = a ⊗_ε b (таблица без гейта — объединение
+              знаний), русла J = Π_Λ(J_A + J_B) с кососимметричностью,
+              консолидация LEXI; born-консолидация в контейнер):
+    --out <F>                контейнер слитого мозга (обязателен)
+    --eps <F>                порог диагностики изоморфизма ∈ (0,1]
+                              (default 0.5; гейт НЕ заперт — слияние
+                              объединяет даже ортогональные домены)
+    --ask <ВОПРОС>           проверка мульти-доменного мышления сразу
+                              после слияния (без записи в мозг)
+    --seed <S>               сид Born-лотереи --ask (default 42)
+    --json                   машинно-читаемый отчёт (zero-dep JSON)
+
 INSPECT OPTIONS (дополнительно):
     --modes <N>               RQ10: число резонансных мод Im(P) для v3 (default 8)
                               RQ11: моды печатаются с невязками Ritz (инвариантность
@@ -238,6 +252,7 @@ fn main() {
         Some("chat") => cmd_ask(&args[1..], true),
         Some("archetype") => cmd_archetype(&args[1..]),
         Some("learn") => cmd_learn(&args[1..]),
+        Some("merge") => cmd_merge(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -4128,6 +4143,7 @@ fn cmd_train(args: &[String]) -> i32 {
 use pqc::archetype_lattice::{archetype_product_packed4, DEFAULT_BRIDGE_EPS};
 use pqc::generate::{GenerationReport, GeneratorConfig, L5Generator};
 use pqc::gyro_lattice::QuantizedGyroCurriculum;
+use pqc::merge::{merge_brains, MergeConfig};
 
 /// Общая конфигурация команд генерации.
 struct GenConfig {
@@ -4885,6 +4901,265 @@ fn cmd_learn(args: &[String]) -> i32 {
         }
         println!("\nпроверка: pqc ask \"{}\" --brain {path}", cfg.topic);
     }
+    0
+}
+
+// ============================================================================
+// RQ20: pqc merge — архетипическое слияние мозгов
+// ============================================================================
+
+fn merge_usage_err(msg: &str) -> i32 {
+    eprintln!("pqc merge: {msg}");
+    eprintln!("формат: pqc merge BRAIN_A.pqw BRAIN_B.pqw --out MERGED.pqw [--ask Q]");
+    2
+}
+
+/// `pqc merge A.pqw B.pqw --out M.pqw`: слияние знаний двух мозгов —
+/// фазы `c = a ⊗_ε b` (таблица интерференции без гейта: прозрачность
+/// объединяет, конфликты аннигилируют), русла `J = Π_Λ(J_A + J_B)`
+/// (кососимметричность по построению), лексиконы LEXI консолидируются
+/// (A — база, B заполняет пустые координаты). Born-консолидация:
+/// продукт пишется бит-в-бит в контейнер v4/v3/v2.
+/// Живая проверка слитого мозга: ответ на вопрос без записи в
+/// контейнер (байты слияния остаются детерминированными).
+fn merge_ask(merged: &[u8], question: &str, seed: u64) -> Result<String, String> {
+    let reader = pqw::PqwReader::from_bytes(merged).map_err(|e| format!("слитый мозг: {e}"))?;
+    let window = reader
+        .gyro()
+        .map(|g| g.window().max(1) as usize)
+        .unwrap_or(GEN_INLINE_WINDOW);
+    let eps = reader.hyperparams().epsilon_threshold;
+    let mut engine =
+        QuantizedGyroCurriculum::new(reader.d_pol(), eps, seed, window).map_err(|e| e.to_string())?;
+    engine
+        .resume_from_reader(&reader)
+        .map_err(|e| format!("resume: {e}"))?;
+    let gcfg = GeneratorConfig {
+        think_steps: 4,
+        max_tokens: 24,
+        window: engine.gyro_window(),
+        seed,
+        ..GeneratorConfig::default()
+    };
+    let mut gen = L5Generator::new(&mut engine, gcfg).map_err(|e| e.to_string())?;
+    gen.generate(question).map(|rep| rep.text).map_err(|e| e.to_string())
+}
+
+fn cmd_merge(args: &[String]) -> i32 {
+    let mut brains: Vec<String> = Vec::new();
+    let mut out: Option<String> = None;
+    let mut eps = DEFAULT_BRIDGE_EPS;
+    let mut ask: Option<String> = None;
+    let mut seed = 42u64;
+    let mut json = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].clone();
+        let mut val = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("нет значения у {name}"))
+        };
+        match a.as_str() {
+            "--out" => match val("--out") {
+                Ok(v) => out = Some(v),
+                Err(e) => return merge_usage_err(&e),
+            },
+            "--eps" => match val("--eps")
+                .map_err(|_| ())
+                .and_then(|v| v.parse::<f64>().map_err(|_| ()))
+            {
+                Ok(e) if e.is_finite() && e > 0.0 && e <= 1.0 => eps = e,
+                _ => return merge_usage_err("--eps: порог диагностики изоморфизма ∈ (0, 1]"),
+            },
+            "--ask" => match val("--ask") {
+                Ok(v) => ask = Some(v),
+                Err(e) => return merge_usage_err(&e),
+            },
+            "--seed" => match val("--seed").unwrap_or_default().parse::<u64>() {
+                Ok(s) => seed = s,
+                _ => return merge_usage_err("--seed: целое u64"),
+            },
+            "--json" => json = true,
+            _ if !a.starts_with("--") && brains.len() < 2 => brains.push(a),
+            _ => return merge_usage_err(&format!("неизвестная опция: {a}")),
+        }
+        i += 1;
+    }
+    let err = |m: &str| -> i32 {
+        eprintln!("pqc merge: {m}");
+        2
+    };
+    if brains.len() != 2 {
+        return err("нужно два мозга: pqc merge A.pqw B.pqw --out M.pqw");
+    }
+    let Some(out_path) = out else {
+        return err("нужен --out M.pqw (контейнер слитого мозга)");
+    };
+
+    // Мозги.
+    let (path_a, path_b) = (&brains[0], &brains[1]);
+    let src_a = match load(path_a) {
+        Ok(s) => s,
+        Err(e) => return err(&format!("{path_a}: {e}")),
+    };
+    let src_b = match load(path_b) {
+        Ok(s) => s,
+        Err(e) => return err(&format!("{path_b}: {e}")),
+    };
+
+    // Слияние: c = a ⊗_ε b, J = Π_Λ(J_A + J_B), LEXI-консолидация.
+    let cfg = MergeConfig { eps };
+    let (merged, report) =
+        match merge_brains(src_a.as_slice(), src_b.as_slice(), &cfg) {
+            Ok(x) => x,
+            Err(e) => return err(&e),
+        };
+    if let Err(e) = std::fs::write(&out_path, &merged) {
+        return err(&format!("запись {out_path}: {e}"));
+    }
+
+    // Живая проверка мульти-доменного мышления (без записи в мозг:
+    // байты слияния детерминированы только входами A и B).
+    let answer = match ask.as_deref().filter(|q| !q.trim().is_empty()) {
+        Some(q) => match merge_ask(&merged, q, seed) {
+            Ok(text) => Some((q.to_string(), text)),
+            Err(e) => return err(&e),
+        },
+        None => None,
+    };
+
+    if json {
+        let mut j = vec![
+            (
+                "brain_a".into(),
+                Json::Obj(vec![
+                    ("path".into(), Json::str(path_a)),
+                    ("d_pol".into(), Json::num(report.d_pol as f64)),
+                    ("nnz".into(), Json::num(report.nnz_a as f64)),
+                    ("channels".into(), Json::num(report.channels_a as f64)),
+                    ("lexicon".into(), Json::num(report.lexicon_a as f64)),
+                ]),
+            ),
+            (
+                "brain_b".into(),
+                Json::Obj(vec![
+                    ("path".into(), Json::str(path_b)),
+                    ("nnz".into(), Json::num(report.nnz_b as f64)),
+                    ("channels".into(), Json::num(report.channels_b as f64)),
+                    ("lexicon".into(), Json::num(report.lexicon_b as f64)),
+                ]),
+            ),
+            (
+                "phases".into(),
+                Json::Obj(vec![
+                    ("co_support".into(), Json::num(report.co_support as f64)),
+                    ("resonance".into(), Json::num(report.resonance as f64)),
+                    ("conflict".into(), Json::num(report.conflict as f64)),
+                    ("energy".into(), Json::num(report.energy)),
+                    ("isomorphic".into(), Json::Bool(report.isomorphic)),
+                    ("nnz_merged".into(), Json::num(report.nnz_merged as f64)),
+                ]),
+            ),
+            (
+                "channels".into(),
+                Json::Obj(vec![
+                    ("merged".into(), Json::num(report.channels_merged as f64)),
+                    ("shared".into(), Json::num(report.channels_shared as f64)),
+                    (
+                        "annihilated".into(),
+                        Json::num(report.channels_annihilated as f64),
+                    ),
+                    ("window".into(), Json::num(report.window as f64)),
+                    ("ticks".into(), Json::num(report.ticks_merged as f64)),
+                ]),
+            ),
+            (
+                "lexicon".into(),
+                Json::Obj(vec![
+                    ("merged".into(), Json::num(report.lexicon_merged as f64)),
+                    (
+                        "collisions".into(),
+                        Json::num(report.lexicon_collisions as f64),
+                    ),
+                ]),
+            ),
+            (
+                "container".into(),
+                Json::Obj(vec![
+                    ("version".into(), Json::num(report.container as f64)),
+                    ("path".into(), Json::str(&out_path)),
+                    ("bytes".into(), Json::num(report.brain_bytes as f64)),
+                ]),
+            ),
+            ("eps".into(), Json::num(eps)),
+        ];
+        if let Some((q, text)) = &answer {
+            j.push((
+                "ask".into(),
+                Json::Obj(vec![
+                    ("question".into(), Json::str(q)),
+                    ("answer".into(), Json::str(text)),
+                ]),
+            ));
+        }
+        println!("{}", Json::Obj(j).to_string());
+        return 0;
+    }
+
+    println!("POLER Quantum Core — Merge (RQ20): merged = A ⊗_ε B — рождение единого разума");
+    println!(
+        "мозг A  : {path_a} (d_pol={}, носитель {} дуг, русла {}, слов {})",
+        report.d_pol, report.nnz_a, report.channels_a, report.lexicon_a
+    );
+    println!(
+        "мозг B  : {path_b} (носитель {} дуг, русла {}, слов {})",
+        report.nnz_b, report.channels_b, report.lexicon_b
+    );
+    println!(
+        "фазы    : c = a ⊗_ε b — резонанс {}, конфликт {} (аннигиляция в открытый вопрос), \
+         прозрачный проход {} (уникальное каждого)",
+        report.resonance, report.conflict, report.nnz_merged - report.resonance
+    );
+    println!(
+        "          носитель слитого мозга: {} дуг — объединение знаний",
+        report.nnz_merged
+    );
+    println!(
+        "изоморфизм: E = co/min(nnz) = {:.3} {} {} — {}",
+        report.energy,
+        if report.energy >= eps { "≥" } else { "<" },
+        eps,
+        if report.isomorphic {
+            "мозги структурно изоморфны (глубокая общность)"
+        } else {
+            "домены почти ортогональны (слияние всё равно объединяет)"
+        }
+    );
+    println!(
+        "русла   : J = Π_Λ(J_A + J_B) — {} каналов (общих пар {}, встречной циркуляции погашено {}), \
+         кососимметричность сохранена",
+        report.channels_merged, report.channels_shared, report.channels_annihilated
+    );
+    println!(
+        "лексикон: {} слов (коллизий доминант {} — победа мозга A), окно W={}, тактов {}",
+        report.lexicon_merged, report.lexicon_collisions, report.window, report.ticks_merged
+    );
+    println!(
+        "сохранено: {out_path} → v{} контейнер ({} Б)",
+        report.container, report.brain_bytes
+    );
+    if let Some((q, text)) = &answer {
+        println!("\nвопрос  : {q}");
+        println!(
+            "ответ   : {}",
+            if text.is_empty() { "(молчание)" } else { text }
+        );
+    }
+    println!(
+        "\nпроверка: pqc ask \"вопрос на стыке дисциплин\" --brain {out_path}"
+    );
     0
 }
 
