@@ -8,6 +8,33 @@
 //! карта — [лексикон](LexiconBuilder) кристалла, накопленный во время
 //! обучения: доминантный токен на координату.
 //!
+//! ## RQ22: фокусировка волны и релевантность
+//!
+//! RQ17–RQ21 оставили волну свободной: ассоциации ведут речь куда
+//! угодно, и ответ на вопрос мог уйти в посторонние ветки решётки.
+//! RQ22 направляет волну **от дуг вопроса**:
+//!
+//! ```text
+//!   промпт ──▶ p₀: дуги вопроса зажжены (TF-IDF + кинетика внимания)
+//!        │        аттрактор = дуги свидетельства после ε-ворот
+//!        ▼
+//!   мышление: Π_Λ(e^{Δt·J} p) — транспорт течёт по зажжённым дугам
+//!        ▼
+//!   речь: лотерея × фокус-множитель BFS-дистанции до аттрактора
+//!        │   dist 0 → ×4, 1 → ×3, 2 → ×2, 3..radius → ×1,
+//!        │   вне радиуса → ×0 (посторонние ветки отсечены)
+//!        │   русл в радиусе нет → шаг блуждания (честный фолбэк)
+//!        ▼
+//!   релевантность = доля шагов в фокусе (телеметрия ответа)
+//! ```
+//!
+//! Грамматика **самоподкрепляется**: удачно вставленный коннектор
+//! (мост RQ21, за которым гарантированно следует знаменательное
+//! слово) получает второй направленный свидетель — русло коннектора
+//! насыщается за одну реплику, а кинетика внимания делает его путём
+//! волны. Мозг учится говорить связно через собственную речь
+//! (метрика: `syntax_bridges_density` — мостов на 100 слов).
+//!
 //! ## Физика речи: Born-блуждание по руслам J
 //!
 //! ```text
@@ -21,6 +48,7 @@
 //!   │ кольцо контекста → билеты по нисходящим руслам J    │
 //!   │   вес = 1 + |крутящий момент|: устоявшаяся связь    │
 //!   │   говорит (1), напряжённая — кричит (2)             │
+//!   │ × синтаксис (RQ21) × фокус аттрактора (RQ22)        │
 //!   │ Born-лотерея (целые билеты, ноль FPU) → координата  │
 //!   │ лексикон: координата → слово                        │
 //!   │ эмиссия = сенсорное событие: gyro.observe(coord,±1) │
@@ -88,6 +116,18 @@ use crate::syntax_unfolder::morpheme_at;
 /// Потолок длины токена для лексикона: прогоны длиннее — шум
 /// (канонический предел секции — 255 байт, уходим с запасом).
 pub const LEXICON_TOKEN_MAX: usize = 64;
+
+/// Радиус фокуса по умолчанию в CLI (маршрутизация волны включена).
+pub const DEFAULT_FOCUS_RADIUS: usize = 3;
+
+/// Радиус метрики релевантности при выключенной маршрутизации:
+/// телеметрия считается всегда — показывает, насколько свободная
+/// речь держится темы.
+const FOCUS_METRIC_RADIUS: usize = 3;
+
+/// Максимум радиуса фокуса (BFS по руслам — радиус больше 8
+/// обесценивает отсечку: почти вся решётка достигаема).
+pub const FOCUS_RADIUS_MAX: usize = 8;
 
 // ===================== Лексикон-строитель =====================
 
@@ -268,6 +308,20 @@ pub struct GeneratorConfig {
     /// Выключено по умолчанию — чистая ассоциативная топология RQ17
     /// (CLI включает: `--no-syntax` снимает).
     pub syntax: bool,
+    /// Радиус фокуса волны RQ22: маршрутизация речи от дуг вопроса.
+    /// `0` — выключено (свободное блуждание RQ17/RQ21);
+    /// `1..=[`FOCUS_RADIUS_MAX`]` — кандидаты лотареи вне BFS-радиуса
+    /// от аттрактора вопроса отсекаются (вес ×0), близкие — усиливаются
+    /// (dist 0 → ×4, 1 → ×3, 2 → ×2). Библиотечный дефолт — `0`
+    /// (совместимость RQ17); CLI включает `3` (`--no-focus` снимает).
+    pub focus_radius: usize,
+    /// Самоподкрепление грамматики RQ22: удачно вставленные
+    /// коннекторы (мосты RQ21, за которыми следует знаменательное
+    /// слово) укрепляют свои русла `J` — второй направленный свидетель
+    /// (насыщение русла за одну реплику) + кинетика внимания
+    /// (коннектор — путь волны). Библиотечный дефолт — `false`;
+    /// CLI включает (`--no-reinforce` снимает).
+    pub reinforce: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -283,6 +337,8 @@ impl Default for GeneratorConfig {
             bridge: true,
             bridge_eps: DEFAULT_BRIDGE_EPS,
             syntax: false,
+            focus_radius: 0,
+            reinforce: false,
         }
     }
 }
@@ -371,6 +427,28 @@ pub struct GenerationReport {
     /// Пик облака знаменательных слов (телеметрия связности;
     /// с синтаксисом не превышает [`crate::syntax_bridge::BRIDGE_RUN`]).
     pub syntax_run_max: usize,
+    /// RQ22: плотность грамматических мостов — вставленных коннекторов
+    /// на 100 сгенерированных слов (метрика связности речи; здоровая
+    /// связная речь ≈ 15–25).
+    pub syntax_bridges_density: f64,
+    /// RQ22: коннекторов подкреплено (русла J укреплены —
+    /// самоподкрепление грамматики).
+    pub reinforced: usize,
+    /// RQ22: дуг вопроса в аттракторе (семантическое ядро промпта).
+    pub attractor_arcs: usize,
+    /// RQ22: радиус фокуса, применённый при маршрутизации
+    /// (`0` — маршрутизация выключена).
+    pub focus_radius: usize,
+    /// RQ22: маршрутизация волны была активна (аттрактор непуст).
+    pub focus_active: bool,
+    /// RQ22: шагов речи в фокусе (BFS-дистанция до аттрактора
+    /// ≤ радиуса метрики).
+    pub focused_steps: usize,
+    /// RQ22: шагов речи вне фокуса (блуждание/фолбэк).
+    pub wander_steps: usize,
+    /// RQ22: релевантность ответа — доля шагов в фокусе `[0, 1]`
+    /// (пустая речь — `1.0`: нечему блуждать).
+    pub relevance: f64,
     /// Сквозная задержка.
     pub elapsed: std::time::Duration,
 }
@@ -412,6 +490,16 @@ pub struct L5Generator<'a> {
     /// Алфавит речи (кириллица ↔ латиница) по последнему слову —
     /// таблица мостов RU/EN.
     script_cyrillic: Option<bool>,
+    /// RQ22: BFS-дистанция каждой координаты до аттрактора вопроса
+    /// (по руслам J, оба направления; `u8::MAX` — вне радиуса).
+    /// Пуста, когда фокус выключен или аттрактора нет.
+    dist: Vec<u8>,
+    /// RQ22: маршрутизация волны активна (аттрактор непуст и
+    /// `focus_radius > 0`).
+    focus_on: bool,
+    /// RQ22: радиус метрики релевантности (радиус маршрутизации при
+    /// активном фокусе, иначе `FOCUS_METRIC_RADIUS`).
+    metric_radius: usize,
 }
 
 impl<'a> L5Generator<'a> {
@@ -427,6 +515,7 @@ impl<'a> L5Generator<'a> {
             adj[j as usize].push((i, -dir));
         }
         let window = cfg.window.max(1);
+        let focus_on = cfg.focus_radius > 0;
         Ok(L5Generator {
             qc,
             cfg,
@@ -440,6 +529,9 @@ impl<'a> L5Generator<'a> {
             veto: VecDeque::with_capacity(cfg.repeat_veto + 1),
             chain: SyntaxChain::new(),
             script_cyrillic: None,
+            dist: Vec::new(),
+            focus_on,
+            metric_radius: FOCUS_METRIC_RADIUS,
         })
     }
 
@@ -465,17 +557,27 @@ impl<'a> L5Generator<'a> {
             cycled: false,
             bridges: 0,
             syntax_run_max: 0,
+            syntax_bridges_density: 0.0,
+            reinforced: 0,
+            attractor_arcs: 0,
+            focus_radius: 0,
+            focus_active: false,
+            focused_steps: 0,
+            wander_steps: 0,
+            relevance: 1.0,
             elapsed: std::time::Duration::ZERO,
         };
 
         // ---- Фаза A: слушание промпта ----
         // Токены входят в кольцо гироскопа (каналы вопроса копятся),
         // свидетельство TF-IDF зажигает момент — БЕЗ born-кристаллизации:
-        // вопрос — вход, а не знание.
-        let (arcs, ignited, tokens) = self.qc.listen_ignite(prompt);
+        // вопрос — вход, а не знание. RQ22: дуги свидетельства —
+        // семантический аттрактор волны (p₀).
+        let (attractor, ignited, tokens) = self.qc.listen_ignite_arcs(prompt);
         report.prompt_tokens = tokens;
-        report.prompt_arcs = arcs;
+        report.prompt_arcs = attractor.len();
         report.ignited = ignited;
+        report.attractor_arcs = attractor.len();
 
         // Кольцо контекста: координаты промпта в порядке появления,
         // без повторов, с потолком окна.
@@ -510,6 +612,39 @@ impl<'a> L5Generator<'a> {
                             .map(is_cyrillic_token);
                     }
                 }
+            }
+        }
+
+        // ---- Фаза A1: аттрактор вопроса (RQ22) ----
+        // Дуги TF-IDF свидетельства — семантическое ядро вопроса. Если
+        // вопрос мозгу незнаком (дуг нет), аттрактором становятся
+        // сырые координаты токенов — фокус держится хотя бы на
+        // окрестности вопроса. Пустой промпт — аттрактора нет:
+        // свободная речь блуждает по-честному.
+        let mut attractor = attractor;
+        if attractor.is_empty() && !seen_ring.is_empty() {
+            attractor = seen_ring.clone();
+            report.attractor_arcs = attractor.len();
+        }
+        if !attractor.is_empty() {
+            let radius = self.cfg.focus_radius;
+            self.metric_radius = if radius > 0 { radius } else { FOCUS_METRIC_RADIUS };
+            if self.focus_on {
+                // BFS по руслам J от аттрактора: дистанция каждой
+                // достижимой координаты (обе стороны русла — волна
+                // течёт в обе стороны).
+                self.dist = Self::attractor_distances(&self.adj, &attractor, radius);
+                report.focus_active = true;
+                report.focus_radius = radius;
+            } else {
+                // Маршрутизация выключена — метрика релевантности
+                // всё равно считается (насколько свободная речь
+                // держится темы).
+                self.dist = Self::attractor_distances(
+                    &self.adj,
+                    &attractor,
+                    self.metric_radius,
+                );
             }
         }
 
@@ -628,6 +763,16 @@ impl<'a> L5Generator<'a> {
                 self.qc.momentum_feedback(bcoord, bp_emp - bp);
                 let bsign: i8 = if bbit { -1 } else { 1 };
                 self.qc.observe_event(bcoord, bsign);
+                // RQ22: самоподкрепление грамматики — коннектор удачен
+                // по построению (за ним в этой же итерации последует
+                // выбранное знаменательное слово: бюджет проверен с
+                // запасом). Второй направленный свидетель насыщает русла
+                // коннектора сразу (кольцо ещё не содержит следующего
+                // слова — реверсивных пар нет), а кинетика внимания
+                // делает дугу коннектора путём волны.
+                if self.cfg.reinforce {
+                    self.qc.observe_reinforcement(bcoord, bsign);
+                }
                 self.qc.observe_lexicon(btoken);
                 let bstats = self.qc.reasoning_step_mode(if free {
                     TransportMode::Free
@@ -650,6 +795,9 @@ impl<'a> L5Generator<'a> {
                     morpheme: false,
                 });
                 report.bridges += 1;
+                if self.cfg.reinforce {
+                    report.reinforced += 1;
+                }
                 self.chain.push(bclass);
                 self.script_cyrillic = Some(is_cyrillic_token(btoken));
                 if self.cfg.repeat_veto > 0 {
@@ -702,6 +850,14 @@ impl<'a> L5Generator<'a> {
                 morpheme,
             });
 
+            // RQ22: телеметрия фокуса — держит ли шаг речь возле
+            // аттрактора вопроса (BFS-дистанция по руслам J).
+            if self.focus_step(coord) {
+                report.focused_steps += 1;
+            } else {
+                report.wander_steps += 1;
+            }
+
             // RQ21: цепочка синтаксиса поглощает эмиссию (морфемы AOT —
             // знаменательные: это кодовый скелет, не коннекторы).
             let class = if morpheme {
@@ -724,8 +880,89 @@ impl<'a> L5Generator<'a> {
         }
 
         report.syntax_run_max = self.chain.max_run();
+        // RQ22: плотность грамматических мостов — метрика связности
+        // (мостов на 100 сгенерированных слов) и релевантность ответа
+        // (доля шагов в фокусе аттрактора).
+        let words = report.steps.len();
+        report.syntax_bridges_density = if words > 0 {
+            report.bridges as f64 * 100.0 / words as f64
+        } else {
+            0.0
+        };
+        let total = report.focused_steps + report.wander_steps;
+        report.relevance = if total > 0 {
+            report.focused_steps as f64 / total as f64
+        } else {
+            1.0
+        };
         report.elapsed = t0.elapsed();
         Ok(report)
+    }
+
+    /// RQ22: шаг в фокусе аттрактора? BFS-дистанция координаты до дуг
+    /// вопроса не превышает радиуса метрики. Без аттрактора (свободная
+    /// речь) — `true`: нечему блуждать. Мосты-коннекторы не считаются:
+    /// релевантность меряет, куда идёт **волна** (выборы лотареи),
+    /// а не синтаксический клей.
+    fn focus_step(&self, coord: u32) -> bool {
+        if self.dist.is_empty() {
+            return true;
+        }
+        let d = self.dist[coord as usize];
+        d != u8::MAX && d as usize <= self.metric_radius
+    }
+
+    /// RQ22: BFS-дистанции от аттрактора по руслам `J` (обе стороны
+    /// русла: волна течёт вперёд и возвращается). `u8::MAX` — координата
+    /// за радиусом (недостижима). Аттрактор — дистанция 0. Радиус
+    /// клампится до 250: `d + 1` не должен столкнуться с сентинелом
+    /// `u8::MAX`.
+    fn attractor_distances(
+        adj: &[Vec<(u32, i8)>],
+        attractor: &[u32],
+        radius: usize,
+    ) -> Vec<u8> {
+        let radius = radius.min(250);
+        let mut dist = vec![u8::MAX; adj.len()];
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        for &c in attractor {
+            let idx = c as usize;
+            if idx < dist.len() && dist[idx] == u8::MAX {
+                dist[idx] = 0;
+                queue.push_back(c);
+            }
+        }
+        while let Some(c) = queue.pop_front() {
+            let d = dist[c as usize];
+            // Не расширяем дальше радиуса: всё за ним — «далеко».
+            if d as usize >= radius {
+                continue;
+            }
+            for &(n, _dir) in &adj[c as usize] {
+                if dist[n as usize] == u8::MAX {
+                    dist[n as usize] = d + 1;
+                    queue.push_back(n);
+                }
+            }
+        }
+        dist
+    }
+
+    /// RQ22: множитель фокуса координаты. В фокусированном проходе:
+    /// дист. 0 → ×4, 1 → ×3, 2 → ×2, дальше в радиусе → ×1,
+    /// за радиусом → ×0 (посторонняя ветка отсечена). В свободном
+    /// проходе — ×1 всегда (чистая топология RQ17/RQ21).
+    fn focus_gain(&self, coord: u32, focused: bool) -> u32 {
+        if !focused || self.dist.is_empty() {
+            return 1;
+        }
+        match self.dist[coord as usize] {
+            0 => 4,
+            1 => 3,
+            2 => 2,
+            d if d != u8::MAX => 1,
+            _ => 0,
+        }
     }
 
     /// Синтаксический множитель билета координаты (RQ21): класс слова
@@ -741,7 +978,8 @@ impl<'a> L5Generator<'a> {
         }
     }
 
-    /// Born-лотерея одного шага: каскад источников билетов.
+    /// Born-лотерея одного шага: каскад источников билетов +
+    /// фокусировка волны RQ22.
     ///
     /// Лотерея семплирует **ассоциативную топологию**: вес билета
     /// нисходящего русла `(c → n)` — `1 + |k|`, где `k = s·sin(Δθ)` —
@@ -752,14 +990,41 @@ impl<'a> L5Generator<'a> {
     /// Фазы меняются транспортом — распределение речи следует за
     /// волной: настоящая авторегрессия, а не случайный блуждатель.
     ///
+    /// RQ22: при активной маршрутизации первый проход —
+    /// **фокусированный**: веса русел и кинетики умножаются на
+    /// фокус-множитель BFS-дистанции до аттрактора вопроса, за
+    /// радиусом вес ×0 (посторонние ветки отсечены). Архетипический
+    /// мост RQ18 фокусом не режется — это санкционированный прыжок
+    /// (дуги пересечения `a ⊗_ε lattice` уже принадлежат вопросу).
+    /// Если в фокусированном проходе не осталось ни одного билета
+    /// (русл в радиусе нет) — честный шаг блуждания чистым проходом:
+    /// молчание хуже отклонения.
+    ///
     /// Возвращает `(координата, источник, всего билетов)` или `None`,
     /// если волна иссякла (русл из кольца нет).
     fn born_lottery(&mut self) -> Option<(u32, TicketSource, usize)> {
+        if self.focus_on && !self.dist.is_empty() {
+            if let Some(pick) = self.lottery_pass(true) {
+                return Some(pick);
+            }
+            // Фокус пуст — шаг блуждания (русл в радиусе аттрактора
+            // больше нет: русла исчерпаны вето и кольцом).
+            return self.lottery_pass(false);
+        }
+        self.lottery_pass(false)
+    }
+
+    /// Один проход лотареи: `focused = true` — фокус-множители и
+    /// отсечка посторонних веток; `false` — чистая топология
+    /// RQ17/RQ21.
+    fn lottery_pass(&mut self, focused: bool) -> Option<(u32, TicketSource, usize)> {
         // Уровень 1+2: русла из кольца контекста. Внимание = членство
         // в кольце (моментные ворота — домен транспорта, не речи).
         // RQ21: вес каждого русла умножается на синтаксический
         // множитель цепочки (`syntax_boost`) — топология остаётся
         // источником смысла, грамматика лишь перераспределяет шансы.
+        // RQ22: поверх — фокус-множитель аттрактора (0 = ветка
+        // отсечена).
         let (mut total_down, mut total_up) = (0u64, 0u64);
         self.candidates.clear();
         for &c in self.ring.iter() {
@@ -767,12 +1032,16 @@ impl<'a> L5Generator<'a> {
                 if self.veto.contains(&n) {
                     continue;
                 }
+                let fg = self.focus_gain(n, focused);
+                if fg == 0 {
+                    continue; // посторонняя ветка: билетов нет
+                }
                 let ci = self.qc.phase_code(c) as usize;
                 let cj = self.qc.phase_code(n) as usize;
                 let k = (dir as i32) * (SIN_LUT[ci][cj] as i32);
                 // Крутящий момент русла: 0 — устоявшаяся связь, ±1 —
                 // напряжённая (суперпозиция на одном из концов).
-                let w = (1 + k.unsigned_abs()) * self.syntax_boost(n);
+                let w = (1 + k.unsigned_abs()) * self.syntax_boost(n) * fg;
                 if dir > 0 {
                     if self.down[n as usize] == 0 {
                         self.candidates.push((n, 0));
@@ -816,7 +1085,8 @@ impl<'a> L5Generator<'a> {
         // метафора там, где русл J нет. Конфликт кричит весом 3,
         // согласие говорит весом 2, прозрачная память (фон метафоры)
         // шепчет весом 1. RQ21: билеты моста несут синтаксический
-        // множитель наравне с руслами.
+        // множитель наравне с руслами. RQ22: фокус мост не режет —
+        // прыжок уже вырос из вопроса (пересечение с его архетипом).
         if !self.bridge.is_empty() {
             self.candidates.clear();
             let mut total: u64 = 0;
@@ -840,14 +1110,32 @@ impl<'a> L5Generator<'a> {
         // Уровень 4: кинетические дуги вне кольца — внутренний голос.
         // RQ21: синтаксический множитель применяется и к кинетике
         // (поля взяты явно — замыкание живёт в мире disjoint captures).
+        // RQ22: кинетика внимания (дуги вопроса + подкреплённые
+        // коннекторы) направляется фокусом наравне с руслами.
         self.candidates.clear();
         let ring = &self.ring;
         let veto = &self.veto;
         let syntax = self.cfg.syntax;
         let chain = &self.chain;
         let lexicon = &self.qc;
+        let dist = &self.dist;
         self.qc.for_each_kinetic_arc(|arc, _m| {
             if ring.contains(&arc) || veto.contains(&arc) {
+                return;
+            }
+            // Фокус-множитель кинетической дуги (0 — посторонняя).
+            let fg = if focused && !dist.is_empty() {
+                match dist[arc as usize] {
+                    0 => 4,
+                    1 => 3,
+                    2 => 2,
+                    d if d != u8::MAX => 1,
+                    _ => 0,
+                }
+            } else {
+                1
+            };
+            if fg == 0 {
                 return;
             }
             // Одна координата — один билет за уровень (с множителем).
@@ -859,7 +1147,7 @@ impl<'a> L5Generator<'a> {
                 chain.ticket_boost(class)
             } else {
                 1
-            };
+            } * fg;
             if let Some(slot) = self.candidates.iter_mut().find(|s| s.0 == arc) {
                 slot.1 += w;
             } else {
@@ -1541,5 +1829,263 @@ mod tests {
                 .count();
             assert!(bridges <= rep.bridges);
         }
+    }
+
+    // ===================== RQ22: фокус волны =====================
+
+    /// Цепочка из двух кластеров: квант→фаза→решётка (вопрос) и
+    /// маяк→берег→туман (посторонний кластер), соединённые одним
+    /// руслом решётка→маяк. Окно гироскопа 1 — пары только с
+    /// непосредственным предшественником; кольцо сбрасывается между
+    /// ингестами (иначе краевая пара туман→квант сшила бы кластеры
+    /// напрямую). Три повтора — каждое русло насыщено.
+    const TWO_CLUSTER_CORPUS: &str = "квант фаза решётка маяк берег туман";
+
+    fn two_cluster_engine() -> QuantizedGyroCurriculum {
+        let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 1).unwrap();
+        for _ in 0..3 {
+            qc.ingest(TWO_CLUSTER_CORPUS, 1).unwrap();
+            qc.reset_context_ring();
+        }
+        qc
+    }
+
+    /// Базовая конфигурация RQ22-тестов: без архетипа (чистая
+    /// проверка отсечки), без синтаксиса (без коннекторов-клея).
+    fn rq22_cfg(focus_radius: usize) -> GeneratorConfig {
+        GeneratorConfig {
+            max_tokens: 48,
+            seed: 7,
+            bridge: false,
+            focus_radius,
+            ..GeneratorConfig::default()
+        }
+    }
+
+    #[test]
+    fn focus_routes_speech_into_attractor_radius() {
+        // Цепочка: квант(0) — фаза(1) — решётка(2) — маяк(3) — берег(4).
+        // Радиус 2: маяк и дальше — посторонние ветки, отсечены.
+        let mut qc = two_cluster_engine();
+        let mut gen = L5Generator::new(&mut qc, rq22_cfg(2)).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        assert!(rep.focus_active, "маршрутизация обязана включиться");
+        assert_eq!(rep.focus_radius, 2);
+        assert_eq!(rep.attractor_arcs, 1, "аттрактор — дуга «квант»");
+        // Каждый выбор лотареи — в радиусе (архетип выключен:
+        // посторонних прыжков нет, фолбэка быть не должно).
+        assert_eq!(rep.wander_steps, 0, "волна ушла из фокуса: {rep:?}");
+        assert_eq!(rep.relevance, 1.0);
+        // Посторонние слова кластера «маяк» не произнесены НИ РАЗУ.
+        let near: [&str; 3] = ["квант", "фаза", "решётка"];
+        for s in &rep.steps {
+            assert!(
+                near.contains(&s.token.as_str()),
+                "фокус пропустил постороннее слово «{}»",
+                s.token
+            );
+        }
+        // Речь не пуста — фокус не гасит ответ (в радиусе есть русла).
+        assert!(!rep.steps.is_empty());
+    }
+
+    #[test]
+    fn focus_off_measures_relevance_of_free_speech() {
+        // Фокус выключен: телеметрия релевантности всё равно считается —
+        // насколько свободное блуждание держится темы вопроса.
+        let mut qc = two_cluster_engine();
+        let mut gen = L5Generator::new(&mut qc, rq22_cfg(0)).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        assert!(!rep.focus_active);
+        assert_eq!(rep.attractor_arcs, 1);
+        assert!(rep.focus_radius == 0);
+        assert!((0.0..=1.0).contains(&rep.relevance));
+        assert_eq!(
+            rep.focused_steps + rep.wander_steps,
+            rep.steps.len()
+        );
+    }
+
+    #[test]
+    fn focus_tight_radius_cuts_chain_earlier() {
+        // Радиус 1 — «решётка» (дист. 2) уже посторонняя: речь
+        // заперта в паре квант↔фаза.
+        let mut qc = two_cluster_engine();
+        let mut gen = L5Generator::new(&mut qc, rq22_cfg(1)).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        let near: [&str; 2] = ["квант", "фаза"];
+        for s in &rep.steps {
+            assert!(
+                near.contains(&s.token.as_str()),
+                "радиус 1 пропустил «{}»",
+                s.token
+            );
+        }
+    }
+
+    #[test]
+    fn focus_unknown_question_stays_honest() {
+        // Незнакомый вопрос: редкий токен получает высокий IDF —
+        // аттрактор существует даже для неизвестного слова (его
+        // собственная координата + кинетика внимания — «внутренний
+        // голос» RQ17). Фокус не гасит ответ: мозг одинаково жив
+        // (говорит или честно сходится), релевантность измерена
+        // корректно в обоих режимах.
+        let mk = |focus: usize| {
+            let mut qc = QuantizedGyroCurriculum::new(4096, 0.05, 42, 8).unwrap();
+            for _ in 0..3 {
+                qc.ingest(TWO_CLUSTER_CORPUS, 1).unwrap();
+            }
+            let mut gen = L5Generator::new(&mut qc, rq22_cfg(focus)).unwrap();
+            gen.generate("зюзяля").unwrap()
+        };
+        let r_focused = mk(3);
+        let r_free = mk(0);
+        // Аттрактор — сама координата незнакомого слова (IDF высок).
+        assert!(r_focused.attractor_arcs >= 1);
+        assert_eq!(r_focused.attractor_arcs, r_free.attractor_arcs);
+        // Одинаковая жизнеспособность: оба говорят или оба честно молчат.
+        assert_eq!(
+            r_focused.steps.is_empty(),
+            r_free.steps.is_empty(),
+            "фокус изменил жизнеспособность незнакомого вопроса"
+        );
+        for r in [&r_focused, &r_free] {
+            assert!((0.0..=1.0).contains(&r.relevance));
+            assert_eq!(r.focused_steps + r.wander_steps, r.steps.len());
+        }
+    }
+
+    #[test]
+    fn focus_deterministic_by_seed() {
+        let mk = || {
+            let mut qc = two_cluster_engine();
+            let mut gen = L5Generator::new(&mut qc, rq22_cfg(2)).unwrap();
+            gen.generate("квант").unwrap().text
+        };
+        assert_eq!(mk(), mk());
+    }
+
+    #[test]
+    fn focus_gains_by_distance() {
+        // Таблица множителей: 0→×4, 1→×3, 2→×2, дальше в радиусе→×1,
+        // за радиусом→×0; свободный проход — всегда ×1.
+        let mut qc = two_cluster_engine();
+        let mut gen = L5Generator::new(&mut qc, rq22_cfg(3)).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        assert!(rep.focus_active);
+        // Цепочка: квант(0) → фаза(1) → решётка(2) → маяк(3) → берег(4).
+        let coord = |t: &str| (fnv1a64(t.as_bytes()) % 256) as u32;
+        assert_eq!(gen.focus_gain(coord("квант"), true), 4);
+        assert_eq!(gen.focus_gain(coord("фаза"), true), 3);
+        assert_eq!(gen.focus_gain(coord("решётка"), true), 2);
+        assert_eq!(gen.focus_gain(coord("маяк"), true), 1, "дист. 3 в радиусе 3");
+        assert_eq!(gen.focus_gain(coord("туман"), true), 0, "за радиусом — отсечён");
+        assert_eq!(gen.focus_gain(coord("туман"), false), 1, "свободный проход не режет");
+    }
+
+    #[test]
+    fn attractor_bfs_respects_radius() {
+        // Дистанции: BFS не заходит за радиус; недостижимые — MAX.
+        let qc = two_cluster_engine();
+        let adj: Vec<Vec<(u32, i8)>> = {
+            let mut adj: Vec<Vec<(u32, i8)>> = vec![Vec::new(); 256];
+            for (i, j, w) in qc.channels() {
+                let dir = if w > 0.0 { 1i8 } else { -1 };
+                adj[i as usize].push((j, dir));
+                adj[j as usize].push((i, -dir));
+            }
+            adj
+        };
+        let coord = |t: &str| (fnv1a64(t.as_bytes()) % 256) as u32;
+        let dist = L5Generator::attractor_distances(&adj, &[coord("квант")], 2);
+        assert_eq!(dist[coord("квант") as usize], 0);
+        assert_eq!(dist[coord("фаза") as usize], 1);
+        assert_eq!(dist[coord("решётка") as usize], 2);
+        assert_eq!(dist[coord("маяк") as usize], u8::MAX, "маяк за радиусом 2");
+    }
+
+    // ============== RQ22: самоподкрепление грамматики ==============
+
+    #[test]
+    fn observe_reinforcement_saturates_channel() {
+        // Физика подкрепления: пара (слово → коннектор). Обычное
+        // наблюдение — один свидетель (русло свежее, наружу невидимо);
+        // подкрепление — второй согласованный свидетель (насыщенное
+        // русло J, контейнер его переживёт) + кинетика внимания.
+        let mut qc = QuantizedGyroCurriculum::new(1024, 0.05, 42, 8).unwrap();
+        let coord = |t: &str| (fnv1a64(t.as_bytes()) % 1024) as u32;
+        let (w, c) = (coord("фотон"), coord("и"));
+        assert_ne!(w, c, "коллизия хеша в d=1024 — поменяйте сид");
+        // Свидетель 1: пара (w → c).
+        qc.observe_event(w, 1);
+        qc.observe_event(c, 1);
+        let touches = |qc: &QuantizedGyroCurriculum, x: u32| {
+            qc.channels().iter().any(|&(i, j, _)| i == x || j == x)
+        };
+        assert!(!touches(&qc, c), "одно свидетельство — русло свежее");
+        // Подкрепление: второй свидетель — русло насыщается.
+        qc.observe_reinforcement(c, 1);
+        assert!(touches(&qc, c), "подкрепление открывает русло коннектора");
+        // Кинетика внимания: дуга коннектора стала путём волны.
+        assert_ne!(qc.momentum_at(c), 0);
+        // Насыщенное русло переживает чекпоинт + рестарт (секция GYRO).
+        let bytes = qc.checkpoint().unwrap();
+        let reader = pqw::PqwReader::from_bytes(&bytes).unwrap();
+        let mut qc2 = QuantizedGyroCurriculum::new(1024, 0.05, 1, 8).unwrap();
+        qc2.resume_from_reader(&reader).unwrap();
+        assert!(touches(&qc2, c), "русло коннектора пережило рестарт");
+    }
+
+    #[test]
+    fn bridges_density_metric_per_hundred_words() {
+        // Плотность мостов = bridges × 100 / слов — считается честно.
+        let mut qc = QuantizedGyroCurriculum::new(256, 0.05, 42, 8).unwrap();
+        for _ in 0..3 {
+            qc.ingest(SYNTAX_CORPUS, 1).unwrap();
+        }
+        let cfg = GeneratorConfig {
+            syntax: true,
+            reinforce: true,
+            max_tokens: 48,
+            seed: 42,
+            bridge: false,
+            ..GeneratorConfig::default()
+        };
+        let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+        let rep = gen.generate("квант").unwrap();
+        assert!(rep.bridges > 0);
+        // Подкрепление в речи: каждый вставленный коннектор укреплен.
+        assert_eq!(rep.reinforced, rep.bridges);
+        let expect = rep.bridges as f64 * 100.0 / rep.steps.len() as f64;
+        assert!((rep.syntax_bridges_density - expect).abs() < 1e-12);
+        assert!(rep.syntax_bridges_density > 0.0);
+        assert!(rep.syntax_bridges_density < 100.0);
+    }
+
+    #[test]
+    fn focus_and_syntax_compose() {
+        // Фокус + мосты: коннектор не выводит речь из фокуса
+        // (релевантность меряет только выборы лотареи), и вся
+        // комбинация детерминирована сидом.
+        let mk = || {
+            let mut qc = two_cluster_engine();
+            let cfg = GeneratorConfig {
+                syntax: true,
+                reinforce: true,
+                focus_radius: 2,
+                max_tokens: 40,
+                seed: 9,
+                bridge: false,
+                ..GeneratorConfig::default()
+            };
+            let mut gen = L5Generator::new(&mut qc, cfg).unwrap();
+            gen.generate("квант фаза").unwrap()
+        };
+        let r1 = mk();
+        let r2 = mk();
+        assert_eq!(r1.text, r2.text, "детерминизм RQ22");
+        assert_eq!(r1.wander_steps, 0);
+        assert_eq!(r1.relevance, 1.0);
     }
 }

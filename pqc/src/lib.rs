@@ -102,6 +102,7 @@ pub mod inspect;
 pub mod json;
 pub mod learn;
 pub mod learn_net;
+pub mod docsrc;
 pub mod merge;
 pub mod netfetch;
 pub mod parallel;

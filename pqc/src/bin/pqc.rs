@@ -47,6 +47,7 @@ USAGE:
     pqc chat --brain F [opts]                                  RQ17: REPL-диалог (сохранение на выходе)
     pqc archetype (--brain F [--prompt T|--with F]) [opts]     RQ18: мозг ⊗_ε промпт/мозг
     pqc learn «ТЕМА» --brain F [opts]                          RQ19: интернет-ингест (TLS 1.3 zero-dep)
+                                                              RQ22: --docs URL — документации/markdown через HTTPS
     pqc merge A.pqw B.pqw --out M.pqw [opts]                  RQ20: слияние мозгов ⊗_ε → v4
                                                               RQ21: --settle — консолидация волной
 
@@ -165,6 +166,16 @@ GENERATE/ASK/CHAT OPTIONS (RQ17: L5-генерация — первые слов
                               чистая ассоциативная топология RQ17
                               (по умолчанию синтаксис ВКЛЮЧЁН:
                               взвешивание цепочек + коннекторы)
+    --no-focus                RQ22: выключить маршрутизацию волны от дуг
+                              вопроса (по умолчанию ВКЛЮЧЁНА: аттрактор
+                              вопроса → BFS-радиус по руслам J, отсечка
+                              посторонних веток, релевантность ответа)
+    --focus-radius <N>        радиус фокуса волны 0..=8 (default 3:
+                              dist 0 → x4, 1 → x3, 2 → x2, дальше в
+                              радиусе → x1, за радиусом → вырезано)
+    --no-reinforce            RQ22: выключить самоподкрепление грамматики
+                              (по умолчанию ВКЛЮЧЕНО: удачные коннекторы
+                              укрепляют русла J — насыщение за реплику)
     --json                    машинно-читаемый отчёт (zero-dep JSON)
 
 ARCHETYPE OPTIONS (RQ18: нелинейная алгебра a ⊗_ε b — мышление
@@ -177,7 +188,8 @@ ARCHETYPE OPTIONS (RQ18: нелинейная алгебра a ⊗_ε b — мы
     --json                    машинно-читаемый отчёт
 
 LEARN OPTIONS (RQ19: pqc learn \"ТЕМА\" — целенаправленный интернет-ингест;
-              TLS 1.3 + HTTP/1.1 с нуля, zero-dep; источник — Wikipedia API):
+              TLS 1.3 + HTTP/1.1 с нуля, zero-dep; источник — Wikipedia API;
+              RQ22: --docs — источник документаций/markdown по HTTPS):
     --brain <F>               контейнер-мозг .pqw: существует — расширяется,
                               нет — создаётся свежий (v4, d_pol 4096)
     --pages <N>               страниц на раунд поиска (default 5)
@@ -194,6 +206,10 @@ LEARN OPTIONS (RQ19: pqc learn \"ТЕМА\" — целенаправленный
                               существующего берётся из контейнера)
     --text <T>                offline-режим: одна «страница» из строки —
                               без сети (тема = заголовок)
+    --docs <URL>              RQ22: источник документаций — markdown/текст
+                              по HTTPS (повторяется для каждого файла);
+                              разметка вычищается, раунд один — список
+                              файлов явный (raw.githubusercontent.com …)
     --json                    машинно-читаемый отчёт (zero-dep JSON)
 
 MERGE OPTIONS (RQ20: pqc merge — архетипическое слияние мозгов;
@@ -4154,7 +4170,9 @@ fn cmd_train(args: &[String]) -> i32 {
 // ============================================================================
 
 use pqc::archetype_lattice::{archetype_product_packed4, DEFAULT_BRIDGE_EPS};
-use pqc::generate::{GenerationReport, GeneratorConfig, L5Generator};
+use pqc::generate::{
+    GenerationReport, GeneratorConfig, L5Generator, DEFAULT_FOCUS_RADIUS, FOCUS_RADIUS_MAX,
+};
 use pqc::gyro_lattice::QuantizedGyroCurriculum;
 use pqc::merge::{merge_brains, MergeConfig};
 
@@ -4176,6 +4194,11 @@ struct GenConfig {
     /// RQ21: грамматические мосты (включены по умолчанию в CLI —
     /// качество речи; `--no-syntax` возвращает чистую топологию RQ17).
     syntax: bool,
+    /// RQ22: радиус фокуса волны (маршрутизация от дуг вопроса;
+    /// `--focus-radius N` / `--no-focus`; дефолт 3).
+    focus_radius: usize,
+    /// RQ22: самоподкрепление грамматики (`--no-reinforce` снимает).
+    reinforce: bool,
     learn: bool,
     json: bool,
     /// Позиционный вопрос (ask/chat).
@@ -4199,6 +4222,8 @@ impl Default for GenConfig {
             bridge: true,
             bridge_eps: DEFAULT_BRIDGE_EPS,
             syntax: true,
+            focus_radius: DEFAULT_FOCUS_RADIUS,
+            reinforce: true,
             learn: true,
             json: false,
             question: None,
@@ -4256,6 +4281,18 @@ fn parse_gen_args(args: &[String], cfg: &mut GenConfig) -> Result<(), String> {
             }
             "--no-bridge" => cfg.bridge = false,
             "--no-syntax" => cfg.syntax = false,
+            "--no-focus" => cfg.focus_radius = 0,
+            "--no-reinforce" => cfg.reinforce = false,
+            "--focus-radius" => {
+                let v = val("--focus-radius")?;
+                let r: usize = v
+                    .parse()
+                    .map_err(|_| "--focus-radius: целое 0..=8".to_string())?;
+                if r > FOCUS_RADIUS_MAX {
+                    return Err("--focus-radius: целое 0..=8 (0 — выключить фокус)".to_string());
+                }
+                cfg.focus_radius = r;
+            }
             "--bridge-eps" => {
                 cfg.bridge_eps = val("--bridge-eps")?
                     .parse()
@@ -4412,6 +4449,22 @@ fn generation_json_pairs(
         ),
         ("bridge_tokens".into(), Json::num(rep.bridges as f64)),
         ("syntax_run_max".into(), Json::num(rep.syntax_run_max as f64)),
+        (
+            "syntax_bridges_density".into(),
+            Json::num(rep.syntax_bridges_density),
+        ),
+        ("reinforced".into(), Json::num(rep.reinforced as f64)),
+        (
+            "focus".into(),
+            Json::Obj(vec![
+                ("attractor_arcs".into(), Json::num(rep.attractor_arcs as f64)),
+                ("radius".into(), Json::num(rep.focus_radius as f64)),
+                ("active".into(), Json::Bool(rep.focus_active)),
+                ("focused_steps".into(), Json::num(rep.focused_steps as f64)),
+                ("wander_steps".into(), Json::num(rep.wander_steps as f64)),
+                ("relevance".into(), Json::num(rep.relevance)),
+            ]),
+        ),
         ("skipped_unseen".into(), Json::num(rep.skipped_unseen as f64)),
         ("converged".into(), Json::Bool(rep.converged)),
         ("cycled".into(), Json::Bool(rep.cycled)),
@@ -4488,16 +4541,41 @@ fn print_generation_human(rep: &GenerationReport, step_mode: bool) {
         if rep.text.is_empty() { "—" } else { &rep.text }
     );
     println!(
-        "статистика: слов {} (морфем {}, мостов {}), пик облака {}, пропусков {}, сходимость: {}, цикл: {}, {:.1} мс",
+        "статистика: слов {} (морфем {}, мостов {} — {:.1}/100 слов{}), пик облака {}, пропусков {}, сходимость: {}, цикл: {}, {:.1} мс",
         rep.steps.len(),
         morphemes,
         rep.bridges,
+        rep.syntax_bridges_density,
+        if rep.reinforced > 0 {
+            format!(", укреплено {}", rep.reinforced)
+        } else {
+            String::new()
+        },
         rep.syntax_run_max,
         rep.skipped_unseen,
         if rep.converged { "да (ĤΨ = 0)" } else { "нет" },
         if rep.cycled { "вырожденный" } else { "нет" },
         rep.elapsed.as_secs_f64() * 1000.0
     );
+    // RQ22: фокус волны и релевантность ответа.
+    if rep.attractor_arcs > 0 {
+        if rep.focus_active {
+            println!(
+                "фокус    : аттрактор {} дуг, радиус {} — {} шагов в фокусе, {} блужданий, релевантность {:.1}%",
+                rep.attractor_arcs,
+                rep.focus_radius,
+                rep.focused_steps,
+                rep.wander_steps,
+                rep.relevance * 100.0
+            );
+        } else {
+            println!(
+                "фокус    : выключен — свободная речь держится темы на {:.1}% (аттрактор {} дуг)",
+                rep.relevance * 100.0,
+                rep.attractor_arcs
+            );
+        }
+    }
 }
 
 /// `pqc archetype`: нелинейная алгебра архетипов RQ18 — интроспекция
@@ -4720,6 +4798,7 @@ fn cmd_learn(args: &[String]) -> i32 {
     let mut seed = 42u64;
     let mut dim = 4096u32;
     let mut text: Option<String> = None;
+    let mut docs: Vec<String> = Vec::new();
     let mut json = false;
     let mut i = 0usize;
     while i < args.len() {
@@ -4764,6 +4843,10 @@ fn cmd_learn(args: &[String]) -> i32 {
                 Ok(v) => text = Some(v),
                 Err(e) => return learn_usage_err(&e),
             },
+            "--docs" => match val("--docs") {
+                Ok(v) => docs.push(v),
+                Err(e) => return learn_usage_err(&e),
+            },
             "--json" => json = true,
             _ if !a.starts_with("--") && topic.is_empty() => topic = a,
             _ => return learn_usage_err(&format!("неизвестная опция: {a}")),
@@ -4782,8 +4865,8 @@ fn cmd_learn(args: &[String]) -> i32 {
     };
     let cfg = pqc::learn_net::LearnConfig {
         topic: topic.trim().to_string(),
-        pages,
-        rounds,
+        pages: if docs.is_empty() { pages } else { docs.len().max(1) },
+        rounds: if docs.is_empty() { rounds } else { 1 },
         full,
         seed,
         dim,
@@ -4792,9 +4875,14 @@ fn cmd_learn(args: &[String]) -> i32 {
     };
 
     if !json {
-        println!("POLER Quantum Core — Learn (RQ19): целенаправленный интернет-ингест");
+        println!("POLER Quantum Core — Learn (RQ19/RQ22): целенаправленный ингест знаний");
         if let Some(t) = &text {
             println!("режим   : offline (--text, {} Б без сети)", t.len());
+        } else if !docs.is_empty() {
+            println!("источник: документации/markdown через HTTPS (RQ22, {} файлов)", docs.len());
+            for d in docs.iter().take(5) {
+                println!("         • {d}");
+            }
         } else {
             println!("источник: {}.wikipedia.org API (TLS 1.3 zero-dep)", {
                 if lang == "auto" {
@@ -4804,7 +4892,7 @@ fn cmd_learn(args: &[String]) -> i32 {
                 }
             });
         }
-        println!("мозг    : {path} (d_pol={dim}, раундов={rounds}, страниц/раунд={pages})");
+        println!("мозг    : {path} (d_pol={dim}, раундов={}, страниц/раунд={})", cfg.rounds, cfg.pages);
     }
 
     // Существующий мозг — расширяем; отсутствующий — создаём.
@@ -4813,15 +4901,23 @@ fn cmd_learn(args: &[String]) -> i32 {
         Err(_) => None,
     };
     let brain_existed = brain_bytes.is_some();
-    let (engine, report) = match &text {
-        Some(t) => {
+    let (engine, report) = match (&text, docs.is_empty()) {
+        (Some(t), _) => {
             let mut src = OfflineSource { topic: cfg.topic.clone(), text: t.clone() };
             match pqc::learn_net::learn(&cfg, &mut src, brain_bytes.as_deref()) {
                 Ok(x) => x,
                 Err(e) => return err(&e),
             }
         }
-        None => {
+        (None, false) => {
+            // RQ22: источник документаций — markdown/текст по HTTPS.
+            let mut src = pqc::docsrc::DocsSource::new(&docs);
+            match pqc::learn_net::learn(&cfg, &mut src, brain_bytes.as_deref()) {
+                Ok(x) => x,
+                Err(e) => return err(&format!("{e} (документы/HTTPS)")),
+            }
+        }
+        (None, true) => {
             let lang = if lang == "auto" {
                 pqc::wikisrc::WikiSource::detect_language(&cfg.topic).to_string()
             } else {
@@ -4965,6 +5061,8 @@ fn merge_ask(merged: &[u8], question: &str, seed: u64) -> Result<String, String>
         window: engine.gyro_window(),
         seed,
         syntax: true,
+        focus_radius: DEFAULT_FOCUS_RADIUS,
+        reinforce: true,
         ..GeneratorConfig::default()
     };
     let mut gen = L5Generator::new(&mut engine, gcfg).map_err(|e| e.to_string())?;
@@ -5301,6 +5399,8 @@ fn cmd_generate(args: &[String], step_mode: bool) -> i32 {
         bridge: cfg.bridge,
         bridge_eps: cfg.bridge_eps,
         syntax: cfg.syntax,
+        focus_radius: cfg.focus_radius,
+        reinforce: cfg.reinforce,
     };
     let mut gen = match L5Generator::new(engine, gcfg) {
         Ok(g) => g,
@@ -5429,6 +5529,8 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
             bridge: cfg.bridge,
             bridge_eps: cfg.bridge_eps,
             syntax: cfg.syntax,
+            focus_radius: cfg.focus_radius,
+            reinforce: cfg.reinforce,
         };
         let report = {
             let mut gen = match L5Generator::new(&mut engine, gcfg) {

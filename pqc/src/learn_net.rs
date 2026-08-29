@@ -284,6 +284,9 @@ pub fn learn(
                 max_tokens: 24,
                 window: engine.gyro_window(),
                 seed: cfg.seed,
+                syntax: true,
+                focus_radius: crate::generate::DEFAULT_FOCUS_RADIUS,
+                reinforce: true,
                 ..GeneratorConfig::default()
             };
             let mut gen = L5Generator::new(&mut engine, gcfg).map_err(|e| e.to_string())?;
