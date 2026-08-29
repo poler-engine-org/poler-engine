@@ -6,7 +6,7 @@
 updated_utc: 2026-08-29T22:35:00Z
 repo: poler-engine
 branch: main
-commit: (заполняется после коммита сессии)
+commit: e6c2458 (org-transfer: перенос в poler-engine-org + FUTURE_ROADMAP §7)
 tag: v0.17.6 (релизные теги — не на каждый патч; v0.18.0 — License Gate)
 pushed: true
 remote: https://github.com/poler-engine-org/poler-engine.git (репо ПЕРЕНЕСЁН в оргу poler-engine-org 2026-08-29; старые URL Kotokvit/* редиректят; второй репо орги — poler-engine-org/POLER-Quantum-RS, тоже private)
