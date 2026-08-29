@@ -1,6 +1,6 @@
 # POLER-Engine
 
-[![CI](https://github.com/Kotokvit/poler-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Kotokvit/poler-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/poler-engine-org/poler-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/poler-engine-org/poler-engine/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust 1.98](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](Cargo.toml)
 

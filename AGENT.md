@@ -1,7 +1,7 @@
 # AGENT.md — протокол агента этого репозитория
 
 Канонический протокол **Context-Free Resilience** живёт в
-POLER-Quantum-RS v0.3.8: [`../poler-quantum-rs/AGENT.md`](https://github.com/Kotokvit/POLER-Quantum-RS/blob/main/AGENT.md)
+POLER-Quantum-RS v0.3.8: [`../poler-quantum-rs/AGENT.md`](https://github.com/poler-engine-org/POLER-Quantum-RS/blob/main/AGENT.md)
 (иерархия истины, персистентный tmux-слой, git-first, гигиена токенов,
 холодный старт фаз 0–4, bootstrap-скрипт). Этот файл — обязательный минимум
 для агентов, работающих с poler-engine:
