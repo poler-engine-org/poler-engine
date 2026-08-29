@@ -892,7 +892,18 @@ fn run(cli: Cli) -> ExitCode {
                 println!("  poler-engine --google-drive \"отчёт\"");
                 println!("  poler-engine --google-status");
                 let _ = t;
-                ExitCode::SUCCESS
+                // v0.17.7: гарантированный выход после успешного OAuth.
+                // Наблюдалось: при переиспользовании уже поднятого CDP-браузера
+                // (порт 9223 занят другим процессом) CLI изредка не завершался
+                // после печати результатов — вся работа сделана, токены
+                // сохранены, но процесс жил минутами. hard-exit надёжен для CLI.
+                // СВОЙ headless-браузер закрываем ЯВНО до exit: process::exit
+                // пропускает shutdown в main() (регресс v0.17.5 недопустима —
+                // CDP-порт без аутентификации не должен переживать CLI).
+                poler_engine::google::shutdown_owned_headless_browser();
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                std::process::exit(0);
             }
             Err(e) => {
                 eprintln!("poler-engine google-auth: {e}");

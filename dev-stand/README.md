@@ -42,6 +42,8 @@ auth-companion на виртуальном дисплее и транслиру�
 | `gcp-e2e-enter-code.js` | ввод Защитного кода (ootp-челлендж) в форму + атомарный клик «Далее» одним eval |
 | `gcp-e2e-probe.js` | чтение текущего состояния страницы живого браузера e2e (URL/title/body) — отладка |
 | `gcp-verify-state.js` | API-проверка настройки GCP по refresh-токену: проект, brand (applicationTitle), статусы Drive/Gmail API — факты без секретов |
+| `poler-auth-selftest.js` | **self-test `poler-engine --google-auth` по настоящему пути движка**: браузер на CDP 9223 (движок переиспользует для обмена) → движок в фоне → авто-клики consent → редирект на loopback движка → токены 0600 + аудит; проверяет client_secret.json из `~/.config/poler-engine/` |
+| `poler-auth-fakecode.js` | детерминированный тест exit-механики `--google-auth` без Google-consent: фейковый код на loopback движка → обмен (ожидаем 400) → чистый exit; валидирует loopback, spawn opener-а, GoogleHttp-обмен и завершение процесса |
 | `app/` | Next.js-пульт: `src/app/page.js` (скринкаст + ввод + кнопки), `next.config.mjs` (`/api/*` → релей) |
 | `security-audit.py` | 29 проверок безопасности (артефакты, сеть, утечки через HTTP, логи, статический анализ, процессы) |
 | `test-relay-ws.js` | smoke-тест WS-канала релея |
@@ -119,6 +121,34 @@ tail -f logs/gcp-e2e.log                     # 🔢 цифра / код → вв
 node dev-stand/gcp-e2e-retry.js <cdp> <port> # реанимация после Error 500
 node dev-stand/gcp-verify-state.js           # факт-чек настройки по API
 ```
+
+## poler-auth-selftest: прогон `--google-auth` движка целиком
+
+`gcp-e2e-oauth.js` проверяет OAuth-клиент на JS; `poler-auth-selftest.js`
+прогоняет **настоящий Rust-бинарь** `poler-engine --google-auth` тем путём,
+которым будет ходить пользователь: `client_secret.json` → consent URL из
+stdout движка → авто-клики (аккаунт → «Разрешить») → код на loopback движка →
+token exchange через CDP-браузер движка → `google_tokens.json` (0600) →
+запись `oauth.auth` в audit-лог. Токены не печатаются — только факты
+(размер файла, права, длина refresh_token, скоупы).
+
+Браузер поднимается скриптом на CDP 9223 ДО запуска движка — тогда
+`ensure_google_browser` его переиспользует (один профиль, один писатель).
+Google может потребовать подтвердить личность (цифра на телефоне) —
+self-test печатает её и ждёт, ничего не перезапуская.
+
+```bash
+cargo build                                            # движок
+node dev-stand/poler-auth-selftest.js                  # полный путь
+./target/debug/poler-engine --google-status            # authorized: true
+node dev-stand/poler-auth-fakecode.js                  # exit-механика без Google
+```
+
+Известная особенность (v0.17.7): после успешного `--google-auth` при
+переиспользованном CDP-браузере процесс изредка не завершался сам (вся
+работа сделана, токены сохранены) — добавлен гарантированный exit c явным
+`shutdown_owned_headless_browser()` до него (регресс v0.17.5 исключена).
+`poler-auth-fakecode.js` фиксирует чистый exit обменного пути.
 
 ## Известные ограничения
 
