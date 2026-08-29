@@ -6,7 +6,7 @@
 updated_utc: 2026-08-29T23:20:00Z
 repo: poler-engine
 branch: main
-commit: (заполняется после коммита сессии)
+commit: c05af94 (web-ux-audit + WebLens-архитектура, FUTURE_ROADMAP §8)
 tag: v0.17.6 (релизные теги — не на каждый патч; v0.18.0 — License Gate)
 pushed: true
 remote: https://github.com/poler-engine-org/poler-engine.git (репо ПЕРЕНЕСЁН в оргу poler-engine-org 2026-08-29; старые URL Kotokvit/* редиректят; второй репо орги — poler-engine-org/POLER-Quantum-RS, тоже private)
