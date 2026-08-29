@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>poler-engine · Auth Companion</title>
+<style>
+  :root {
+    --bg: #0b0f17; --panel: #111827; --panel2: #0d1420;
+    --border: #1f2a3a; --text: #e5eaf3; --muted: #8b96a8;
+    --accent: #5b9cff; --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    --mono: ui-monospace, 'Cascadia Mono', 'JetBrains Mono', Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #0e1522, #0b0f17);
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand b { font-size: 16px; letter-spacing: .3px; }
+  .brand span { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 12px; border-radius: 999px; font-size: 12.5px;
+    border: 1px solid var(--border); background: var(--panel2); color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .chip.waiting { color: var(--warn); border-color: #4a3b12; }
+  .chip.waiting .dot { background: var(--warn); animation: pulse 1.2s infinite; }
+  .chip.authorized { color: var(--ok); border-color: #14432f; }
+  .chip.authorized .dot { background: var(--ok); }
+  .chip.bad { color: var(--err); border-color: #4a1f1f; }
+  .chip.bad .dot { background: var(--err); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .spacer { flex: 1; }
+  .timer { font-family: var(--mono); color: var(--muted); font-size: 12.5px; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #stage {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    padding: 16px; min-width: 0; position: relative;
+  }
+  #screenWrap {
+    position: relative; max-width: 100%; max-height: 100%;
+    display: flex; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5), 0 0 0 1px var(--border);
+    cursor: crosshair;
+  }
+  #screen {
+    display: block; max-width: 100%; max-height: calc(100vh - 150px);
+    user-select: none; -webkit-user-drag: none;
+  }
+  #overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 10px;
+    background: rgba(8, 11, 18, .82); color: var(--muted); font-size: 13.5px;
+    text-align: center; padding: 20px;
+  }
+  .spin {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 3px solid var(--border); border-top-color: var(--accent);
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  aside {
+    width: 300px; border-left: 1px solid var(--border); padding: 16px;
+    display: flex; flex-direction: column; gap: 16px; overflow-y: auto;
+    background: var(--panel2);
+  }
+  aside h2 {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); margin: 0 0 8px;
+  }
+  .steps { margin: 0; padding-left: 18px; color: #c3ccdb; display: grid; gap: 8px; font-size: 13px; }
+  .steps li::marker { color: var(--accent); }
+  .note { font-size: 12px; color: var(--muted); border-left: 2px solid var(--border); padding-left: 10px; }
+  .note b { color: #c3ccdb; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    background: #16233a; color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 12px; font-size: 12.5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.danger { color: var(--err); }
+  #eventlog { font-family: var(--mono); font-size: 11px; color: var(--muted); display: grid; gap: 4px; }
+  footer {
+    padding: 8px 18px; border-top: 1px solid var(--border); color: var(--muted);
+    font-size: 11.5px; display: flex; gap: 16px; flex-wrap: wrap;
+  }
+  @media (max-width: 860px) { aside { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>poler-engine</b><span>auth companion · v0.17.6</span></div>
+  <div id="chip" class="chip"><span class="dot"></span><span id="chipText">подключение…</span></div>
+  <div id="wsChip" class="chip"><span class="dot"></span>канал</div>
+  <div class="spacer"></div>
+  <div class="timer" id="timer">—</div>
+</header>
+<main>
+  <div id="stage">
+    <div id="screenWrap">
+      <img id="screen" alt="Экран изолированного Chromium" draggable="false">
+      <div id="overlay">
+        <div class="spin"></div>
+        <div id="overlayText">Ждём окно Chromium…</div>
+      </div>
+    </div>
+  </div>
+  <aside>
+    <div>
+      <h2>Как войти</h2>
+      <ol class="steps">
+        <li>Кликни в поле <b>Email</b> на экране слева</li>
+        <li>Печатай — клавиши идут прямо в изолированный Chromium</li>
+        <li>Пройди 2FA (SMS / Authenticator)</li>
+        <li>Движок сам увидит куки сессии и закроет окно</li>
+      </ol>
+    </div>
+    <div>
+      <h2>Статус</h2>
+      <div id="stateDetail" class="note">—</div>
+    </div>
+    <div>
+      <h2>Управление</h2>
+      <div class="btnrow">
+        <button id="btnRefresh">Обновить кадр</button>
+        <button id="btnStatus">Статус JSON</button>
+        <button id="btnShutdown" class="danger">Завершить</button>
+      </div>
+    </div>
+    <div>
+      <h2>События</h2>
+      <div id="eventlog"></div>
+    </div>
+    <div class="note">
+      <b>Безопасность:</b> это изолированный Chromium движка (свежий профиль
+      <span style="font-family:var(--mono)">google-profile</span>). Релей пересылает
+      клавиши без логирования; куки читает только auth-companion →
+      <span style="font-family:var(--mono)">google_session.json</span> (0600).
+    </div>
+  </aside>
+</main>
+<footer>
+  <span>CDP screencast · вход только между тобой и Google</span>
+  <span>таймаут сессии: 30 мин</span>
+</footer>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const img = $('screen'), overlay = $('overlay'), overlayText = $('overlayText');
+  const chip = $('chip'), chipText = $('chipText'), wsChip = $('wsChip');
+  const stateDetail = $('stateDetail'), timerEl = $('timer'), eventlog = $('eventlog');
+
+  let ws = null, wsOk = false, backoff = 1000;
+  const t0 = Date.now();
+
+  function logLine(m) {
+    const d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString() + ' · ' + m;
+    eventlog.prepend(d);
+    while (eventlog.children.length > 8) eventlog.lastChild.remove();
+  }
+
+  const STATE_LABELS = {
+    starting:          ['companion стартует…', 'waiting'],
+    waiting:           ['окно открыто — ждём входа', 'waiting'],
+    authorized:        ['сессия захвачена', 'authorized'],
+    closed:            ['окно закрыто без входа', 'bad'],
+    timeout:           ['таймаут входа', 'bad'],
+    error:             ['ошибка companion', 'bad'],
+    interrupted:       ['прервано', 'bad'],
+    'companion-down':  ['companion не отвечает', 'bad'],
+  };
+
+  function applyState(s) {
+    const st = (s && s.state) || 'unknown';
+    const def = STATE_LABELS[st] || [st, ''];
+    chip.className = 'chip' + (def[1] ? ' ' + def[1] : '');
+    chipText.textContent = def[0];
+    const parts = [];
+    if (s && s.detail) parts.push(String(s.detail));
+    if (s && typeof s.cookie_count === 'number' && s.cookie_count > 0)
+      parts.push('google-кук: ' + s.cookie_count);
+    if (s && s.cdp_port) parts.push('CDP :' + s.cdp_port);
+    stateDetail.textContent = parts.join(' · ') || '—';
+    if (st === 'authorized') {
+      overlay.style.display = 'flex';
+      overlay.innerHTML = '<div style="color:#34d399;font-size:16px;font-weight:600">Сессия Google захвачена ✓</div>' +
+        '<div>Куки сохранены в google_session.json (0600),<br>окно Chromium закрыто.</div>';
+    }
+    if (st === 'waiting' && lastFrameSeen) overlay.style.display = 'none';
+  }
+
+  let lastFrameSeen = false;
+
+  // ---------------- WebSocket ----------------
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(proto + '://' + location.host + '/ws');
+    ws.onopen = () => {
+      wsOk = true; backoff = 1000;
+      wsChip.className = 'chip authorized';
+      ws.send(JSON.stringify({ t: 'hello' }));
+      logLine('канал открыт');
+    };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      if (m.t === 'frame') {
+        lastFrameSeen = true;
+        img.src = 'data:image/jpeg;base64,' + m.d;
+        overlay.style.display = 'none';
+      } else if (m.t === 'state') {
+        applyState(m.s);
+      } else if (m.t === 'log') {
+        logLine(m.m);
+      }
+    };
+    ws.onclose = () => {
+      wsOk = false;
+      wsChip.className = 'chip bad';
+      logLine('канал закрыт — переподключение');
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 5000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  }
+  connect();
+
+  setInterval(() => {
+    timerEl.textContent = wsOk ? Math.floor((Date.now() - t0) / 1000) + ' c' : '—';
+  }, 1000);
+
+  // статус по HTTP (fallback, если WS ещё не поднялся)
+  fetch('/status').then((r) => r.json()).then(applyState).catch(() => {});
+
+  const send = (o) => { if (wsOk && ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+  // ---------------- мышь (нормализованные 0..1) ----------------
+  function rel(cx, cy) {
+    const r = img.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (cx - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (cy - r.top) / r.height)),
+    };
+  }
+
+  const wrap = $('screenWrap');
+  wrap.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const p = rel(e.clientX, e.clientY);
+    send({ t: 'md', x: p.x, y: p.y, cc: e.detail || 1 });
+  });
+  wrap.addEventListener('mouseup', (e) => {
+    if (e.button !== 0) return;
+    const p = rel(e.clientX, e.clientY);
+    send({ t: 'mu', x: p.x, y: p.y, cc: e.detail || 1 });
+  });
+  wrap.addEventListener('contextmenu', (e) => e.preventDefault());
+  let lastMove = 0;
+  wrap.addEventListener('mousemove', (e) => {
+    const now = performance.now();
+    if (now - lastMove < 40) return;
+    lastMove = now;
+    const p = rel(e.clientX, e.clientY);
+    send({ t: 'mm', x: p.x, y: p.y, b: e.buttons });
+  });
+  wrap.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const p = rel(e.clientX, e.clientY);
+    send({ t: 'wh', x: p.x, y: p.y, dx: e.deltaX, dy: e.deltaY });
+  }, { passive: false });
+
+  // тач-тапы
+  wrap.addEventListener('touchstart', (e) => {
+    const t = e.touches[0]; if (!t) return;
+    const p = rel(t.clientX, t.clientY);
+    send({ t: 'md', x: p.x, y: p.y, cc: 1 });
+  }, { passive: true });
+  wrap.addEventListener('touchend', (e) => {
+    const t = e.changedTouches[0]; if (!t) return;
+    const p = rel(t.clientX, t.clientY);
+    send({ t: 'mu', x: p.x, y: p.y, cc: 1 });
+  }, { passive: true });
+
+  // ---------------- клавиатура ----------------
+  const VK = {
+    Enter: 13, Backspace: 8, Tab: 9, Shift: 16, Control: 17, Alt: 18, Meta: 91,
+    Escape: 27, ' ': 32, PageUp: 33, PageDown: 34, End: 35, Home: 36,
+    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46, CapsLock: 20,
+  };
+  const mods = (e) =>
+    (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+
+  function keyPayload(e) {
+    const printable = e.key.length === 1;
+    let text = '';
+    if (printable) text = e.key;
+    else if (e.key === 'Enter') text = '\r';
+    else if (e.key === 'Tab') text = '\t';
+    return {
+      key: e.key, code: e.code,
+      vk: VK[e.key] || (printable ? e.key.toUpperCase().charCodeAt(0) : 0),
+      text, mods: mods(e),
+    };
+  }
+
+  // хоткеи самого пульта: F5/Ctrl+R (reload) и Ctrl+V (paste) не перехватываем
+  const ownKey = (e) =>
+    e.key === 'F5' ||
+    ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'r') ||
+    ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v');
+
+  window.addEventListener('keydown', (e) => {
+    if (ownKey(e)) return;
+    e.preventDefault();
+    send(Object.assign({ t: 'kd' }, keyPayload(e)));
+  });
+  window.addEventListener('keyup', (e) => {
+    if (ownKey(e)) return;
+    e.preventDefault();
+    send(Object.assign({ t: 'ku' }, keyPayload(e)));
+  });
+  window.addEventListener('paste', (e) => {
+    const cd = e.clipboardData || window.clipboardData;
+    const text = cd ? cd.getData('text') : '';
+    if (text) { send({ t: 'ins', text: text.slice(0, 5000) }); e.preventDefault(); }
+  });
+
+  // ---------------- кнопки ----------------
+  $('btnRefresh').onclick = () => send({ t: 'hello' }); // hello вернёт последний кадр
+  $('btnStatus').onclick = async () => {
+    try {
+      const r = await fetch('/status');
+      alert(JSON.stringify(await r.json(), null, 2));
+    } catch (e) { alert('нет связи с companion: ' + e.message); }
+  };
+  $('btnShutdown').onclick = () => {
+    if (!confirm('Завершить auth-companion? Окно Chromium закроется.')) return;
+    fetch('/shutdown', { method: 'POST' })
+      .then(() => logLine('shutdown отправлен'))
+      .catch(() => logLine('shutdown не удался'));
+  };
+})();
+</script>
+</body>
+</html>

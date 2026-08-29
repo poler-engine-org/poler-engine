@@ -57,6 +57,7 @@ poler-engine --auth-ui
 | `~/.config/poler-engine/google_session.json` | снапшот сессии, 0600 (значения кук — только тут) |
 | `~/.config/poler-engine/auth-companion.state.json` | transient-состояние (state/port/счётчик) |
 | `scripts/auth-companion.js` | сам companion (self-test: `node scripts/auth-companion.js --self-test`) |
+| `dev-stand/` | headless-стенд для контейнеров/песочниц: CDP-релей превью + супервизор + security-audit (`dev-stand/README.md`) |
 
 | код | смысл |
 |---|---|
@@ -65,6 +66,13 @@ poler-engine --auth-ui
 | 3 | таймаут (`POLER_AUTH_TIMEOUT_SECS`, default 600) |
 | 4 | preflight: нет Node≥18/Chromium, профиль занят, запрещённый путь |
 | 130 | прервано сигналом |
+
+### Контейнеры без дисплея: dev-stand
+
+В песочнице/headless-контейнере окно показать некуда — `dev-stand/` поднимает
+companion на Xvfb и транслирует его экран владельцу через CDP-релей в превью
+платформы (скринкаст + мышь/клавиатура + кнопки навигации «Назад/Вперёд»).
+Модель безопасности и 29 проверок аудита — в `dev-stand/README.md`.
 
 ### Почему сессия пишется в google_session.json, а не в google_tokens.json
 
