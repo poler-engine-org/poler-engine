@@ -181,6 +181,13 @@ struct Cli {
     #[arg(long = "google-scopes", value_name = "SCOPES")]
     google_scopes: Option<String>,
 
+    /// v0.17.5 (security): ЯВНЫЙ перенос Google-сессии из основного
+    /// браузера хоста (~/.config/chromium) в профиль движка. Спрашивает
+    /// [y/N], пишет audit-запись. По умолчанию перенос куков ЗАПРЕЩЁН
+    /// (раньше sync_host_chromium_profile тянул их молча).
+    #[arg(long = "import-browser-session", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    import_browser_session: bool,
+
     // ---------- NotebookLM через RPC-протокол NLMTools (v0.13.0) ----------
 
     /// Все ноутбуки NotebookLM с источниками (RPC wXbhsf из протокола
@@ -791,6 +798,15 @@ fn save_unique(prefix: &str, ext: &str, bytes: &[u8]) -> Result<std::path::PathB
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let code = run(cli);
+    // v0.17.5: headless google-браузер, поднятый ЭТИМ процессом, не должен
+    // переживать CLI и оставлять открытый CDP-порт без аутентификации.
+    // Headed-браузер (--google-browse) не трогаем — его закрывает владелец.
+    poler_engine::google::shutdown_owned_headless_browser();
+    code
+}
+
+fn run(cli: Cli) -> ExitCode {
 
     if let Some(threads) = cli.threads {
         if let Err(e) = rayon::ThreadPoolBuilder::new()
@@ -829,6 +845,17 @@ fn main() -> ExitCode {
     if cli.tui {
         let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
         return poler_engine::shell::run_tui(db_path);
+    }
+
+    // ---------- v0.17.5: явный перенос сессии из основного браузера ----------
+    if cli.import_browser_session {
+        return match poler_engine::google::import_browser_session_interactive() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("poler-engine import-browser-session: {e}");
+                ExitCode::from(2)
+            }
+        };
     }
 
     // ---------- Google-сервисы: OAuth без пароля (v0.12.0) ----------

@@ -21,6 +21,7 @@
 
 use rusqlite::Connection;
 
+use crate::google::audit;
 use crate::google::nlm::{NlmNote, NlmSession};
 use crate::notes::{self, Note, NoteSource};
 
@@ -51,6 +52,33 @@ pub struct SyncPlan {
 impl SyncPlan {
     pub fn is_empty(&self) -> bool {
         self.pull_new.is_empty() && self.pull_update.is_empty() && self.push_new.is_empty()
+    }
+
+    /// Есть ли изменения, пишущие В ОБЛАКО (push)?
+    pub fn has_cloud_writes(&self) -> bool {
+        !self.push_new.is_empty()
+    }
+
+    /// Человекочитаемое превью плана для --dry-run / подтверждения.
+    /// Содержит только заголовки и счётчики — без тел заметок.
+    pub fn preview(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("  ↓ pull (облако → локально): {} новых, {} обновлений\n",
+            self.pull_new.len(), self.pull_update.len()));
+        for cn in self.pull_new.iter().take(5) {
+            s.push_str(&format!("      + «{}»\n", cn.title));
+        }
+        if self.pull_new.len() > 5 {
+            s.push_str(&format!("      … и ещё {}\n", self.pull_new.len() - 5));
+        }
+        s.push_str(&format!("  ↑ push (локально → облако): {} заметок\n", self.push_new.len()));
+        for l in self.push_new.iter().take(5) {
+            s.push_str(&format!("      → «{}»\n", l.title));
+        }
+        if self.push_new.len() > 5 {
+            s.push_str(&format!("      … и ещё {}\n", self.push_new.len() - 5));
+        }
+        s
     }
 }
 
@@ -98,12 +126,19 @@ pub struct SyncReport {
     pub pulled_new: usize,
     pub pulled_updated: usize,
     pub pushed: usize,
+    /// Локальные заметки, готовые к push, но НЕ отправленные
+    /// (режим PullOnly без подтверждения). v0.17.5.
+    pub pending_push: usize,
     pub errors: Vec<String>,
 }
 
 impl SyncReport {
     pub fn is_empty(&self) -> bool {
-        self.pulled_new == 0 && self.pulled_updated == 0 && self.pushed == 0 && self.errors.is_empty()
+        self.pulled_new == 0
+            && self.pulled_updated == 0
+            && self.pushed == 0
+            && self.pending_push == 0
+            && self.errors.is_empty()
     }
 
     /// Однострочная сводка для чата/вывода.
@@ -121,6 +156,9 @@ impl SyncReport {
         if self.pushed > 0 {
             parts.push(format!("{} отправлено в NLM", self.pushed));
         }
+        if self.pending_push > 0 {
+            parts.push(format!("{} ожидают отправки (нужен --yes)", self.pending_push));
+        }
         if !self.errors.is_empty() {
             parts.push(format!("{} ошибок", self.errors.len()));
         }
@@ -128,14 +166,41 @@ impl SyncReport {
     }
 }
 
-/// Выполнить синхронизацию заметок ноутбука: pull + push.
+/// Режим синхронизации (v0.17.5 confirmation gate).
 ///
-/// Сеть нужна только для `list_notes_structured` и `create_note`;
-/// план вычисляется чистой функцией [`plan_notes_sync`].
-pub fn sync_notebook_notes(
+/// * [`SyncMode::PullOnly`] — безопасное направление (облако — источник
+///   истины): авто-синк TUI/открытия ноутбука. Если есть локальные
+///   заметки на отправку — они НЕ пушатся, а отмечаются `pending_push`.
+/// * [`SyncMode::Full`] — двусторонняя синхронизация, включая push
+///   в облако. Требует явного подтверждения (`--yes`) от вызывающего.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    PullOnly,
+    Full,
+}
+
+/// Вычислить план синхронизации ноутбука без выполнения (для --dry-run
+/// и подтверждения): одна сеть-запрос list_notes_structured + чистая логика.
+pub fn plan_notebook_sync(
     sess: &mut NlmSession,
     conn: &Connection,
     notebook_id: &str,
+) -> Result<SyncPlan, String> {
+    let cloud = sess.list_notes_structured(notebook_id)?;
+    let local_all = notes::list_notes(conn, 100_000).map_err(|e| format!("list_notes: {e}"))?;
+    Ok(plan_notes_sync(&cloud, &local_all, notebook_id))
+}
+
+/// Выполнить синхронизацию заметок ноутбука в заданном режиме.
+///
+/// Сеть нужна только для `list_notes_structured` и `create_note`;
+/// план вычисляется чистой функцией [`plan_notes_sync`].
+/// Все изменения фиксируются в audit.log (действие `nlm.notes_sync`).
+pub fn sync_notebook_notes_mode(
+    sess: &mut NlmSession,
+    conn: &Connection,
+    notebook_id: &str,
+    mode: SyncMode,
 ) -> Result<SyncReport, String> {
     let cloud = sess.list_notes_structured(notebook_id)?;
     let local_all = notes::list_notes(conn, 100_000).map_err(|e| format!("list_notes: {e}"))?;
@@ -143,7 +208,7 @@ pub fn sync_notebook_notes(
 
     let mut report = SyncReport::default();
 
-    // ---- pull: облако → локально ----
+    // ---- pull: облако → локально (безопасное направление) ----
     for cn in &plan.pull_new {
         let tags = vec![nlm_tag(&cn.id)];
         match notes::add_note(conn, &cn.title, &cn.text, &tags, NoteSource::Nlm, Some(notebook_id)) {
@@ -164,25 +229,55 @@ pub fn sync_notebook_notes(
         }
     }
 
-    // ---- push: локально → облако ----
-    for l in &plan.push_new {
-        match sess.create_note(notebook_id, &l.title, &l.body) {
-            Ok(cloud_id) => {
-                let mut tags = l.tags.clone();
-                let tag = nlm_tag(&cloud_id);
-                if !tags.contains(&tag) {
-                    tags.push(tag);
+    // ---- push: локально → облако (только с явным подтверждением) ----
+    match mode {
+        SyncMode::Full => {
+            for l in &plan.push_new {
+                match sess.create_note(notebook_id, &l.title, &l.body) {
+                    Ok(cloud_id) => {
+                        let mut tags = l.tags.clone();
+                        let tag = nlm_tag(&cloud_id);
+                        if !tags.contains(&tag) {
+                            tags.push(tag);
+                        }
+                        if let Err(e) = notes::update_note(conn, l.id, &l.title, &l.body, &tags) {
+                            report.errors.push(format!("push-тег {}: {e}", l.id));
+                        }
+                        report.pushed += 1;
+                    }
+                    Err(e) => report.errors.push(format!("push «{}»: {e}", l.title)),
                 }
-                if let Err(e) = notes::update_note(conn, l.id, &l.title, &l.body, &tags) {
-                    report.errors.push(format!("push-тег {}: {e}", l.id));
-                }
-                report.pushed += 1;
             }
-            Err(e) => report.errors.push(format!("push «{}»: {e}", l.title)),
+        }
+        SyncMode::PullOnly => {
+            // без подтверждения облако не трогаем — только отчитываемся
+            report.pending_push = plan.push_new.len();
         }
     }
 
+    if !report.is_empty() {
+        audit::record(
+            "nlm.notes_sync",
+            &format!(
+                "nb={} mode={:?} pulled_new={} pulled_updated={} pushed={} pending_push={} errors={}",
+                notebook_id, mode, report.pulled_new, report.pulled_updated,
+                report.pushed, report.pending_push, report.errors.len()
+            ),
+        );
+    }
+
     Ok(report)
+}
+
+/// Двусторонняя синхронизация (pull + push) — legacy-обёртка.
+/// v0.17.5: push-часть требует подтверждения у вызывающего
+/// (shell — `--yes`, CLI — интерактивный [y/N]).
+pub fn sync_notebook_notes(
+    sess: &mut NlmSession,
+    conn: &Connection,
+    notebook_id: &str,
+) -> Result<SyncReport, String> {
+    sync_notebook_notes_mode(sess, conn, notebook_id, SyncMode::Full)
 }
 
 #[cfg(test)]
@@ -276,6 +371,46 @@ mod tests {
         r.pushed = 1;
         assert!(r.summary().contains("2 скачано"));
         assert!(r.summary().contains("1 отправлено"));
+    }
+
+    // ---- v0.17.5: confirmation gate ----
+
+    #[test]
+    fn plan_preview_and_cloud_writes_v0175() {
+        let cloud = vec![cn("c-1", "Облачная", "A")];
+        let local = vec![ln(1, "Локальная", "B", vec![], NoteSource::Manual)];
+        let plan = plan_notes_sync(&cloud, &local, "nb-1");
+        assert!(plan.has_cloud_writes(), "есть push — есть запись в облако");
+        let pv = plan.preview();
+        assert!(pv.contains("push (локально → облако): 1"));
+        assert!(pv.contains("«Локальная»"));
+        assert!(pv.contains("pull (облако → локально): 1"));
+        // тела заметок в превью не попадают (минимум метаданных)
+        assert!(!pv.contains("\"B\""));
+    }
+
+    #[test]
+    fn plan_no_cloud_writes_when_only_pull() {
+        let cloud = vec![cn("c-1", "Облачная", "A")];
+        let local: Vec<Note> = vec![];
+        let plan = plan_notes_sync(&cloud, &local, "nb-1");
+        assert!(!plan.has_cloud_writes());
+        assert_eq!(plan.pull_new.len(), 1);
+    }
+
+    #[test]
+    fn report_summary_mentions_pending_push_v0175() {
+        let mut r = SyncReport::default();
+        r.pending_push = 3;
+        let s = r.summary();
+        assert!(s.contains("3 ожидают отправки"));
+        assert!(s.contains("--yes"));
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn sync_mode_enum_distinct() {
+        assert_ne!(SyncMode::PullOnly, SyncMode::Full);
     }
 
     #[test]

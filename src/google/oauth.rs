@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{gcp_tokens_path, read_http_head, tokens_path, write_http_response, GoogleHttp};
+use super::audit;
 use crate::web::cdp::random_key_16;
 
 pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
@@ -586,6 +587,11 @@ pub fn run_auth(extra_scopes: &[String]) -> Result<StoredTokens, String> {
     let mut http = GoogleHttp::connect(super::google_cdp_port())?;
     let tokens = exchange_code(&mut http, &secret, &code, &lb.redirect_uri)?;
     let path = save_tokens(&tokens)?;
+    // v0.17.5: OAuth-обмен фиксируется в audit-логе (без значений токенов)
+    audit::record(
+        "oauth.auth",
+        &format!("scopes={} refresh_token=yes saved={}", tokens.scope, path.display()),
+    );
     println!("Токены сохранены: {} (права 0600)", path.display());
     println!(
         "Отзыв в любой момент: https://myaccount.google.com/permissions \
@@ -636,6 +642,11 @@ pub fn run_gcp_auth() -> Result<StoredTokens, String> {
     let mut http = GoogleHttp::connect(super::google_cdp_port())?;
     let tokens = exchange_code(&mut http, &secret, &code, &lb.redirect_uri)?;
     let path = save_gcp_tokens(&tokens)?;
+    // v0.17.5: аудит GCP-обмена (скоуп cloud-platform — самый широкий)
+    audit::record(
+        "oauth.gcp_auth",
+        &format!("scopes={} saved={}", tokens.scope, path.display()),
+    );
     println!("GCP-токены сохранены: {} (права 0600)", path.display());
     println!(
         "Отзыв в любой момент: https://myaccount.google.com/permissions \
@@ -645,9 +656,9 @@ pub fn run_gcp_auth() -> Result<StoredTokens, String> {
     println!();
     println!("Теперь доступны:");
     println!("  poler-engine --gcp-status");
-    println!("  poler-engine --nlm-upload <NB_ID> <PATH>   # POST sources:uploadFile");
-    println!("  poler-engine --nlm-aoview <NB_ID>          # POST audioOverviews");
-    println!("  poler-engine --nlm-aodel <NB_ID>           # DELETE audioOverviews/default");
+    // v0.17.5: write-операции Companion Bridge планируются в v0.18.0 (M5)
+    // и будут включать confirmation gate (см. src/google/confirm.rs).
+    println!("  (загрузка источников и аудио-обзоры через оф. API — v0.18.0, M5)");
     Ok(tokens)
 }
 

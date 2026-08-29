@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.17.4"
+version = "0.17.5"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -50,6 +50,9 @@ gix = { version = "0.66", default-features = false, features = ["blocking-http-t
 # v0.17.3: Companion Bridge M2+M3+M4 — real GcpEnterpriseProvider calls + HybridProvider
 # v0.17.4: Transcript / Response View — лента чата nlm ask (окно F3 в TUI)
 #          routing+fallback + TUI Enter-handler на источнике + future-streaming-archives.md
+# v0.17.5: Security Hardening — confirmation gate (--yes/--dry-run) для write-операций,
+#          cookie-import только по явному согласию (--import-browser-session),
+#          shutdown headless-браузера при выходе, JSONL audit-лог (~/.config/poler-engine/audit.log)
 # arboard — системный буфер обмена (drag-select → Ctrl+Y копирование)
 arboard = "3"
 # tui-textarea — встроенный редактор для Ctrl+N (новая заметка) прямо в TUI

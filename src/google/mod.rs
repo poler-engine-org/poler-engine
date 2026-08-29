@@ -20,7 +20,9 @@
 //! (это отдельный профиль для API-вызовов, не stealth-краулер).
 
 pub mod api;
+pub mod audit;
 pub mod companion;
+pub mod confirm;
 pub mod nlm;
 pub mod nlm_ingest;
 pub mod nlm_notes_sync;
@@ -29,6 +31,7 @@ pub mod oauth;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::web::cdp::CdpSession;
@@ -148,11 +151,59 @@ fn google_browser_args(port: u16) -> Vec<String> {
     ]
 }
 
-/// Гарантирует живой google-браузер на `port` с персистентным профилем.
-/// `headed = true` — с окном (для ручного логина в сервисы без API).
-/// Если браузер уже поднят (например, окно `--google-browse` открыто) —
-/// переиспользуем его.
-/// Автоматическая подтяжка cookies и Local State из основного профиля Chromium хоста (~/.config/chromium)
+/// Разрешён ли перенос сессий из основного браузера хоста?
+/// v0.17.5: по умолчанию НЕТ (безопасный отказ); включается
+/// `POLER_IMPORT_BROWSER_SESSION=1` или командой `--import-browser-session`.
+pub fn import_session_allowed() -> bool {
+    std::env::var("POLER_IMPORT_BROWSER_SESSION")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Явный одноразовый перенос Google-сессии из основного браузера хоста
+/// (CLI-команда `--import-browser-session`). Спрашивает [y/N], пишет
+/// audit-запись, печатает путь-источник и подсказку об отзыве.
+pub fn import_browser_session_interactive() -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let src = std::path::PathBuf::from(&home).join(".config/chromium");
+    if !src.is_dir() {
+        return Err(format!(
+            "основной профиль Chromium не найден: {} \
+             (логинься вручную через --google-browse <URL>)",
+            src.display()
+        ));
+    }
+    let dest = profile_dir();
+    println!("Перенос Google-сессии из основного браузера:");
+    println!("  источник:      {}", src.display());
+    println!("  приёмник:      {}", dest.display());
+    println!();
+    println!("ВНИМАНИЕ: poler-engine получит доступ ко ВСЕМ сессиям,");
+    println!("сохранённым в этом профиле Chromium (Google и не только).");
+    if !confirm::confirm_interactive("Перенести куки и Local State?") {
+        println!("Отказано — профиль движка не тронут.");
+        return Ok(());
+    }
+    let _ = std::fs::create_dir_all(&dest);
+    sync_host_chromium_profile(&dest);
+    audit::record("security.import_browser_session", &format!("src={}", src.display()));
+    println!("✓ Сессия перенесена в профиль движка (audit-запись сделан).");
+    println!("  Отозвать доступ: закрыть сессии в самом браузере или");
+    println!("  https://myaccount.google.com/permissions для OAuth-приложений.");
+    Ok(())
+}
+
+/// Перенос cookies и Local State из основного профиля Chromium хоста
+/// (~/.config/chromium) в профиль движка.
+///
+/// v0.17.5 (security hardening): вызывается ТОЛЬКО при явном согласии
+/// пользователя — либо env `POLER_IMPORT_BROWSER_SESSION=1`, либо
+/// интерактивная команда `--import-browser-session`. Молчаливый перенос
+/// сессий чужого браузера без спроса нарушает принцип явного согласия
+/// (запись в audit.log ведётся модулем [`audit`]).
 fn sync_host_chromium_profile(dest_profile: &std::path::Path) {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let host_chromium = std::path::PathBuf::from(home).join(".config/chromium");
@@ -183,6 +234,10 @@ fn sync_host_chromium_profile(dest_profile: &std::path::Path) {
     }
 }
 
+/// Гарантирует живой google-браузер на `port` с персистентным профилем.
+/// `headed = true` — с окном (для ручного логина в сервисы без API).
+/// Если браузер уже поднят (например, окно `--google-browse` открыто) —
+/// переиспользуем его (и НЕ убиваем при выходе — см. shutdown_owned_headless).
 pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
     if cdp_alive(port) {
         return Ok(());
@@ -209,8 +264,15 @@ pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
 
     let profile = profile_dir();
     let _ = std::fs::create_dir_all(&profile);
-    // Автоматическая подтяжка кук из ~/.config/chromium хоста
-    sync_host_chromium_profile(&profile);
+    // v0.17.5: перенос куков основного браузера — только по явному согласию
+    // (env POLER_IMPORT_BROWSER_SESSION=1; интерактивно — --import-browser-session).
+    if import_session_allowed() {
+        sync_host_chromium_profile(&profile);
+        audit::record(
+            "security.import_browser_session",
+            "src=~/.config/chromium",
+        );
+    }
     // Автоматическая очистка повисших Singleton-замков после крашей/сигналов
     let _ = std::fs::remove_file(profile.join("SingletonLock"));
     let _ = std::fs::remove_file(profile.join("SingletonCookie"));
@@ -237,6 +299,10 @@ pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
         .map_err(|e| format!("запуск {:?}: {e}", bin))?;
     for _ in 0..60 {
         if cdp_alive(port) {
+            // v0.17.5: ЭТОТ процесс поднял браузер — по выходе приберём за собой
+            if !headed {
+                OWNED_HEADLESS_PORT.store(port, Ordering::SeqCst);
+            }
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -245,6 +311,45 @@ pub fn ensure_google_browser(port: u16, headed: bool) -> Result<(), String> {
     Err(format!(
         "google-браузер не поднялся на порт {port} за 15 с (лог: {log:?})"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// v0.17.5: жизненный цикл headless-браузера (не оставляем CDP-порт открытым)
+// ---------------------------------------------------------------------------
+
+/// Порт headless-браузера, ПОДНЯТОГО этим процессом (0 — не поднимали).
+/// Headed-браузер (`--google-browse`) здесь не отмечается: его закрывает
+/// сам пользователь после ручного логина.
+static OWNED_HEADLESS_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Закрыть headless-браузер, если ЕГО поднял этот процесс.
+///
+/// До v0.17.5 CLI-команды (`--google-gmail`, `--nlm-*`, OAuth-обмены)
+/// оставляли headless Chromium жить неограниченно долго: CDP-порт без
+/// аутентификации торчал в системе, и любой локальный процесс мог
+/// управлять авторизованной сессией Google. Теперь CLI убирает за собой.
+///
+/// Идемпотентно; безопасно звать всегда (no-op, если браузер не наш).
+pub fn shutdown_owned_headless_browser() {
+    let port = OWNED_HEADLESS_PORT.swap(0, Ordering::SeqCst);
+    if port == 0 {
+        return; // не поднимали — чужой/headed-браузер не трогаем
+    }
+    if !cdp_alive(port) {
+        return; // уже мёртв
+    }
+    // штатное закрытие через CDP Browser.close (аккуратнее kill:
+    // сохраняет куки профиля на диск)
+    if let Ok(mut s) = CdpSession::connect(port) {
+        if s.close_browser().is_ok() {
+            for _ in 0..20 {
+                if !cdp_alive(port) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,5 +637,29 @@ mod tests {
         if let Ok(v) = saved {
             std::env::set_var("POLER_GOOGLE_CDP_PORT", v);
         }
+    }
+
+    #[test]
+    fn import_session_disabled_by_default_v0175() {
+        // v0.17.5: молчаливый перенос куков ЗАПРЕЩЁН по умолчанию
+        let saved = std::env::var("POLER_IMPORT_BROWSER_SESSION");
+        std::env::remove_var("POLER_IMPORT_BROWSER_SESSION");
+        assert!(!import_session_allowed(), "без env — отказ");
+        std::env::set_var("POLER_IMPORT_BROWSER_SESSION", "1");
+        assert!(import_session_allowed());
+        std::env::set_var("POLER_IMPORT_BROWSER_SESSION", "0");
+        assert!(!import_session_allowed(), "0 — это явный отказ");
+        match saved {
+            Ok(v) => std::env::set_var("POLER_IMPORT_BROWSER_SESSION", v),
+            Err(_) => std::env::remove_var("POLER_IMPORT_BROWSER_SESSION"),
+        }
+    }
+
+    #[test]
+    fn shutdown_owned_headless_is_noop_when_not_spawned_v0175() {
+        // браузер не поднимался этим процессом — вызов безопасен и тих
+        OWNED_HEADLESS_PORT.store(0, Ordering::SeqCst);
+        shutdown_owned_headless_browser(); // не должен паниковать/зависнуть
+        assert_eq!(OWNED_HEADLESS_PORT.load(Ordering::SeqCst), 0);
     }
 }

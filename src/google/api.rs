@@ -141,7 +141,7 @@ pub fn parse_gmail_message(v: &serde_json::Value) -> Option<MailHit> {
 }
 
 /// Поиск в Gmail владельца. Пустой запрос — недавняя почта.
-/// Требует одноразового `--google-auth`.
+/// Требует одноразового `--google-auth`. Фиксируется в audit.log (v0.17.5).
 pub fn gmail_search(query: &str, max: usize) -> Result<Vec<MailHit>, String> {
     let mut http = GoogleHttp::connect(crate::google::google_cdp_port())?;
     let tokens = ensure_fresh(&mut http)?;
@@ -178,6 +178,10 @@ pub fn gmail_search(query: &str, max: usize) -> Result<Vec<MailHit>, String> {
             }
         }
     }
+    super::audit::record(
+        "gmail.search",
+        &format!("q={} hits={}", super::audit::clip(query, 80), hits.len()),
+    );
     Ok(hits)
 }
 
@@ -270,6 +274,7 @@ pub fn parse_drive_file(v: &serde_json::Value) -> Option<DriveHit> {
 }
 
 /// Файлы Google Drive по имени (пустой запрос — недавние).
+/// Фиксируется в audit.log (v0.17.5).
 pub fn drive_list(query: &str, max: usize) -> Result<Vec<DriveHit>, String> {
     let mut http = GoogleHttp::connect(crate::google::google_cdp_port())?;
     let tokens = ensure_fresh(&mut http)?;
@@ -284,11 +289,16 @@ pub fn drive_list(query: &str, max: usize) -> Result<Vec<DriveHit>, String> {
     }
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("ответ Drive не JSON: {e}"))?;
-    Ok(v
+    let hits: Vec<DriveHit> = v
         .get("files")
         .and_then(|f| f.as_array())
         .map(|arr| arr.iter().filter_map(parse_drive_file).collect())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    super::audit::record(
+        "drive.list",
+        &format!("q={} hits={}", super::audit::clip(query, 80), hits.len()),
+    );
+    Ok(hits)
 }
 
 /// Текстовое представление для CLI/MCP.

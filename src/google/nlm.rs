@@ -767,6 +767,7 @@ impl NlmSession {
 
     /// Создать заметку в NLM: CREATE_NOTE + UPDATE_NOTE с контентом
     /// (двухшаговый протокол, как в NLMTools). Возвращает id новой заметки.
+    /// WRITE-операция: фиксируется в audit.log (v0.17.5).
     pub fn create_note(
         &mut self,
         notebook_id: &str,
@@ -785,6 +786,10 @@ impl NlmSession {
         if !content.is_empty() {
             self.update_note(notebook_id, &note_id, content, title)?;
         }
+        crate::google::audit::record(
+            "nlm.create_note",
+            &format!("nb={} note={} title={}", notebook_id, note_id, crate::google::audit::clip(title, 60)),
+        );
         Ok(note_id)
     }
 
@@ -1007,6 +1012,15 @@ impl NlmSession {
                     .to_string(),
             );
         }
+        crate::google::audit::record(
+            "nlm.chat",
+            &format!(
+                "nb={} q={} answer_chars={}",
+                notebook_id,
+                crate::google::audit::clip(question, 80),
+                answer.chars().count()
+            ),
+        );
         Ok(answer)
     }
 }

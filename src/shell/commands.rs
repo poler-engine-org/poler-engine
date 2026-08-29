@@ -90,7 +90,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
             }
         }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.17.3 — TUI Redesign + Companion Bridge M2+M3+M4: real GcpEnterpriseProvider calls + HybridProvider routing + TUI Enter-handler + оф. NotebookLM API I/O)",
+            "poler-engine {} (poler-shell v0.17.5 — Security Hardening: confirmation gate [y/N]+--yes+--dry-run для write-операций, cookie-import только по явному согласию, shutdown headless-браузера при выходе, JSONL audit-лог)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -270,24 +270,61 @@ fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
             }
         }
         // M5: двусторонняя синхронизация заметок облако ↔ локально
+        // v0.17.5 confirmation gate: push в облако — только с --yes;
+        // --dry-run показывает план без выполнения; без флагов — безопасный
+        // PullOnly + превью ожидающих отправки заметок.
         "notes-sync" | "nsync" => {
-            let nb = match rest.first().cloned().or_else(|| state.active_notebook_id.clone()) {
+            use crate::google::confirm::{env_yes, split_gate_flags};
+            use crate::google::nlm_notes_sync::{plan_notebook_sync, sync_notebook_notes_mode, SyncMode};
+            let (yes_flag, dry_run, positional) = split_gate_flags(rest);
+            let nb = match positional
+                .first()
+                .cloned()
+                .or_else(|| state.active_notebook_id.clone())
+            {
                 Some(id) => id,
                 None => {
                     return CmdResult::Done(
-                        "nlm notes-sync <NB_ID> — не указан ID (или выберите ноутбук в TUI)".into(),
+                        "nlm notes-sync <NB_ID> [--yes | --dry-run] — не указан ID (или выберите ноутбук в TUI)".into(),
                     )
                 }
             };
+            // 1) --dry-run: только план, ничего не выполняем
+            if dry_run {
+                return match state.with_nlm_notes(|sess, conn| plan_notebook_sync(sess, conn, &nb)) {
+                    Ok(plan) => {
+                        let out = format!(
+                            "🔍 DRY-RUN синка заметок {nb} (ничего не выполнено):\n{}\nВыполнить: nlm notes-sync {nb} --yes",
+                            plan.preview()
+                        );
+                        state.set_output(out.clone());
+                        CmdResult::Done(out)
+                    }
+                    Err(e) => CmdResult::Done(format!("❌ nlm notes-sync --dry-run: {e}")),
+                };
+            }
+            // 2) push разрешён только с --yes (или env POLER_YES — скрипты)
+            let mode = if yes_flag || env_yes() { SyncMode::Full } else { SyncMode::PullOnly };
             match state.with_nlm_notes(|sess, conn| {
-                crate::google::nlm_notes_sync::sync_notebook_notes(sess, conn, &nb)
+                sync_notebook_notes_mode(sess, conn, &nb, mode)
             }) {
                 Ok(rep) => {
-                    let mut out = format!("🔄 Синк заметок ноутбука {nb}: {}\n", rep.summary());
+                    let mut out = format!("🔄 Синк заметок ноутбука {nb} ({}): {}\n",
+                        if mode == SyncMode::Full { "pull+push" } else { "только pull — push требует --yes" },
+                        rep.summary());
                     for e in &rep.errors {
                         out.push_str(&format!("  ⚠ {e}\n"));
                     }
-                    out.push_str("Заметки теперь одинаковы в TUI, poler_notes и NotebookLM.\n");
+                    if rep.pending_push > 0 {
+                        out.push_str(&format!(
+                            "\n🔒 {} локальных заметок готовы к отправке в облако.\n",
+                            rep.pending_push
+                        ));
+                        out.push_str("Просмотр: nlm notes-sync <NB_ID> --dry-run\n");
+                        out.push_str("Отправка: nlm notes-sync <NB_ID> --yes\n");
+                    } else {
+                        out.push_str("Заметки синхронизированы (облако — источник истины).\n");
+                    }
                     state.set_output(out.clone());
                     CmdResult::Done(out)
                 }
@@ -1356,17 +1393,31 @@ fn cmd_notes(state: &mut ShellState, args: &[String]) -> CmdResult {
             ))
         }
         "rm" => {
-            if rest.is_empty() {
-                return CmdResult::Done("notes rm <id>".into());
+            // v0.17.5: удаление локальной заметки — с подтверждением --yes
+            use crate::google::confirm::{env_yes, split_gate_flags};
+            let (yes_flag, _dry, positional) = split_gate_flags(rest);
+            if positional.is_empty() {
+                return CmdResult::Done("notes rm <id> [--yes]".into());
             }
-            let id: i64 = match rest[0].parse() {
+            let id: i64 = match positional[0].parse() {
                 Ok(n) => n,
-                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", rest[0])),
+                Err(_) => return CmdResult::Done(format!("❌ id должен быть числом: {}", positional[0])),
             };
             let conn = match state.ensure_notes_conn() {
                 Ok(c) => c,
                 Err(e) => return CmdResult::Done(format!("❌ {e}")),
             };
+            if !(yes_flag || env_yes()) {
+                // покажем, что удаляем, и попросим подтверждение
+                let shown = match notes::get_note(conn, id) {
+                    Ok(Some(n)) => format!("«{}»", n.title),
+                    Ok(None) => return CmdResult::Done(format!("note id {id} не найдена")),
+                    Err(e) => return CmdResult::Done(format!("❌ {e}")),
+                };
+                return CmdResult::Done(format!(
+                    "🔒 Заметка #{id} {shown} будет удалена локально (без возможности отмены).\nПодтверди: notes rm {id} --yes"
+                ));
+            }
             match notes::delete_note(conn, id) {
                 Ok(()) => CmdResult::Done(format!("✓ Заметка #{id} удалена")),
                 Err(e) => CmdResult::Done(format!("❌ {e}")),
@@ -1666,6 +1717,81 @@ mod tests {
         }
     }
 
+    // ---- v0.17.5: confirmation gate ----
+
+    #[test]
+    fn cmd_notes_rm_requires_yes_v0175() {
+        // создаём заметку в реальной временной БД, затем пробуем удалить без --yes
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("notes.db");
+        let mut s = ShellState::new(db.clone());
+        // add работает без подтверждения (создание — не деструктивная операция)
+        dispatch(&mut s, "notes add Тестовая");
+        let notes_out = match dispatch(&mut s, "notes list") {
+            CmdResult::Done(o) => o,
+            _ => panic!("notes list"),
+        };
+        // id заметки — первое поле строки вида «#1. Тестовая» / «1. Тестовая»
+        let id: String = notes_out
+            .lines()
+            .find(|l| l.contains("Тестовая"))
+            .and_then(|l| l.trim().split('.').next().map(|s| s.trim().trim_start_matches('#').to_string()))
+            .expect("заметка создана");
+        // удаление БЕЗ --yes → гейт: показываем что удалим и просим подтверждение
+        let r = dispatch(&mut s, &format!("notes rm {id}"));
+        match r {
+            CmdResult::Done(out) => {
+                assert!(out.contains("--yes"), "подсказка о --yes: {out}");
+                assert!(out.contains("Тестовая"), "показываем что удаляем: {out}");
+            }
+            _ => panic!(),
+        }
+        // заметка ещё жива
+        let still = match dispatch(&mut s, "notes list") {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        assert!(still.contains("Тестовая"), "без --yes заметка не удалена");
+        // с --yes → удаление
+        let r2 = dispatch(&mut s, &format!("notes rm {id} --yes"));
+        match r2 {
+            CmdResult::Done(out) => assert!(out.contains("удалена")),
+            _ => panic!(),
+        }
+        let gone = match dispatch(&mut s, "notes list") {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        assert!(!gone.contains("Тестовая"), "с --yes заметка удалена");
+    }
+
+    #[test]
+    fn cmd_notes_rm_unknown_id_gives_not_found_v0175() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/notes-rm-404.db"));
+        let r = dispatch(&mut s, "notes rm 99999");
+        match r {
+            CmdResult::Done(out) => assert!(out.contains("не найдена")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_nlm_notes_sync_hint_mentions_flags_v0175() {
+        // без NLM-сессии команда упадёт с ошибкой браузера — но подсказка
+        // о флагах должна присутствовать в тексте помощи
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let r = dispatch(&mut s, "nlm notes-sync");
+        match r {
+            CmdResult::Done(out) => {
+                assert!(
+                    out.contains("--yes") || out.contains("--dry-run") || out.contains("NB_ID"),
+                    "подсказка о gate-флагах: {out}"
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
     #[test]
     fn cmd_impact_no_args_gives_help() {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
@@ -1746,12 +1872,12 @@ mod tests {
     #[test]
     fn cmd_version_string_updated_for_v0171() {
         // shadow test marker — used by other tests via name
-        // v0.17.1: Companion Bridge — бейдж poler-shell обновлён.
+        // v0.17.5: Security Hardening — бейдж poler-shell обновлён.
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("0.17.3"));
+                assert!(out.contains("0.17.5"));
                 assert!(out.contains("poler-shell"));
             }
             _ => panic!(),
@@ -1765,7 +1891,7 @@ mod tests {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("0.17.3")),
+            CmdResult::Done(out) => assert!(out.contains("0.17.5")),
             _ => panic!(),
         }
     }

@@ -53,7 +53,7 @@ pub struct HelpEntry {
     pub short: &'static str,
 }
 
-/// Все команды poler-shell v0.17.3 (полный реестр для `help`).
+/// Все команды poler-shell v0.17.5 (полный реестр для `help`).
 pub fn all_entries() -> Vec<HelpEntry> {
     vec![
         HelpEntry { group: HelpGroup::Search, cmd: "search \"<query>\" [--top N]", short: "Пошук по web-index.db (NLM+веб+локал)" },
@@ -130,7 +130,7 @@ pub fn help_overview() -> String {
         HelpGroup::Sources,
         HelpGroup::Meta,
     ];
-    let _ = writeln!(s, "poler-shell v0.17.3 — TUI Redesign + Companion Bridge M2+M3+M4 (MiMo Code-style 4-pane + mouse + CRUD + оф. NotebookLM API I/O + TUI Enter-handler)");
+    let _ = writeln!(s, "poler-shell v0.17.5 — Security Hardening (confirmation gate --yes/--dry-run + cookie-import по согласию + shutdown headless + audit.log)");
     let _ = writeln!(s, "Доступні команди ({}):\n", entries.len());
     for g in groups {
         let g_entries: Vec<&HelpEntry> = entries.iter().filter(|e| e.group == g).collect();

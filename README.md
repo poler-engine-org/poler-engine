@@ -14,6 +14,72 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.17.5: Security Hardening — ручной контроль над аккаунтными операциями
+
+Аудит безопасности выявил четыре слабых места в работе движка с аккаунтом
+владельца (Google/NotebookLM): молчаливый перенос куков из основного
+браузера, отсутствие подтверждений перед write-операциями, «вечно живой»
+headless-браузер с открытым CDP-портом и отсутствие журнала действий.
+v0.17.5 закрывает все четыре.
+
+### 1. Cookie-import — только по явному согласию
+
+`sync_host_chromium_profile()` больше НЕ тянет куки из `~/.config/chromium`
+автоматически при каждом запуске google-браузера. Перенос сессии внешнего
+браузера — осознанное действие:
+
+```bash
+poler-engine --import-browser-session   # [y/N] + предупреждение + audit-запись
+POLER_IMPORT_BROWSER_SESSION=1 …        # скрипты (тоже логируется)
+```
+
+Логин своими руками через `--google-browse <URL>` — по-прежнему основной
+и рекомендуемый путь (пароль между вами и Google).
+
+### 2. Confirmation Gate для write-операций
+
+- `nlm notes-sync <NB>` — теперь **только pull** (облако → локально).
+  Отправка локальных заметок в облако — отдельно, с подтверждением:
+  `--dry-run` — план изменений без выполнения; `--yes` — выполнить push.
+- TUI: открытие ноутбука синхронизирует только pull; ожидающие отправки
+  заметки показываются с подсказкой команды.
+- `notes rm <id>` — показывает заголовок заметки и требует `notes rm <id> --yes`.
+- Скрипты: env `POLER_YES=1` снимает вопросы (каждое действие всё равно
+  попадает в audit-лог).
+- Новый модуль `google::confirm`: интерактивный `[y/N]` для CLI,
+  двухшаговый паттерн plan→apply для shell/TUI, безопасный отказ по умолчанию.
+
+### 3. Shutdown headless-браузера при выходе
+
+До v0.17.5 `--google-gmail`/`--nlm-*`/OAuth-обмены оставляли headless
+Chromium жить неограниченно — CDP-порт 9223 без аутентификации торчал в
+системе, и любой локальный процесс мог управлять авторизованной сессией.
+Теперь CLI закрывает поднятый им браузер через `Browser.close` (headed-окно
+`--google-browse` не трогается — его закрывает владелец).
+
+### 4. JSONL audit-лог
+
+Все обращения к аккаунту фиксируются в `~/.config/poler-engine/audit.log`
+(права 0600, best-effort — ошибка лога никогда не ломает операцию):
+
+```json
+{"ts":"2026-08-29T13:04:00Z","action":"nlm.create_note","details":"nb=abc note=n-1 title=\"Мысль\""}
+{"ts":"2026-08-29T13:05:11Z","action":"gmail.search","details":"q=from:me hits=8"}
+```
+
+Логируемые действия: `oauth.auth`, `oauth.gcp_auth`, `gmail.search`,
+`drive.list`, `nlm.create_note`, `nlm.chat`, `nlm.notes_sync`,
+`security.import_browser_session`. Отключение: `POLER_AUDIT_LOG=off`,
+свой путь: `POLER_AUDIT_LOG=/path/to.log`. В details — только
+идентификаторы и счётчики, без тел писем/заметок.
+
+```
+количество новых тестов: 15 (gate-логика, audit JSONL/0600/env,
+  import-гейт по умолчанию OFF, shutdown no-op, dispatch notes rm)
+```
+
+---
+
 ## v0.17.4: Transcript / Response View — лента чата в окне TUI
 
 Восстановление ключевой функции Ask-вкладки Web GUI (удалён в v0.17.0 —
