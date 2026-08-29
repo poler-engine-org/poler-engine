@@ -251,9 +251,20 @@ impl McpServer {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(self.wait_ms);
+        // пер-страничный таймаут и robots — управляесы вызовом (WebLens
+        // передаёт respect_robots=false для кнопки «индексировать ЭТУ страницу»)
+        let page_timeout_ms = args
+            .get("page_timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(45_000)
+            .clamp(1_000, 300_000);
+        let respect_robots = args
+            .get("respect_robots")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         web::ensure_chromium(self.cdp_port)?;
-        let mut fetcher = CdpFetcher::new(self.cdp_port, wait_ms)?;
+        let mut fetcher = CdpFetcher::new(self.cdp_port, wait_ms, page_timeout_ms)?;
         let mut ix = WebIndex::open(&self.db_path).map_err(|e| e.to_string())?;
         let cfg = web::CrawlConfig {
             max_pages: max_pages.clamp(1, 500),
@@ -261,6 +272,8 @@ impl McpServer {
             delay_ms,
             cross_site,
             wait_ms,
+            page_timeout_ms,
+            respect_robots,
         };
         eprintln!("poler-mcp: crawl seed={seed} depth={} max={}", cfg.max_depth, cfg.max_pages);
         let stats = web::crawl::crawl(&mut ix, &mut fetcher, seed, &cfg, false)

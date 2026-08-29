@@ -61,6 +61,13 @@ pub struct CrawlConfig {
     pub cross_site: bool,
     /// Пауза после load на XHR, мс.
     pub wait_ms: u64,
+    /// Пер-страничный таймаут загрузки, мс (0 = без лимита).
+    /// Передаётся в CdpFetcher через cdp_fetcher_with_timeout.
+    pub page_timeout_ms: u64,
+    /// Соблюдать robots.txt (по умолчанию — да).
+    /// false = явное распоряжение пользователя индексировать конкретную
+    /// страницу (--browser-index): ручное сохранение, не автоматический обход.
+    pub respect_robots: bool,
 }
 
 impl Default for CrawlConfig {
@@ -71,6 +78,8 @@ impl Default for CrawlConfig {
             delay_ms: 1000,
             cross_site: false,
             wait_ms: 800,
+            page_timeout_ms: 45_000,
+            respect_robots: true,
         }
     }
 }
@@ -87,7 +96,16 @@ pub struct CrawlStats {
     pub sitemap_urls: usize,
     pub frontier_left: usize,
     pub elapsed_ms: u64,
+    /// Человекочитаемые события обхода (robots-запреты с хостами,
+    /// таймауты страниц и т.п.) — не только счётчики: пользователь
+    /// должен видеть ПОЧЕМУ страница не попала в индекс.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
+
+/// Сколько robots-сообщений печатать в stderr по ходу обхода
+/// (остальные — только в stats.notes, чтобы sitemap-простыни не спамили).
+const ROBOTS_PRINT_CAP: usize = 10;
 
 /// Расширения, которые не рендерятся в текст (медиа/архивы).
 const SKIP_EXT: &[&str] = &[
@@ -190,27 +208,58 @@ pub fn crawl(
         }
         visited.insert(key.clone());
 
-        let robots = match robots_cache.get(index, fetcher, &url) {
-            Ok(r) => r,
-            Err(e) => {
-                if verbose {
+        let robots = if cfg.respect_robots {
+            match robots_cache.get(index, fetcher, &url) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    stats.errors += 1;
+                    stats
+                        .notes
+                        .push(format!("robots.txt недоступен {key}: {e} — страница пропущена"));
                     eprintln!("poler-crawl: robots {key}: {e}");
+                    continue;
                 }
-                stats.errors += 1;
+            }
+        } else {
+            None
+        };
+        if let Some(robots) = &robots {
+            if !robots.allowed(&url.robots_path()) {
+                stats.skipped_robots += 1;
+                let note = format!(
+                    "robots.txt хоста {} запрещает {} — страница пропущена (RFC 9309)",
+                    url.host_key(),
+                    url.robots_path()
+                );
+                stats.notes.push(note.clone());
+                // всегда сообщаем (не только verbose): молчаливый
+                // skipped_robots — боль UX-аудита №3
+                if stats.skipped_robots <= ROBOTS_PRINT_CAP {
+                    eprintln!("poler-crawl: {note}");
+                } else if stats.skipped_robots == ROBOTS_PRINT_CAP + 1 {
+                    eprintln!("poler-crawl: … дальнейшие robots-запреты — в stats.notes");
+                }
                 continue;
             }
-        };
-        if !robots.allowed(&url.robots_path()) {
-            stats.skipped_robots += 1;
-            if verbose {
-                eprintln!("poler-crawl: robots запрещает {key}");
+        } else if !cfg.respect_robots {
+            // явное распоряжение пользователя: индексируем вопреки robots,
+            // но честно фиксируем это в notes
+            if let Ok(r) = robots_cache.get(index, fetcher, &url) {
+                if !r.allowed(&url.robots_path()) {
+                    stats.notes.push(format!(
+                        "{} запрещает robots.txt — индексировано по явной команде пользователя",
+                        key
+                    ));
+                }
             }
-            continue;
         }
 
         // per-host politeness: delay = max(настройка, Crawl-delay)
         let host = url.host_key().to_string();
-        let delay_ms = cfg.delay_ms.max((robots.crawl_delay_s * 1000.0) as u64);
+        let delay_ms = robots
+            .as_ref()
+            .map(|r| cfg.delay_ms.max((r.crawl_delay_s * 1000.0) as u64))
+            .unwrap_or(cfg.delay_ms);
         if let Some(t) = robots_cache.last_hit.get(&host).copied() {
             let wait = t + Duration::from_millis(delay_ms);
             let now = Instant::now();
@@ -224,10 +273,18 @@ pub fn crawl(
         let page = match fetcher.fetch(&key) {
             Ok(p) => p,
             Err(e) => {
-                if verbose {
-                    eprintln!("poler-crawl: fetch {key}: {e}");
-                }
                 stats.errors += 1;
+                let is_timeout = e.contains("таймаут");
+                stats.notes.push(format!(
+                    "страница не загружена {key}: {e}{}",
+                    if is_timeout {
+                        " (пер-страничный лимит; увеличьте --crawl-page-timeout-ms, \
+                         если сайт медленный)"
+                    } else {
+                        ""
+                    }
+                ));
+                eprintln!("poler-crawl: fetch {key}: {e}");
                 continue;
             }
         };
@@ -491,6 +548,15 @@ mod tests {
             ),
         );
         pages.insert(
+            "https://site.com/private/x".to_string(),
+            page(
+                "https://site.com/private/x",
+                "Private",
+                "закрытая robots страница для теста явной команды пользователя",
+                &[],
+            ),
+        );
+        pages.insert(
             "https://site.com/from-sitemap".to_string(),
             page(
                 "https://site.com/from-sitemap",
@@ -513,6 +579,8 @@ mod tests {
             delay_ms: 0, // тесты без пауз
             cross_site: false,
             wait_ms: 0,
+            page_timeout_ms: 0,
+            respect_robots: true,
         }
     }
 
@@ -529,6 +597,53 @@ mod tests {
         assert!(hits.iter().any(|h| h.url == "https://site.com/from-sitemap"));
         // внешний хост не пошёл
         assert!(!f.log.borrow().iter().any(|l| l.contains("other.com/away")));
+    }
+
+    // ---- фикс №3 UX-аудита: robots-запрет объясняется, а не молчит ----
+
+    #[test]
+    fn crawl_robots_skip_is_explained_in_notes() {
+        let mut ix = WebIndex::open_memory().unwrap();
+        let mut f = mock();
+        let stats = crawl(&mut ix, &mut f, "https://site.com/", &cfg(), false).unwrap();
+        // не только счётчик, но и человекочитаемое ПОЧЕМУ с хостом и путём
+        assert!(stats.notes.iter().any(|n| {
+            n.contains("robots.txt")
+                && n.contains("site.com")
+                && n.contains("/private")
+        }));
+    }
+
+    // ---- --browser-index: явная команда пользователя обходит robots ----
+
+    #[test]
+    fn crawl_respect_robots_false_indexes_disallowed_page() {
+        let mut ix = WebIndex::open_memory().unwrap();
+        let mut f = mock();
+        let mut c = cfg();
+        c.max_depth = 0; // одиночная страница — режим --browser-index
+        c.max_pages = 1;
+        c.respect_robots = false;
+        let stats = crawl(&mut ix, &mut f, "https://site.com/private/x", &c, false).unwrap();
+        assert_eq!(stats.skipped_robots, 0, "явная команда не считается запретом");
+        assert_eq!(stats.indexed, 1, "страница должна попасть в индекс");
+        // честность: notes фиксируют, что robots был нарушен по команде пользователя
+        assert!(stats.notes.iter().any(|n| n.contains("явной команде")));
+        // переиндексация той же страницы — без изменений (Percolator-lite)
+        let stats2 = crawl(&mut ix, &mut f, "https://site.com/private/x", &c, false).unwrap();
+        assert_eq!(stats2.unchanged, 1);
+    }
+
+    #[test]
+    fn crawl_fetch_error_lands_in_notes() {
+        let mut ix = WebIndex::open_memory().unwrap();
+        let mut f = mock();
+        let mut c = cfg();
+        c.max_depth = 0;
+        // страницы нет в моке → 404-ошибка попадает в notes
+        let stats = crawl(&mut ix, &mut f, "https://site.com/nope", &c, false).unwrap();
+        assert_eq!(stats.errors, 1);
+        assert!(stats.notes.iter().any(|n| n.contains("nope")));
     }
 
     #[test]

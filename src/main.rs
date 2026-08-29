@@ -111,6 +111,30 @@ struct Cli {
     #[arg(long = "crawl-delay-ms", default_value_t = 1000)]
     crawl_delay_ms: u64,
 
+    /// Пер-страничный таймаут загрузки в краулинге, мс [default: 45000].
+    /// JS-тяжёлые сайты (бесконечные XHR/стриминг) не зависят дольше лимита.
+    #[arg(long = "crawl-page-timeout-ms", default_value_t = 45_000)]
+    crawl_page_timeout_ms: u64,
+
+    /// ИНДЕКСАЦИЯ ОДНОЙ СТРАНИЦЫ: URL → рендер (Chromium CDP) → веб-индекс.
+    /// Явная команда пользователя: robots.txt не блокирует (но фиксируется
+    /// в notes). После — доступен --web-search по общему индексу.
+    #[arg(long = "browser-index", value_name = "URL", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact"])]
+    browser_index: Option<String>,
+
+    /// БРАУЗЕРНЫЙ РЕЖИМ: материализует WebLens (расширение MV3), запускает
+    /// оконный Chromium с уже установленным WebLens и держит MCP-сервер
+    /// на 127.0.0.1:8765 (BIND как у --mcp-http, или только порт).
+    #[arg(long = "web-lens", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens_install", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    web_lens: Option<String>,
+
+    /// Установить WebLens в ЕЖЕДНЕВНЫЙ браузер: материализует файлы
+    /// и печатает шаги «Load unpacked» (chrome://-страницы автоматизировать
+    /// нельзя — это защита браузера; управляемый движком браузер ставит
+    /// WebLens сам через --web-lens).
+    #[arg(long = "web-lens-install", conflicts_with_all = ["web_lens", "mcp_http", "mcp", "shell", "tui", "crawl", "web_search", "browser_index"])]
+    web_lens_install: bool,
+
     /// MCP-СЕРВЕР (Model Context Protocol): poler-engine как нативный
     /// инструмент LLM-агентов поверх stdio JSON-RPC.
     /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search /
@@ -902,6 +926,85 @@ fn run(cli: Cli) -> ExitCode {
         return ExitCode::from(code as u8);
     }
 
+    // ---------- v0.19.0: WebLens — браузерный режим движка ----------
+    // Материализует расширение MV3 (вшито в бинарник), запускает оконный
+    // Chromium с уже установленным WebLens (--load-extension — автоустановка)
+    // и держит MCP-сервер на localhost: Ctrl+C останавливает демона,
+    // окно браузера живёт своей жизнью.
+    if let Some(bind) = cli.web_lens.clone() {
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let token = match poler_engine::web::weblens::weblens_token() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("poler-weblens: токен: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        // «8765» → «127.0.0.1:8765» (тот же канон, что у --mcp-http)
+        let bind_addr = match bind.parse::<u16>() {
+            Ok(port) => format!("127.0.0.1:{port}"),
+            Err(_) => bind.clone(),
+        };
+        let endpoint = format!("http://{bind_addr}/");
+        let ext_dir = match poler_engine::web::weblens::materialize(&endpoint, &token) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("poler-weblens: материализация: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        eprintln!("poler-weblens: расширение готово: {}", ext_dir.display());
+        // оконный браузер с WebLens; неудача (нет дисплея/браузера) —
+        // не фатально: демон продолжает serve, расширение можно поставить
+        // в свой браузер (--web-lens-install)
+        match poler_engine::web::weblens::spawn_windowed_browser(&ext_dir, "about:blank") {
+            Ok(_child) => {
+                eprintln!("poler-weblens: браузер запущен с WebLens — Alt+P открывает панель");
+            }
+            Err(e) => {
+                eprintln!("poler-weblens: оконный браузер не запущен: {e}");
+            }
+        }
+        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db);
+        return ExitCode::from(code as u8);
+    }
+
+    // ---------- --web-lens-install: WebLens в ЕЖЕДНЕВНЫЙ браузер ----------
+    // chrome://-страницы автоматизировать нельзя (защита браузера) —
+    // движок делает всё, что можно: файлы + конфиг + инструкция.
+    if cli.web_lens_install {
+        let token = match poler_engine::web::weblens::weblens_token() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("poler-weblens: токен: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let endpoint = "http://127.0.0.1:8765/".to_string();
+        let dir = match poler_engine::web::weblens::materialize(&endpoint, &token) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("poler-weblens: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        println!("WebLens материализован: {}", dir.display());
+        println!();
+        println!("Установка в свой браузер (один раз, ~30 секунд):");
+        println!("  1. Откройте chrome://extensions (или edge://extensions, brave://extensions)");
+        println!("  2. Включите «Режим разработчика» (переключатель справа сверху)");
+        println!("  3. «Загрузить распакованное расширение» → выберите каталог:");
+        println!("     {}", dir.display());
+        println!("  4. Alt+P (или иконка POLER на панели) — боковая панель поиска");
+        println!();
+        println!("Демон движка (панель работает, пока он жив):");
+        println!("  poler-engine --web-lens            # рекомендуемый режим: свой браузер + демон");
+        println!("  poler-engine --mcp-http 8765 --mcp-token <токен>   # только демон");
+        println!();
+        println!("Токен уже вписан в config.json расширения: {endpoint}");
+        return ExitCode::SUCCESS;
+    }
+
     // ---------- MCP-сервер по HTTP: удалённый агент через туннель ----------
     if let Some(bind) = cli.mcp_http.clone() {
         let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
@@ -1248,7 +1351,11 @@ fn run(cli: Cli) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let mut fetcher = match poler_engine::web::cdp_fetcher(cli.cdp_port, cli.web_wait_ms) {
+        let mut fetcher = match poler_engine::web::cdp_fetcher_with_timeout(
+            cli.cdp_port,
+            cli.web_wait_ms,
+            cli.crawl_page_timeout_ms,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("poler-engine: Chromium CDP (порт {}): {e}", cli.cdp_port);
@@ -1263,6 +1370,8 @@ fn run(cli: Cli) -> ExitCode {
             delay_ms: cli.crawl_delay_ms,
             cross_site: cli.cross_site,
             wait_ms: cli.web_wait_ms,
+            page_timeout_ms: cli.crawl_page_timeout_ms,
+            respect_robots: true,
         };
         eprintln!("poler-crawl: seed {seed}, глубина ≤ {}, до {} страниц, база {db:?}", cfg.max_depth, cfg.max_pages);
         let stats = match poler_engine::web::crawl::crawl(&mut ix, &mut fetcher, &seed, &cfg, cli.verbose) {
@@ -1274,9 +1383,78 @@ fn run(cli: Cli) -> ExitCode {
         };
         println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
         eprintln!(
-            "poler-crawl: готово — {} загружено, {} проиндексировано, {} дубликатов, {} мс",
-            stats.fetched, stats.indexed, stats.duplicates, stats.elapsed_ms
+            "poler-crawl: готово — {} загружено, {} проиндексировано, {} без изменений, {} дубликатов, {} robots-запретов, {} ошибок, {} мс",
+            stats.fetched,
+            stats.indexed,
+            stats.unchanged,
+            stats.duplicates,
+            stats.skipped_robots,
+            stats.errors,
+            stats.elapsed_ms
         );
+        return ExitCode::SUCCESS;
+    }
+
+    // ---------- Индексация одной страницы: --browser-index <URL> ----------
+    if let Some(url) = cli.browser_index.clone() {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            eprintln!("poler-engine: --browser-index ожидает URL (http(s)://...), получено: {url}");
+            return ExitCode::from(2);
+        }
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let mut ix = match poler_engine::web::WebIndex::open(&db) {
+            Ok(ix) => ix,
+            Err(e) => {
+                eprintln!("poler-engine: web-индекс {db:?}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut fetcher = match poler_engine::web::cdp_fetcher_with_timeout(
+            cli.cdp_port,
+            cli.web_wait_ms,
+            cli.crawl_page_timeout_ms,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-engine: Chromium CDP (порт {}): {e}", cli.cdp_port);
+                return ExitCode::from(2);
+            }
+        };
+        // одиночная страница: глубина 0; явная команда пользователя —
+        // robots не блокирует, но честно фиксируется в notes
+        let cfg = poler_engine::web::CrawlConfig {
+            max_pages: 1,
+            max_depth: 0,
+            delay_ms: cli.crawl_delay_ms,
+            cross_site: false,
+            wait_ms: cli.web_wait_ms,
+            page_timeout_ms: cli.crawl_page_timeout_ms,
+            respect_robots: false,
+        };
+        let stats = match poler_engine::web::crawl::crawl(&mut ix, &mut fetcher, &url, &cfg, false) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("poler-browser-index: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+        for n in stats.notes.iter().take(5) {
+            eprintln!("  • {n}");
+        }
+        if stats.indexed == 1 {
+            eprintln!("poler-browser-index: страница в индексе — poler-engine --web-search \"запрос\"");
+        } else if stats.unchanged == 1 {
+            eprintln!("poler-browser-index: уже в индексе, контент не менялся (Percolator-lite)");
+        } else if stats.duplicates == 1 {
+            eprintln!("poler-browser-index: near-дубликат уже известной страницы (SimHash)");
+        } else {
+            eprintln!(
+                "poler-browser-index: страница НЕ попала в индекс (ошибок: {}) — см. notes выше",
+                stats.errors
+            );
+            return ExitCode::from(1);
+        }
         return ExitCode::SUCCESS;
     }
 

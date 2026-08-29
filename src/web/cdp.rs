@@ -16,10 +16,26 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Максимальный размер одного WebSocket-сообщения (текст страницы).
 const MAX_WS_MESSAGE: usize = 64 * 1024 * 1024;
+
+/// Бюджет на выгрузку тел перехваченных JSON-ответов (внутри одной страницы):
+/// long-polling/стриминг не должны съедать минуты.
+const INTERCEPT_BUDGET: Duration = Duration::from_secs(8);
+/// Сколько тел JSON-ответов выгружать максимум на страницу.
+const INTERCEPT_MAX: usize = 32;
+
+/// Таймаут чтения WS с учётом дедлайна страницы: не больше `cap`,
+/// но и не дольше остатка дедлайна (пол ≥ 100 мс — без busy-loop).
+fn clamp_timeout(remaining: Option<Duration>, cap: Duration) -> Duration {
+    let floor = Duration::from_millis(100);
+    match remaining {
+        Some(r) => r.max(floor).min(cap),
+        None => cap,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // base64: encode для Sec-WebSocket-Key, decode для скриншотов и медиа
@@ -318,6 +334,9 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
 pub struct CdpSession {
     ws: WsClient,
     next_id: u64,
+    /// Кооперативный дедлайн текущей загрузки страницы (пер-страничный
+    /// таймаут краулера). None = без лимита.
+    page_deadline: Option<Instant>,
 }
 
 /// Результат загрузки страницы: рендер-текст + перехваченный JSON.
@@ -363,11 +382,38 @@ impl CdpSession {
             .and_then(|(_, rest)| rest.find('/').map(|i| rest[i..].to_string()))
             .unwrap_or_else(|| "/devtools/page/0".to_string());
         let ws = WsClient::connect("127.0.0.1", port, &path)?;
-        let mut s = Self { ws, next_id: 1 };
+        let mut s = Self {
+            ws,
+            next_id: 1,
+            page_deadline: None,
+        };
         s.command("Page.enable", "{}")?;
         s.command("Network.enable", "{}")?;
         s.apply_stealth()?;
         Ok(s)
+    }
+
+    /// Установить/снять дедлайн текущей страницы (пер-страничный таймаут).
+    pub fn set_page_deadline(&mut self, deadline: Option<Instant>) {
+        self.page_deadline = deadline;
+    }
+
+    /// Остаток до дедлайна страницы (None = лимита нет).
+    fn deadline_remaining(&self) -> Option<Duration> {
+        self.page_deadline.map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// Дедлайн страницы истёк?
+    fn deadline_hit(&self) -> bool {
+        self.page_deadline
+            .map(|d| Instant::now() >= d)
+            .unwrap_or(false)
+    }
+
+    /// Подстроить read-таймаут WS под дедлайн (cap 30 с).
+    fn tune_recv_timeout(&mut self) {
+        let t = clamp_timeout(self.deadline_remaining(), Duration::from_secs(30));
+        self.ws.stream.set_read_timeout(Some(t)).ok();
     }
 
     /// Десктопный UA вместо «HeadlessChrome/…» (выдаёт автоматизацию
@@ -409,13 +455,26 @@ impl CdpSession {
         self.next_id += 1;
         let msg = format!(r#"{{"id":{id},"method":"{method}","params":{params}}}"#);
         self.ws.send_text(&msg)?;
-        // сброс таймаута: фаза ожидания load могла оставить 100-250 мс
-        self.ws
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
         loop {
-            let text = self.ws.recv_text()?;
+            if self.deadline_hit() {
+                return Err("пер-страничный таймаут (CdpSession::command_collect)".into());
+            }
+            self.tune_recv_timeout();
+            let text = match self.ws.recv_text() {
+                Ok(t) => t,
+                // read-timeout при почти истёкшем дедлайне — это таймаут
+                // страницы, а не сетевая ошибка: называем вещи своими именами
+                Err(e) => {
+                    let near = self
+                        .deadline_remaining()
+                        .map(|r| r < Duration::from_secs(2))
+                        .unwrap_or(false);
+                    if near {
+                        return Err(format!("пер-страничный таймаут: страница не отдалась за лимит ({e})"));
+                    }
+                    return Err(e);
+                }
+            };
             let v: serde_json::Value =
                 serde_json::from_str(&text).map_err(|e| format!("cdp json: {e}"))?;
             if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
@@ -490,6 +549,7 @@ impl CdpSession {
 
     /// Навигация + ожидание load + дренирование событий сети.
     /// Возвращает собранные CDP-события (перехват JSON, статусы ответов).
+    /// Ожидание load ограничено min(20 с, остаток дедлайна страницы).
     fn navigate_and_collect(
         &mut self,
         url: &str,
@@ -502,8 +562,15 @@ impl CdpSession {
             &mut events,
         )?;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let nav_cap = self
+            .deadline_remaining()
+            .map(|r| r.min(Duration::from_secs(20)))
+            .unwrap_or(Duration::from_secs(20));
+        let deadline = std::time::Instant::now() + nav_cap;
         while std::time::Instant::now() < deadline {
+            if self.deadline_hit() {
+                return Err("пер-страничный таймаут: load не наступил".into());
+            }
             self.ws
                 .stream
                 .set_read_timeout(Some(Duration::from_millis(250)))
@@ -526,12 +593,20 @@ impl CdpSession {
             }
         }
         if wait_ms > 0 {
-            std::thread::sleep(Duration::from_millis(wait_ms));
+            // пауза на XHR не дальше дедлайна страницы
+            let pause = self
+                .deadline_remaining()
+                .map(|r| r.min(Duration::from_millis(wait_ms)))
+                .unwrap_or_else(|| Duration::from_millis(wait_ms));
+            std::thread::sleep(pause);
             self.ws
                 .stream
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .ok();
             while let Ok(text) = self.ws.recv_text() {
+                if self.deadline_hit() {
+                    break;
+                }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if v.get("method").is_some() {
                         events.push(v);
@@ -547,26 +622,26 @@ impl CdpSession {
     }
 
     /// Перехват JSON-ответов скрытых API из накопленных событий.
+    /// Только ЗАВЕРШЁННЫСЯ ответы (Network.loadingFinished): тело незавершённого
+    /// (long-polling/стрим) запроса не выгружается — раньше это висло минутами.
+    /// Бюджет `INTERCEPT_BUDGET` и лимит `INTERCEPT_MAX` — жёсткие.
     fn intercept_json(
         &mut self,
         events: &[serde_json::Value],
     ) -> Vec<(String, String)> {
-        let json_requests: Vec<(String, String)> = events
-            .iter()
-            .filter_map(|e| {
-                let p = e.get("params")?;
-                let resp = p.get("response")?;
-                let mime = resp.get("mimeType")?.as_str()?;
-                if !mime.contains("json") {
-                    return None;
-                }
-                let url = resp.get("url")?.as_str()?.to_string();
-                let rid = p.get("requestId")?.as_str()?.to_string();
-                Some((rid, url))
-            })
-            .collect();
+        let json_requests = finished_json_requests(events);
+        let budget = std::time::Instant::now() + INTERCEPT_BUDGET;
         let mut intercepted: Vec<(String, String)> = Vec::new();
-        for (rid, url) in json_requests.iter().take(64) {
+        for (rid, url) in json_requests.into_iter().take(INTERCEPT_MAX) {
+            if std::time::Instant::now() >= budget || self.deadline_hit() {
+                break;
+            }
+            // короткий read-таймаут: тело либо отдаётся быстро, либо не ждём
+            let t = clamp_timeout(
+                Some(budget.saturating_duration_since(Instant::now())),
+                Duration::from_secs(3),
+            );
+            self.ws.stream.set_read_timeout(Some(t)).ok();
             if let Ok(res) = self.command(
                 "Network.getResponseBody",
                 &format!(r#"{{"requestId":"{rid}"}}"#),
@@ -576,8 +651,14 @@ impl CdpSession {
                         intercepted.push((url.clone(), body.to_string()));
                     }
                 }
+            } else {
+                break; // бюджет исчерпан — остальные тела пропускаем
             }
         }
+        self.ws
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
         intercepted
     }
 
@@ -686,6 +767,39 @@ impl CdpSession {
     }
 }
 
+/// Из событий CDP выбрать ЗАВЕРШЁННЫЕ JSON-ответы: (requestId, url).
+/// Завершённость = было `Network.loadingFinished` для requestId
+/// (незавершённый long-polling/стрим тело не отдаёт — источник висений).
+fn finished_json_requests(events: &[serde_json::Value]) -> Vec<(String, String)> {
+    use std::collections::HashSet;
+    let finished: HashSet<&str> = events
+        .iter()
+        .filter(|e| {
+            e.get("method").and_then(|m| m.as_str()) == Some("Network.loadingFinished")
+        })
+        .filter_map(|e| e.get("params")?.get("requestId")?.as_str())
+        .collect();
+    events
+        .iter()
+        .filter_map(|e| {
+            let p = e.get("params")?;
+            if e.get("method").and_then(|m| m.as_str()) != Some("Network.responseReceived") {
+                return None;
+            }
+            let mime = p.get("response")?.get("mimeType")?.as_str()?;
+            if !mime.contains("json") {
+                return None;
+            }
+            let rid = p.get("requestId")?.as_str()?;
+            if !finished.contains(rid) {
+                return None; // ещё стримится — тело не готово
+            }
+            let url = p.get("response")?.get("url")?.as_str()?.to_string();
+            Some((rid.to_string(), url))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +811,52 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    // ---- пер-страничные дедлайны (фикс №2 UX-аудита) ----
+
+    #[test]
+    fn clamp_timeout_respects_deadline_and_floor() {
+        let cap = Duration::from_secs(30);
+        // без дедлайна — полный cap
+        assert_eq!(clamp_timeout(None, cap), cap);
+        // дедлайн дальше cap — cap
+        assert_eq!(clamp_timeout(Some(Duration::from_secs(120)), cap), cap);
+        // дедлайн ближе cap — дедлайн
+        assert_eq!(
+            clamp_timeout(Some(Duration::from_secs(2)), cap),
+            Duration::from_secs(2)
+        );
+        // истёкший дедлайн — пол 100 мс (без busy-loop)
+        assert_eq!(
+            clamp_timeout(Some(Duration::ZERO), cap),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn finished_json_requests_skips_unfinished_streams() {
+        let events = vec![
+            // JSON-ответ пришёл и ЗАВЕРШИЛСЯ — тело выгружаем
+            serde_json::json!({"method": "Network.responseReceived", "params": {
+                "requestId": "r1", "response": {"url": "https://a/api/1", "mimeType": "application/json"}}}),
+            serde_json::json!({"method": "Network.loadingFinished", "params": {"requestId": "r1"}}),
+            // JSON-ответ пришёл, но стрим ещё жив (нет loadingFinished) — пропускаем:
+            // getResponseBody по нему висел минутами (кейс docs.rs из UX-аудита)
+            serde_json::json!({"method": "Network.responseReceived", "params": {
+                "requestId": "r2", "response": {"url": "https://a/poll", "mimeType": "application/json"}}}),
+            // не-JSON — не интересует
+            serde_json::json!({"method": "Network.responseReceived", "params": {
+                "requestId": "r3", "response": {"url": "https://a/img", "mimeType": "image/png"}}}),
+            serde_json::json!({"method": "Network.loadingFinished", "params": {"requestId": "r3"}}),
+        ];
+        let got = finished_json_requests(&events);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], ("r1".to_string(), "https://a/api/1".to_string()));
+    }
+
+    #[test]
+    fn finished_json_requests_empty() {
+        assert!(finished_json_requests(&[]).is_empty());
     }
 }

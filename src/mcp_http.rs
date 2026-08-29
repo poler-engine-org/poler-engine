@@ -304,9 +304,26 @@ fn write_response(
 fn respond(w: &mut TcpStream, req: HttpRequest, server: &McpServer, token: &str) {
     let is_mcp = req.path == "/" || req.path == "/mcp";
     match req.method.as_str() {
-        // CORS-preflight (браузерные MCP-клиенты)
+        // CORS-preflight (браузерные MCP-клиенты: WebLens, туннельные агенты).
+        // Allow-Headers обязателен: fetch с Authorization/Content-Type
+        // проходит preflight только при явном разрешении заголовков.
         "OPTIONS" => {
-            let _ = write_response(w, 204, "No Content", "text/plain", b"", req.keep_alive, &[]);
+            let _ = write_response(
+                w,
+                204,
+                "No Content",
+                "text/plain",
+                b"",
+                req.keep_alive,
+                &[
+                    ("Access-Control-Allow-Methods", "POST, GET, OPTIONS".to_string()),
+                    (
+                        "Access-Control-Allow-Headers",
+                        "Authorization, Content-Type, X-Poler-Token".to_string(),
+                    ),
+                    ("Access-Control-Max-Age", "86400".to_string()),
+                ],
+            );
         }
         // smoke-проба туннеля: без токена, без данных
         "GET" if req.path == "/health" => {

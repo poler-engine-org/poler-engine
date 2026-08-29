@@ -212,11 +212,16 @@ API**, не забивая локальный диск сотнями гигаб
    community/pro/enterprise + trial 14 дн. + скользящие квоты; платные
    интеграции (Gmail/Drive/NotebookLM) за гейтом, локальное — всегда
    свободно. ✅ shipped (2026-08-29, см. раздел 7)
-6. **v0.19.0 — Hugging Face Hub**: model cards + datasets API → влитие в
+6. **v0.19.0 — Browser Surface**: фиксы краулера по живому UX-аудиту
+   (автодетект Chromium из playwright-кеша, пер-страничный таймаут,
+   человекочитаемые robots-сообщения, самовосстановление CDP),
+   `--browser-index`, WebLens — расширение MV3, вшитое в бинарник
+   (§8). ✅ shipped (2026-08-30)
+7. **v0.20.0 — Hugging Face Hub**: model cards + datasets API → влитие в
    web-index.db как `hf://` URL-схема.
-7. **v0.20.0 — DVC + Oxen**: data-versioning pointer files, remote storage
+8. **v0.21.0 — DVC + Oxen**: data-versioning pointer files, remote storage
    resolve.
-8. **v0.21.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
+9. **v0.22.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+
@@ -326,27 +331,27 @@ API**, не забивая локальный диск сотнями гигаб
 REPL, MCP stdio + MCP HTTP (`127.0.0.1:8765`, Bearer, CORS-preflight
 уже реализованы — `src/mcp_http.rs`). Поверхность для агентов закончена.
 
-**T1 — v0.19.0-окно ( Dogfooding-мультипликатор ).** Без единого байта
-в браузере: фикс-лист §8.2 + новый флаг `--browser-index <URL|tab>`:
-прочитать страницу через существующий CDP/профильный fetch
-(механика `--google-fetch`) и upsert в web-index.db одной командой.
-«Прочитал → индексируй» без открытия терминала второй раз.
+**T1 — v0.19.0. ✅ SHIPPED (2026-08-30).** Фикс-лист §8.2 закрыт
+целиком (автодетект playwright-кеша; пер-страничный таймаут
+`--crawl-page-timeout-ms` + бюджет интерсепта 8 с + finished-only
+тела; robots-сообщения с хостом/путём в stderr и `stats.notes`;
+`/json/version`-healthcheck + тихий перезапуск осиротевшего CDP),
+плюс `--browser-index <URL>`: страница → web-index.db одной командой
+(respect_robots=false — явная команда пользователя, фиксируется в notes).
 
-**T2 — WebLens MVP (расширение, НЕ форк).** Manifest V3 для
-Chrome/Edge/Brave (+Firefox тем же WebExtensions-кодом):
-
-- Side Panel: `poler_web_search` по общему индексу
-  (NLM + веб + код + VCS — единый `--web-search`-инвариант v0.14.0);
-- кнопка «проиндексировать эту страницу» → `poler_fetch`/`poler_crawl`
-  на localhost-демоне движка;
-- подсветка сниппетов/терминов в DOM (content script + ranges);
-- кнопка «в NotebookLM» — через существующий NLM-синк,
-  за лицензионным гейтом (`FEATURE_NLM`);
-- горячая клавиша Alt+P / Ctrl+Shift+F.
-
-Бэкенд T2 писать не надо: **им уже является `--mcp-http`** — расширение
-стучится в `http://127.0.0.1:8765/` с Bearer-токеном (CORS `*`
-и preflight на месте, `mcp_http.rs:293,307,387`). Новое — только JS-оболочка.
+**T2 — WebLens MVP. ✅ SHIPPED (2026-08-30, v0.19.0).** Расширение
+Manifest V3, вшитое в бинарник (`include_bytes!`, src/web/weblens.rs):
+Side Panel (поиск по общему индексу — тот же инвариант v0.14.0),
+подсветка термов (TreeWalker + `<mark>`, DOM не портится), кнопка
+«Индексировать эту страницу» (poler_crawl с respect_robots=false),
+Alt+P. Бэкенд — прежний `--mcp-http` (Bearer; preflight доведён:
+Allow-Headers для Authorization/Content-Type/X-Poler-Token).
+`--web-lens` = материализация + оконный Chromium с `--load-extension`
+(автоустановка, ноль кликов) + MCP-демон; `--web-lens-install` —
+файлы + инструкция «Load unpacked» для ежедневного браузера
+(chrome://-страницы автоматизировать нельзя — защита браузера).
+WebLens НЕ гейтится лицензией: локальный поиск всегда свободен
+(философия §v0.18.0), гейт — только на NLM/Gmail/Drive-интеграциях.
 
 **T3 — форк Chromium. ОТКЛОНЁН с цифрами.** Исходники ~100 ГБ,
 полная сборка часами на 16–32 ГБ RAM, поезд релизов каждые 4 недели,

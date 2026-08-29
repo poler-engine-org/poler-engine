@@ -652,7 +652,7 @@ fn cmd_crawl(state: &mut ShellState, args: &[String]) -> CmdResult {
     }
 
     // Открываем CDP-фечер. Если Chromium не запущен — пробуем ensure_chromium.
-    let mut fetcher = match crate::web::cdp_fetcher(cdp_port, wait_ms) {
+    let mut fetcher = match crate::web::cdp_fetcher_with_timeout(cdp_port, wait_ms, 45_000) {
         Ok(f) => f,
         Err(e) => {
             let mut out = format!("❌ CDP fetcher не инициализирован (порт {cdp_port}): {e}\n");
@@ -673,6 +673,8 @@ fn cmd_crawl(state: &mut ShellState, args: &[String]) -> CmdResult {
         delay_ms,
         cross_site,
         wait_ms,
+        page_timeout_ms: 45_000,
+        respect_robots: true,
     };
 
     let progress = format!(
