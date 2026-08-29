@@ -6,7 +6,7 @@
 updated_utc: 2026-08-29T21:05:00Z
 repo: poler-engine
 branch: main
-commit: pending
+commit: 14fd916
 tag: v0.17.6 (релизные теги — не на каждый патч)
 pushed: true
 tests: cargo test 667 пройдено (628 lib + 38 integration + 1 doc, 0 failed, 4 ignored=live); secret-scan-commit PASS; самопроверка: --google-status authorized:true refreshable:true; --google-gmail живой запрос; refresh-флоу живой (токен обновлён по refresh_token)
