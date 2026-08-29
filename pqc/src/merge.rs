@@ -604,18 +604,35 @@ pub fn merge_brains(
     let mut buf = Vec::with_capacity(
         pqw::HEADER_SIZE + d.div_ceil(4) + n_pairs * 6 + lst_lex.out * 10,
     );
-    let container = match (&gyro_data, &lexicon) {
-        (Some(g), Some(l)) => {
+    // RQ23: автобиография наследуется от мозга A (хозяин личности):
+    // слитый мозг помнит собеседника и нить A. Рефлекс B растворяется
+    // в знаниях — знания объединяются, биография одна.
+    let reflex_a = ra.reflex().and_then(|sec| {
+        pqw::ReflexData::new(
+            sec.interlocutor(),
+            sec.turns(),
+            sec.events().iter().copied().collect(),
+            d as u32,
+        )
+        .ok()
+    });
+    let container = match (&gyro_data, &lexicon, &reflex_a) {
+        (Some(g), Some(l), Some(r)) => {
+            w.write_v5(&mut buf, g, l, r)
+                .map_err(|e| format!("контейнер v5: {e}"))?;
+            5
+        }
+        (Some(g), Some(l), None) => {
             w.write_v4(&mut buf, g, l)
                 .map_err(|e| format!("контейнер v4: {e}"))?;
             4
         }
-        (Some(g), None) => {
+        (Some(g), None, _) => {
             w.write_v3(&mut buf, g)
                 .map_err(|e| format!("контейнер v3: {e}"))?;
             3
         }
-        (None, _) => {
+        (None, _, _) => {
             // Вся циркуляция аннигилировала: лексикон не переживает
             // отсутствие русел — контракт формата (v4 = v3 + LEXI,
             // а v3 требует непустую секцию GYRO).

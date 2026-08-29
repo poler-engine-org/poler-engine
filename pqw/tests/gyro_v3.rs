@@ -61,16 +61,22 @@ fn v3_full_roundtrip() {
 
 #[test]
 fn v3_layout_math() {
-    // d=64: фазы 16 B, гироскоп 32 + 4×5 = 52 B, итого 0x80+16+52 = 196.
+    // d=64: фазы 16 B; гироскоп — кодек по измерению (RQ23): для этого
+    // набора пар gap-RLE (слоты 7, 38, 70, 73 → Δ 7/31/32/3, записи
+    // 2 Б) даёт 32 + 8 = 40 B против 52 B разреженного — выбран v2.
     let bytes = v3_writer().to_bytes_v3(&sample_gyro()).unwrap();
-    assert_eq!(bytes.len(), HEADER_SIZE + 16 + 32 + 4 * 5);
+    assert_eq!(bytes.len(), HEADER_SIZE + 16 + 32 + 4 * 2);
     let h = Header::from_bytes(&bytes).unwrap();
     assert_eq!(h.phase_offset, HEADER_SIZE as u64);
     assert_eq!(h.phase_len, 16);
     assert_eq!(h.topology_offset, (HEADER_SIZE + 16) as u64);
-    assert_eq!(h.topology_len, 52);
+    assert_eq!(h.topology_len, 40);
     assert_eq!(h.flags, Flags::v3(true));
     assert!(h.flags.gyro());
+    // Выбранный кодек — gap-RLE, пары читаются как раньше.
+    let r = PqwReader::from_bytes(&bytes).unwrap();
+    assert_eq!(r.gyro().unwrap().codec(), pqw::GYRO_SECTION_VERSION_RLE);
+    assert_eq!(r.gyro().unwrap().pairs().len(), 4);
 }
 
 #[test]
@@ -133,7 +139,9 @@ fn v2_reader_still_blind_to_gyro() {
 
 #[test]
 fn v3_u32_indices_when_d_pol_large() {
-    // d_pol > 65536 → пары u32, записи 9 B.
+    // d_pol > 65536 → u32-режим разреженного кодека = 9 Б/пару;
+    // gap-RLE пишет слот (≈2.1e9 → varint 5 Б) + квант = 6 Б —
+    // измерение выбирает RLE и здесь (RQ23).
     let mut w = PqwWriter::new(70_000).unwrap();
     w.add_phase(65_537, 0.9).unwrap();
     let g = GyroData::new(64, 5, vec![(65_536, 65_537, 1.5)], 70_000).unwrap();
@@ -141,14 +149,12 @@ fn v3_u32_indices_when_d_pol_large() {
     let r = PqwReader::from_bytes(&bytes).unwrap();
     let sec = r.gyro().unwrap();
     assert!(!sec.index16());
+    assert_eq!(sec.codec(), pqw::GYRO_SECTION_VERSION_RLE);
     assert_eq!(sec.pairs().len(), 1);
     assert_eq!(sec.pairs()[0].i, 65_536);
     assert!((sec.pairs()[0].weight - 1.5).abs() <= 1.5 / 127.0 / 2.0 + 1e-12);
-    // Размер: 32 + 9 на пару.
-    assert_eq!(
-        sec_bytes(&bytes),
-        32 + 9
-    );
+    // Размер: 32 + varint(слот) 5 Б + квант 1 Б = 38.
+    assert_eq!(sec_bytes(&bytes), 32 + 6);
 }
 
 fn sec_bytes(bytes: &[u8]) -> usize {

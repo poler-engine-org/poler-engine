@@ -128,6 +128,22 @@ impl Lexicon {
     /// Срез обязан исчерпываться записями ровно до конца (никаких
     /// хвостовых байтов) — ридер подаёт хвост контейнера целиком.
     pub fn decode(bytes: &[u8], d_pol: u32) -> Result<Lexicon> {
+        let (lex, used) = Self::decode_prefix(bytes, d_pol)?;
+        if used != bytes.len() {
+            return Err(PqwError::Layout(
+                "lexicon section: trailing bytes after the last entry",
+            ));
+        }
+        Ok(lex)
+    }
+
+    /// Разбор с возвратом числа потреблённых байтов — контейнер v5
+    /// хранит за лексиконом секцию контекст-рефлекса `REFL` (RQ23):
+    /// длина LEXI выводима из её собственного заголовка, EOF больше
+    /// не равен концу лексикона.
+    ///
+    /// Возвращает лексикон и длину секции в байтах.
+    pub fn decode_prefix(bytes: &[u8], d_pol: u32) -> Result<(Lexicon, usize)> {
         if bytes.len() < LEXI_HEADER_SIZE {
             return Err(PqwError::Truncated {
                 need: LEXI_HEADER_SIZE,
@@ -190,12 +206,8 @@ impl Lexicon {
             entries.push((coord, token.to_string()));
             body = &body[6 + len..];
         }
-        if !body.is_empty() {
-            return Err(PqwError::Layout(
-                "lexicon section: trailing bytes after the last entry",
-            ));
-        }
-        Ok(Lexicon { entries })
+        let used = bytes.len() - body.len();
+        Ok((Lexicon { entries }, used))
     }
 }
 
@@ -288,5 +300,22 @@ mod tests {
         // доминантность разрешается на этапе строительства (builder).
         let lex = Lexicon::new(vec![(4, "энтропия".into())], 8).unwrap();
         assert_eq!(lex.token_of(4), Some("энтропия"));
+    }
+
+    #[test]
+    fn decode_prefix_reports_consumed_bytes() {
+        // v5-контракт: за лексиконом могут идти данные рефлекса —
+        // decode_prefix возвращает точную длину секции.
+        let lex = sample();
+        let mut bytes = lex.encode(16);
+        let consumed = bytes.len();
+        bytes.extend_from_slice(b"REFL-GARBAGE-FOLLOW");
+        let (back, used) = Lexicon::decode_prefix(&bytes, 16).unwrap();
+        assert_eq!(used, consumed);
+        assert_eq!(back.len(), 3);
+        // Полный decode с теми же хвостовыми байтами — отказ (v4-контракт).
+        assert!(Lexicon::decode(&bytes, 16).is_err());
+        // Без хвоста decode сходится бит-в-бит.
+        assert_eq!(Lexicon::decode(&bytes[..consumed], 16).unwrap(), back);
     }
 }

@@ -114,6 +114,7 @@ use crate::archetype_lattice::archetype_product_packed4;
 use crate::bloch_stream::born_step_packed4_sparse;
 use crate::error::{PqcError, Result};
 use crate::generate::LexiconBuilder;
+use crate::reflex::ContextReflex;
 use crate::rng::Rng;
 use crate::stream_engine::tfidf_arcs;
 
@@ -322,6 +323,23 @@ impl TritGyro {
     /// (гистерезис двух свидетелей), накопленная циркуляция живёт.
     pub fn reset_ring(&mut self) {
         self.ring.clear();
+    }
+
+    /// Восстановление кольца контекста из следа контекст-рефлекса W
+    /// (RQ23): хвост событий занимает окно — **без** повторного
+    /// наблюдения (пары уже накоплены в прошлой сессии, тики не растут).
+    ///
+    /// Первый вопрос новой сессии спаривается с последними словами
+    /// предыдущей: русла растут сквозь границу сессий.
+    pub fn restore_ring(&mut self, events: &[(u32, i8)]) {
+        self.ring.clear();
+        let take = events.len().min(self.window);
+        let start = events.len() - take;
+        for &(c, s) in &events[start..] {
+            if c < self.d {
+                self.ring.push_back((c, s.signum()));
+            }
+        }
     }
 
     /// Прогон последовательности событий `(координата, полярность)`.
@@ -1021,6 +1039,11 @@ pub struct QuantizedGyroCurriculum {
     /// Лексикон кристалла (RQ17): доминантный токен на координату —
     /// обратная карта кодировщика, путь генерации речи.
     lexicon: LexiconBuilder,
+    /// Контекст-рефлекс W (RQ23): динамический след диалога —
+    /// хвост сенсорного потока + имя собеседника. Автобиографическая
+    /// память: нить разговора переживает рестарт через кольцо
+    /// гироскопа и затравку волны речи.
+    reflex: ContextReflex,
     /// Плотная TF-IDF статистика (HashMap нет нигде).
     doc_freq: Vec<u32>,
     docs: u64,
@@ -1062,6 +1085,7 @@ impl QuantizedGyroCurriculum {
             momentum: MomentumLattice::new(d_pol),
             gyro: TritGyro::new(d_pol, window)?,
             lexicon: LexiconBuilder::new(d_pol),
+            reflex: ContextReflex::new(),
             doc_freq: vec![0u32; d],
             docs: 0,
             ingests: 0,
@@ -1676,6 +1700,25 @@ impl QuantizedGyroCurriculum {
         self.gyro.reset_ring();
     }
 
+    /// Контекст-рефлекс W (RQ23): динамический след диалога.
+    pub fn reflex(&self) -> &ContextReflex {
+        &self.reflex
+    }
+
+    /// Мутабельный доступ к рефлексу (имя собеседника, ручной след).
+    pub fn reflex_mut(&mut self) -> &mut ContextReflex {
+        &mut self.reflex
+    }
+
+    /// Одна реплика диалога в контекст-рефлекс (RQ23): вопрос
+    /// собеседника + эмиссии ответа (координата, Born-полярность).
+    /// Счётчик реплик растёт; фазы и русла не тронуты (это делает
+    /// [`ingest`](Self::ingest) — рефлекс наблюдатель, не участник).
+    pub fn observe_dialog_turn(&mut self, question: &str, answer: &[(u32, i8)]) {
+        let d = self.d_pol;
+        self.reflex.observe_turn(question, answer, d);
+    }
+
     /// Моментная обратная связь генерации: градиент Born-измерения
     /// `g = p_emp − p` обновляет момент дуги (правило гистерезиса
     /// RQ16 — зажигание/инерция/срыв).
@@ -1710,11 +1753,15 @@ impl QuantizedGyroCurriculum {
         self.momentum.for_each_kinetic(f);
     }
 
-    /// Чекпоинт: контейнер v4 при непустом лексиконе (фазовая
-    /// решётка бит-в-бит + секция GYRO из каналов J + секция LEXI
-    /// со словарём), v3 — если каналы есть, но слов ещё нет, v2 —
-    /// если каналов нет. γ-слот заголовка = 0: трение
-    /// заменено порогами насыщающего момента, инерция не затухает.
+    /// Чекпоинт: контейнер v5 при непустом рефлексе и живых каналах
+    /// со словарём (фазы + русла + лексикон + контекст-рефлекс W,
+    /// RQ23), v4 — при живых каналах и словаре без следа, v3 — если
+    /// каналы есть, но слов ещё нет, v2 — если каналов нет.
+    /// γ-слот заголовка = 0: трение заменено порогами насыщающего
+    /// момента, инерция не затухает.
+    ///
+    /// RQ23: кодек гироскопной секции выбирается измерением —
+    /// gap-RLE (v2) для кластеризованных топологий.
     pub fn checkpoint(&self) -> Result<Vec<u8>> {
         let mut w = PqwWriter::new(self.d_pol)?
             .hyperparams(self.eta as f32, 0.0, 1.0, self.epsilon);
@@ -1730,12 +1777,18 @@ impl QuantizedGyroCurriculum {
             }
         }
         let mut buf = Vec::with_capacity(pqw::HEADER_SIZE + self.lattice.len());
-        // RQ17: непустой лексикон при живых каналах — контейнер v4
-        // (обратная карта кодировщика переживает рестарт вместе с
-        // фазами и руслами). Нет каналов или словаря — v3/v2 как раньше.
+        // RQ17/RQ23: непустой лексикон при живых каналах — контейнер
+        // v4 (обратная карта кодировщика) или v5 (+ контекст-рефлекс
+        // W, если след диалога непуст). Нет каналов или словаря —
+        // v3/v2 как раньше.
+        let refl = self.reflex.to_data(self.d_pol);
         match (self.gyro.gyro_data(), self.lexicon.finish()) {
             (Some(data), Some(lex)) => {
-                w.write_v4(&mut buf, &data, &lex)?;
+                if let Some(refl) = refl {
+                    w.write_v5(&mut buf, &data, &lex, &refl)?;
+                } else {
+                    w.write_v4(&mut buf, &data, &lex)?;
+                }
             }
             (Some(data), None) => {
                 w.write_v3(&mut buf, &data)?;
@@ -1747,8 +1800,11 @@ impl QuantizedGyroCurriculum {
         Ok(buf)
     }
 
-    /// Resume: фазовая решётка бит-в-бит + каналы J из секции v3/v4
-    /// + лексикон из секции LEXI (v4).
+    /// Resume: фазовая решётка бит-в-бит + каналы J из секции v3/v4/v5
+    /// + лексикон из секции LEXI (v4) + контекст-рефлекс W из секции
+    /// REFL (v5, RQ23): хвост следа восстанавливает кольцо гироскопа
+    /// (без повторного наблюдения — тики не растут), имя собеседника
+    /// и счётчик реплик продолжают жить.
     ///
     /// Момент и TF-IDF статистика стартуют с нуля («мнение пережило
     /// рестарт, инерция — нет»); каналы циркуляции поднимаются из
@@ -1765,7 +1821,7 @@ impl QuantizedGyroCurriculum {
         }
         if reader.encoding() != pqw::phase::TritEncoding::Packed4 {
             return Err(PqcError::Unsupported {
-                what: "quantized gyro curriculum requires Packed4 container (v2/v3/v4)",
+                what: "quantized gyro curriculum requires Packed4 container (v2/v3/v4/v5)",
             });
         }
         let phase = reader.phase_bytes();
@@ -1795,6 +1851,14 @@ impl QuantizedGyroCurriculum {
         }
         if let Some(lex) = reader.lexicon() {
             self.lexicon.absorb(&lex);
+        }
+        // RQ23: контекст-рефлекс — след диалога переживает рестарт;
+        // хвост занимает кольцо гироскопа (русла не тронуты).
+        if let Some(refl) = reader.reflex() {
+            self.reflex.absorb(&refl);
+            let window = self.gyro.window();
+            let tail: Vec<(u32, i8)> = refl.trail_tail(window).to_vec();
+            self.gyro.restore_ring(&tail);
         }
         Ok(self.nnz())
     }
@@ -2436,6 +2500,91 @@ mod tests {
     }
 
     // ===================== Движок слияния =====================
+
+    // ===================== RQ23: контекст-рефлекс =====================
+
+    #[test]
+    fn restore_ring_keeps_channels_and_ticks() {
+        // Восстановление кольца из следа НЕ трогает русла и тики:
+        // события уже наблюдались в прошлой сессии.
+        let mut g = TritGyro::new(64, 4).unwrap();
+        g.observe_seq(&[(1, 1), (2, 1), (3, 1), (4, 1), (2, 1), (3, 1)]);
+        let channels_before = g.channel_count();
+        let ticks_before = g.ticks();
+        assert!(channels_before > 0);
+        g.restore_ring(&[(9, 1), (10, -1), (11, 1), (12, 1), (13, 1), (14, 1)]);
+        assert_eq!(g.channel_count(), channels_before, "русла не тронуты");
+        assert_eq!(g.ticks(), ticks_before, "тики не растут");
+        // Кольцо занято хвостом следа (окно 4, событий 6 → последние 4:
+        // 11, 12, 13, 14): новое событие 13 спаривается с предшественниками
+        // кольца — свежие русла появляются СРАЗУ (пустое кольцо дало бы
+        // ноль пар).
+        g.observe(13, 1);
+        let (dir, _) = g.pair_state(11, 13);
+        assert_ne!(dir, Trit::Zero, "пара кольца сразу даёт вклад");
+        // Контроль: чистое кольцо + то же событие — пар нет.
+        let mut g2 = TritGyro::new(64, 4).unwrap();
+        g2.observe(13, 1);
+        assert_eq!(g2.pair_state(11, 13).0, Trit::Zero);
+    }
+
+    #[test]
+    fn reflex_survives_checkpoint_resume() {
+        // Полный цикл автобиографии: диалог → чекпоинт v5 → resume →
+        // рефлекс жив, кольцо гироскопа восстановлено из хвоста следа.
+        let mut qc = QuantizedGyroCurriculum::new(128, 0.05, 42, 4).unwrap();
+        for _ in 0..3 {
+            qc.ingest(sample_text(), 1).unwrap();
+        }
+        qc.reflex_mut().set_interlocutor("Мария");
+        qc.observe_dialog_turn("квант фаза", &[(7, 1), (9, -1), (11, 1)]);
+        qc.observe_dialog_turn("решётка трит", &[(3, 1)]);
+        assert_eq!(qc.reflex().turns(), 2);
+        assert_eq!(qc.reflex().interlocutor(), "Мария");
+
+        let bytes = qc.checkpoint().unwrap();
+        assert_eq!(&bytes[..8], b"POLER_Q5", "живой рефлекс → контейнер v5");
+
+        // Resume: свежий движок поднимает рефлекс и кольцо.
+        let reader = pqw::PqwReader::from_bytes(&bytes).unwrap();
+        let mut qc2 = QuantizedGyroCurriculum::new(128, 0.05, 7, 4).unwrap();
+        qc2.resume_from_reader(&reader).unwrap();
+        assert_eq!(qc2.reflex().interlocutor(), "Мария");
+        assert_eq!(qc2.reflex().turns(), 2);
+        assert_eq!(qc2.reflex().trail().len(), qc.reflex().trail().len());
+        // Кольцо гироскопа несёт хвост следа: вопрос новой сессии
+        // спаривается с последними словами предыдущей — русла растут.
+        let before = qc2.channel_count();
+        qc2.ingest("трит момент", 1).unwrap();
+        assert!(qc2.channel_count() >= before);
+        // Повторный чекпоинт — снова v5, рефлекс переживает круг.
+        let bytes2 = qc2.checkpoint().unwrap();
+        assert_eq!(&bytes2[..8], b"POLER_Q5");
+        let reader2 = pqw::PqwReader::from_bytes(&bytes2).unwrap();
+        assert_eq!(reader2.reflex().unwrap().interlocutor(), "Мария");
+    }
+
+    #[test]
+    fn empty_reflex_keeps_v4_container() {
+        // Без следа диалога контейнер остаётся v4 (контракт RQ17).
+        let mut qc = QuantizedGyroCurriculum::new(128, 0.05, 42, 4).unwrap();
+        for _ in 0..3 {
+            qc.ingest(sample_text(), 1).unwrap();
+        }
+        let bytes = qc.checkpoint().unwrap();
+        assert_eq!(&bytes[..8], b"POLER_Q4");
+    }
+
+    #[test]
+    fn train_ingest_does_not_pollute_reflex() {
+        // Обучение (ingest корпуса) не трогает след W — автобиография
+        // растёт только в диалоге (ask/chat), не при чтении книг.
+        let mut qc = QuantizedGyroCurriculum::new(128, 0.05, 42, 4).unwrap();
+        qc.ingest(sample_text(), 1).unwrap();
+        qc.ingest("совсем другой текст про другие вещи", 1).unwrap();
+        assert!(qc.reflex().is_empty());
+        assert_eq!(qc.reflex().turns(), 0);
+    }
 
     #[test]
     fn engine_ingest_full_loop() {

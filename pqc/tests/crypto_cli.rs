@@ -71,7 +71,9 @@ fn cli_encrypt_decrypt_roundtrip() {
         "42",
     ]);
     assert_eq!(code, 0, "encrypt failed: {err}\n{out}");
-    assert!(out.contains("RQ13"), "out: {out}");
+    // RQ23: дефолт — нелинейная схема v2 (транспорт + спин-раунд GF(3)).
+    assert!(out.contains("GF(3)"), "out: {out}");
+    assert!(out.contains("спин-раунд"), "out: {out}");
     assert!(out.contains("лавина"), "out: {out}");
     assert!(cipher.exists());
 
@@ -383,13 +385,19 @@ fn cli_trite_json_telemetry() {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(99.0);
     assert!(exp <= 2.0, "расширение ×{exp} — триты не экономят");
-    // Лавина измерена и в разумных границах (≥ 0.4, ≤ 2/3 + допуск).
+    // Лавина с ТЕМ ЖЕ IV (RQ23): честная диффузия без шума цепочки.
+    // Флип в середине 17-блочного текста: CBC-каскад идёт только вперёд,
+    // префиксные блоки не тронуты — разведённая лавина ≥ 0.1 при
+    // поблочной ~2/3 (см. pqc avalanche — метрика от блока зонда).
     let av: f64 = out
         .split("\"avalanche\":")
         .nth(1)
         .and_then(|s| s.split(',').next())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0.0);
-    assert!(av >= 0.4, "лавина {av} — диффузии нет");
+    assert!(av >= 0.1, "лавина {av} — диффузии нет");
     assert!(av <= 0.72, "лавина {av} выше потолка GF(3)");
+    // Схема v2 по умолчанию: спин-раунды активны, версия в отчёте.
+    assert!(out.contains("\"version\":2"), "out: {out}");
+    assert!(out.contains("\"nl_rounds\":"), "out: {out}");
 }

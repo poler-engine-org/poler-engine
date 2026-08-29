@@ -24,6 +24,12 @@
 //!   доминантный токен). Смещение секции выводимо:
 //!   `topology_offset + topology_len`, до конца файла. Доступ —
 //!   [`PqwReader::lexicon`]; digest покрывает фазы + гироскоп + лексикон.
+//! * **v5** (`POLER_Q5`): v4 + секция контекст-рефлекса `REFL` сразу за
+//!   лексиконом до конца файла (RQ23) — динамический след диалога:
+//!   события `(координата, полярность)` + имя собеседника + счётчик
+//!   реплик. Длина LEXI выводится её собственным разбором
+//!   ([`Lexicon::decode_prefix`]); REFL занимает остаток до EOF.
+//!   Доступ — [`PqwReader::reflex`]; digest покрывает всё.
 
 use std::borrow::Cow;
 
@@ -33,6 +39,7 @@ use crate::header::{Header, HEADER_SIZE, OFF_RESERVED};
 use crate::lexicon::Lexicon;
 use crate::mcweeny;
 use crate::phase::{packed_trit_at, PhaseByte, Trit, TritEncoding};
+use crate::reflex::ReflexSection;
 use crate::sha256::sha256_trunc24;
 use crate::topology;
 use crate::trit_bloch;
@@ -72,6 +79,9 @@ impl<'a> PqwReader<'a> {
         let header = Header::from_bytes(data)?;
 
         if header.is_packed() {
+            if header.is_reflex() {
+                return Self::validate_v5(header, data);
+            }
             if header.is_lexicon() {
                 return Self::validate_v4(header, data);
             }
@@ -294,6 +304,68 @@ impl<'a> PqwReader<'a> {
         if ticks_reserved != section.ticks() {
             return Err(PqwError::Layout(
                 "v4: reserved tick counter disagrees with the gyro section",
+            ));
+        }
+        Ok(reader)
+    }
+
+    /// Валидация контейнера v5 (v4 + контекст-рефлекс `REFL` за
+    /// лексиконом): фазы и гироскоп — по правилам v3, лексикон — по
+    /// правилам v4 (но не до EOF: за ним рефлекс), затем секция REFL
+    /// от конца лексикона до конца файла.
+    ///
+    /// Проверяются структура секции рефлекса (magic/версия/d_pol/
+    /// события/имя) и перекрёстная пара: reserved-слово заголовка =
+    /// счётчику тактов гироскопной секции (как в v3/v4).
+    fn validate_v5(header: Header, data: &'a [u8]) -> Result<PqwReader<'a>> {
+        // Фазы — по правилам v2/v3/v4.
+        let reader = Self::validate_packed_v3_phases(&header, data)?;
+
+        let d = header.d_pol as usize;
+        let packed_len = d.div_ceil(4);
+        let topo_off = header.topology_offset as usize;
+        let topo_len = header.topology_len as usize;
+        if topo_off != HEADER_SIZE + packed_len {
+            return Err(PqwError::Layout(
+                "v5: gyro section must follow the phase blocks",
+            ));
+        }
+        let gyro_end = topo_off + topo_len;
+        if data.len() < gyro_end {
+            return Err(PqwError::Truncated {
+                need: gyro_end,
+                have: data.len(),
+            });
+        }
+        let section = GyroSection::decode(
+            &data[topo_off..gyro_end],
+            header.d_pol,
+            header.flags.index16(),
+        )?;
+
+        // Лексикон — префикс-разбором (за ним рефлекс, EOF ≠ конец LEXI).
+        let (_lexi, lexi_len) = Lexicon::decode_prefix(&data[gyro_end..], header.d_pol)?;
+        let refl_start = gyro_end + lexi_len;
+        if refl_start >= data.len() {
+            return Err(PqwError::Layout(
+                "v5: reflex section requires at least one byte after the lexicon",
+            ));
+        }
+        // Секция контекст-рефлекса — от конца лексикона до EOF, без хвостов.
+        let (_refl, refl_used) =
+            ReflexSection::decode(&data[refl_start..], header.d_pol, header.flags.index16())?;
+        if refl_used != data.len() - refl_start {
+            return Err(PqwError::Layout(
+                "v5: trailing bytes after the reflex section",
+            ));
+        }
+
+        // Перекрёстная проверка: счётчик тактов в reserved-слове.
+        let ticks_reserved =
+            u64::from_le_bytes(data[OFF_RESERVED..OFF_RESERVED + 8].try_into().unwrap());
+        if ticks_reserved != section.ticks() {
+            return Err(PqwError::Layout(
+                "v5: reserved tick counter disagrees with the gyro section",
             ));
         }
         Ok(reader)
@@ -523,10 +595,12 @@ impl<'a> PqwReader<'a> {
         }
     }
 
-    /// Гироскопная топология v3/v4: пары `J = A − Aᵀ` + счётчик тактов.
+    /// Гироскопная топология v3/v4/v5: пары `J = A − Aᵀ` + счётчик тактов.
     ///
     /// `None` для контейнеров v1/v2 (топологической секции нет).
     /// Ошибка невозможна после `from_bytes` (секция уже провалидирована).
+    /// RQ23: секция может быть закодирована кодеком v1 (разреженный)
+    /// или v2 (gap-RLE) — [`GyroSection::codec`].
     pub fn gyro(&self) -> Option<GyroSection> {
         if !self.header.flags.gyro() {
             return None;
@@ -537,18 +611,46 @@ impl<'a> PqwReader<'a> {
             .ok()
     }
 
-    /// Секция лексикона v4: обратная карта кодировщика
+    /// Секция лексикона v4/v5: обратная карта кодировщика
     /// (координата → доминантный токен).
     ///
     /// `None` для контейнеров v1/v2/v3 (лексикона нет — мозолю v3
     /// дообучение не знает слов). Ошибка невозможна после `from_bytes`.
+    /// В v5 за лексиконом следует секция рефлекса — разбор
+    /// останавливается на её границе.
     pub fn lexicon(&self) -> Option<Lexicon> {
         if !self.header.is_lexicon() {
             return None;
         }
         let a =
             self.header.topology_offset as usize + self.header.topology_len as usize;
-        Lexicon::decode(&self.data[a..], self.header.d_pol).ok()
+        Lexicon::decode_prefix(&self.data[a..], self.header.d_pol)
+            .ok()
+            .map(|(lex, _)| lex)
+    }
+
+    /// Секция контекст-рефлекса v5: динамический след диалога
+    /// (события `(координата, полярность)`, имя собеседника, реплики).
+    ///
+    /// `None` для контейнеров v1–v4 (рефлекса нет — мозг не помнит
+    /// нить разговора за пределами русел J). Ошибка невозможна после
+    /// `from_bytes`.
+    pub fn reflex(&self) -> Option<ReflexSection> {
+        if !self.header.is_reflex() {
+            return None;
+        }
+        let gyro_end =
+            self.header.topology_offset as usize + self.header.topology_len as usize;
+        match Lexicon::decode_prefix(&self.data[gyro_end..], self.header.d_pol) {
+            Ok((_, lexi_len)) => ReflexSection::decode(
+                &self.data[gyro_end + lexi_len..],
+                self.header.d_pol,
+                self.header.flags.index16(),
+            )
+            .ok()
+            .map(|(s, _)| s),
+            Err(_) => None, // unreachable после from_bytes
+        }
     }
 
     /// McWeeny-очистка хранимых дуг: `steps` итераций `p ← purify_p(p)`.

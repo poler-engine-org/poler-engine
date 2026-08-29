@@ -166,3 +166,11 @@ pub mod syntax_unfolder;
 // RQ21: грамматические мосты — синтаксическая связность речи L5.
 pub mod syntax_bridge;
 pub use syntax_bridge::{is_cyrillic_token, syntax_class, SyntaxChain, SyntaxClass, BRIDGE_RUN};
+
+// RQ23: контекст-рефлекс W — автобиографическая память диалога.
+pub mod reflex;
+pub use reflex::{ContextReflex, REFLEX_NAME_CAP, REFLEX_TRAIL_CAP};
+
+// RQ23: спиновая лавина GF(3) — нелинейный слой диффузии трит-шифра.
+pub mod spin_avalanche;
+pub use spin_avalanche::{measure_avalanche, msg_from_seed, AvalancheStats};

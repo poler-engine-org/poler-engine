@@ -28,6 +28,10 @@ pub const MAGIC_V3: [u8; 8] = *b"POLER_Q3";
 /// Магические байты контейнера v4 (v3 + секция лексикона `LEXI`:
 /// координата → доминантный токен, обратная карта кодировщика).
 pub const MAGIC_V4: [u8; 8] = *b"POLER_Q4";
+/// Магические байты контейнера v5 (v4 + секция контекст-рефлекса
+/// `REFL`: динамический след диалога — нить разговора переживает
+/// рестарт, RQ23).
+pub const MAGIC_V5: [u8; 8] = *b"POLER_Q5";
 /// Версия формата v1, поддерживаемая этой сборкой.
 pub const FORMAT_VERSION: u32 = 1;
 /// Версия формата v2 (Packed4, magic `POLER_Q2`).
@@ -36,6 +40,8 @@ pub const FORMAT_VERSION_V2: u32 = 2;
 pub const FORMAT_VERSION_V3: u32 = 3;
 /// Версия формата v4 (v3 + лексикон, magic `POLER_Q4`).
 pub const FORMAT_VERSION_V4: u32 = 4;
+/// Версия формата v5 (v4 + контекст-рефлекс, magic `POLER_Q5`).
+pub const FORMAT_VERSION_V5: u32 = 5;
 /// Размер фиксированного заголовка.
 pub const HEADER_SIZE: usize = 0x80;
 
@@ -114,6 +120,9 @@ impl Flags {
     /// v4: за гироскопной секцией следует лексикон `LEXI` — обратная
     /// карта кодировщика (координата → доминантный токен, RQ17).
     pub const LEXICON: u64 = 1 << 3;
+    /// v5: за лексиконом следует контекст-рефлекс `REFL` — динамический
+    /// след диалога (кольцо гироскопа + имя собеседника, RQ23).
+    pub const REFL: u64 = 1 << 4;
 
     /// Флаги для записи: CURVATURE всегда; INDEX16 по выбору писателя.
     pub fn new(index16: bool) -> Flags {
@@ -170,6 +179,12 @@ impl Flags {
         Flags(Self::v3(index16).0 | Self::LEXICON)
     }
 
+    /// Флаги для записи v5: GYRO + LEXICON + REFL; INDEX16 — по выбору
+    /// писателя (ширина координат пар гироскопа, лексикона и следа).
+    pub fn v5(index16: bool) -> Flags {
+        Flags(Self::v4(index16).0 | Self::REFL)
+    }
+
     /// Гироскопная топология присутствует? (v3)
     pub fn gyro(self) -> bool {
         self.0 & Self::GYRO != 0
@@ -178,6 +193,11 @@ impl Flags {
     /// Секция лексикона присутствует? (v4)
     pub fn lexicon(self) -> bool {
         self.0 & Self::LEXICON != 0
+    }
+
+    /// Секция контекст-рефлекса присутствует? (v5)
+    pub fn reflex(self) -> bool {
+        self.0 & Self::REFL != 0
     }
 
     /// Проверка флагов контейнера v3: GYRO обязан быть установлен,
@@ -200,6 +220,20 @@ impl Flags {
             return Err(PqwError::ReservedBits { value: v });
         }
         if v & (Self::GYRO | Self::LEXICON) != Self::GYRO | Self::LEXICON {
+            return Err(PqwError::UnsupportedFlags(v));
+        }
+        Ok(Flags(v))
+    }
+
+    /// Проверка флагов контейнера v5: GYRO, LEXICON и REFL обязаны быть
+    /// установлены, допускается INDEX16 (ширина координат пар гироскопа,
+    /// лексикона и следа рефлекса). Прочие биты запрещены.
+    pub fn validate_v5(v: u64) -> Result<Flags> {
+        if v & !(Self::INDEX16 | Self::GYRO | Self::LEXICON | Self::REFL) != 0 {
+            return Err(PqwError::ReservedBits { value: v });
+        }
+        let need = Self::GYRO | Self::LEXICON | Self::REFL;
+        if v & need != need {
             return Err(PqwError::UnsupportedFlags(v));
         }
         Ok(Flags(v))
@@ -286,24 +320,34 @@ impl Header {
     }
 
     /// Это контейнер v3 с гироскопной топологией `J = A − Aᵀ`?
+    /// (v4/v5 также содержат гироскоп — ответ `true` для них тоже.)
     pub fn is_gyro(&self) -> bool {
-        self.format_version == FORMAT_VERSION_V3
+        matches!(
+            self.format_version,
+            FORMAT_VERSION_V3 | FORMAT_VERSION_V4 | FORMAT_VERSION_V5
+        )
     }
 
-    /// Это контейнер v4 с секцией лексикона `LEXI`?
+    /// Это контейнер v4+ с секцией лексикона `LEXI`?
     pub fn is_lexicon(&self) -> bool {
-        self.format_version == FORMAT_VERSION_V4
+        self.format_version >= FORMAT_VERSION_V4
+    }
+
+    /// Это контейнер v5 с секцией контекст-рефлекса `REFL`?
+    pub fn is_reflex(&self) -> bool {
+        self.format_version == FORMAT_VERSION_V5
     }
 
     /// Сериализация в 128 байт; checksum вычисляется последним.
     /// Magic выбирается по версии: v1 → `POLER_QW`, v2 → `POLER_Q2`,
-    /// v3 → `POLER_Q3`, v4 → `POLER_Q4`.
+    /// v3 → `POLER_Q3`, v4 → `POLER_Q4`, v5 → `POLER_Q5`.
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut b = [0u8; HEADER_SIZE];
         let magic = match self.format_version {
             FORMAT_VERSION_V2 => MAGIC_V2,
             FORMAT_VERSION_V3 => MAGIC_V3,
             FORMAT_VERSION_V4 => MAGIC_V4,
+            FORMAT_VERSION_V5 => MAGIC_V5,
             _ => MAGIC,
         };
         b[..8].copy_from_slice(&magic);
@@ -329,10 +373,11 @@ impl Header {
 
     /// Разбор и проверка: magic → version → checksum → flags/reserved → d_pol.
     ///
-    /// Поддержаны все четыре поколения: `POLER_QW` (v1, кривизна),
-    /// `POLER_Q2` (v2, упакованные триты), `POLER_Q3` (v3, гироскоп)
-    /// и `POLER_Q4` (v4, гироскоп + лексикон); пара magic ↔ версия
-    /// перекрёстно проверяется. В v3/v4 reserved-слово (0x70) хранит
+    /// Поддержаны все пять поколений: `POLER_QW` (v1, кривизна),
+    /// `POLER_Q2` (v2, упакованные триты), `POLER_Q3` (v3, гироскоп),
+    /// `POLER_Q4` (v4, гироскоп + лексикон) и `POLER_Q5` (v5, гироскоп
+    /// + лексикон + контекст-рефлекс); пара magic ↔ версия
+    /// перекрёстно проверяется. В v3/v4/v5 reserved-слово (0x70) хранит
     /// счётчик тактов гироскопа — проверка «reserved = 0» для них
     /// отключена.
     pub fn from_bytes(data: &[u8]) -> Result<Header> {
@@ -344,7 +389,12 @@ impl Header {
         }
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&data[..8]);
-        if magic != MAGIC && magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4 {
+        if magic != MAGIC
+            && magic != MAGIC_V2
+            && magic != MAGIC_V3
+            && magic != MAGIC_V4
+            && magic != MAGIC_V5
+        {
             return Err(PqwError::BadMagic(magic));
         }
         let version = get_u32(data, OFF_VERSION);
@@ -352,7 +402,8 @@ impl Header {
             MAGIC => FORMAT_VERSION,
             MAGIC_V2 => FORMAT_VERSION_V2,
             MAGIC_V3 => FORMAT_VERSION_V3,
-            _ => FORMAT_VERSION_V4,
+            MAGIC_V4 => FORMAT_VERSION_V4,
+            _ => FORMAT_VERSION_V5,
         };
         if version != expected {
             return Err(PqwError::UnsupportedVersion(version));
@@ -366,11 +417,13 @@ impl Header {
             FORMAT_VERSION_V2 => Flags::validate_v2(get_u64(data, OFF_FLAGS))?,
             FORMAT_VERSION_V3 => Flags::validate_v3(get_u64(data, OFF_FLAGS))?,
             FORMAT_VERSION_V4 => Flags::validate_v4(get_u64(data, OFF_FLAGS))?,
+            FORMAT_VERSION_V5 => Flags::validate_v5(get_u64(data, OFF_FLAGS))?,
             _ => Flags::validate(get_u64(data, OFF_FLAGS))?,
         };
         let reserved = get_u64(data, OFF_RESERVED);
         if version != FORMAT_VERSION_V3
             && version != FORMAT_VERSION_V4
+            && version != FORMAT_VERSION_V5
             && reserved != 0
         {
             return Err(PqwError::ReservedBits { value: reserved });
@@ -600,6 +653,91 @@ mod tests {
         assert!(matches!(
             Header::from_bytes(&b),
             Err(PqwError::UnsupportedVersion(2))
+        ));
+    }
+
+    fn sample_v5() -> Header {
+        Header {
+            format_version: FORMAT_VERSION_V5,
+            d_pol: 512,
+            hyper: HyperParams {
+                eta: 0.25,
+                gamma: 0.5,
+                rho: 0.99,
+                epsilon_threshold: 0.05,
+            },
+            mcweeny_residual: 0.0,
+            payload_digest: [11u8; 24],
+            topology_offset: (HEADER_SIZE + 128) as u64,
+            topology_len: 47,
+            phase_offset: HEADER_SIZE as u64,
+            phase_len: 128,
+            nnz: 64,
+            flags: Flags::v5(true),
+        }
+    }
+
+    #[test]
+    fn v5_header_roundtrip_and_magic() {
+        let h = sample_v5();
+        let b = h.to_bytes();
+        assert_eq!(&b[..8], b"POLER_Q5");
+        let h2 = Header::from_bytes(&b).unwrap();
+        assert_eq!(h2, h);
+        assert!(h2.is_reflex());
+        assert!(h2.is_lexicon());
+        assert!(h2.is_gyro());
+        assert!(h2.flags.reflex());
+        assert!(h2.flags.lexicon());
+        assert!(h2.flags.gyro());
+        assert!(h2.flags.index16());
+    }
+
+    #[test]
+    fn v5_reserved_holds_ticks() {
+        // В v5 reserved-слово = счётчик тактов: ненулевое значение легально.
+        let mut b = sample_v5().to_bytes();
+        b[OFF_RESERVED..OFF_RESERVED + 8].copy_from_slice(&987_654u64.to_le_bytes());
+        let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+        b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(Header::from_bytes(&b).is_ok());
+    }
+
+    #[test]
+    fn v5_requires_refl_flag() {
+        // REFL сброшен → UnsupportedFlags (после пересчёта checksum).
+        let mut b = sample_v5().to_bytes();
+        let without_refl = Flags::v4(true).bits();
+        b[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&without_refl.to_le_bytes());
+        let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+        b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&b),
+            Err(PqwError::UnsupportedFlags(_))
+        ));
+    }
+
+    #[test]
+    fn v5_rejects_stray_bits() {
+        for bad in [Flags::CURVATURE, 1 << 5, Flags::v5(false).bits() | (1 << 9)] {
+            let mut b = sample_v5().to_bytes();
+            b[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&bad.to_le_bytes());
+            let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+            b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+            assert!(Header::from_bytes(&b).is_err(), "flags {bad}");
+        }
+    }
+
+    #[test]
+    fn v5_magic_version_cross_check() {
+        // POLER_Q5 с version = 4 — рассинхрон пары.
+        let mut b = sample_v5().to_bytes();
+        b[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&4u32.to_le_bytes());
+        let checksum = fnv1a64(&b[..OFF_CHECKSUM]);
+        b[OFF_CHECKSUM..OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&b),
+            Err(PqwError::UnsupportedVersion(4))
         ));
     }
 }

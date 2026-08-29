@@ -266,7 +266,13 @@ fn chat_repl_accumulates_and_saves() {
     );
     assert_eq!(stdout.matches("ответ").count() >= 2, true);
     assert!(stdout.contains("сохранено"), "мозг сохранён на выходе");
-    assert_eq!(fs::read(&brain).unwrap()[..8], *b"POLER_Q4");
+    // RQ23: диалог с --learn пишет контекст-рефлекс W — контейнер v5.
+    assert_eq!(fs::read(&brain).unwrap()[..8], *b"POLER_Q5");
+    assert!(stdout.contains("v5 контейнер"), "сохранение объявляет v5");
+    assert!(
+        stdout.contains("контекст-рефлекс"),
+        "сохранение объявляет рефлекс"
+    );
 }
 
 #[test]

@@ -50,6 +50,7 @@ pub mod mcweeny;
 pub mod mmap;
 pub mod phase;
 pub mod reader;
+pub mod reflex;
 pub mod sha256;
 pub mod stream;
 pub mod topology;
@@ -57,10 +58,14 @@ pub mod trit_bloch;
 pub mod writer;
 
 pub use error::{PqwError, Result};
-pub use gyro::{GyroData, GyroPair, GyroSection, GYRO_HEADER_SIZE, GYRO_MAGIC, GYRO_SECTION_VERSION};
+pub use gyro::{
+    GyroData, GyroPair, GyroSection, GYRO_CODEC_GAP_RLE, GYRO_HEADER_SIZE, GYRO_MAGIC,
+    GYRO_QUANT_MAX, GYRO_SECTION_VERSION, GYRO_SECTION_VERSION_RLE, gyro_slot, slot_to_pair,
+};
 pub use header::{
     Flags, Header, HyperParams, FORMAT_VERSION, FORMAT_VERSION_V2, FORMAT_VERSION_V3,
-    FORMAT_VERSION_V4, HEADER_SIZE, MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4,
+    FORMAT_VERSION_V4, FORMAT_VERSION_V5, HEADER_SIZE, MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4,
+    MAGIC_V5,
 };
 pub use lexicon::{Lexicon, LEXI_HEADER_SIZE, LEXI_MAGIC, LEXI_MAX_TOKEN, LEXI_SECTION_VERSION};
 pub use phase::{
@@ -68,6 +73,10 @@ pub use phase::{
     QUANT_EPS, SIGMA_MAX,
 };
 pub use reader::{Arc, Arcs, PackedTrits, PqwReader};
+pub use reflex::{
+    ReflexData, ReflexSection, REFL_HEADER_SIZE, REFL_MAGIC, REFL_MAX_EVENTS, REFL_MAX_NAME,
+    REFL_SECTION_VERSION,
+};
 pub use stream::TextPhaseEncoder;
 pub use writer::PqwWriter;
 

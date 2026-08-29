@@ -36,15 +36,19 @@ USAGE:
     pqc unfurl <file> [--threshold T]                         AOT phase unfurling to syntax
     pqc precess <file> [options]                              RQ11: петля архетипа поверх чекпоинта
     pqc bloch <file.pqw> [--head N] [--window W] [--json]    RQ14: триты → углы Блоха (mmap, θ на лету)
-    pqc encrypt <IN> --key <ARCH.pqw> --out <C.pqt> [opts]    RQ13: триты GF(3), прецессия+лавина
-    pqc decrypt <C.pqt> --key <ARCH.pqw> [--out <PLAIN>]      RQ13: m = p* ⊕ (a ⊗_ε p*) точно
+    pqc encrypt <IN> --key <ARCH.pqw> --out <C.pqt> [opts]    RQ23: триты GF(3), транспорт+спин-лавина
+    pqc decrypt <C.pqt> --key <ARCH.pqw> [--out <PLAIN>]      m = p* ⊕ (a ⊗_ε p*) точно (v1+v2)
+    pqc avalanche --key <ARCH.pqw> [--size N] [--probes P]    RQ23: нелинейная спиновая лавина
+                                                              GF(3) на больших блоках данных
     pqc inspect <file> [options]
     pqc train (--corpus DIR | --stdin) [options]              накопительное обучение
     pqc generate (--brain F | --corpus TEXT | --corpus-file F) [opts]
                               RQ17: L5-генерация — Born-блуждание по руслам J
     pqc step (--brain F | --corpus TEXT) [--prompt T] [opts]  RQ17: один квант авторегрессии
     pqc ask «вопрос» --brain F [opts]                          RQ17: диалог с памятью
-    pqc chat --brain F [opts]                                  RQ17: REPL-диалог (сохранение на выходе)
+    pqc chat --brain F [opts]                                  RQ23: REPL-диалог с автобиографией —
+                                                              помнит собеседника и нить между
+                                                              сессиями (--name ИМЯ / --fresh)
     pqc archetype (--brain F [--prompt T|--with F]) [opts]     RQ18: мозг ⊗_ε промпт/мозг
     pqc learn «ТЕМА» --brain F [opts]                          RQ19: интернет-ингест (TLS 1.3 zero-dep)
                                                               RQ22: --docs URL — документации/markdown через HTTPS
@@ -59,12 +63,27 @@ ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию
                               decrypt: файл открытого текста (без — stdout)
     --f32                     RQ12-схема на f32-фазах (×43, без лавины) —
                               для сравнения/воспроизведения RQ12
+    --linear                  RQ23: линейная трит-схема RQ13 v1 (чистый
+                              транспорт, без спинового слоя) — дефолт
+                              теперь нелинейная v2: такт = транспорт +
+                              квадратичный спин-проход GF(3)
     --modes <N>               число мод проектора (default: авто-калибровка
                               по помехе проекции; 1..=8)
     --seed <S>                семя IV xoshiro256++ (default: энтропия)
     --text <T>                encrypt: сообщение из строки вместо файла
     --stdin                   encrypt: сообщение из stdin
     --json                    машинно-читаемый отчёт
+
+AVALANCHE OPTIONS (RQ23: pqc avalanche — нелинейная спиновая лавина
+                   GF(3) на больших блоках данных):
+    --key <F>                 контейнер-ключ .pqw v3+ с гироскопом J
+    --size <N>                размер блока данных (default 65536 B;
+                              псевдослучайный текст детерминирован сидом)
+    --probes <N>              битовых зондов равномерно по тексту (default 16)
+    --seed <S>                семя данных (default 42)
+    --linear                  только нелинейный отчёт без сравнения с v1
+    --json                    машинно-читаемый отчёт (лавина/каскад CBC/
+                              распространение трансформа/хи-квадрат)
 
 INSPECT OPTIONS (чтение бинарников, графов и крипто-разведка):
     --hex <N|all>             hex-дамп первых N байтов (default 512)
@@ -176,6 +195,13 @@ GENERATE/ASK/CHAT OPTIONS (RQ17: L5-генерация — первые слов
     --no-reinforce            RQ22: выключить самоподкрепление грамматики
                               (по умолчанию ВКЛЮЧЕНО: удачные коннекторы
                               укрепляют русла J — насыщение за реплику)
+    --name <ИМЯ>              RQ23: запомнить собеседника — имя живёт в
+                              контекст-рефлексе W и переживает рестарт
+    --fresh                   RQ23: холодный старт волны — не подхватывать
+                              нить прошлого диалога из рефлекса W
+                              (по умолчанию чат ПОМНИТ: кольцо гироскопа
+                              восстанавливается из следа, затравка речи —
+                              хвост нити; --brain с секцией REFL v5)
     --json                    машинно-читаемый отчёт (zero-dep JSON)
 
 ARCHETYPE OPTIONS (RQ18: нелинейная алгебра a ⊗_ε b — мышление
@@ -273,6 +299,7 @@ fn main() {
         Some("bloch") => cmd_bloch(&args[1..]),
         Some("encrypt") => cmd_encrypt(&args[1..]),
         Some("decrypt") => cmd_decrypt(&args[1..]),
+        Some("avalanche") => cmd_avalanche(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("train") => cmd_train(&args[1..]),
         Some("generate") => cmd_generate(&args[1..], false),
@@ -1229,7 +1256,8 @@ fn cmd_inspect(args: &[String]) -> i32 {
     let mut d_pol: u32 = 0;
 
     match kind {
-        FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3 | FileKind::PqwV4 => {
+        FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3 | FileKind::PqwV4
+        | FileKind::PqwV5 => {
             match try_pqw_reader(data) {
                 Ok(Some(r)) => {
                     d_pol = r.d_pol();
@@ -1289,7 +1317,41 @@ fn cmd_inspect(args: &[String]) -> i32 {
             ("pairs".into(), Json::num(g.pairs().len() as f64)),
             ("scale".into(), Json::num(g.scale() as f64)),
             ("index16".into(), Json::Bool(g.index16())),
+            (
+                "codec".into(),
+                Json::num(if g.codec() == pqw::GYRO_SECTION_VERSION_RLE {
+                    2.0
+                } else {
+                    1.0
+                }),
+            ),
         ];
+        // RQ23: статистика сжатия gap-RLE против разреженного кодека.
+        if g.codec() == pqw::GYRO_SECTION_VERSION_RLE {
+            let data = pqw::GyroData::new(
+                g.window(),
+                g.ticks(),
+                g.pairs().iter().map(|p| (p.i, p.j, p.weight)).collect(),
+                d_pol,
+            );
+            if let Ok(data) = data {
+                let sparse = data.encode(reader.as_ref().map(|r| r.header().flags.index16()).unwrap_or(false));
+                if let Ok(sparse) = sparse {
+                    let stored = data
+                        .encode_rle()
+                        .map(|v| v.len())
+                        .unwrap_or_default();
+                    if sparse.len() > 0 && stored > 0 {
+                        obj.push(("sparse_bytes".into(), Json::num(sparse.len() as f64)));
+                        obj.push(("rle_bytes".into(), Json::num(stored as f64)));
+                        obj.push((
+                            "compression".into(),
+                            Json::num(sparse.len() as f64 / stored as f64),
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(modes) = &gyro_modes {
             // Фазовый портрет Im(P): p̂ и θ = arccos(p̂) дуг моды —
             // из фазовой секции контейнера.
@@ -1332,10 +1394,21 @@ fn cmd_inspect(args: &[String]) -> i32 {
 
     // ── JSON-режим: единый объект и выход ──
     if cfg.json {
-        println!(
-            "{}",
-            report_json(&file, data, kind, &arcs, d_pol, &recon, gyro_json).to_string()
-        );
+        // RQ23: контекст-рефлекс W — автобиография диалога.
+        let mut report = report_json(&file, data, kind, &arcs, d_pol, &recon, gyro_json);
+        if let Json::Obj(pairs) = &mut report {
+            if let Some(r) = reader.as_ref().and_then(|r| r.reflex()) {
+                pairs.push((
+                    "reflex".into(),
+                    Json::Obj(vec![
+                        ("interlocutor".into(), Json::str(r.interlocutor())),
+                        ("turns".into(), Json::num(r.turns() as f64)),
+                        ("trail_events".into(), Json::num(r.events().len() as f64)),
+                    ]),
+                ));
+            }
+        }
+        println!("{}", report.to_string());
         return 0;
     }
 
@@ -2105,6 +2178,13 @@ struct CryptoConfig {
     json: bool,
     /// RQ12-схема на f32-фазах (legacy; трит-схема GF(3) — по умолчанию).
     legacy_f32: bool,
+    /// RQ23: линейная трит-схема RQ13 v1 (чистый транспорт, без
+    /// нелинейного спинового слоя) — дефолт теперь v2.
+    linear_v1: bool,
+    /// RQ23: размер сообщения для команды avalanche (байт).
+    size: usize,
+    /// RQ23: число зондов лавины.
+    probes: usize,
 }
 
 impl Default for CryptoConfig {
@@ -2118,6 +2198,9 @@ impl Default for CryptoConfig {
             stdin: false,
             json: false,
             legacy_f32: false,
+            linear_v1: false,
+            size: 0,
+            probes: 0,
         }
     }
 }
@@ -2165,6 +2248,27 @@ fn parse_crypto_args(cmd: &str, args: &[String]) -> Result<(Option<String>, Cryp
             "--stdin" => cfg.stdin = true,
             "--json" => cfg.json = true,
             "--f32" => cfg.legacy_f32 = true,
+            "--linear" => cfg.linear_v1 = true,
+            "--size" => {
+                let v = val!("--size");
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 && n <= 16 * 1024 * 1024 => cfg.size = n,
+                    _ => {
+                        eprintln!("pqc {cmd}: bad --size: {v} (1..=16 МиБ)");
+                        return Err(2);
+                    }
+                }
+            }
+            "--probes" => {
+                let v = val!("--probes");
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 && n <= 256 => cfg.probes = n,
+                    _ => {
+                        eprintln!("pqc {cmd}: bad --probes: {v} (1..=256)");
+                        return Err(2);
+                    }
+                }
+            }
             other if !other.starts_with("--") => {
                 if file.replace(other.to_string()).is_some() {
                     eprintln!("pqc {cmd}: файл задан дважды\n\n{USAGE}");
@@ -2337,11 +2441,23 @@ fn cmd_encrypt_trite(key_path: &str, out_path: &str, msg: &[u8], cfg: &CryptoCon
         None => pqc::Rng::from_entropy(),
     };
     let t0 = std::time::Instant::now();
-    let (cipher, rep) = match pqc::trite::encrypt(&key, msg, &mut rng) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("pqc encrypt: {e}");
-            return 1;
+    // RQ23: дефолт — нелинейная схема v2 (транспорт + спин-раунд GF(3));
+    // --linear возвращает чистый транспорт RQ13 (v1).
+    let (cipher, rep) = if cfg.linear_v1 {
+        match pqc::trite::encrypt_v1(&key, msg, &mut rng) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("pqc encrypt: {e}");
+                return 1;
+            }
+        }
+    } else {
+        match pqc::trite::encrypt(&key, msg, &mut rng) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("pqc encrypt: {e}");
+                return 1;
+            }
         }
     };
     let dt = t0.elapsed();
@@ -2355,6 +2471,7 @@ fn cmd_encrypt_trite(key_path: &str, out_path: &str, msg: &[u8], cfg: &CryptoCon
             ("key".into(), pqc::Json::str(key_path)),
             ("out".into(), pqc::Json::str(out_path)),
             ("scheme".into(), pqc::Json::str("trite-gf3")),
+            ("version".into(), pqc::Json::num(rep.version as f64)),
             ("msg_len".into(), pqc::Json::num(rep.msg_len as f64)),
             ("out_len".into(), pqc::Json::num(rep.out_len as f64)),
             ("blocks".into(), pqc::Json::num(rep.blocks as f64)),
@@ -2364,6 +2481,7 @@ fn cmd_encrypt_trite(key_path: &str, out_path: &str, msg: &[u8], cfg: &CryptoCon
             ("raw_pairs".into(), pqc::Json::num(key.raw_pairs as f64)),
             ("pairs_total".into(), pqc::Json::num(rep.pairs_total as f64)),
             ("ticks".into(), pqc::Json::num(rep.ticks as f64)),
+            ("nl_rounds".into(), pqc::Json::num(rep.nl_rounds as f64)),
             ("avalanche".into(), pqc::Json::num(rep.avalanche)),
             ("expansion".into(), pqc::Json::num(rep.expansion)),
             ("ritz_max".into(), pqc::Json::num(key.ritz_max)),
@@ -2373,16 +2491,155 @@ fn cmd_encrypt_trite(key_path: &str, out_path: &str, msg: &[u8], cfg: &CryptoCon
         ]);
         println!("{}", obj.to_string());
     } else {
-        println!("POLER Quantum Core — Encrypt: трит-схема алгебры архетипа (RQ13, GF(3))");
+        let scheme_name = if rep.version == pqc::trite::TRITE_VERSION_V2 {
+            "нелинейная v2: транспорт + спин-раунд GF(3) (RQ23)"
+        } else {
+            "линейная v1: чистый транспорт (RQ13)"
+        };
+        println!("POLER Quantum Core — Encrypt: трит-схема алгебры архетипа (GF(3), {scheme_name})");
         println!("key       : {key_path} (d_pol={}, русел J={}, мод K={})", key.d_pol, key.raw_pairs, key.k_modes);
         println!("            Ritz {:.1e} | орто {:.1e} (идемпотентность a ⊗ a = a)", key.ritz_max, key.ortho_max);
         println!("message   : {} B → {} блоков × {} трит (упаковка {}↔{})", rep.msg_len, rep.blocks, rep.capacity_trites, 19, 30);
         println!("cipher    : {out_path} ({} B, расширение ×{:.2} — было ×43 в RQ12)", rep.out_len, rep.expansion);
-        println!("прецессия : {} тактов × {} русл (J {} + решётка LENS {})", rep.ticks, rep.pairs_total, key.raw_pairs, rep.pairs_total - key.raw_pairs);
-        println!("лавина    : {:.1}% трит блока от 1 бита (было: 1 бит → 1 фаза в RQ12; потолок GF(3) 66.7%)", 100.0 * rep.avalanche);
+        println!("диффузия  : {} тактов × {} русл (J {} + решётка LENS {}){}",
+            rep.ticks,
+            rep.pairs_total,
+            key.raw_pairs,
+            rep.pairs_total - key.raw_pairs,
+            if rep.nl_rounds > 0 {
+                format!(" + {} спин-раундов (квадратичный T-проход)", rep.nl_rounds)
+            } else {
+                String::new()
+            }
+        );
+        println!("лавина    : {:.1}% трит блока от 1 бита, тот же IV (потолок GF(3) 66.7%)", 100.0 * rep.avalanche);
         println!("digest    : sha256-24 = {}", rep.digest_hex);
         println!("время     : {:.3} с", dt.as_secs_f64());
         println!("уравнение : p* = a ⊗_ε p* ⊕ m — Packed4-триты, расшифровка побитово точна (GF(3))");
+    }
+    0
+}
+
+/// `pqc avalanche --key F.pqw [--size N] [--probes P] [--linear] [--json]`:
+/// измерение нелинейной спиновой лавины GF(3) на большом блоке данных
+/// (RQ23). Псевдослучайный текст детерминирован сидом (--seed, дефолт 42):
+/// одинаковые прогоны сравнимы побитово.
+fn cmd_avalanche(args: &[String]) -> i32 {
+    let (file, cfg) = match parse_crypto_args("avalanche", args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let Some(key_path) = &cfg.key else {
+        eprintln!("pqc avalanche: требуется --key <ARCH.pqw> (контейнер v3+ с гироскопом)");
+        return 2;
+    };
+    if file.is_some() {
+        eprintln!("pqc avalanche: вход не нужен — текст генерируется сидом (--size)");
+        return 2;
+    }
+    let size = if cfg.size > 0 { cfg.size } else { 65_536 };
+    let probes = if cfg.probes > 0 { cfg.probes } else { 16 };
+    let seed = cfg.seed.unwrap_or(42);
+
+    let key = match load_trite_key(key_path, cfg.modes) {
+        Ok(k) => k,
+        Err(c) => return c,
+    };
+    let msg = pqc::spin_avalanche::msg_from_seed(seed, size);
+    let t0 = std::time::Instant::now();
+    let stats = match pqc::spin_avalanche::measure_avalanche(&key, &msg, probes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pqc avalanche: {e}");
+            return 1;
+        }
+    };
+    let dt = t0.elapsed();
+    // Линейный прогон для сравнения слоёв: та же схема измерения
+    // (флип первого зонда, тот же IV-сид), но тело v1 без спина.
+    let (linear_mean, linear_spread) = if cfg.linear_v1 {
+        (None, None)
+    } else {
+        let iv_seed = 0xA11CE_u64;
+        let mut rng = pqc::Rng::seed_from_u64(iv_seed);
+        let (_, data, _) = key.encrypt_body_version(&msg, &mut rng, pqc::trite::TRITE_VERSION);
+        // Флип того же бита, что и первый зонд.
+        let mut flipped = msg.clone();
+        flipped[0] ^= 1;
+        let mut rng3 = pqc::Rng::seed_from_u64(iv_seed);
+        let (_, data3, _) = key.encrypt_body_version(&flipped, &mut rng3, pqc::trite::TRITE_VERSION);
+        let n = data.len() * 4;
+        let t1 = pqc::trite::unpack_trites(&data, n);
+        let t3 = pqc::trite::unpack_trites(&data3, n);
+        let av = t1
+            .iter()
+            .zip(t3.iter())
+            .filter(|(a, b)| a != b)
+            .count() as f64
+            / n as f64;
+        let spread = pqc::spin_avalanche::transform_spread(
+            key.pairs(),
+            key.keystream(),
+            key.d_pol,
+            key.positions()[0] as usize,
+            key.ticks,
+        );
+        (Some(av), Some(spread))
+    };
+
+    if cfg.json {
+        let mut obj = vec![
+            ("key".into(), pqc::Json::str(key_path)),
+            ("scheme".into(), pqc::Json::str("spin-avalanche-gf3")),
+            ("version".into(), pqc::Json::num(pqc::trite::TRITE_VERSION_V2 as f64)),
+            ("size".into(), pqc::Json::num(size as f64)),
+            ("probes".into(), pqc::Json::num(probes as f64)),
+            ("seed".into(), pqc::Json::num(seed as f64)),
+            ("d_pol".into(), pqc::Json::num(key.d_pol as f64)),
+            ("blocks".into(), pqc::Json::num(stats.blocks as f64)),
+            ("ticks".into(), pqc::Json::num(stats.ticks as f64)),
+            ("nl_rounds".into(), pqc::Json::num(stats.nl_rounds as f64)),
+            ("ticks_linear".into(), pqc::Json::num(key.ticks as f64)),
+            ("avalanche_mean".into(), pqc::Json::num(stats.avalanche_mean)),
+            (
+                "avalanche_from_probe".into(),
+                pqc::Json::num(stats.avalanche_from_probe),
+            ),
+            ("avalanche_min".into(), pqc::Json::num(stats.avalanche_min)),
+            ("avalanche_max".into(), pqc::Json::num(stats.avalanche_max)),
+            ("ceiling".into(), pqc::Json::num(stats.ceiling)),
+            ("cascade_after".into(), pqc::Json::num(stats.cascade_after)),
+            (
+                "transform_spread_mean".into(),
+                pqc::Json::num(stats.transform_spread_mean),
+            ),
+            ("chi2_blocks".into(), pqc::Json::num(stats.chi2_blocks)),
+            ("seconds".into(), pqc::Json::num(dt.as_secs_f64())),
+        ];
+        if let Some(lm) = linear_mean {
+            obj.push(("linear_avalanche_probe".into(), pqc::Json::num(lm)));
+        }
+        if let Some(ls) = linear_spread {
+            obj.push(("linear_spread_probe".into(), pqc::Json::num(ls)));
+        }
+        println!("{}", pqc::Json::Obj(obj).to_string());
+    } else {
+        println!("POLER Quantum Core — Avalanche: нелинейная спиновая лавина GF(3) (RQ23)");
+        println!("key       : {key_path} (d_pol={}, русел J={})", key.d_pol, key.raw_pairs);
+        println!("данные    : {size} B (сид {seed}) → {} блоков × {} трит, зондов {probes}", stats.blocks, stats.block_trites);
+        println!("схема     : v2 — такт = транспорт + спин-раунд ({} тактов); линейная v1 — {} тактов", stats.ticks, key.ticks);
+        println!("лавина    : {:.1}% трит всего шифртекста (мин {:.1}% / макс {:.1}%)",
+            100.0 * stats.avalanche_mean, 100.0 * stats.avalanche_min, 100.0 * stats.avalanche_max);
+        println!("            от блока зонда вперёд — {:.1}% (честная диффузия; префикс CBC не трогает), потолок GF(3) {:.1}%",
+            100.0 * stats.avalanche_from_probe, 100.0 * stats.ceiling);
+        println!("каскад    : {:.1}% трит в блоках ПОСЛЕ зонда (цепочка CBC разносит замену вперёд)", 100.0 * stats.cascade_after);
+        println!("трансформ : {:.1}% позиций блока от одной триты (зонды состояния)", 100.0 * stats.transform_spread_mean);
+        println!("хи-квадрат: {:.2} по {} блокам (равномерность изменений)", stats.chi2_blocks, stats.blocks);
+        if let (Some(lm), Some(ls)) = (linear_mean, linear_spread) {
+            println!("сравнение : линейная v1 — зонд {:.1}% / распространение {:.1}% (спин ускоряет диффузию)", 100.0 * lm, 100.0 * ls);
+        }
+        println!("время     : {:.3} с", dt.as_secs_f64());
+        println!("физика    : квадратичный T-проход x[i] += c[i]·x[i+1]·x[i+2] ломает линейность GF(3)");
     }
     0
 }
@@ -4199,6 +4456,12 @@ struct GenConfig {
     focus_radius: usize,
     /// RQ22: самоподкрепление грамматики (`--no-reinforce` снимает).
     reinforce: bool,
+    /// RQ23: имя собеседника для автобиографической памяти
+    /// (`--name ИМЯ`; пусто — аноним).
+    name: Option<String>,
+    /// RQ23: холодный старт волны (`--fresh` — не подхватывать нить
+    /// прошлого диалога из контекст-рефлекса W).
+    fresh: bool,
     learn: bool,
     json: bool,
     /// Позиционный вопрос (ask/chat).
@@ -4224,6 +4487,8 @@ impl Default for GenConfig {
             syntax: true,
             focus_radius: DEFAULT_FOCUS_RADIUS,
             reinforce: true,
+            name: None,
+            fresh: false,
             learn: true,
             json: false,
             question: None,
@@ -4303,6 +4568,8 @@ fn parse_gen_args(args: &[String], cfg: &mut GenConfig) -> Result<(), String> {
                 }
             }
             "--no-learn" => cfg.learn = false,
+            "--name" => cfg.name = Some(val("--name")?),
+            "--fresh" => cfg.fresh = true,
             "--json" => cfg.json = true,
             _ if !a.starts_with("--") && cfg.question.is_none() => {
                 cfg.question = Some(a);
@@ -4334,7 +4601,7 @@ fn load_gen_engine(cfg: &GenConfig) -> Result<BrainSource, String> {
             .map_err(|e| format!("--brain {path}: {e}"))?;
         if reader.encoding() != pqw::phase::TritEncoding::Packed4 {
             return Err(format!(
-                "--brain {path}: нужен контейнер v2/v3/v4 (Packed4); \
+                "--brain {path}: нужен контейнер v2/v3/v4/v5 (Packed4); \
                  обучите pqc train --quantized --gyro"
             ));
         }
@@ -5401,6 +5668,7 @@ fn cmd_generate(args: &[String], step_mode: bool) -> i32 {
         syntax: cfg.syntax,
         focus_radius: cfg.focus_radius,
         reinforce: cfg.reinforce,
+        autobiographical: false,
     };
     let mut gen = match L5Generator::new(engine, gcfg) {
         Ok(g) => g,
@@ -5490,11 +5758,54 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
         Err(e) => return gen_usage_err(&e),
     };
 
+    // RQ23: автобиографическая память — имя собеседника и нить
+    // разговора переживают рестарт (контекст-рефлекс W из секции REFL
+    // v5-контейнера; кольцо гироскопа уже восстановлено в resume).
+    let refl = engine.reflex().clone();
+    if let Some(name) = &cfg.name {
+        engine.reflex_mut().set_interlocutor(name);
+    }
+    let autobiographical = !cfg.fresh;
+    let mut reflex_json = None;
+    let mut autobio_line = String::new();
+    if !refl.is_empty() {
+        let thread: Vec<&str> = refl.thread_words(12, |c| engine.lexicon_token(c));
+        if cfg.json {
+            reflex_json = Some(Json::Obj(vec![
+                ("interlocutor".into(), Json::str(refl.interlocutor())),
+                ("turns".into(), Json::num(refl.turns() as f64)),
+                ("trail_events".into(), Json::num(refl.trail().len() as f64)),
+                (
+                    "thread".into(),
+                    Json::Arr(thread.iter().map(|&t| Json::str(t)).collect()),
+                ),
+            ]));
+        } else {
+            let name_disp = if refl.interlocutor().is_empty() {
+                "аноним"
+            } else {
+                refl.interlocutor()
+            };
+            let thread_disp = if thread.is_empty() {
+                "(координаты без слов лексикона)".to_string()
+            } else {
+                thread.join(" ")
+            };
+            autobio_line = format!(
+                "автобио  : собеседник {name_disp}, {} реплик — помню нить: {thread_disp} …",
+                refl.turns()
+            );
+        }
+    }
+
     if !cfg.json {
         println!(
             "POLER Quantum Core — L5 Dialog (RQ17): диалог с памятью, H^Ψ = 0"
         );
         println!("мозг     : {path} (d_pol={}, каналы J={}, лексикон {} слов)", engine.d_pol(), engine.channel_count(), engine.lexicon_len());
+        if !autobio_line.is_empty() {
+            println!("{autobio_line}");
+        }
         if chat_mode {
             println!("режим    : REPL — вводите вопросы, Ctrl-D завершает и сохраняет");
         }
@@ -5531,6 +5842,7 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
             syntax: cfg.syntax,
             focus_radius: cfg.focus_radius,
             reinforce: cfg.reinforce,
+            autobiographical,
         };
         let report = {
             let mut gen = match L5Generator::new(&mut engine, gcfg) {
@@ -5545,10 +5857,18 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
 
         // Память диалога: вопрос + ответ перещёлкивают фазы born-шагом —
         // модель обогащается на лету (мнение кристаллизуется, русла
-        // вопроса↔ответа копятся).
+        // вопроса↔ответа копятся). RQ23: реплика уходит и в
+        // контекст-рефлекс W — нить диалога переживает рестарт.
         let mut memory_json = None;
         let mut learned_desc = String::new();
         if cfg.learn {
+            // RQ23: след W — вопрос + эмиссии ответа с Born-полярностями.
+            let answer_events: Vec<(u32, i8)> = report
+                .steps
+                .iter()
+                .map(|s| (s.coord, if s.born_bit { -1 } else { 1 }))
+                .collect();
+            engine.observe_dialog_turn(&current_question, &answer_events);
             let dialog = format!("{current_question} {}", report.text);
             match engine.ingest(&dialog, 1) {
                 Ok(rep) => {
@@ -5563,6 +5883,10 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
                         ("born_moved".into(), Json::num(rep.moved as f64)),
                         ("channels".into(), Json::num(rep.channels as f64)),
                         ("lexicon".into(), Json::num(engine.lexicon_len() as f64)),
+                        (
+                            "reflex_turns".into(),
+                            Json::num(engine.reflex().turns() as f64),
+                        ),
                     ]));
                 }
                 Err(e) => {
@@ -5573,16 +5897,17 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
 
         if cfg.json {
             let mut j = if first {
+                let mut brain = vec![
+                    ("path".into(), Json::str(&path)),
+                    ("d_pol".into(), Json::num(engine.d_pol() as f64)),
+                    ("channels".into(), Json::num(engine.channel_count() as f64)),
+                    ("lexicon".into(), Json::num(engine.lexicon_len() as f64)),
+                ];
+                if let Some(rj) = &reflex_json {
+                    brain.push(("reflex".into(), rj.clone()));
+                }
                 vec![
-                    (
-                        "brain".into(),
-                        Json::Obj(vec![
-                            ("path".into(), Json::str(&path)),
-                            ("d_pol".into(), Json::num(engine.d_pol() as f64)),
-                            ("channels".into(), Json::num(engine.channel_count() as f64)),
-                            ("lexicon".into(), Json::num(engine.lexicon_len() as f64)),
-                        ]),
-                    ),
+                    ("brain".into(), Json::Obj(brain)),
                     ("question".into(), Json::str(&current_question)),
                 ]
             } else {
@@ -5619,17 +5944,30 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
         current_question = String::new();
     }
 
-    // Обратная запись мозга: контейнер v4 (фазы + русла + лексикон).
+    // Обратная запись мозга: v5 при живом рефлексе (фазы + русла +
+    // лексикон + контекст-рефлекс W), иначе v4 (RQ23).
     if cfg.learn {
         match engine.checkpoint() {
             Ok(bytes) => match std::fs::write(&path, &bytes) {
                 Ok(()) => {
                     if !cfg.json {
-                        println!(
-                            "\nсохранено: {path} → v4 контейнер ({} Б: фазы + русла J + лексикон {} слов)",
-                            bytes.len(),
-                            engine.lexicon_len()
-                        );
+                        let has_reflex = !engine.reflex().is_empty()
+                            && engine.reflex().to_data(engine.d_pol()).is_some();
+                        if has_reflex {
+                            println!(
+                                "\nсохранено: {path} → v5 контейнер ({} Б: фазы + русла J + \
+                                 лексикон {} слов + контекст-рефлекс W: {} реплик)",
+                                bytes.len(),
+                                engine.lexicon_len(),
+                                engine.reflex().turns()
+                            );
+                        } else {
+                            println!(
+                                "\nсохранено: {path} → v4 контейнер ({} Б: фазы + русла J + лексикон {} слов)",
+                                bytes.len(),
+                                engine.lexicon_len()
+                            );
+                        }
                     }
                 }
                 Err(e) => {

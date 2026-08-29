@@ -48,7 +48,7 @@ use crate::json::Json;
 use pqw::mcweeny::idempotency_residual;
 use pqw::phase::{unpack_quad, Trit};
 use pqw::sha256::sha256;
-use pqw::{PqwReader, HEADER_SIZE, MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4};
+use pqw::{PqwReader, HEADER_SIZE, MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5};
 
 /// Порог χ² против равномерного для df = 255 (p ≈ 0.001): ~352.
 const CHI2_UNIFORM_BAND: f64 = 352.0;
@@ -75,6 +75,9 @@ pub enum FileKind {
     /// Контейнер v4: magic `POLER_Q4`, v3 + лексикон `LEXI`
     /// (координата → доминантный токен, RQ17).
     PqwV4,
+    /// Контейнер v5: magic `POLER_Q5`, v4 + контекст-рефлекс `REFL`
+    /// (динамический след диалога, RQ23).
+    PqwV5,
     /// Кандидат в сырые Packed4-пакеты (без заголовка); `d_pol = 4 × len`.
     RawPacked4 { d_pol: u32 },
     /// Неизвестный формат — универсальная разведка.
@@ -89,6 +92,9 @@ impl FileKind {
             FileKind::PqwV2 => "pqw-v2 (POLER_Q2, Packed4)",
             FileKind::PqwV3 => "pqw-v3 (POLER_Q3, Packed4 + gyro J = A − Aᵀ)",
             FileKind::PqwV4 => "pqw-v4 (POLER_Q4, Packed4 + gyro J + lexicon LEXI)",
+            FileKind::PqwV5 => {
+                "pqw-v5 (POLER_Q5, Packed4 + gyro J + lexicon + reflex REFL)"
+            }
             FileKind::RawPacked4 { .. } => "raw-packed4 (candidate)",
             FileKind::Opaque => "opaque",
         }
@@ -98,7 +104,11 @@ impl FileKind {
     pub fn is_pqw(self) -> bool {
         matches!(
             self,
-            FileKind::PqwV1 | FileKind::PqwV2 | FileKind::PqwV3 | FileKind::PqwV4
+            FileKind::PqwV1
+                | FileKind::PqwV2
+                | FileKind::PqwV3
+                | FileKind::PqwV4
+                | FileKind::PqwV5
         )
     }
 }
@@ -117,6 +127,9 @@ pub fn detect_kind(data: &[u8]) -> FileKind {
         }
         if data[..8] == MAGIC_V4 {
             return FileKind::PqwV4;
+        }
+        if data[..8] == MAGIC_V5 {
+            return FileKind::PqwV5;
         }
     }
     if !data.is_empty() && packed4_valid(data) && printable_ratio(data) < 0.85 {

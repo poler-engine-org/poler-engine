@@ -322,6 +322,15 @@ pub struct GeneratorConfig {
     /// (коннектор — путь волны). Библиотечный дефолт — `false`;
     /// CLI включает (`--no-reinforce` снимает).
     pub reinforce: bool,
+    /// Автобиографическая затравка RQ23: кольцо контекста речи
+    /// стартует из хвоста контекст-рефлекса `W` (последние слова
+    /// предыдущей сессии диалога) — волна продолжает нить разговора
+    /// вместо холодного старта. Нить занимает половину окна,
+    /// вопрос — вторую половину; пустой промпт заполняет кольцо
+    /// следом целиком (свободная речь как продолжение монолога).
+    /// Библиотечный дефолт — `false` (RQ17-совместимость); CLI
+    /// включает (`--fresh` снимает).
+    pub autobiographical: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -339,6 +348,7 @@ impl Default for GeneratorConfig {
             syntax: false,
             focus_radius: 0,
             reinforce: false,
+            autobiographical: false,
         }
     }
 }
@@ -505,6 +515,11 @@ pub struct L5Generator<'a> {
 impl<'a> L5Generator<'a> {
     /// Новая сессия речи поверх движка. Строит смежность русел —
     /// O(каналы), один раз.
+    ///
+    /// RQ23: при `cfg.autobiographical` кольцо контекста получает
+    /// затравку из хвоста контекст-рефлекса `W` движка (последние
+    /// ⌈window/2⌉ слов предыдущей сессии) — волна продолжает нить
+    /// разговора.
     pub fn new(qc: &'a mut QuantizedGyroCurriculum, cfg: GeneratorConfig) -> Result<Self> {
         let d = qc.d_pol() as usize;
         let mut adj: Vec<Vec<(u32, i8)>> = vec![Vec::new(); d];
@@ -516,11 +531,22 @@ impl<'a> L5Generator<'a> {
         }
         let window = cfg.window.max(1);
         let focus_on = cfg.focus_radius > 0;
+        let mut ring = VecDeque::with_capacity(window + 1);
+        // Автобиографическая затравка: нить прошлого диалога —
+        // половина кольца (вторая половина достанется вопросу).
+        if cfg.autobiographical {
+            let take = window.div_ceil(2);
+            for &(c, _) in qc.reflex().trail_tail(take) {
+                if (c as usize) < d {
+                    ring.push_back(c);
+                }
+            }
+        }
         Ok(L5Generator {
             qc,
             cfg,
             rng: Rng::seed_from_u64(cfg.seed),
-            ring: VecDeque::with_capacity(window + 1),
+            ring,
             adj,
             bridge: Vec::new(),
             down: vec![0u32; d],
@@ -597,7 +623,15 @@ impl<'a> L5Generator<'a> {
         for &c in seen_ring.iter().take(window) {
             self.ring.push_back(c);
         }
-        // Пустой промпт — свободная речь: затравка из лексикона.
+        // RQ23: нить + вопрос делят кольцо — вопрос вытесняет старейшие
+        // слова нити, но не наоборот (никогда не превышаем окно).
+        while self.ring.len() > window {
+            self.ring.pop_front();
+        }
+        // Пустой промпт — свободная речь. RQ23: автобиографическая
+        // затравка приоритетнее — свободная речь как продолжение
+        // монолога (кольцо уже несёт хвост следа из конструктора);
+        // затравка из лексикона — только холодный старт без следа.
         if self.ring.is_empty() {
             let n = self.qc.lexicon_len();
             if n > 0 {
@@ -1225,6 +1259,85 @@ mod tests {
             qc.ingest(CORPUS, 1).unwrap();
         }
         qc
+    }
+
+    // ===================== RQ23: автобиография =====================
+
+    #[test]
+    fn autobiographical_seed_prefills_ring() {
+        // Рефлекс с хвостом следа: генератор с autobiographical=true
+        // стартует кольцо из нити прошлого диалога (полокна), вопрос
+        // занимает вторую половину; fresh-конфиг — холодный старт.
+        let mut qc = trained_engine();
+        qc.observe_dialog_turn("квант фаза решётка", &[(20, 1), (30, -1)]);
+        assert!(!qc.reflex().trail().is_empty());
+
+        let gcfg = GeneratorConfig {
+            autobiographical: true,
+            ..GeneratorConfig::default()
+        };
+        let gen = L5Generator::new(&mut qc, gcfg).unwrap();
+        // Окно 8 по умолчанию → затравка ⌈8/2⌉ = 4 координаты следа.
+        assert_eq!(gen.ring.len(), 4);
+
+        // Без автобиографии кольцо пусто до промпта.
+        let gen2 = L5Generator::new(&mut qc, GeneratorConfig::default()).unwrap();
+        assert!(gen2.ring.is_empty());
+    }
+
+    #[test]
+    fn autobiographical_free_speech_continues_thread() {
+        // Пустой промпт + след: кольцо остаётся с нитью (затравка
+        // лексикона НЕ перезаписывает её) — свободная речь продолжает
+        // монолог прошлой сессии.
+        let mut qc = trained_engine();
+        qc.observe_dialog_turn("квант фаза решётка", &[(20, 1), (30, -1)]);
+        let gcfg = GeneratorConfig {
+            autobiographical: true,
+            max_tokens: 6,
+            ..GeneratorConfig::default()
+        };
+        let rep = {
+            let mut gen = L5Generator::new(&mut qc, gcfg).unwrap();
+            gen.generate("").unwrap()
+        };
+        // Речь либо состоялась из нити, либо честно молчит — но не
+        // падает и не зацикливается.
+        assert!(rep.steps.len() <= 6);
+        let _ = rep.text;
+    }
+
+    #[test]
+    fn autobiographical_turn_changes_next_answer() {
+        // Нить влияет на следующую реплику: ответ после обновления
+        // следа отличается от ответа холодного старта (тот же сид).
+        let mut qc = trained_engine();
+        let cold = {
+            let gcfg = GeneratorConfig {
+                seed: 11,
+                max_tokens: 12,
+                ..GeneratorConfig::default()
+            };
+            let mut gen = L5Generator::new(&mut qc, gcfg).unwrap();
+            gen.generate("квант").unwrap().text
+        };
+        // Реплика уходит в след (как в chat --learn).
+        qc.observe_dialog_turn("квант фаза", &[(20, 1), (30, -1), (40, 1)]);
+        let warm = {
+            let gcfg = GeneratorConfig {
+                seed: 11,
+                max_tokens: 12,
+                autobiographical: true,
+                ..GeneratorConfig::default()
+            };
+            let mut gen = L5Generator::new(&mut qc, gcfg).unwrap();
+            gen.generate("квант").unwrap().text
+        };
+        // Затравка кольца меняет путь волны: тексты различны (или оба
+        // пусты — вырожденный словарь; здесь лексикон живой).
+        if !cold.is_empty() && !warm.is_empty() {
+            assert_ne!(cold, warm, "нить обязана менять течение мысли");
+        }
     }
 
     #[test]

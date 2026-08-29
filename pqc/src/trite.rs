@@ -74,13 +74,19 @@
 
 use crate::crypto::{bits_to_bytes, bytes_to_bits, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64, CipherKey};
 use crate::rng::Rng;
+use crate::spin_avalanche::block_ticks;
 use pqw::reader::PqwReader;
 use pqw::sha256::sha256_trunc24;
 
 /// Магия контейнера тритного шифртекста.
 pub const TRITE_MAGIC: [u8; 4] = *b"PQT1";
-/// Версия формата.
+/// Версия формата — линейная схема RQ13 (чистый транспорт).
 pub const TRITE_VERSION: u16 = 1;
+/// Версия формата — нелинейная схема RQ23: такт блока = транспорт +
+/// спин-раунд (квадратичный T-проход GF(3),
+/// [`crate::spin_avalanche`]). Шифртексты v1 расшифровываются как
+/// раньше — версия в заголовке).
+pub const TRITE_VERSION_V2: u16 = 2;
 /// Размер заголовка `.pqt` (байт).
 pub const TRITE_HEADER_SIZE: usize = 64;
 /// Максимум тактов прецессии на блок (калибровка не выше).
@@ -119,8 +125,12 @@ pub struct TritKey {
     pub strides: (u32, u32, u32),
     /// Ключевой поток: тритификация `a·p₀`.
     keystream: Vec<u8>,
-    /// Тактов прецессии на блок (калибровка по зондам лавины).
+    /// Тактов линейной прецессии на блок (калибровка v1 по зондам).
     pub ticks: u32,
+    /// Тактов комбинированного нелинейного такта v2 (транспорт + спин,
+    /// RQ23): калибровка по тем же зондам на комбинированном
+    /// преобразовании.
+    ticks_v2: u32,
     /// Группа упаковки: `group_t` трит ↔ `group_b` бит.
     pub group_t: usize,
     pub group_b: usize,
@@ -133,6 +143,8 @@ pub struct TritKey {
 /// Сводка шифрования (трит-схема).
 #[derive(Clone, Debug)]
 pub struct EncryptReport {
+    /// Версия схемы: 1 — линейная (RQ13), 2 — нелинейная спиновая (RQ23).
+    pub version: u16,
     /// Блоков сообщения (IV хранится отдельно, в блоки не входит).
     pub blocks: usize,
     /// Размер открытого текста (байт).
@@ -145,10 +157,12 @@ pub struct EncryptReport {
     pub capacity_trites: usize,
     /// Тактов прецессии на блок.
     pub ticks: u32,
+    /// Спин-раундов на блок (v2: чередуются с транспортом; v1: 0).
+    pub nl_rounds: u32,
     /// Всего русел (семантические + решётчатые).
     pub pairs_total: usize,
     /// Измеренная лавина: доля трит шифртекста, изменившихся от смены
-    /// одного бита сообщения (с тем же IV).
+    /// одного бита сообщения (с тем же IV — честная диффузия, RQ23).
     pub avalanche: f64,
     /// Расширение: `out_len / msg_len`.
     pub expansion: f64,
@@ -379,6 +393,35 @@ fn calibrate_ticks(pairs: &[TritPair], d: usize, positions: &[u32]) -> u32 {
     MAX_TICKS
 }
 
+/// Калибровка нелинейных тактов v2 (RQ23): тот же критерий (лавина
+/// ≥ [`AVALANCHE_TARGET`] на четырёх зондах), но преобразование —
+/// комбинированный такт «транспорт + спин-раунд» с лентой ключевого
+/// потока. Спиновый слой заражает блок быстрее линейного транспорта —
+/// `T₂ ≤ T₁`: нелинейность дешевле диффузии.
+fn calibrate_ticks_v2(pairs: &[TritPair], ks: &[u8], d: usize, positions: &[u32]) -> u32 {
+    let n = positions.len();
+    let probes: [usize; 4] = [
+        positions[0] as usize,
+        positions[n / 4] as usize,
+        positions[n / 2] as usize,
+        positions[n - 1] as usize,
+    ];
+    for &t in &[1u32, 2, 4, 8, 16, 32, MAX_TICKS] {
+        let mut worst = 1.0_f64;
+        for &p in &probes {
+            let mut x = vec![0u8; d];
+            x[p] = 1;
+            block_ticks(pairs, ks, &mut x, t, false);
+            let spread = x.iter().filter(|&&v| v != 0).count() as f64 / d as f64;
+            worst = worst.min(spread);
+        }
+        if worst >= AVALANCHE_TARGET {
+            return t;
+        }
+    }
+    MAX_TICKS
+}
+
 impl TritKey {
     /// Загрузка ключа из контейнера v3 (готовый `precess --out` /
     /// `train --gyro`): геометрия архетипа — как в RQ12 (`CipherKey`:
@@ -426,6 +469,8 @@ impl TritKey {
         // Ключевой поток: терцили тритификации a·p₀.
         let keystream: Vec<u8> = tritify_terciles(&inner.keystream());
         let ticks = calibrate_ticks(&pairs, d, &positions);
+        // RQ23: нелинейная калибровка — комбинированный такт.
+        let ticks_v2 = calibrate_ticks_v2(&pairs, &keystream, d, &positions);
         Ok(TritKey {
             d_pol: d,
             k_modes: inner.k_modes,
@@ -436,6 +481,7 @@ impl TritKey {
             strides,
             keystream,
             ticks,
+            ticks_v2,
             group_t,
             group_b,
             ritz_max: inner.ritz_max,
@@ -443,8 +489,48 @@ impl TritKey {
         })
     }
 
-    /// Триты сообщения → блок состояния → прецессия → Packed4-байты.
-    fn encrypt_body(&self, msg: &[u8], rng: &mut Rng) -> (Vec<u8>, Vec<u8>, usize) {
+    /// Холодные позиции блока (там живёт сообщение).
+    pub fn positions(&self) -> &[u32] {
+        &self.positions
+    }
+
+    /// Русла прецессии (семантические J + решётчатые LENS) — порядок
+    /// определяет транспорт; слияние/чтение контейнера его сохраняет.
+    pub fn pairs(&self) -> &[TritPair] {
+        &self.pairs
+    }
+
+    /// Ключевой поток (триты 0..2) — лента коэффициентов спинового слоя.
+    pub fn keystream(&self) -> &[u8] {
+        &self.keystream
+    }
+
+    /// Тактов комбинированного нелинейного такта v2 (транспорт + спин).
+    pub fn ticks_v2(&self) -> u32 {
+        self.ticks_v2
+    }
+
+    /// Триты сообщения → блок состояния → преобразование → Packed4-байты.
+    ///
+    /// `version` выбирает слой диффузии: 1 — линейный транспорт RQ13
+    /// (`ticks` тактов), 2 — комбинированный нелинейный такт RQ23
+    /// (транспорт + спин-раунд × `ticks_v2`). Нелинейная схема —
+    /// общедоступный примитив лавины ([`crate::spin_avalanche`]).
+    pub fn encrypt_body(
+        &self,
+        msg: &[u8],
+        rng: &mut Rng,
+    ) -> (Vec<u8>, Vec<u8>, usize) {
+        self.encrypt_body_version(msg, rng, TRITE_VERSION_V2)
+    }
+
+    /// Тело шифрования с явной версией схемы (v1 — legacy).
+    pub fn encrypt_body_version(
+        &self,
+        msg: &[u8],
+        rng: &mut Rng,
+        version: u16,
+    ) -> (Vec<u8>, Vec<u8>, usize) {
         let d = self.d_pol;
         let cap = self.capacity_trites;
         let bits = bytes_to_bits(msg);
@@ -467,8 +553,13 @@ impl TritKey {
             for i in 0..d {
                 x[i] = ((x[i] + self.keystream[i] + prev[i]) % 3) as u8;
             }
-            // Прецессия: T тактов по руслам (семантическим + решётчатым).
-            transport_ticks(&self.pairs, &mut x, self.ticks, false);
+            // Диффузия: v2 — нелинейные такты (транспорт + спин),
+            // v1 — чистый линейный транспорт RQ13.
+            if version == TRITE_VERSION_V2 {
+                block_ticks(&self.pairs, &self.keystream, &mut x, self.ticks_v2, false);
+            } else {
+                transport_ticks(&self.pairs, &mut x, self.ticks, false);
+            }
             data.extend_from_slice(&pack_trites(&x));
             prev = x;
         }
@@ -476,20 +567,47 @@ impl TritKey {
     }
 }
 
-/// Шифрование (трит-схема, RQ13): `m → p*` в Packed4-тритах.
+/// Шифрование (трит-схема, RQ23): `m → p*` в Packed4-тритах.
+///
+/// По умолчанию — нелинейная схема v2: такт блока = линейный транспорт
+/// русл + квадратичный спин-проход GF(3) (лавина + защита от линейного
+/// криптоанализа). [`encrypt_v1`] пишет legacy-контейнер RQ13 (чистый
+/// транспорт) — оба читаются [`decrypt`].
 ///
 /// Лавина измеряется на месте: повторное шифрование с перевёрнутым
-/// битом (тот же IV — клон rng) и подсчёт изменившихся трит блоков.
+/// битом и **тем же IV** (клон rng ДО первого шифрования — честная
+/// диффузия без шума цепочки, RQ23) и подсчёт изменившихся трит блоков.
 pub fn encrypt(key: &TritKey, msg: &[u8], rng: &mut Rng) -> Result<(Vec<u8>, EncryptReport), String> {
-    let (iv_bytes, data, n_blocks) = key.encrypt_body(msg, rng);
+    encrypt_version(key, msg, rng, TRITE_VERSION_V2)
+}
+
+/// Шифрование линейной схемой RQ13 (v1): чистый транспорт, без
+/// спинового слоя — для воспроизведения старых прогонов.
+pub fn encrypt_v1(
+    key: &TritKey,
+    msg: &[u8],
+    rng: &mut Rng,
+) -> Result<(Vec<u8>, EncryptReport), String> {
+    encrypt_version(key, msg, rng, TRITE_VERSION)
+}
+
+fn encrypt_version(
+    key: &TritKey,
+    msg: &[u8],
+    rng: &mut Rng,
+    version: u16,
+) -> Result<(Vec<u8>, EncryptReport), String> {
+    // Клон ДО первого шифрования: зонд лавины получает тот же IV —
+    // меряем диффузию, а не разницу случайных цепочек.
+    let rng_probe = rng.clone();
+    let (iv_bytes, data, n_blocks) = key.encrypt_body_version(msg, rng, version);
     // Лавина: 1 бит сообщения → доля изменившихся трит шифртекста.
     let avalanche = if msg.is_empty() || data.is_empty() {
         0.0
     } else {
         let mut flipped = msg.to_vec();
         flipped[msg.len() / 2] ^= 1;
-        let mut rng2 = rng.clone();
-        let (_, data2, _) = key.encrypt_body(&flipped, &mut rng2);
+        let (_, data2, _) = key.encrypt_body_version(&flipped, &mut rng_probe.clone(), version);
         let n = data.len() * 4;
         let t1 = unpack_trites(&data, n);
         let t2 = unpack_trites(&data2, n);
@@ -499,16 +617,21 @@ pub fn encrypt(key: &TritKey, msg: &[u8], rng: &mut Rng) -> Result<(Vec<u8>, Enc
             .count() as f64
             / n as f64
     };
+    let (ticks_header, nl_rounds) = if version == TRITE_VERSION_V2 {
+        (key.ticks_v2, key.ticks_v2)
+    } else {
+        (key.ticks, 0)
+    };
     let digest = sha256_trunc24(&[&iv_bytes[..], &data[..]].concat());
     let mut out = Vec::with_capacity(TRITE_HEADER_SIZE + iv_bytes.len() + data.len());
     out.extend_from_slice(&TRITE_MAGIC);
-    put_u16(&mut out, TRITE_VERSION);
+    put_u16(&mut out, version);
     put_u16(&mut out, 0); // flags
     put_u32(&mut out, key.d_pol as u32);
     put_u32(&mut out, n_blocks as u32);
     put_u64(&mut out, msg.len() as u64);
     put_u32(&mut out, key.k_modes as u32);
-    put_u32(&mut out, key.ticks);
+    put_u32(&mut out, ticks_header);
     put_u16(&mut out, key.strides.0 as u16);
     put_u16(&mut out, key.strides.1 as u16);
     put_u16(&mut out, key.strides.2 as u16);
@@ -526,12 +649,14 @@ pub fn encrypt(key: &TritKey, msg: &[u8], rng: &mut Rng) -> Result<(Vec<u8>, Enc
     Ok((
         out,
         EncryptReport {
+            version,
             blocks: n_blocks,
             msg_len: msg.len(),
             out_len,
             k_modes: key.k_modes,
             capacity_trites: key.capacity_trites,
-            ticks: key.ticks,
+            ticks: ticks_header,
+            nl_rounds,
             pairs_total: key.pairs.len(),
             avalanche,
             expansion,
@@ -549,7 +674,7 @@ pub fn decrypt(key: &TritKey, cipher: &[u8]) -> Result<(Vec<u8>, DecryptReport),
         return Err("не контейнер .pqt (магия PQT1 не найдена)".into());
     }
     let version = get_u16(cipher, 4);
-    if version != TRITE_VERSION {
+    if version != TRITE_VERSION && version != TRITE_VERSION_V2 {
         return Err(format!("неподдерживаемая версия .pqt: {version}"));
     }
     let d = get_u32(cipher, 8) as usize;
@@ -578,11 +703,17 @@ pub fn decrypt(key: &TritKey, cipher: &[u8]) -> Result<(Vec<u8>, DecryptReport),
             key.k_modes
         ));
     }
-    if ticks != key.ticks || strides != key.strides {
-        return Err(
-            "параметры прецессии (такты/решётчатые русла) не совпадают — ключ не от этого шифртекста"
-                .into(),
-        );
+    // Такты в заголовке — калибровка соответствующей версии схемы.
+    let key_ticks = if version == TRITE_VERSION_V2 {
+        key.ticks_v2
+    } else {
+        key.ticks
+    };
+    if ticks != key_ticks || strides != key.strides {
+        return Err(format!(
+            "параметры прецессии (такты {ticks} ≠ {key_ticks} / решётчатые русла) \
+             не совпадают — ключ не от этого шифртекста"
+        ));
     }
     let block_len = d.div_ceil(4);
     if body.len() != block_len * (n_blocks + 1) {
@@ -609,9 +740,15 @@ pub fn decrypt(key: &TritKey, cipher: &[u8]) -> Result<(Vec<u8>, DecryptReport),
     let mut prev = iv;
     for b in 0..n_blocks {
         let block = &body[block_len * (b + 1)..block_len * (b + 2)];
-        let stored = unpack_trites(block, d); // шифрблок (после прецессии)
+        let stored = unpack_trites(block, d); // шифрблок (после диффузии)
         let mut x = stored.clone();
-        transport_ticks(&key.pairs, &mut x, key.ticks, true); // обратная прецессия
+        // Обратная диффузия: v2 — спин-инверсия + обратный транспорт,
+        // v1 — чистый обратный транспорт RQ13.
+        if version == TRITE_VERSION_V2 {
+            block_ticks(&key.pairs, &key.keystream, &mut x, key.ticks_v2, true);
+        } else {
+            transport_ticks(&key.pairs, &mut x, key.ticks, true);
+        }
         for j in 0..cap {
             let pos = position_of(key, j);
             let t =
@@ -868,15 +1005,19 @@ mod tests {
 
     #[test]
     fn avalanche_single_bit() {
-        // Лавина: 1 бит сообщения → ≥ 40% трит шифртекста (насыщение
-        // ~2/3 = AVALANCHE_CEILING). RQ12: 1 бит → 1 фаза.
+        // Лавина с ТЕМ ЖЕ IV (RQ23 — честная метрика без шума цепочки):
+        // флип бита → доля изменившихся трит шифртекста. Репорт меряет
+        // весь шифртекст: CBC-каскад разносит замену только ВПЕРЁД —
+        // флип в середине даёт ≥ 25% по всем блокам (префиксные блоки
+        // не тронуты), флип в первом байте — почти потолок 2/3
+        // (см. avalanche_from_first_byte ниже).
         let key = load(&chain_key());
         let msg: Vec<u8> = (0..600u32).map(|i| (i * 17 + 3) as u8).collect();
         let mut rng = Rng::seed_from_u64(42);
         let (_, rep) = encrypt(&key, &msg, &mut rng).unwrap();
         assert!(
-            rep.avalanche >= 0.4,
-            "лавина {:.3} < 0.4 (тактов {})",
+            rep.avalanche >= 0.2,
+            "лавина {:.3} < 0.2 (тактов {})",
             rep.avalanche,
             rep.ticks
         );
@@ -885,6 +1026,114 @@ mod tests {
             "лавина {:.3} выше потолка GF(3)",
             rep.avalanche
         );
+        // Схема v2 по умолчанию: спин-раунды активны.
+        assert_eq!(rep.version, TRITE_VERSION_V2);
+        assert!(rep.nl_rounds >= 1);
+    }
+
+    // ===================== RQ23: схема v2 (спин-слой) =====================
+
+    #[test]
+    fn v2_roundtrip_large_message() {
+        // Большое много-блочное сообщение через нелинейную схему —
+        // расшифровка побитово точна.
+        let key = load(&chain_key());
+        let msg: Vec<u8> = (0..20_000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let mut rng = Rng::seed_from_u64(5);
+        let (cipher, rep) = encrypt(&key, &msg, &mut rng).unwrap();
+        assert_eq!(rep.version, TRITE_VERSION_V2);
+        assert!(rep.blocks > 1, "многоблочное сообщение");
+        let (plain, dec) = decrypt(&key, &cipher).unwrap();
+        assert_eq!(plain, msg);
+        assert_eq!(dec.blocks, rep.blocks);
+        assert_eq!(dec.ticks, key.ticks_v2());
+    }
+
+    #[test]
+    fn v1_ciphertext_still_decrypts() {
+        // Legacy-шифртекст v1 (линейный транспорт) расшифровывается
+        // после RQ23: версия в заголовке направляет на чистый транспорт.
+        let key = load(&chain_key());
+        let msg: Vec<u8> = (0..900u32).map(|i| (i * 13 + 1) as u8).collect();
+        let mut rng = Rng::seed_from_u64(3);
+        let (cipher, rep) = encrypt_v1(&key, &msg, &mut rng).unwrap();
+        assert_eq!(rep.version, TRITE_VERSION);
+        assert_eq!(rep.nl_rounds, 0);
+        assert_eq!(rep.ticks, key.ticks);
+        let (plain, _) = decrypt(&key, &cipher).unwrap();
+        assert_eq!(plain, msg);
+        // v1 и v2 шифртексты одного сообщения различаются (слой диффузии).
+        let mut rng2 = Rng::seed_from_u64(3);
+        let (cipher2, _) = encrypt(&key, &msg, &mut rng2).unwrap();
+        assert_ne!(cipher, cipher2);
+    }
+
+    #[test]
+    fn v2_rejects_wrong_ticks() {
+        // Заголовок v2 с тактами v1 — ключ не от этого шифртекста.
+        let key = load(&chain_key());
+        if key.ticks == key.ticks_v2 {
+            return; // вырожденный ключ: калибровки совпали
+        }
+        let msg = b"mismatch probe".to_vec();
+        let mut rng = Rng::seed_from_u64(9);
+        let (mut cipher, _) = encrypt(&key, &msg, &mut rng).unwrap();
+        // Подменяем такты в заголовке (offset 28) + пересчитываем digest
+        // не нужно — проверка тактов идёт ДО digest.
+        cipher[28..32].copy_from_slice(&key.ticks.to_le_bytes());
+        assert!(decrypt(&key, &cipher).is_err());
+    }
+
+    #[test]
+    fn v2_deterministic_same_seed() {
+        // Один сид → побитово одинаковый шифртекст (детерминизм IV).
+        let key = load(&chain_key());
+        let msg = b"determinism".to_vec();
+        let (c1, _) = encrypt(&key, &msg, &mut Rng::seed_from_u64(77)).unwrap();
+        let (c2, _) = encrypt(&key, &msg, &mut Rng::seed_from_u64(77)).unwrap();
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn ticks_v2_never_exceeds_linear() {
+        // Нелинейный комбинированный такт достигает цели калибровки
+        // не медленнее чистого транспорта (спин только добавляет
+        // перемешивание) — на обоих тестовых ключах.
+        for bytes in [path_key(), chain_key()] {
+            let reader = pqw::PqwReader::from_bytes(&bytes).unwrap();
+            let key = TritKey::from_reader(&reader, 0).unwrap();
+            assert!(
+                key.ticks_v2 <= key.ticks,
+                "T2={} > T1={} — спин не должен замедлять диффузию",
+                key.ticks_v2,
+                key.ticks
+            );
+        }
+    }
+
+    #[test]
+    fn avalanche_from_first_byte_near_ceiling() {
+        // Флип ПЕРВОГО бита: CBC-каскад заражает все блоки от первого —
+        // честная диффузия схемы без префиксного разведения ≈ 2/3.
+        let key = load(&chain_key());
+        let msg: Vec<u8> = (0..600u32).map(|i| (i * 17 + 3) as u8).collect();
+        // Тот же IV на оба прогона — изолируем диффузию от шума цепочки.
+        let iv_seed = 4242u64;
+        let mut rng = Rng::seed_from_u64(iv_seed);
+        let (_, data, _) = key.encrypt_body_version(&msg, &mut rng, TRITE_VERSION_V2);
+        let mut flipped = msg.clone();
+        flipped[0] ^= 1;
+        let mut rng2 = Rng::seed_from_u64(iv_seed);
+        let (_, data2, _) = key.encrypt_body_version(&flipped, &mut rng2, TRITE_VERSION_V2);
+        let n = data.len() * 4;
+        let t1 = unpack_trites(&data, n);
+        let t2 = unpack_trites(&data2, n);
+        let av = t1.iter().zip(t2.iter()).filter(|(a, b)| a != b).count() as f64 / n as f64;
+        assert!(
+            av >= 0.5,
+            "диффузия от первого бита {av:.3} < 0.5 — спин+транспорт обязаны"
+        );
+        assert!(av <= AVALANCHE_CEILING + 0.05);
     }
 
     #[test]
