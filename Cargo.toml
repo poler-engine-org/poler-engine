@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.17.7"
+version = "0.18.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -62,6 +62,9 @@ arboard = "3"
 tui-textarea = "0.7"
 # globset — glob-паттерны для src/sources (фильтр по расширению/пути)
 globset = "0.4"
+# v0.18.0: License Gate — офлайн-проверка ed25519-подписей лицензий PO1
+# (приватный мастер-ключ — офлайн у владельца, license-tool/, в поставку не входит)
+ed25519-dalek = "2"
 
 
 [dev-dependencies]

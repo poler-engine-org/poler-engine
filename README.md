@@ -14,6 +14,72 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.18.0: License Gate — офлайн-лицензии ed25519 (PO1)
+
+Коммерческая основа движка: платные интеграции (Gmail / Drive / NotebookLM)
+закрываются лицензионным гейтом с **офлайн-проверкой ed25519-подписей**.
+Без серверов, без телеметрии, без «звонков домой» — математика вместо сети.
+
+### Философия гейта: три принципа
+
+1. **Локальное — свято.** Поиск, резонанс Ψ, AIDDE impact, граф, shell/TUI
+   работают ВСЕГДА и БЕЗ лицензии. «Кирпич» невозможен по построению.
+2. **Офлайн-честность.** Лицензия = JSON {product, name, email, tier,
+   issued, expires, features} + подпись ed25519 мастер-ключом POLER.
+   Проверка — микросекунды локально. Подделка без приватного ключа —
+   задача дискретного логарифма, а не «поменять байтик в файле».
+3. **Мягкие пределы.** Community: интеграции — 50 операций за скользящие
+   24 ч (локальное — без лимитов). Trial: 14 дней всех функций с первого
+   запуска. Истёкшая лицензия: 7 дней grace с предупреждением, затем
+   тихий откат на Community — ничего не блокируется и не удаляется.
+
+### CLI
+
+```
+poler-engine --license                        # статус: тир, срок, квоты
+poler-engine --license-import PO1.….….       # активация (ключ или путь к файлу)
+poler-engine --license-import ./my.key       # проверка подписи ДО сохранения
+```
+
+Файл лицензии: `~/.config/poler-engine/license.key` (0600). Для автоматизации:
+`POLER_LICENSE_KEY` (ключ строкой) или `POLER_LICENSE_FILE` (путь).
+Точки гейта: `--google-gmail`, `--google-drive`, все `--nlm-*`, shell/TUI
+`nlm …`, MCP-инструменты `poler_gmail` / `poler_drive` — везде единая
+скользящая квота Community.
+
+### Формат ключа PO1
+
+```
+PO1.<base64url(payload JSON)>.<base64url(подпись ed25519, 64 байта)>
+```
+
+Подпись считается по сырым байтам payload мастер-ключом POLER; в бинарник
+вшит только ПУБЛИЧНЫЙ ключ (`src/license/mod.rs::POLER_LICENSE_PUBLIC_KEY_HEX`).
+Приватный ключ — офлайн у владельца: выпуск лицензий — `license-tool/`
+(отдельный крейт, в поставку не входит):
+
+```
+cd license-tool && cargo build --release
+./target/release/poler-license-tool keygen --out ~/.config/poler-engine/license-signing-key
+./target/release/poler-license-tool issue --key ~/.config/poler-engine/license-signing-key \
+    --name "Имя Покупателя" --email buyer@example.com --tier pro --days 365
+```
+
+Тиры: `community` (бесплатный), `pro` (годовая), `enterprise`
+(бессрочная разрешена). 20 unit-тестов: base64url (все 256 байт, все
+выравнивания, Reject стандартного алфавита и паддинга), чужая подпись,
+подмена payload после подписи, будущая дата выдачи, бессрочный pro,
+grace-семантика, скользящее окно квот, независимость фич, civil-даты.
+
+### Прозрачность Google-авторизации
+
+`--google-auth` теперь печатает человеческим языком, ЧТО получает движок:
+Gmail (readonly), Drive (readonly) через OAuth; NotebookLM — НЕ отдельный
+OAuth-скоуп, синк идёт через профиль браузера движка (`--auth-ui`),
+логин и 2FA остаются между пользователем и Google.
+
+---
+
 ## v0.17.6: Auth Companion — интерактивное окно авторизации с изоляцией
 
 Локальный легковесный мост между владельцем и движком: `poler-engine --auth-ui`

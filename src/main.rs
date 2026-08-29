@@ -197,6 +197,19 @@ struct Cli {
     #[arg(long = "auth-ui", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "import_browser_session"])]
     auth_ui: bool,
 
+    // ---------- License Gate (v0.18.0) ----------
+
+    /// Статус лицензии: тир, владелец, срок, квота Community.
+    /// Локальный поиск ВСЕГДА без лицензии; гейтятся только интеграции
+    /// Gmail/Drive/NotebookLM.
+    #[arg(long = "license", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "import_browser_session", "shell", "tui", "mcp", "mcp_http"])]
+    license: bool,
+
+    /// Активация лицензии: PO1-ключ одной строкой ИЛИ путь к файлу с ним.
+    /// Подпись ed25519 проверяется ДО сохранения; файл — 0600.
+    #[arg(long = "license-import", value_name = "KEY|PATH", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "import_browser_session", "shell", "tui", "mcp", "mcp_http"])]
+    license_import: Option<String>,
+
     // ---------- NotebookLM через RPC-протокол NLMTools (v0.13.0) ----------
 
     /// Все ноутбуки NotebookLM с источниками (RPC wXbhsf из протокола
@@ -522,10 +535,65 @@ fn print_drive_hits(hits: &[poler_engine::google::api::DriveHit], query: &str, f
     let _ = std::io::stdout().flush();
 }
 
+/// v0.18.0: человекочитаемый статус лицензии (`--license`).
+fn print_license_status() -> ExitCode {
+    use poler_engine::license::{self, Status, Tier};
+
+    let st: Status = license::status();
+    println!("POLER Engine — лицензия");
+    println!();
+    match st.tier {
+        Tier::Trial => println!("  Тир:         Trial — все функции, {} дн. осталось", st.trial_days_left),
+        Tier::Community => println!("  Тир:         Community (без лицензии)"),
+        Tier::Pro => println!("  Тир:         Pro"),
+        Tier::Enterprise => println!("  Тир:         Enterprise"),
+    }
+    if let Some(lic) = &st.license {
+        println!("  Владелец:    {} <{}>", lic.name, lic.email);
+        println!("  Выдана:      {}", license::civil_date(lic.issued));
+        if lic.expires == 0 {
+            println!("  Срок:        бессрочно");
+        } else {
+            println!("  Действует до: {}", license::civil_date(lic.expires));
+        }
+        if let Some(g) = st.grace_days_left {
+            if g > 0 {
+                println!("  ⚠ Истекла — grace-период: {g} дн., затем Community-лимиты");
+            } else if st.tier == Tier::Community {
+                println!("  ⚠ Истекла сверх grace — работаем на Community-лимитах");
+            }
+        }
+        if !lic.features.is_empty() {
+            println!("  Функции:     {}", lic.features.join(", "));
+        }
+    } else {
+        println!("  Локальный поиск, резонанс, AIDDE, граф, TUI: БЕЗ лимитов");
+        for (feat, used) in &st.quota_used {
+            println!("  Интеграция {feat}: {}/{} операций за 24 ч", used, license::COMMUNITY_DAILY_OPS);
+        }
+        if st.trial_days_left > 0 {
+            println!("  Trial полных функций: {} дн. осталось", st.trial_days_left);
+        }
+    }
+    if let Some(src) = &st.source {
+        println!("  Источник:    {src}");
+    } else {
+        println!("  Источник:    лицензии нет");
+    }
+    println!();
+    println!("  Активация: poler-engine --license-import PO1.….….  (ключ одной строкой)");
+    ExitCode::SUCCESS
+}
+
 /// NotebookLM-режимы (v0.13.0): RPC-протокол NLMTools поверх
 /// персистентного профиля. Сессия открывается один раз на вызов.
 fn run_nlm(cli: &Cli) -> ExitCode {
     use poler_engine::google::nlm::{self, NlmSession};
+
+    // v0.18.0: License Gate — единая точка для всех --nlm-* режимов.
+    if !poler_engine::license::gate_or_print(poler_engine::license::FEATURE_NLM) {
+        return ExitCode::from(2);
+    }
 
     let fail = |e: String| {
         eprintln!("poler-engine nlm: {e}");
@@ -878,6 +946,38 @@ fn run(cli: Cli) -> ExitCode {
         };
     }
 
+    // ---------- v0.18.0: License Gate — статус и активация ----------
+    if cli.license {
+        return print_license_status();
+    }
+    if let Some(k) = cli.license_import.clone() {
+        return match poler_engine::license::import(&k) {
+            Ok(lic) => {
+                println!("✓ Лицензия активирована");
+                println!("  Тир:       {}", lic.tier);
+                println!("  Владелец:  {} <{}>", lic.name, lic.email);
+                if lic.expires == 0 {
+                    println!("  Срок:      бессрочно");
+                } else {
+                    println!(
+                        "  Действует до: {} ({} дн.)",
+                        poler_engine::license::civil_date(lic.expires),
+                        lic.expires.saturating_sub(poler_engine::license::now_unix()) / 86400
+                    );
+                }
+                if !lic.features.is_empty() {
+                    println!("  Функции:   {}", lic.features.join(", "));
+                }
+                println!("  Сохранено: ~/.config/poler-engine/license.key (0600)");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("poler-engine license-import: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
     // ---------- Google-сервисы: OAuth без пароля (v0.12.0) ----------
     if cli.google_auth {
         let extra: Vec<String> = cli
@@ -891,6 +991,8 @@ fn run(cli: Cli) -> ExitCode {
                 println!("  poler-engine --google-gmail \"from:me newer_than:7d\"");
                 println!("  poler-engine --google-drive \"отчёт\"");
                 println!("  poler-engine --google-status");
+                println!("  poler-engine --nlm-notebooks  (NotebookLM — через профиль");
+                println!("   браузера движка, НЕ отдельный OAuth-скоуп)");
                 let _ = t;
                 // v0.17.7: гарантированный выход после успешного OAuth.
                 // Наблюдалось: при переиспользовании уже поднятого CDP-браузера
@@ -972,6 +1074,24 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     if cli.google_status {
+        // Одна строка о тире — прозрачность лицензии рядом с OAuth-статусом.
+        let lst = poler_engine::license::status();
+        match &lst.license {
+            Some(lic) => eprintln!(
+                "Лицензия: {} ({}) — до {}",
+                lic.tier,
+                lic.name,
+                if lic.expires == 0 {
+                    "бессрочно".to_string()
+                } else {
+                    poler_engine::license::civil_date(lic.expires)
+                }
+            ),
+            None => eprintln!(
+                "Лицензия: {} (локальный поиск без лимитов)",
+                lst.tier.as_str()
+            ),
+        }
         return match poler_engine::google::api::status() {
             Ok(st) => {
                 println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
@@ -985,6 +1105,9 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     if let Some(query) = cli.google_gmail.clone() {
+        if !poler_engine::license::gate_or_print(poler_engine::license::FEATURE_GMAIL) {
+            return ExitCode::from(2);
+        }
         return match poler_engine::google::api::gmail_search(&query, cli.google_max.max(1)) {
             Ok(hits) => {
                 if cli.verbose {
@@ -1008,6 +1131,9 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     if let Some(query) = cli.google_drive.clone() {
+        if !poler_engine::license::gate_or_print(poler_engine::license::FEATURE_DRIVE) {
+            return ExitCode::from(2);
+        }
         return match poler_engine::google::api::drive_list(&query, cli.google_max.max(1)) {
             Ok(hits) => {
                 if cli.verbose {

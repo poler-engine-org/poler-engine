@@ -217,6 +217,12 @@ fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
             "nlm: укажите подкоманду (list | notes | notes-sync | artifacts | source | account | ask | sync)".into(),
         );
     }
+    // v0.18.0: License Gate — единая точка для всех nlm-подкоманд shell/TUI.
+    if !crate::license::gate_or_print(crate::license::FEATURE_NLM) {
+        return CmdResult::Done(
+            "⛔ Community-лимит NotebookLM исчерпан. Статус: license (в shell) или poler-engine --license".into(),
+        );
+    }
     let sub = args[0].as_str();
     let rest = &args[1..];
 

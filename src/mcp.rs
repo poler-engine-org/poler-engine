@@ -399,6 +399,10 @@ impl McpServer {
     // poler_gmail: Gmail владельца (OAuth readonly-токен)
     // -----------------------------------------------------------------
     fn tool_gmail(&self, args: &Value) -> Result<String, String> {
+        // v0.18.0: License Gate (Community-квота на интеграции).
+        if !crate::license::gate_or_print(crate::license::FEATURE_GMAIL) {
+            return Err("Community-лимит Gmail исчерпан (50/24ч); локальный поиск без лимитов".into());
+        }
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -419,6 +423,10 @@ impl McpServer {
     // poler_drive: файлы Google Drive (OAuth readonly-токен)
     // -----------------------------------------------------------------
     fn tool_drive(&self, args: &Value) -> Result<String, String> {
+        // v0.18.0: License Gate (Community-квота на интеграции).
+        if !crate::license::gate_or_print(crate::license::FEATURE_DRIVE) {
+            return Err("Community-лимит Drive исчерпан (50/24ч); локальный поиск без лимитов".into());
+        }
         let query = args
             .get("query")
             .and_then(|v| v.as_str())

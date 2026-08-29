@@ -572,7 +572,14 @@ pub fn run_auth(extra_scopes: &[String]) -> Result<StoredTokens, String> {
 
     println!("poler google-auth: OAuth 2.0 loopback (пароль остаётся в твоём браузере)");
     println!("client_secret: {}", secret_path.display());
-    println!("скоупы: {}", scopes.join(" "));
+    println!("Скоупы OAuth: {}", scopes.join(" "));
+    // v0.18.0: честная прозрачность — ЧТО именно получает движок.
+    println!("Что получит poler-engine:");
+    println!("  • Gmail — только чтение (gmail.readonly)");
+    println!("  • Google Drive — только чтение (drive.readonly)");
+    println!("  • NotebookLM — НЕ отдельный OAuth-скоуп: синк идёт через профиль");
+    println!("    браузера движка (--auth-ui / --google-browse); логин и 2FA остаются");
+    println!("    между тобой и Google, пароль движку не передается");
     println!();
     println!("Открываю браузер для согласия Google…");
     println!("Если окно не открылось — скопируй URL вручную:");
