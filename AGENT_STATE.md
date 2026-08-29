@@ -6,7 +6,7 @@
 updated_utc: 2026-08-29T20:10:00Z
 repo: poler-engine
 branch: main
-commit: pending
+commit: ee51326
 tag: v0.17.6
 pushed: true
 tests: secret-scan-commit PASS (26 подстрок, 15 файлов); security-audit 27/2/0 (сессия выше); Rust-код не тронут
