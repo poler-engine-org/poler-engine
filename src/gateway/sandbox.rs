@@ -1,4 +1,4 @@
-//! # Terminal Gateway: Sandbox OS Subshell — политика безопасности (v0.22.1)
+//! # Terminal Gateway: Sandbox OS Subshell — политика безопасности (v0.24.0)
 //!
 //! Классификация хостовых команд ДО исполнения. Три вердикта:
 //!
@@ -30,7 +30,14 @@
 //! - **M** reverse shell (nc -e, socat EXEC, /dev/tcp) → Block;
 //! - **N** симлинк-прокси: цели записи каноникализируются (realpath);
 //! - **O** env-инъекции (LD_PRELOAD/PYTHONPATH/BASH_ENV через env(1)) → Block;
-//! - **R** ssh с payload: удалённая команда классифицируется.
+//! - **R** ssh с payload: удалённая команда классифицируется;
+//! - **W** (v0.24.0) Workspace Boundary Guard: пути вне корня проекта
+//!   (аргументы, редиректы, цели копирования, код интерпретаторов,
+//!   payload `bash -c` рекурсивно) → Confirm; allowlist владельца
+//!   (`allow <путь>`) смягчает ТОЛЬКО границу — Block-инварианты
+//!   (rm -rf /, dd of=/dev/*, reverse-shell…) действует всегда.
+//!   Payload шелла разбирается как настоящая командная строка:
+//!   кавычки, пайпы, `&&`/`;`/`&`-сплит, рекурсия в `$(…)`/бэктики.
 //!
 //! Threat model честная (docs/terminal-gateway-architecture.md §4.2):
 //! это политический userspace-фильтр от ОШИБОК ПОЛЬЗОВАТЕЛЯ (и от
@@ -39,7 +46,8 @@
 //! что реально будет исполнено. Политика fail-closed: сомнительное —
 //! Block/Confirm, легитимное — Allow (см. tests).
 
-use super::pipeline::Pipeline;
+use super::pipeline::{parse_line, Pipeline};
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Вердикты
@@ -146,6 +154,18 @@ const INTERP_CODE_FLAGS: &[&str] = &["-c", "-e", "-r", "-m", "-p", "-w", "-i"];
 /// Полный вердикт по конвейеру: все хостовые сегменты + цель редиректа.
 /// Сегменты движка безопасны by construction (это наши функции).
 pub fn judge_pipeline(pipeline: &Pipeline, host_segments: &[usize]) -> Policy {
+    judge_pipeline_ws(pipeline, host_segments, None)
+}
+
+/// v0.24.0: вердикт с Workspace Boundary Guard — пути вне корня проекта
+/// (аргументы сегментов + цель редиректа) дают Confirm. Порядок: сырой
+/// скан → конвейерные инварианты → сегменты → редирект → граница внутри
+/// каждого (Block-вердикты специфических судей приоритетнее границы).
+pub fn judge_pipeline_ws(
+    pipeline: &Pipeline,
+    host_segments: &[usize],
+    ws: Option<&WsGuard>,
+) -> Policy {
     // 1) сырой скан всей строки: бомбы/замаскированные паттерны/reverse-shell
     let raw_all = pipeline
         .segments
@@ -169,14 +189,14 @@ pub fn judge_pipeline(pipeline: &Pipeline, host_segments: &[usize]) -> Policy {
     // 3) по сегментам
     for &idx in host_segments {
         let seg = &pipeline.segments[idx];
-        match judge_segment(&seg.tokens) {
+        match judge_segment_ws(&seg.tokens, ws) {
             Policy::Allow => continue,
             other => return other,
         }
     }
     // 4) цель редиректа
     if let Some(r) = &pipeline.redirect {
-        match judge_redirect_target(&r.path) {
+        match judge_redirect_target_ws(&r.path, ws) {
             Policy::Allow => {}
             other => return other,
         }
@@ -184,8 +204,28 @@ pub fn judge_pipeline(pipeline: &Pipeline, host_segments: &[usize]) -> Policy {
     Policy::Allow
 }
 
-/// Вердикт по одному хостовому сегменту.
+/// Вердикт по одному хостовому сегменту (без границы workspace).
 pub fn judge_segment(tokens: &[String]) -> Policy {
+    judge_segment_ws(tokens, None)
+}
+
+/// v0.24.0: вердикт сегмента + Workspace Boundary Guard. Инвариант:
+/// Block-вердикты специфических судей (rm/dd/nc/…) граница НЕ заменяет и
+/// allowlist НЕ ослабляет — граница лишь превращает финальный Allow в
+/// Confirm, если аргументы указывают вне корня проекта.
+pub fn judge_segment_ws(tokens: &[String], ws: Option<&WsGuard>) -> Policy {
+    let verdict = judge_segment_core(tokens, ws);
+    if verdict.is_allow() {
+        if let Some(g) = ws {
+            if let Some(p) = boundary_policy(tokens, g) {
+                return p;
+            }
+        }
+    }
+    verdict
+}
+
+fn judge_segment_core(tokens: &[String], ws: Option<&WsGuard>) -> Policy {
     if tokens.is_empty() {
         return Policy::Allow;
     }
@@ -286,32 +326,40 @@ pub fn judge_segment(tokens: &[String]) -> Policy {
     if INTERPRETERS.contains(&cmd) {
         return judge_interpreter(cmd, args);
     }
-    // sh -c '…' / bash -c '…' — полезаем внутрь: payload токенизируется,
-    // сканируется на бомбы/дд/редиректы/интерп-паттерны и разбирается
-    // как команда (ловит «rm -rf /usr», «env rm …», «tee /etc/x»).
-    if is_shell(cmd) && args.len() >= 2 {
-        let is_c = args[0] == "-c" || args[0] == "--command";
-        if is_c {
-            let payload = args[1..].join(" ");
-            if let Some(b) = raw_danger_scan(&payload) {
-                return b;
-            }
-            if let Some(d) = interp_danger_scan(&payload) {
-                return Policy::Block(format!(
-                    "шелл с деструктивным payload (паттерн «{d}»)"
-                ));
-            }
-            let inner_tokens: Vec<String> =
-                payload.split_whitespace().map(|s| s.to_string()).collect();
-            if !inner_tokens.is_empty() {
-                match judge_segment(&inner_tokens) {
-                    Policy::Allow => {}
-                    other => return other,
-                }
+    // sh -c '…' / bash -c '…' — полезаем внутрь payload: разбор как
+    // НАСТОЯЩЕЙ командной строки (кавычки/пайпы/редиректы), сплит
+    // &&/;/||/&/переводы строк, рекурсия в $(…)/бэктики —
+    // v0.24.0 judge_shell_payload. Ловит «cat '/etc/passwd'»,
+    // «ls && rm -rf /usr», «echo $(cat /etc/shadow)» и т.п.
+    // Хвост после payload (позиционные параметры $0/$1…) подключается
+    // к payload — судится консервативно (как в v0.22: join).
+    if is_shell(cmd) {
+        if let Some(pi) = shell_c_payload(args) {
+            let payload = args[pi..].join(" ");
+            let v = judge_shell_payload(&payload, ws, 0);
+            if !v.is_allow() {
+                return v;
             }
         }
     }
     Policy::Allow
+}
+
+/// Индекс payload-строки в аргументах шелла: `bash -c CMD …`,
+/// `bash -lc CMD …` (кластер флагов с 'c'), `bash --command CMD`.
+fn shell_c_payload(args: &[String]) -> Option<usize> {
+    let a0 = args.first()?;
+    if a0 == "-c" || a0 == "--command" {
+        return if args.len() > 1 { Some(1) } else { None };
+    }
+    if a0.starts_with('-')
+        && !a0.starts_with("--")
+        && a0 != "-"
+        && a0.chars().any(|c| c == 'c')
+    {
+        return if args.len() > 1 { Some(1) } else { None };
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -908,12 +956,19 @@ fn home_prefix() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/home".into())
 }
 
-/// Privilege-эскалация по тексту причины Confirm (v0.23.0): sudo-гейт
+/// Привилегия-эскалация по тексту причины Confirm (v0.23.0): sudo-гейт
 /// dispatch различает «эскалация прав» и прочие подтверждения — лизинг
 /// `grant sudo` покрывает только эскалации. Конвенция: judge_privilege
 /// формирует причину с префиксом «эскалация прав».
 pub fn is_privilege_escalation(reason: &str) -> bool {
     reason.starts_with("эскалация прав")
+}
+
+/// Граница workspace по тексту причины Confirm (v0.24.0): mediated-агент
+/// и dispatch различают boundary-подтверждения (для агента — отказ;
+/// для владельца — `allow <путь>` вместо ручного подтверждения).
+pub fn is_boundary_confirm(reason: &str) -> bool {
+    reason.starts_with("доступ вне workspace") || reason.starts_with("выход из workspace")
 }
 
 /// `~/x` → `/home/user/x`; прочее без изменений. Хвостовые `/` срезаются
@@ -991,20 +1046,572 @@ fn is_whole_home_dir(p: &str) -> bool {
 /// Цель редиректа: устройства и системные каталоги — Block. Путь
 /// каноникализируется — симлинк на /etc/* не спасает атакующего.
 pub fn judge_redirect_target(path: &str) -> Policy {
-    let p = resolve_real(path);
-    if p.starts_with("/dev/") {
-        let safe = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero"];
-        if safe.contains(&p.as_str()) {
+    judge_redirect_target_ws(path, None)
+}
+
+/// v0.24.0: цель редиректа + Workspace Boundary Guard. Порядок: Block
+/// (устройства/системные каталоги) → граница (Confirm) → Allow.
+/// Относительные пути якорятся к корню ws (у mediated-процесса cwd может
+/// отличаться от workspace).
+pub fn judge_redirect_target_ws(path: &str, ws: Option<&WsGuard>) -> Policy {
+    let expanded = expand_home(path);
+    let p: String = match ws {
+        Some(g) => {
+            let abs = if expanded.starts_with('/') {
+                PathBuf::from(&expanded)
+            } else {
+                g.cwd.join(&expanded)
+            };
+            lexical_real(&abs).display().to_string()
+        }
+        None => resolve_real(path),
+    };
+    if expanded.starts_with("/dev/") || p.starts_with("/dev/") {
+        let safe = [
+            "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero",
+            "/dev/full", "/dev/stdin", "/dev/random", "/dev/urandom",
+        ];
+        if safe.contains(&expanded.as_str()) || safe.contains(&p.as_str()) {
             return Policy::Allow;
         }
         return Policy::Block(format!(
             "редирект в устройство {p} (блочное/символьное — данные на носителе)"
         ));
     }
-    if BLOCKED_WRITE_ROOTS.iter().any(|r| p == *r || p.starts_with(&format!("{r}/"))) {
+    if BLOCKED_WRITE_ROOTS
+        .iter()
+        .any(|r| p == *r || p.starts_with(&format!("{r}/")))
+    {
         return Policy::Block(format!("редирект в системный каталог: {p}"));
     }
+    if let Some(g) = ws {
+        if !g.contains(Path::new(&p)) {
+            return Policy::Confirm(format!(
+                "доступ вне workspace: {p} (редирект)"
+            ));
+        }
+    }
     Policy::Allow
+}
+
+// ---------------------------------------------------------------------------
+// Workspace Boundary Guard (v0.24.0)
+// ---------------------------------------------------------------------------
+
+/// Контекст границы workspace: канонический корень проекта + сессионный
+/// allowlist владельца (`allow <путь>` — пути вне корня, подтверждённые
+/// явно). Allowlist смягчает ТОЛЬКО boundary-Confirm: Block-инварианты
+/// (rm -rf /, dd of=/dev/*, reverse-shell, запись в /etc…) действуют
+/// вне зависимости от него.
+pub struct WsGuard {
+    /// Канонический корень workspace (граница по умолчанию).
+    pub root: PathBuf,
+    /// Якорь относительных путей (cwd процесса; может быть глубже root).
+    pub cwd: PathBuf,
+    /// Канонические пути вне корня, разрешённые владельцем на сессию.
+    pub allow: Vec<PathBuf>,
+}
+
+impl WsGuard {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            allow: Vec::new(),
+        }
+    }
+
+    /// Контекст mediated-процесса: POLER_WORKSPACE (корень) + файл
+    /// POLER_SHIM_ALLOW (канонические пути, по одному на строку) +
+    /// cwd процесса как якорь относительных путей.
+    /// Нет POLER_WORKSPACE → None (контекст не mediated).
+    pub fn from_env() -> Option<Self> {
+        let root = std::env::var("POLER_WORKSPACE").ok()?;
+        let root = PathBuf::from(root).canonicalize().ok()?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
+        let mut allow = Vec::new();
+        if let Ok(path) = std::env::var("POLER_SHIM_ALLOW") {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                for line in text.lines() {
+                    let l = line.trim();
+                    if l.is_empty() {
+                        continue;
+                    }
+                    if let Ok(c) = PathBuf::from(l).canonicalize() {
+                        allow.push(c);
+                    }
+                }
+            }
+        }
+        Some(Self { root, cwd, allow })
+    }
+
+    /// Путь внутри workspace ИЛИ в allowlist (сравнение по компонентам:
+    /// `/ws/x2` не внутри `/ws/x`).
+    pub fn contains(&self, path: &Path) -> bool {
+        if path.starts_with(&self.root) {
+            return true;
+        }
+        self.allow.iter().any(|a| path.starts_with(a))
+    }
+}
+
+/// Псевдоустройства, встречающиеся в каждой второй команде (`2>/dev/null`)
+/// — без границы; запись в прочие /dev/* и так Block.
+const SAFE_DEVICES: &[&str] = &[
+    "/dev/null", "/dev/tty", "/dev/zero", "/dev/full", "/dev/stdin",
+    "/dev/stdout", "/dev/stderr", "/dev/random", "/dev/urandom",
+];
+
+/// Корни системных бинарников: argv[0] из них — обычный запуск программы.
+const SYSTEM_BIN_ROOTS: &[&str] = &[
+    "/usr", "/bin", "/sbin", "/usr/local", "/opt", "/snap", "/nix",
+    "/run/current-system", "/etc/alternatives",
+];
+
+/// Префиксы абсолютных путей, по которым пути извлекаются из «склеенных»
+/// токенов (код интерпретаторов, остатки payload): `/etc/passwd'`,
+/// `open('/home/x')`, `cat</tmp/x`. Относительные `~/…` и `../…`
+/// извлекаются отдельными триггерами.
+const ABS_ROOT_PREFIXES: &[&str] = &[
+    "/etc/", "/home/", "/usr/", "/var/", "/tmp/", "/root/", "/boot/",
+    "/sys/", "/proc/", "/dev/", "/opt/", "/srv/", "/mnt/", "/media/",
+    "/bin/", "/sbin/", "/lib/", "/lib64/", "/libx32/", "/run/",
+    "/private/", "/Users/", "/snap/", "/nix/", "/etc", "/home", "/usr",
+    "/var", "/tmp", "/root", "/boot", "/sys", "/proc", "/dev", "/opt",
+    "/srv", "/mnt", "/media", "/bin", "/sbin", "/lib", "/lib64", "/run",
+];
+
+/// Граница для сегмента: tokens[0] — команда (абсолютный argv[0] из
+/// системных корней допускается), остальные — аргументы. Возвращает
+/// Confirm при первом обращении вне workspace.
+/// Граница НЕ ослабляет Block-вердикты (вызывается только на Allow).
+pub fn boundary_policy(tokens: &[String], ws: &WsGuard) -> Option<Policy> {
+    boundary_scan(tokens, ws, false)
+}
+
+/// Граница для чистых аргументов (без argv[0]): позиционные параметры
+/// шелла, аргументы движковых команд.
+pub fn boundary_policy_args(args: &[String], ws: &WsGuard) -> Option<Policy> {
+    boundary_scan(args, ws, true)
+}
+
+fn boundary_scan(tokens: &[String], ws: &WsGuard, all_args: bool) -> Option<Policy> {
+    for (idx, raw) in tokens.iter().enumerate() {
+        let mut tok = raw.as_str();
+
+        if idx == 0 && !all_args {
+            // argv[0]: судим только явные пути вне системных корней
+            // (`~/evil.sh`, `/tmp/x.sh`); `ls`, `/usr/bin/vim` — не аргумент
+            if !tok.contains('/') {
+                continue;
+            }
+            let t = strip_env_assign(tok);
+            if t.starts_with('/')
+                && SYSTEM_BIN_ROOTS
+                    .iter()
+                    .any(|r| t == *r || t.starts_with(&format!("{r}/")))
+            {
+                continue;
+            }
+            tok = t;
+        } else {
+            // флаги: интересна только величина после '=' (--output=/tmp/x)
+            if tok.starts_with('-') && tok != "-" && tok != "--" {
+                match tok.split_once('=') {
+                    Some((_, v)) if v.contains('/') || v.starts_with('~') => tok = v,
+                    _ => continue,
+                }
+            }
+            // присваивание VAR=путь (make PREFIX=/usr …)
+            tok = strip_env_assign(tok);
+        }
+
+        let tok = unquote(tok);
+        if tok.is_empty() || is_url(&tok) {
+            continue;
+        }
+
+        // кандидаты: явный путь (ведет '/', '~', './', '../', содержит '/')
+        // + абсолютные фрагменты из «склеенных» токенов (код, payload)
+        let mut candidates: Vec<String> = Vec::new();
+        let explicit = tok.starts_with('/')
+            || tok.starts_with('~')
+            || tok.starts_with("./")
+            || tok.starts_with("../")
+            || tok == "."
+            || tok == ".."
+            || tok.contains('/');
+        if explicit {
+            candidates.push(tok.to_string());
+        }
+        candidates.extend(extract_path_fragments(&tok));
+
+        if candidates.is_empty() {
+            // «голое» имя: симлинк внутри workspace, ведущий наружу
+            if let Some(escaped) = symlink_escape(&tok, ws) {
+                return Some(Policy::Confirm(format!(
+                    "доступ вне workspace: {escaped} (симлинк из workspace)"
+                )));
+            }
+            continue;
+        }
+
+        for c in &candidates {
+            if let Some(p) = resolve_ws_path(c, &ws.cwd) {
+                if is_safe_dev(c) || is_safe_dev(&p.display().to_string()) {
+                    continue;
+                }
+                if !ws.contains(&p) {
+                    return Some(Policy::Confirm(format!(
+                        "доступ вне workspace: {} (аргумент «{raw}»)",
+                        p.display()
+                    )));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Вердикт payload шелла (`bash -c '…'`, shim-медиация): сплит на
+/// `&&`/`||`/`;`/`&`/переводы строк (вне кавычек), подстановки
+/// `$(…)`/бэктики/`<(…)`/`>(…)` вынимаются и судятся рекурсивно,
+/// каждая часть разбирается parse_line и судится целиком (кавычки,
+/// пайпы, редиректы). Fail-closed: неразбираемое/незакрытое — Block.
+pub fn judge_shell_payload(payload: &str, ws: Option<&WsGuard>, depth: u8) -> Policy {
+    if depth > 4 {
+        return Policy::Block("слишком глубокая вложенность shell-payload (>4)".into());
+    }
+    if let Some(b) = raw_danger_scan(payload) {
+        return b;
+    }
+    if let Some(d) = interp_danger_scan(payload) {
+        return Policy::Block(format!("шелл с деструктивным payload (паттерн «{d}»)"));
+    }
+    let mut worst = Policy::Allow;
+    for piece in split_top_level(payload) {
+        let (text, inners, balanced) = take_substitutions(&piece);
+        if !balanced {
+            return Policy::Block(
+                "незакрытая подстановка $(…)/`…` в payload шелла — fail-closed".into(),
+            );
+        }
+        if !text.trim().is_empty() {
+            match parse_line(&text) {
+                Err(e) => {
+                    return Policy::Block(format!(
+                        "payload не разбирается шлюзом ({e}) — fail-closed"
+                    ))
+                }
+                Ok(p) => {
+                    let host: Vec<usize> = (0..p.segments.len()).collect();
+                    worst = worst_policy(worst, judge_pipeline_ws(&p, &host, ws));
+                }
+            }
+        }
+        for inner in inners {
+            worst = worst_policy(worst, judge_shell_payload(&inner, ws, depth + 1));
+        }
+        if matches!(worst, Policy::Block(_)) {
+            return worst;
+        }
+    }
+    worst
+}
+
+/// Потоковый shell/интерпретатор в payload: запуск БЕЗ кода в аргументах
+/// (`bash`, `bash -i`, `python3`, `exec bash`, `nohup sh -s`) — код пойдёт
+/// по stdin от агента, медиация его не видит. Только для mediated-режима
+/// (в REPL потоковый шелл безвреден: stdin — Stdio::null).
+pub fn has_stream_shell(payload: &str) -> bool {
+    for piece in split_top_level(payload) {
+        let Ok(p) = parse_line(&piece) else { continue };
+        if p.segments.len() != 1 {
+            continue;
+        }
+        let toks = &p.segments[0].tokens;
+        //.exec/command/обёртки: смотрим следующее слово как команду
+        let mut start = 0usize;
+        if let Some(t0) = toks.first() {
+            let base = basename(t0);
+            if base == "exec" || base == "command" || WRAPPER_CMDS.contains(&base) {
+                start = 1;
+            }
+        }
+        if let Some(t) = toks.get(start) {
+            let base = basename(t);
+            let is_runner = is_shell(base)
+                || INTERPRETERS.contains(&base)
+                || base == "python3";
+            if is_runner {
+                let rest_flags_only = toks[start + 1..]
+                    .iter()
+                    .all(|a| a.starts_with('-'));
+                if rest_flags_only {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Худший из вердиктов: Block > Confirm > Allow.
+fn worst_policy(a: Policy, b: Policy) -> Policy {
+    match (&a, &b) {
+        (Policy::Block(_), _) => a,
+        (_, Policy::Block(_)) => b,
+        (Policy::Confirm(_), _) => a,
+        (_, Policy::Confirm(_)) => b,
+        _ => Policy::Allow,
+    }
+}
+
+/// Сплит payload на команды верхнего уровня: `&&`, `||`, `;`, одиночный
+/// `&` (фон), переводы строк — ВНЕ кавычек. `|` (пайп) остаётся — его
+/// разбирает parse_line.
+fn split_top_level(payload: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let chars: Vec<char> = payload.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' if !in_dq => {
+                in_sq = !in_sq;
+                cur.push(c);
+            }
+            '"' if !in_sq => {
+                in_dq = !in_dq;
+                cur.push(c);
+            }
+            '&' if !in_sq && !in_dq => {
+                parts.push(std::mem::take(&mut cur));
+                if chars.get(i + 1) == Some(&'&') {
+                    i += 1;
+                }
+            }
+            '|' if !in_sq && !in_dq => {
+                if chars.get(i + 1) == Some(&'|') {
+                    parts.push(std::mem::take(&mut cur));
+                    i += 1;
+                } else {
+                    cur.push(c);
+                }
+            }
+            ';' | '\n' if !in_sq && !in_dq => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+    parts.into_iter().filter(|p| !p.trim().is_empty()).collect()
+}
+
+/// Вынуть подстановки `$(…)`, `` `…` ``, `<(…)`, `>(…)` из текста (вне
+/// кавычек): вернуть текст с подстановками, заменёнными на `X`, список
+/// внутренних команд и флаг сбалансированности (незакрытая — false).
+fn take_substitutions(text: &str) -> (String, Vec<String>, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut inners: Vec<String> = Vec::new();
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_sq || in_dq {
+            if (in_sq && c == '\'') || (in_dq && c == '"') {
+                in_sq = false;
+                in_dq = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // опенер: $( … ), `…`, <( … ), >( … )
+        let opener: Option<(usize, char)> = if c == '$' && chars.get(i + 1) == Some(&'(') {
+            Some((i + 2, ')'))
+        } else if c == '`' {
+            Some((i + 1, '`'))
+        } else if (c == '<' || c == '>') && chars.get(i + 1) == Some(&'(') {
+            Some((i + 2, ')'))
+        } else {
+            None
+        };
+        if let Some((start, close)) = opener {
+            let mut depth = 1i32;
+            let mut j = start;
+            let mut inner = String::new();
+            while j < chars.len() {
+                let cj = chars[j];
+                if cj == '(' {
+                    depth += 1;
+                } else if cj == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                } else if cj == '`' && close == '`' {
+                    break;
+                }
+                inner.push(cj);
+                j += 1;
+            }
+            if j >= chars.len() {
+                return (out, inners, false); // нет парной — fail-closed
+            }
+            inners.push(inner);
+            out.push('X');
+            i = j + 1;
+            continue;
+        }
+        if c == '\'' {
+            in_sq = true;
+        } else if c == '"' {
+            in_dq = true;
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, inners, true)
+}
+
+// ---- мелкие помощники границы ----
+
+/// `VAR=value` → `value` (имя — POSIX-идентификатор); прочее — как есть.
+fn strip_env_assign(tok: &str) -> &str {
+    if let Some((name, val)) = tok.split_once('=') {
+        let mut chars = name.chars();
+        if let Some(first) = chars.next() {
+            if (first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return val;
+            }
+        }
+    }
+    tok
+}
+
+/// Срезать парные кавычки по краям токена: `'/etc/passwd'` → `/etc/passwd`.
+fn unquote(tok: &str) -> &str {
+    let t = tok.trim();
+    for q in ['\'', '"'] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            return &t[1..t.len() - 1];
+        }
+    }
+    t
+}
+
+/// URL (схема://) — не путь.
+fn is_url(tok: &str) -> bool {
+    tok.contains("://")
+}
+
+fn is_safe_dev(p: &str) -> bool {
+    SAFE_DEVICES.contains(&p) || p.starts_with("/dev/fd/")
+}
+
+/// Символы, из которых состоит путь во фрагменте (без кавычек/скобок).
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '+' | '@' | '%')
+}
+
+/// Извлечь пути из «склеенного» токена: триггеры — абсолютные префиксы
+/// (`/etc/…`), `~/…`, `../…`; фрагмент тянется до не-путевого символа.
+/// `open('/etc/passwd')` → `/etc/passwd`; `ls /etc` → `/etc`;
+/// `s/a/b/` → ничего.
+fn extract_path_fragments(token: &str) -> Vec<String> {
+    let chars: Vec<char> = token.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let rest: String = chars[i..].iter().collect();
+        let trigger = rest.starts_with("~/")
+            || rest.starts_with("../")
+            || ABS_ROOT_PREFIXES.iter().any(|p| rest.starts_with(p));
+        if !trigger {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && is_path_char(chars[j]) {
+            j += 1;
+        }
+        if j > i + 1 {
+            out.push(chars[i..j].iter().collect());
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
+/// Разрешить путь относительно корня ws: `~` → HOME, относительные —
+/// от root; канонизация с раскрытием симлинков (несуществующий хвост —
+/// канонизируется родитель + имя; край — лексическая нормализация).
+pub fn resolve_ws_path(tok: &str, cwd: &Path) -> Option<PathBuf> {
+    let t = unquote(tok);
+    if t.is_empty() {
+        return None;
+    }
+    let expanded = expand_home(t);
+    let abs = if expanded.starts_with('/') {
+        PathBuf::from(&expanded)
+    } else {
+        cwd.join(&expanded)
+    };
+    Some(lexical_real(&abs))
+}
+
+/// Канонизация с fallback'ами: canonicalize → родитель+имя → лексика.
+fn lexical_real(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Ok(cp) = parent.canonicalize() {
+            return cp.join(name);
+        }
+    }
+    let mut out = PathBuf::from("/");
+    for comp in p.components() {
+        match comp {
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::Normal(c) => out.push(c),
+        }
+    }
+    out
+}
+
+/// «Голое» имя — симлинк в workspace, ведущий наружу (и не в allowlist,
+/// и не безопасное устройство).
+fn symlink_escape(tok: &str, ws: &WsGuard) -> Option<String> {
+    let target = ws.cwd.join(tok);
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            if let Ok(real) = target.canonicalize() {
+                if !ws.contains(&real) && !is_safe_dev(&real.display().to_string()) {
+                    return Some(real.display().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1446,5 +2053,214 @@ mod tests {
         assert!(parse_line("a | | b").is_err());
         // && без шелла — просто аргументы; rm -rf / ловится токен-анализом
         assert!(matches!(policy_of("rm -rf / && echo done"), Policy::Block(_)));
+    }
+
+    // ---------- v0.24.0: Workspace Boundary Guard ----------
+
+    /// временный workspace + guard (cwd == root)
+    fn guard_ws(tag: &str) -> (WsGuard, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("poler-bnd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "x\n").unwrap();
+        (WsGuard::new(&dir), dir)
+    }
+
+    fn ws_policy(line: &str, g: &WsGuard) -> Policy {
+        let p = parse_line(line).unwrap();
+        let host: Vec<usize> = (0..p.segments.len()).collect();
+        judge_pipeline_ws(&p, &host, Some(g))
+    }
+
+    #[test]
+    fn boundary_absolute_outside_confirms() {
+        let (g, dir) = guard_ws("abs");
+        // живой кейс эксплуатации: чтение домашнего/системного каталога
+        assert!(matches!(
+            ws_policy("ls /home/vitalij", &g),
+            Policy::Confirm(w) if w.starts_with("доступ вне workspace")
+        ));
+        assert!(matches!(ws_policy("cat /etc/passwd", &g), Policy::Confirm(_)));
+        assert!(matches!(ws_policy("cat ~/.ssh/id_rsa", &g), Policy::Confirm(_)));
+        // запись в /tmp — тоже граница
+        assert!(matches!(
+            ws_policy("echo x > /tmp/poler-bnd.txt", &g),
+            Policy::Confirm(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_inside_and_safe_devices_allow() {
+        let (g, dir) = guard_ws("inside");
+        assert!(ws_policy("cat notes.txt", &g).is_allow());
+        assert!(ws_policy("ls -la", &g).is_allow());
+        assert!(ws_policy("grep foo notes.txt", &g).is_allow());
+        assert!(ws_policy("echo x 2>/dev/null", &g).is_allow());
+        assert!(ws_policy("find . -name '*.txt'", &g).is_allow());
+        assert!(ws_policy("curl https://example.com/x", &g).is_allow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_relative_escape_confirms() {
+        let (g, dir) = guard_ws("rel");
+        assert!(matches!(ws_policy("cat ../outside.txt", &g), Policy::Confirm(_)));
+        assert!(matches!(ws_policy("ls ../../..", &g), Policy::Confirm(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_allowlist_softens_only_boundary() {
+        let (mut g, dir) = guard_ws("allow");
+        g.allow.push(PathBuf::from("/etc/hosts"));
+        assert!(ws_policy("cat /etc/hosts", &g).is_allow());
+        // соседний путь не разрешён
+        assert!(matches!(ws_policy("cat /etc/passwd", &g), Policy::Confirm(_)));
+        // ИНВАРИАНТ: allowlist не ослабляет Block
+        assert!(matches!(ws_policy("cat /dev/urandom > /etc/passwd", &g), Policy::Block(_)));
+        assert!(matches!(ws_policy("rm -rf /", &g), Policy::Block(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_block_precedence_over_confirm() {
+        let (g, dir) = guard_ws("prec");
+        // деструктив с внешним путём — Block, не Confirm
+        assert!(matches!(ws_policy("cat /dev/urandom > /etc/passwd", &g), Policy::Block(_)));
+        assert!(matches!(ws_policy("cp evil /etc/passwd", &g), Policy::Block(_)));
+        assert!(matches!(ws_policy("dd if=/dev/zero of=/dev/sda", &g), Policy::Block(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_symlink_escape_caught() {
+        let (g, dir) = guard_ws("sym");
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("leak")).unwrap();
+        // голое имя — симлинк наружу
+        assert!(matches!(ws_policy("cat leak", &g), Policy::Confirm(_)));
+        // через компонент
+        assert!(matches!(ws_policy("cat leak/x", &g), Policy::Confirm(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_argv0_system_binaries_ok() {
+        let (g, dir) = guard_ws("argv0");
+        assert!(ws_policy("/usr/bin/python3 --version", &g).is_allow());
+        assert!(ws_policy("/bin/ls", &g).is_allow());
+        // argv[0] вне системных корней — граница
+        assert!(matches!(ws_policy("/tmp/evil.sh", &g), Policy::Confirm(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_flag_and_env_values() {
+        let (g, dir) = guard_ws("flag");
+        assert!(matches!(
+            ws_policy("curl --output=/tmp/x https://a.b", &g),
+            Policy::Confirm(_)
+        ));
+        assert!(matches!(ws_policy("make PREFIX=/usr", &g), Policy::Confirm(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_interpreter_code_string_scanned() {
+        let (g, dir) = guard_ws("code");
+        // абсолютный путь внутри кода интерпретатора
+        assert!(matches!(
+            ws_policy("python3 -c \"open('/etc/passwd')\"", &g),
+            Policy::Confirm(_)
+        ));
+        // деструктив в коде — Block (инвариант v0.22)
+        assert!(matches!(
+            ws_policy("python3 -c \"import os; os.system('rm -rf /usr')\"", &g),
+            Policy::Block(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_payload_split_and_substitutions() {
+        let (g, dir) = guard_ws("pay");
+        // &&-сплит: деструктивная часть — Block
+        assert!(matches!(
+            judge_shell_payload("ls && rm -rf /usr", Some(&g), 0),
+            Policy::Block(_)
+        ));
+        // кавычки внутри payload
+        assert!(matches!(
+            judge_shell_payload("cat '/etc/passwd'", Some(&g), 0),
+            Policy::Confirm(_)
+        ));
+        // подстановка $()
+        assert!(matches!(
+            judge_shell_payload("echo $(cat /etc/shadow)", Some(&g), 0),
+            Policy::Confirm(_)
+        ));
+        // бэктики
+        assert!(matches!(
+            judge_shell_payload("echo `cat /etc/shadow`", Some(&g), 0),
+            Policy::Confirm(_)
+        ));
+        // пайп внутри payload судится по сегментам
+        assert!(matches!(
+            judge_shell_payload("cat /etc/passwd | wc -l", Some(&g), 0),
+            Policy::Confirm(_)
+        ));
+        // незакрытая подстановка — fail-closed
+        assert!(matches!(
+            judge_shell_payload("echo $(cat x", Some(&g), 0),
+            Policy::Block(_)
+        ));
+        // безопасный payload
+        assert!(judge_shell_payload("ls -la && cat notes.txt", Some(&g), 0).is_allow());
+        // глубина
+        assert!(matches!(
+            judge_shell_payload("$( $( $( $( $( x", Some(&g), 0),
+            Policy::Block(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_shell_detection() {
+        assert!(has_stream_shell("bash"));
+        assert!(has_stream_shell("bash -i"));
+        assert!(has_stream_shell("sh -s"));
+        assert!(has_stream_shell("exec bash"));
+        assert!(has_stream_shell("nohup bash"));
+        assert!(has_stream_shell("python3"));
+        assert!(has_stream_shell("ls && bash"));
+        // с кодом — НЕ потоковый
+        assert!(!has_stream_shell("bash -c 'ls'"));
+        assert!(!has_stream_shell("bash build.sh"));
+        assert!(!has_stream_shell("python3 script.py"));
+        assert!(!has_stream_shell("ls -la"));
+        assert!(!has_stream_shell("echo bash"));
+    }
+
+    #[test]
+    fn boundary_component_wise_contains() {
+        let (mut g, dir) = guard_ws("comp");
+        // /tmp/polX и /tmp/polX-2 — разные компоненты, не префикс
+        let sibling = std::env::temp_dir().join(format!("poler-bnd-comp-{}-2", std::process::id()));
+        std::fs::create_dir_all(&sibling).unwrap();
+        g.allow.push(sibling.clone());
+        assert!(g.contains(&sibling));
+        assert!(!g.contains(
+            &PathBuf::from(format!("{}-3", sibling.display()))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    #[test]
+    fn boundary_marker_helpers() {
+        assert!(is_boundary_confirm("доступ вне workspace: /etc"));
+        assert!(is_boundary_confirm("выход из workspace: a → b"));
+        assert!(!is_boundary_confirm("эскалация прав: sudo"));
+        assert!(is_privilege_escalation("эскалация прав: sudo"));
     }
 }

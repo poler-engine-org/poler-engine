@@ -1001,6 +1001,16 @@ fn save_unique(prefix: &str, ext: &str, bytes: &[u8]) -> Result<std::path::PathB
 }
 
 fn main() -> ExitCode {
+    // v0.24.0: hidden-вход PATH-shim медиации агентов — перехват ДО clap:
+    // shim-обёртки (~/.poler-engine/shim/bash) вызывают именно его.
+    // `poler-engine __gateway-shim <shell> [args…]` → судит payload тем же
+    // sandbox-гейтом и либо exec реальный shell, либо отказ 126.
+    let mut argv = std::env::args();
+    let _prog = argv.next();
+    if argv.next().as_deref() == Some("__gateway-shim") {
+        let rest: Vec<String> = argv.collect();
+        return ExitCode::from(poler_engine::gateway::shim::shim_main(&rest) as u8);
+    }
     let cli = Cli::parse();
     let code = run(cli);
     // v0.17.5: headless google-браузер, поднятый ЭТИМ процессом, не должен

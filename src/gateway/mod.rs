@@ -24,6 +24,7 @@ pub mod hostexec;
 pub mod pipeline;
 pub mod sandbox;
 pub mod service;
+pub mod shim;
 
 pub use dispatch::{exec_line, GatewayResult, GatewayState};
 
@@ -68,10 +69,13 @@ pub fn banner() -> String {
         "  1 {bold}engine-native{reset} — search · grep · chunk · crawl · impact · nlm · notes · benchmark …\n"
     ));
     s.push_str(&format!(
-        "  2 {dim}host-os-proxy{reset} — любые системные команды в sandbox (деструктивное блокируется)\n"
+        "  2 {dim}host-os-proxy{reset} — системные команды в sandbox (деструктивное блокируется)\n"
     ));
     s.push_str(&format!(
-        "  3 {dim}pty-passthrough{reset} — TUI/IDE/агенты на живом терминале (vim · htop · agy · bare-REPL)\n"
+        "  3 {dim}pty-passthrough{reset} — TUI/IDE/агенты (vim · htop · agy); агенты — в медиации\n"
+    ));
+    s.push_str(&format!(
+        "  {bold}🛡 workspace-guard{reset} — доступ вне корня проекта — только по подтверждению;\n   cd/workspace на выход — тоже; allow <путь> — сессионное исключение\n"
     ));
     s.push('\n');
     s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
@@ -222,6 +226,7 @@ mod tests {
         assert!(b.contains("engine-native"));
         assert!(b.contains("host-os-proxy"));
         assert!(b.contains("pty-passthrough"), "v0.23.0: PTY-контур в баннере");
+        assert!(b.contains("workspace-guard"), "v0.24.0: граница workspace в баннере");
     }
 
     #[test]

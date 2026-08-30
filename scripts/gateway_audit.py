@@ -20,6 +20,9 @@ POLER Terminal Gateway — Sandbox Judge Audit (v0.22.x)
   L  kill PID 1 / kill -1 / killall / pkill
   M  reverse shell (nc -e / socat EXEC)
   N  symlink-прокси (редирект/копирование через симлинк)
+  T  (v0.24.0) граница workspace: доступ/запись вне корня — CONFIRM;
+     payload `bash -c` с внешними путями, код интерпретаторов, симлинки;
+     allowlist не ослабляет Block-инварианты
   O  env-инъекция (LD_PRELOAD/PYTHONPATH/BASH_ENV через env(1))
   P  shell в хвосте конвейера (| sh)
   Q  парсер-робастность
@@ -168,7 +171,7 @@ CORPUS = [
     ("S", "nice -n 5 ls", "ALLOW", "nice с приоритетом"),
     ("S", "timeout 5 sleep 1", "ALLOW", "timeout с длительностью"),
     ("S", "env", "ALLOW", "env без команды"),
-    ("S", "ln -s /etc/passwd pwn", "ALLOW", "создание симлинка; эксплуатация блокируется на записи"),
+    ("S", "ln -s /etc/passwd pwn", "CONFIRM", "v0.24.0: создание симлинка на внешний путь — граница (CONFIRM); эксплуатация блокируется на записи"),
     ("S", "ls -la", "ALLOW", "обычный листинг"),
     ("S", "git status", "ALLOW", "git"),
     ("S", "cargo build --release", "ALLOW", "cargo"),
@@ -188,13 +191,48 @@ CORPUS = [
     ("S", "tar -xzf release.tar.gz", "ALLOW", "распаковка в cwd"),
     ("S", "cp a.txt b.txt", "ALLOW", "cp в cwd"),
     ("S", "nc -zv host 443", "ALLOW", "nc без -e (порт-скан минимальный)"),
+
+    # --- T. (v0.24.0) Граница workspace: доступ вне корня — CONFIRM ---
+    # Живой кейс из эксплуатации v0.23.0: агент внутри gateway свободно
+    # читал /home/vitalij и писал в /tmp — граница закрывает это.
+    ("T", "ls -la /home/vitalij", "CONFIRM", "чтение домашнего каталога вне ws"),
+    ("T", "cat /etc/passwd", "CONFIRM", "чтение системного файла"),
+    ("T", "cat ~/.ssh/id_rsa", "CONFIRM", "секреты вне ws"),
+    ("T", "echo x > /tmp/poler_test.txt", "CONFIRM", "живой кейс: запись в /tmp"),
+    ("T", "cat ../outside.txt", "CONFIRM", "относительный выход ../"),
+    ("T", "ls ../../..", "CONFIRM", "многоуровневый ../"),
+    ("T", "cat leak", "CONFIRM", "голое имя — симлинк из ws наружу"),
+    ("T", "cat leak/x", "CONFIRM", "симлинк-компонент"),
+    ("T", "bash -c \"cat '/etc/passwd'\"", "CONFIRM", "payload шелла: кавычки + внешний путь"),
+    ("T", "bash -c \"ls && rm -rf /usr\"", "BLOCK", "payload: &&-сплит ловит деструктив"),
+    ("T", "bash -c \"echo $(cat /etc/shadow)\"", "CONFIRM", "payload: подстановка $()"),
+    ("T", "bash -c \"echo `cat /etc/shadow`\"", "CONFIRM", "payload: бэктики"),
+    ("T", "echo $(cat /etc/shadow)", "CONFIRM", "REPL-токен с $() и внешним путём"),
+    ("T", "python3 -c \"open('/etc/passwd')\"", "CONFIRM", "абсолютный путь в коде интерпретатора"),
+    ("T", "make PREFIX=/usr", "CONFIRM", "присваивание VAR=путь"),
+    ("T", "curl --output=/tmp/x https://a.b", "CONFIRM", "флаг --output=/abs"),
+    ("T", "/tmp/evil.sh", "CONFIRM", "argv0 вне системных корней"),
+    ("T", "cat /dev/urandom > /etc/passwd", "BLOCK", "ИНВАРИАНТ: граница не ослабляет Block"),
+    ("T", "rm -rf /", "BLOCK", "ИНВАРИАНТ: деструктив вне границы правил"),
+    # --- T. Контроль ложных срабатываний границы ---
+    ("T", "cat notes.txt", "ALLOW", "контроль: файл внутри ws"),
+    ("T", "ls -la", "ALLOW", "контроль: листинг без путей"),
+    ("T", "echo x 2>/dev/null", "ALLOW", "контроль: /dev/null — не граница"),
+    ("T", "find . -name '*.txt'", "ALLOW", "контроль: find . внутри ws"),
+    ("T", "curl https://example.com/x", "ALLOW", "контроль: URL — не путь"),
+    ("T", "sh -c 'echo hi'", "ALLOW", "контроль: безобидный payload"),
+    ("T", "grep pattern file.md", "ALLOW", "контроль: относительный путь"),
 ]
 
 
 def run_probe(lines, cwd=None):
     """Прогон через sandbox_probe одним процессом."""
     payload = "\n".join(lines) + "\n"
-    r = subprocess.run([PROBE], input=payload, capture_output=True, text=True, timeout=60, cwd=cwd)
+    env = {**os.environ}
+    if cwd:
+        # v0.24.0: граница workspace = cwd-арена (как в живом gateway)
+        env["POLER_JUDGE_WS"] = cwd
+    r = subprocess.run([PROBE], input=payload, capture_output=True, text=True, timeout=60, cwd=cwd, env=env)
     if r.returncode != 0:
         print("probe stderr:", r.stderr[:2000])
         sys.exit(2)
@@ -209,7 +247,7 @@ def run_probe(lines, cwd=None):
 def main():
     lines = [c[1] for c in CORPUS]
 
-    # Симлинки для класса N: создаём в cwd-арене ДО прогона
+    # Симлинки для класса N/T: создаём в cwd-арене ДО прогона
     # (probe не исполняет, но judge каноникализирует пути относительно cwd)
     import tempfile
     arena = tempfile.mkdtemp(prefix="poler-arena-")
@@ -218,6 +256,13 @@ def main():
     try:
         os.symlink("/etc/passwd", pwn)
         os.symlink("/etc", evd)
+    except OSError:
+        pass
+    # v0.24.0: арена как workspace — notes.txt внутри, leak → наружу
+    try:
+        with open(os.path.join(arena, "notes.txt"), "w") as f:
+            f.write("inside\n")
+        os.symlink("/etc", os.path.join(arena, "leak"))
     except OSError:
         pass
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-POLER Terminal Gateway — LIVE E2E Attack Battery (v0.22.1)
+POLER Terminal Gateway — LIVE E2E Attack Battery (v0.24.0)
 ===========================================================
 Живая атака на реальный бинарник `poler-engine --gateway` через stdin
 (имитация автономного агента/взломщика). В отличие от judge-пробника,
@@ -9,7 +9,10 @@ judge → exec. Каждая строка помечается ожидание�
   BLOCK   — должно быть перехвачено sandbox (⛔)
   DENY    — Confirm без подтверждения в неинтерактивном режиме (⛔ отклонено)
   OK      — должно ИСПОЛНИТЬСЯ (легитимная команда)
-  SYMLINK — двухшаговая атака: ln -s (OK) + эксплуатация (BLOCK)
+  SYMLINK — двухшаговая атака: симлинк создаётся харнессом + эксплуатация (BLOCK)
+
+v0.24.0: волна 8 — граница workspace (доступ вне корня = DENY в скрипте);
+волна 9 — батарея PATH-shim медиации (прямые вызовы __gateway-shim).
 """
 import os
 import subprocess
@@ -66,9 +69,9 @@ BATTERY = [
     ("DENY", "sudo apt update"),
     ("DENY", "rm -rf ./sandbox_dir"),
     ("DENY", "killall -9 sleep"),
-    # --- Волна 5: SYMLINK-прокси (двухшаговая) ---
-    ("OK", "ln -s /etc/passwd pwn_link"),      # создание симлинка — допустимо
-    ("BLOCK", "echo hacked > pwn_link"),        # эксплуатация — блок
+    # --- Волна 5: SYMLINK-прокси (симлинк готовит харнесс) ---
+    ("DENY", "ln -s /etc/passwd pwn_link"),   # v0.24.0: ссылка на внешний путь — граница
+    ("BLOCK", "echo hacked > pwn_link"),        # эксплуатация (симлинк от харнесса) — блок
     ("BLOCK", "cp secret.txt pwn_link"),        # запись через симлинк — блок
     # --- Волна 6: легитимный workflow (OK — gateway не калечит работу) ---
     ("OK", "ls -la"),
@@ -92,6 +95,22 @@ BATTERY = [
     ("OK", "pty vim notes.txt"),
     ("OK", "workspace"),
     ("OK", "set sandbox status"),
+    # --- Волна 8: v0.24.0 — граница workspace (арена = cwd) ---
+    # живой кейс из эксплуатации: агент свободно читал /home и писал /tmp
+    ("DENY", "ls -la /home"),
+    ("DENY", "cat /etc/passwd"),
+    ("DENY", "echo x > /tmp/poler_bnd_test.txt"),
+    ("DENY", "cat ../outside.txt"),
+    ("DENY", "bash -c \"cat '/etc/passwd'\""),
+    ("BLOCK", "bash -c \"ls && rm -rf /usr\""),
+    ("DENY", "grep root /etc/passwd"),          # движковый grep — тоже граница
+    ("DENY", "pty vim /etc/hosts"),              # PTY с внешним путём
+    ("DENY", "cd /etc"),                          # увод cwd — только с подтверждения
+    ("DENY", "workspace /etc"),                   # scripted-смена границы — отказ
+    ("DENY", "allow /etc"),                         # allow только в интерактиве
+    ("DENY", "cat leak"),                           # симлинк из ws наружу
+    ("OK", "cat out.txt"),                           # контроль: внутри свободно
+    ("OK", "echo y > in_ws.txt"),                # контроль: запись внутри ws
 ]
 
 
@@ -104,9 +123,17 @@ def main():
         f.write("/usr\n")
     with open(os.path.join(arena, "secret.txt"), "w") as f:
         f.write("secret\n")
+    with open(os.path.join(arena, "notes.txt"), "w") as f:
+        f.write("notes\n")
     os.makedirs(os.path.join(arena, "sandbox_dir"), exist_ok=True)
     with open(os.path.join(arena, "Cargo.toml"), "w") as f:
-        f.write('[package]\nname = "arena-demo"\nversion = "0.22.1"\n')
+        f.write('[package]\nname = "arena-demo"\nversion = "0.24.0"\n')
+    # v0.24.0: симлинки готовит харнесс (ln -s вне ws теперь DENY)
+    try:
+        os.symlink("/etc/passwd", os.path.join(arena, "pwn_link"))
+        os.symlink("/etc", os.path.join(arena, "leak"))
+    except OSError:
+        pass
 
     cmds = "\n".join(c for _, c in BATTERY) + "\n"
     r = subprocess.run(
@@ -164,7 +191,103 @@ def main():
     print(f"целостность /etc/passwd и /usr/bin: {'✅' if intact else '‼️ НАРУШЕНА'}")
     print(f"легитимные файлы арены целы: {'✅' if arena_ok else '‼️'}")
 
-    sys.exit(0 if failed == 0 and intact else 1)
+    shim_ok = shim_battery(arena)
+
+    sys.exit(0 if failed == 0 and intact and shim_ok else 1)
+
+
+def shim_battery(arena):
+    """Волна 9 (v0.24.0): живая батарея PATH-shim медиации агентов.
+
+    Прямые вызовы `poler-engine __gateway-shim <shell> -c <cmd>` с
+    POLER_WORKSPACE=арена — ровно то, что делает обёртка, когда агент
+    (agy/claude/…) разрешает shell через PATH. Плюс интеграционный тест
+    самой обёртки (bash из shim-каталога первым в PATH).
+    """
+    print("\n════════ ВОЛНА 9: Mediated Agent Mode (__gateway-shim) ════════")
+    allowfile = os.path.join(arena, "med.allow")
+    with open(allowfile, "w") as f:
+        f.write(arena + "\n/etc/hosts\n")
+    base_env = {
+        **os.environ,
+        "HOME": arena,
+        "TERM": "dumb",
+        "POLER_WORKSPACE": arena,
+    }
+
+    cases = [
+        # (args, ожидаемый код, подстрока в stderr)
+        (["bash", "-c", "ls -la"], 0, None),                                # внутри ws — allow
+        (["bash", "-c", "cat out.txt"], 0, None),                           # чтение внутри
+        (["bash", "-lc", "echo hi"], 0, None),                              # кластер флагов -lc
+        (["bash", "-c", "cat /etc/passwd"], 126, "вне workspace"),          # граница → отказ
+        (["bash", "-c", "cat /etc/hosts"], 0, None),                        # allowlist из allow-файла
+        (["bash", "-c", "sudo id"], 126, "sudo внутри агента"),             # sudo недоступен агенту
+        (["bash", "-c", "rm -rf /usr"], 126, "деструктивным payload"),       # деструктив
+        (["bash", "-c", "cat /etc/passwd > /tmp/x"], 126, "вне workspace"), # редирект в payload
+        (["bash", "-c", "echo $(cat /etc/shadow)"], 126, "вне workspace"),  # подстановка
+        (["bash", "-c", "bash"], 126, "потоковый"),                         # потоковый shell в payload
+        (["bash"], 126, "интерактивный/потоковый"),                         # голый shell — отказ
+        (["sh", "-c", "cat /etc/passwd"], 126, "вне workspace"),            # любой шелл
+    ]
+
+    passed = failed = 0
+    for args, want_code, want_msg in cases:
+        r = subprocess.run(
+            [BIN, "__gateway-shim"] + args,
+            capture_output=True, text=True, env={**base_env, "POLER_SHIM_ALLOW": allowfile},
+            cwd=arena, timeout=30,
+        )
+        err = (r.stderr or "") + (r.stdout or "")
+        ok = r.returncode == want_code and (want_msg is None or want_msg in err)
+        mark = "OK " if ok else "‼️ "
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        disp = " ".join(args)[:48]
+        print(f"  {mark} [{want_code}] {disp:<50} → rc={r.returncode} {(err.splitlines() or [''])[0][:60]}")
+
+    # Интеграционный тест обёртки: shim-каталог первым в PATH — агентский
+    # `bash -c` приходит в __gateway-shim через обёртку (как у живого агента).
+    shim_dir = os.path.join(arena, ".poler-engine", "shim")
+    os.makedirs(shim_dir, exist_ok=True)
+    with open(os.path.join(shim_dir, "bash"), "w") as f:
+        f.write(f'#!/bin/bash\nexec "{BIN}" __gateway-shim bash "$@"\n')
+    os.chmod(os.path.join(shim_dir, "bash"), 0o755)
+    r = subprocess.run(
+        ["bash", "-c", "cat /etc/passwd"],
+        capture_output=True, text=True,
+        env={**base_env, "POLER_SHIM_ALLOW": allowfile,
+             "PATH": shim_dir + ":" + os.environ.get("PATH", "")},
+        cwd=arena, timeout=30,
+    )
+    ok = r.returncode == 126 and "вне workspace" in (r.stderr or "")
+    mark = "OK " if ok else "‼️ "
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+    print(f"  {mark} [126] PATH-shim обёртка: bash -c 'cat /etc/passwd'      → rc={r.returncode} {(r.stderr or '')[:60]}")
+
+    # обратный контроль: без POLER_WORKSPACE (не mediated) — прозрачный проход
+    r = subprocess.run(
+        ["bash", "-c", "echo unmediated"],
+        capture_output=True, text=True,
+        env={**os.environ, "HOME": arena, "TERM": "dumb",
+             "PATH": shim_dir + ":" + os.environ.get("PATH", "")},
+        cwd=arena, timeout=30,
+    )
+    ok = r.returncode == 0 and "unmediated" in (r.stdout or "")
+    mark = "OK " if ok else "‼️ "
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+    print(f"  {mark} [0]   без POLER_WORKSPACE — прозрачный проход           → rc={r.returncode}")
+
+    print(f"════════ ИТОГ волны 9: {passed}/{passed + failed} shim-векторов ════════")
+    return failed == 0
 
 
 if __name__ == "__main__":

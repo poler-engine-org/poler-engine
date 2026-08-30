@@ -18,6 +18,7 @@ use super::hostexec::{self, EnvMode, HostLimits};
 use super::pipeline::{parse_line, Pipeline, Segment};
 use super::sandbox::{self, Policy};
 use super::service;
+use super::shim;
 use crate::shell::{self, ShellState};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -38,6 +39,9 @@ pub struct GatewayState {
     pub shell: ShellState,
     /// Рабочий каталог gateway (cd/pwd/workspace; хостовые команды стартуют отсюда).
     pub cwd: PathBuf,
+    /// v0.24.0: корень workspace (ГРАНИЦА). cd внутри — свободен,
+    /// выход за границу — Confirm; подтверждённый выход переносит границу.
+    pub ws_root: PathBuf,
     /// Лимиты host-прокси (таймаут/кап/env).
     pub limits: HostLimits,
     /// Авто-подтверждение опасных команд (set autoyes on).
@@ -52,6 +56,10 @@ pub struct GatewayState {
     /// sandbox не блокирует и не спрашивает — только предупреждает.
     /// Вся ответственность — на операторе (красный баннер при старте).
     pub danger_mode: bool,
+    /// v0.24.0: сессионный allowlist владельца — канонические пути вне
+    /// workspace, обращение к которым не требует подтверждения (`allow`).
+    /// Смягчает ТОЛЬКО boundary-Confirm: Block-инварианты действует всегда.
+    pub ws_allow: Vec<PathBuf>,
     /// v0.23.0: синхронизировать process-cwd со state.cwd (workspace/cd) —
     /// движковые команды (grep/chunk/search) и подпроцессы видят один корень.
     /// Включается только в живом REPL: юнит-тесты не мутируют глобальный cwd.
@@ -63,11 +71,13 @@ impl GatewayState {
         Self {
             shell: ShellState::new(db_path),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ws_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             limits: HostLimits::default(),
             auto_yes: false,
             last_exit: 0,
             sudo_lease_until: None,
             danger_mode: false,
+            ws_allow: Vec::new(),
             sync_cwd: false,
         }
     }
@@ -81,6 +91,17 @@ impl GatewayState {
         } else {
             None
         }
+    }
+}
+
+/// Граница workspace для судьи: root — граница (v0.24.0: отдельно от cwd;
+/// cd в подкаталог не двигает границу), cwd — якорь относительных путей,
+/// allow — сессионный allowlist.
+fn ws_guard(state: &GatewayState) -> sandbox::WsGuard {
+    sandbox::WsGuard {
+        root: state.ws_root.clone(),
+        cwd: state.cwd.clone(),
+        allow: state.ws_allow.clone(),
     }
 }
 
@@ -104,6 +125,7 @@ pub fn is_engine_command(name: &str) -> bool {
             | "gt" | "gix" | "notes" | "sources" | "grep" | "chunk" | "benchmark" | "service"
             | "attach" | "weblens" | "license" | "cd" | "pwd" | "clear" | "host" | "help"
             | "version" | "quit" | "exit" | "q" | "ver" | "workspace" | "grant" | "pty"
+            | "allow"
     )
 }
 
@@ -187,7 +209,8 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
             } else {
                 t0.clone()
             };
-            let verdict = sandbox::judge_segment(&inner);
+            let guard = ws_guard(state);
+            let verdict = sandbox::judge_segment_ws(&inner, Some(&guard));
             let proceed = if state.danger_mode {
                 if !verdict.is_allow() {
                     eprintln!("⚠ DANGER: sandbox отключён владельцем — PTY-команда исполняется без проверок");
@@ -216,7 +239,41 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                     "pty: интерактивная сессия требует настоящего терминала (TTY); запустите poler-engine --gateway в терминале\n".into(),
                 );
             }
-            let outcome = hostexec::run_pty(&inner, &state.limits, &state.cwd, &[]);
+            // v0.24.0: Mediated Agent Mode — PATH-shim перехватывает
+            // shell-вызовы агента (agy/claude/codex/…): судятся тем же
+            // sandbox-гейтом, граница — workspace. Подтвердить агент не
+            // может: выход за границу/деструктив/sudo → отказ 126.
+            // vim/htop/less — инструменты владельца, не медиируются.
+            let base = inner
+                .first()
+                .map(|s| s.rsplit('/').next().unwrap_or(s))
+                .unwrap_or("")
+                .to_string();
+            let mediation = if shim::is_agent_cmd(&base) {
+                match shim::setup(&state.cwd, &state.ws_allow) {
+                    Ok(m) => {
+                        println!("🛡 Mediated Agent Mode: shell-вызовы агента проходят sandbox-гейт");
+                        println!("   граница: {} · sudo/деструктив/выход за границу → отказ (агент подтвердить не может)", state.cwd.display());
+                        Some(m)
+                    }
+                    Err(e) => {
+                        eprintln!("⚠ медиация недоступна ({e}) — агент запускается БЕЗ фильтра его shell-вызовов");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let extra: Vec<(String, String)> = mediation
+                .iter()
+                .flat_map(|m| m.env.iter().cloned())
+                .collect();
+            let outcome = hostexec::run_pty(&inner, &state.limits, &state.cwd, &extra);
+            if let Some(m) = &mediation {
+                print!("{}", shim::telemetry(&m.log_file));
+                let _ = std::fs::remove_file(&m.log_file);
+                let _ = std::fs::remove_file(&m.allow_file);
+            }
             if let Some(e) = &outcome.spawn_error {
                 state.last_exit = 127;
                 return GatewayResult::Done(format!("⚡ {e}"));
@@ -264,9 +321,11 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
     // v0.22.1: цель редиректа проверяется ВСЕГДА — даже в чисто движковых
     // конвейерах (`chunk x > pwn`, где pwn — симлинк в /etc): каноникализация
     // путей в judge_redirect_target раскрывает symlink-прокси.
+    // v0.24.0: + граница workspace (движковый grep/chunk тоже читают файлы).
+    let guard = ws_guard(state);
     if host_idx.is_empty() {
         if let Some(r) = &pipeline.redirect {
-            let verdict = sandbox::judge_redirect_target(&r.path);
+            let verdict = sandbox::judge_redirect_target_ws(&r.path, Some(&guard));
             if state.danger_mode {
                 if !verdict.is_allow() {
                     eprintln!("⚠ DANGER: sandbox отключён владельцем — редирект исполняется без проверок");
@@ -274,13 +333,18 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
             } else if let Policy::Block(why) = verdict {
                 state.last_exit = 2;
                 return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
+            } else if let Policy::Confirm(why) = verdict {
+                if !resolve_confirm(state, &why, interactive) {
+                    state.last_exit = 125;
+                    return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
+                }
             }
         }
     }
     if !host_idx.is_empty() {
         // пересобираем pipeline с уже срезанными poler-префиксами
         let judged = rebuild_for_judge(&pipeline, &seg_tokens);
-        let verdict = sandbox::judge_pipeline(&judged, &host_idx);
+        let verdict = sandbox::judge_pipeline_ws(&judged, &host_idx, Some(&guard));
         if state.danger_mode {
             // danger-режим: не блокируем и не спрашиваем — только предупреждаем
             if !verdict.is_allow() {
@@ -294,6 +358,30 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                     return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
                 }
                 Policy::Confirm(why) => {
+                    if !resolve_confirm(state, &why, interactive) {
+                        state.last_exit = 125;
+                        return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
+                    }
+                }
+            }
+        }
+    }
+    // v0.24.0: граница и для ДВИЖКОВЫХ сегментов с файл-аргументами
+    // (grep/chunk/impact/crawl/benchmark/gh…): движок читает файлы нативно —
+    // путь вне workspace без подтверждения нельзя. Команды-запросы
+    // (search/nlm/notes…) и навигация (cd/workspace/allow) — исключены:
+    // у них свои ворота.
+    if !state.danger_mode {
+        const WS_CHECKED_ENGINE: &[&str] = &[
+            "grep", "chunk", "impact", "benchmark", "crawl", "gh", "gl", "gt", "gix",
+        ];
+        for tokens in &seg_tokens {
+            let cmd = tokens.first().map(|s| s.as_str()).unwrap_or("");
+            if !WS_CHECKED_ENGINE.contains(&cmd) || tokens.len() < 2 {
+                continue;
+            }
+            if let Some(policy) = sandbox::boundary_policy_args(&tokens[1..], &guard) {
+                if let Policy::Confirm(why) = policy {
                     if !resolve_confirm(state, &why, interactive) {
                         state.last_exit = 125;
                         return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
@@ -543,9 +631,10 @@ fn run_engine(
         "attach" => cmd_attach(args).map_err(EngineFail::Msg),
         "weblens" => cmd_weblens(args).map_err(EngineFail::Msg),
         "license" => Ok(crate::license::status_text()),
-        "cd" => cmd_cd(state, args).map_err(EngineFail::Msg),
-        "workspace" => cmd_workspace(state, args).map_err(EngineFail::Msg),
+        "cd" => cmd_cd(state, args, interactive).map_err(EngineFail::Msg),
+        "workspace" => cmd_workspace(state, args, interactive).map_err(EngineFail::Msg),
         "grant" => cmd_grant(state, args, interactive).map_err(EngineFail::Msg),
+        "allow" => cmd_allow(state, args, interactive).map_err(EngineFail::Msg),
         "pty" => Err(EngineFail::Msg(
             "pty: укажите команду (pty vim main.rs) — TUI/IDE/агент на псевдотерминале".into(),
         )),
@@ -553,7 +642,7 @@ fn run_engine(
         "clear" => Ok("\x1b[2J\x1b[1;1H".into()),
         "help" | "?" => Ok(gateway_help()),
         "version" | "ver" | "v" => Ok(format!(
-            "poler-engine {} — Terminal Gateway v0.23.0 (двойной контур + PTY-passthrough + sudo-гейт)\n",
+            "poler-engine {} — Terminal Gateway v0.24.0 (двойной контур + PTY-passthrough + sudo-гейт + workspace-guard)\n",
             env!("CARGO_PKG_VERSION")
         )),
         "quit" | "exit" | "q" => Err(EngineFail::Quit),
@@ -1086,7 +1175,11 @@ fn sandbox_status(state: &GatewayState) -> String {
         Some(rem) => format!("активен, ещё {} с", rem.as_secs()),
         None => "не активен".to_string(),
     };
-    format!("sandbox: {sb}\nsudo-лизинг: {lease}\n")
+    let allow_n = state.ws_allow.len();
+    format!(
+        "sandbox: {sb}\nsudo-лизинг: {lease}\nworkspace: {}\nallowlist: {allow_n} путей (allow — список)\n",
+        state.cwd.display()
+    )
 }
 
 /// `grant sudo <N|m|s|h>|off|status` (v0.23.0): временный лизинг
@@ -1159,7 +1252,11 @@ fn parse_lease(v: &str) -> Result<(u64, bool), String> {
     }
 }
 
-fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
+fn cmd_cd(
+    state: &mut GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
     let target = match args.first() {
         Some(p) => super::sandbox::expand_home(p),
         None => std::env::var("HOME").unwrap_or_else(|_| ".".into()),
@@ -1175,6 +1272,21 @@ fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
     if !canonical.is_dir() {
         return Err(format!("cd: {} не каталог", path.display()));
     }
+    // v0.24.0: выход ЗА ГРАНИЦУ workspace — только с подтверждения
+    // владельца (в неинтерактиве — отказ: пайп-агент не должен уводить
+    // корень). Навигация внутри (в т.ч. cd .. к корню) — свободна;
+    // подтверждённый выход переносит границу на новое место.
+    if !state.danger_mode && !canonical.starts_with(&state.ws_root) {
+        let why = format!(
+            "выход из workspace: {} → {}",
+            state.ws_root.display(),
+            canonical.display()
+        );
+        if !resolve_confirm(state, &why, interactive) {
+            return Ok("⛔ не подтверждено — остаёмся в workspace\n".into());
+        }
+        state.ws_root = canonical.clone();
+    }
     // v0.23.0: process-cwd следует за state.cwd — движковые и хостовые
     // команды работают от одного корня (в REPL; тесты не мутируют глобал).
     if state.sync_cwd {
@@ -1188,10 +1300,29 @@ fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
 /// `workspace [PATH]` (v0.23.0): выбор корня проекта. Меняет state.cwd
 /// И process-cwd (движковые grep/chunk/search и подпроц-
 /// сы — от одного корня), обновляет приглашение; без PATH — отчёт.
-fn cmd_workspace(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
+/// v0.24.0: смена корня ЗА пределы текущего — подтверждение владельца
+/// (неинтерактив — отказ: scripted-агент не должен двигать границу).
+fn cmd_workspace(
+    state: &mut GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
     let Some(p) = args.first() else {
+        let allow_list = if state.ws_allow.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "allowlist (сессия): {}\n",
+                state
+                    .ws_allow
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         return Ok(format!(
-            "workspace: {}\nдвижковые (grep/chunk/search) и хостовые команды работают от этого корня; workspace <путь> — переключить\n",
+            "workspace: {}\n{allow_list}движковые (grep/chunk/search) и хостовые команды работают от этого корня; workspace <путь> — переключить; allow <путь> — разрешить внешние пути\n",
             state.cwd.display()
         ));
     };
@@ -1206,6 +1337,17 @@ fn cmd_workspace(state: &mut GatewayState, args: &[String]) -> Result<String, St
         .map_err(|e| format!("workspace: {}: {e}", path.display()))?;
     if !canonical.is_dir() {
         return Err(format!("workspace: {} не каталог", path.display()));
+    }
+    if !state.danger_mode && !canonical.starts_with(&state.ws_root) {
+        let why = format!(
+            "выход из workspace: {} → {}",
+            state.ws_root.display(),
+            canonical.display()
+        );
+        if !resolve_confirm(state, &why, interactive) {
+            return Ok("⛔ не подтверждено — workspace не изменён\n".into());
+        }
+        state.ws_root = canonical.clone();
     }
     if state.sync_cwd {
         std::env::set_current_dir(&canonical)
@@ -1223,13 +1365,72 @@ fn cmd_workspace(state: &mut GatewayState, args: &[String]) -> Result<String, St
     }
 }
 
+/// `allow [PATH|clear]` (v0.24.0): сессионный allowlist границ workspace.
+/// Расширение границы — только владелец в интерактиве (пайп-агент не
+/// может сам себе открыть /). Allowlist не ослабляет Block-инварианты.
+fn cmd_allow(
+    state: &mut GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
+    match args.first().map(|s| s.as_str()) {
+        None => {
+            let list = if state.ws_allow.is_empty() {
+                "(пусто)".to_string()
+            } else {
+                state
+                    .ws_allow
+                    .iter()
+                    .map(|p| format!("  {}", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(format!(
+                "workspace: {}\nallowlist сессии:\n{list}\nallow <путь> — добавить (интерактив); allow clear — сброс\n",
+                state.cwd.display()
+            ))
+        }
+        Some("clear") => {
+            state.ws_allow.clear();
+            Ok("allowlist сброшен (граница — только workspace)\n".into())
+        }
+        Some(p) => {
+            if !interactive {
+                return Ok(
+                    "⛔ allow: расширение границы workspace — только в интерактивной сессии (владелец за терминалом)\n"
+                        .into(),
+                );
+            }
+            let target = super::sandbox::expand_home(p);
+            let abs = if target.starts_with('/') {
+                PathBuf::from(target)
+            } else {
+                state.cwd.join(target)
+            };
+            let canon = abs
+                .canonicalize()
+                .map_err(|e| format!("allow: {}: {e}", abs.display()))?;
+            if canon.starts_with(&state.ws_root) {
+                return Ok("✅ путь уже внутри workspace — подтверждение не нужно\n".into());
+            }
+            if !state.ws_allow.contains(&canon) {
+                state.ws_allow.push(canon.clone());
+            }
+            Ok(format!(
+                "✅ разрешено на сессию: {}\nдействует до quit (allow clear — сброс); деструктив (rm -rf / и т.п.) блокируется ВСЁ РАВНО\n",
+                canon.display()
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
 
 pub fn gateway_help() -> String {
     let mut s = String::from(
-        "POLER Terminal Gateway — единый терминальный шлюз (v0.23.0: PTY + workspace + sudo-гейт)\n\
+        "POLER Terminal Gateway — единый терминальный шлюз (v0.24.0: PTY + workspace-guard + sudo-гейт)\n\
          ═════════════════════════════════════════════════════════════\n\
          Двойной контур: команды движка исполняются нативно (приоритет),\n\
          всё остальное — хостовая ОС в sandbox-режиме.\n\n",
@@ -1250,15 +1451,22 @@ pub fn gateway_help() -> String {
     s.push_str("  !grep / host grep           принудительно системный (а не движковый)\n");
     s.push_str("  БЛОКИРУЕТСЯ: rm -rf /, форк-бомбы, dd of=/dev/*, shutdown,\n");
     s.push_str("               curl|sh, > /dev/sd*, > /etc/*\n");
-    s.push_str("  ПОДТВЕРЖДАЕТСЯ: sudo/su (на /dev/tty), rm -r, dd\n\n");
+    s.push_str("  ПОДТВЕРЖДАЕТСЯ: sudo/su (на /dev/tty), rm -r, dd,\n");
+    s.push_str("               доступ к путям ВНЕ workspace (boundary)\n\n");
     s.push_str("PTY-PASSTHROUGH (v0.23.0 — интерактивные TUI/IDE/агенты):\n");
     s.push_str("  pty <команда…>              принудительный псевдотерминал\n");
     s.push_str("  авто-PTY: vim/htop/less/tmux/agy/claude… и bare-REPL (python3)\n");
-    s.push_str("  (политика sandbox судится по той же команде — PTY ≠ обход)\n\n");
-    s.push_str("WORKSPACE (v0.23.0 — корень проекта):\n");
+    s.push_str("  (политика sandbox судится по той же команде — PTY ≠ обход)\n");
+    s.push_str("  v0.24.0 MEDIATED AGENT MODE: агенты (agy/claude/codex/…) —\n");
+    s.push_str("  их shell-вызовы (PATH/$SHELL) судятся гейтом; отказ = 126;\n");
+    s.push_str("  телеметрия после выхода; вызовы /bin/sh напрямую не видны\n\n");
+    s.push_str("WORKSPACE (v0.23.0 — корень проекта; v0.24.0 — граница):\n");
     s.push_str("  workspace [PATH]            показать/переключить корень проекта;\n");
     s.push_str("                              движок+хост+подпроцессы от одного cwd\n");
-    s.push_str("  cd PATH / pwd               быстрая навигация (тот же корень)\n\n");
+    s.push_str("  cd PATH / pwd               быстрая навигация (тот же корень)\n");
+    s.push_str("  ГРАНИЦА: доступ/запись вне корня — Confirm [y/N] (cd/workspace\n");
+    s.push_str("  на выход — тоже); allow <PATH> — сессионное исключение (владелец,\n");
+    s.push_str("  только интерактив); деструктив блокируется ВСЕГДА\n\n");
     s.push_str("ПРИВИЛЕГИИ (v0.23.0 — гранулярный sudo-гейт):\n");
     s.push_str("  sudo <cmd>                  одноразово: подтверждение на /dev/tty\n");
     s.push_str("  grant sudo 5m|90s|2h        временный лизинг (только интерактив,\n");
@@ -1383,13 +1591,18 @@ mod tests {
     #[test]
     fn redirect_writes_file() {
         let mut st = state();
-        let tmp = std::env::temp_dir().join(format!("poler-gw-redir-{}.txt", std::process::id()));
+        // файл внутри workspace (v0.24.0: /tmp-цель вне границы = Confirm)
+        let ws = std::env::temp_dir().join(format!("poler-gw-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        st.cwd = ws.clone();
+        st.ws_root = ws.clone();
+        let tmp = ws.join("redir.txt");
         let path = tmp.display().to_string();
         let out = run(&mut st, &format!("echo hello > {path}")).unwrap();
         assert!(out.contains("→"), "редирект должен отчитаться: {out}");
         let content = std::fs::read_to_string(&tmp).unwrap();
         assert_eq!(content.trim(), "hello");
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1402,17 +1615,34 @@ mod tests {
     #[test]
     fn cd_and_pwd() {
         let mut st = state();
+        // навигация ВНУТРИ workspace — свободна (включая возврат к корню)
+        let ws = std::env::temp_dir().join(format!("poler-gw-cd-{}", std::process::id()));
+        let sub = ws.join("tmp");
+        std::fs::create_dir_all(&sub).unwrap();
+        st.cwd = ws.clone();
+        st.ws_root = ws.clone();
+        run(&mut st, "cd tmp").unwrap();
+        let out = run(&mut st, "pwd").unwrap();
+        assert_eq!(out.trim(), sub.display().to_string());
+        run(&mut st, "cd ..").unwrap();
+        let out = run(&mut st, "pwd").unwrap();
+        assert_eq!(out.trim(), ws.display().to_string());
+        // v0.24.0: cd НАРУЖУ границы — Confirm; в неинтерактиве отказ
+        let out = run(&mut st, "cd /tmp").unwrap();
+        assert!(out.contains("не подтверждено"), "выход из workspace без подтверждения: {out}");
+        let out = run(&mut st, "pwd").unwrap();
+        assert_eq!(out.trim(), ws.display().to_string(), "корень не должен уйти");
+        // auto_yes — владельцем разрешено (граница переносится)
+        st.auto_yes = true;
         run(&mut st, "cd /tmp").unwrap();
         let out = run(&mut st, "pwd").unwrap();
         assert_eq!(out.trim(), "/tmp");
-        // относительный cd
-        run(&mut st, "cd /").unwrap();
-        run(&mut st, "cd tmp").unwrap();
-        let out = run(&mut st, "pwd").unwrap();
-        assert_eq!(out.trim(), "/tmp");
+        assert_eq!(st.ws_root.display().to_string(), "/tmp", "граница следует за подтверждённым выходом");
         // cd в несуществующий — ошибка
+        st.auto_yes = false;
         let out = run(&mut st, "cd /no/such/dir/xyz");
         assert!(out.unwrap().contains("⚡"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1572,6 +1802,8 @@ mod tests {
         assert!(out.contains("workspace:"), "отчёт без PATH: {out}");
         let tmp = std::env::temp_dir().join(format!("poler-ws-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
+        // v0.24.0: смена корня ЗА пределы — Confirm; auto_yes = согласие владельца
+        st.auto_yes = true;
         let out = run(&mut st, &format!("workspace {}", tmp.display())).unwrap();
         assert!(out.contains("workspace →"), "переключение: {out}");
         assert_eq!(st.cwd, tmp.canonicalize().unwrap());
@@ -1582,9 +1814,24 @@ mod tests {
     }
 
     #[test]
+    fn workspace_escape_refused_noninteractive() {
+        let mut st = state();
+        let tmp = std::env::temp_dir().join(format!("poler-ws-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // пайп-агент не может уводить границу workspace
+        let out = run(&mut st, &format!("workspace {}", tmp.display())).unwrap();
+        assert!(
+            out.contains("не подтверждено"),
+            "выход из workspace в неинтерактиве — отказ: {out}"
+        );
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
     fn workspace_syncs_process_cwd_when_enabled() {
         let mut st = state();
         st.sync_cwd = true;
+        st.auto_yes = true; // v0.24.0: смена корня за пределы — с согласия
         let tmp = std::env::temp_dir().join(format!("poler-ws-sync-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let _ = run(&mut st, &format!("workspace {}", tmp.display())).unwrap();
@@ -1708,5 +1955,137 @@ mod tests {
         assert!(h.contains("WORKSPACE"));
         assert!(h.contains("grant sudo"));
         assert!(h.contains("set sandbox"));
+    }
+
+    // ---------- v0.24.0: Workspace Boundary Guard ----------
+
+    /// изолированный workspace для boundary-тестов
+    fn boundary_ws(tag: &str) -> (GatewayState, PathBuf) {
+        let ws = std::env::temp_dir().join(format!("poler-gw-bnd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("notes.txt"), "inside\n").unwrap();
+        let mut st = state();
+        st.cwd = ws.clone();
+        st.ws_root = ws.clone();
+        (st, ws)
+    }
+
+    #[test]
+    fn boundary_outside_read_denied_noninteractive() {
+        let (mut st, ws) = boundary_ws("read");
+        // живой кейс из эксплуатации: агент читает домашний каталог
+        let out = run(&mut st, "ls /home").unwrap();
+        assert!(out.contains("не подтверждено"), "вне workspace = Confirm: {out}");
+        let out = run(&mut st, "cat /etc/passwd").unwrap();
+        assert!(out.contains("не подтверждено"), "/etc/passwd = Confirm: {out}");
+        // внутри — свободно
+        let out = run(&mut st, "cat notes.txt").unwrap();
+        assert!(!out.contains("⛔"), "внутри workspace свободно: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_outside_write_via_redirect_denied() {
+        let (mut st, ws) = boundary_ws("redir");
+        let out = run(&mut st, "echo x > /tmp/poler-bnd-test.txt").unwrap();
+        assert!(
+            out.contains("не подтверждено"),
+            "запись в /tmp вне workspace = Confirm: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_autoyes_and_allowlist() {
+        let (mut st, ws) = boundary_ws("allow");
+        // auto_yes пропускает boundary-Confirm
+        st.auto_yes = true;
+        let out = run(&mut st, "cat /etc/passwd").unwrap();
+        assert!(!out.contains("⛔"), "auto_yes: {out}");
+        st.auto_yes = false;
+        // allowlist: путь разрешён — без вопросов (интерактив-флаг имитируем)
+        st.ws_allow.push(PathBuf::from("/etc/hosts"));
+        let out = exec_line(&mut st, "cat /etc/hosts", true);
+        let GatewayResult::Done(out) = out else { panic!("done") };
+        assert!(!out.contains("⛔"), "allowlist /etc/hosts: {out}");
+        // но БЛИЖНИЙ /etc/passwd — всё ещё Confirm
+        let out = run(&mut st, "cat /etc/passwd").unwrap();
+        assert!(out.contains("не подтверждено"), "соседний путь не разрешён: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn allow_command_gates() {
+        let (mut st, ws) = boundary_ws("allowcmd");
+        // неинтерактив: расширение границы запрещено (пайп-агент)
+        let out = run(&mut st, "allow /etc").unwrap();
+        assert!(out.contains("⛔"), "allow только в интерактиве: {out}");
+        assert!(st.ws_allow.is_empty());
+        // интерактив: добавление
+        let out = exec_line(&mut st, "allow /etc", true);
+        let GatewayResult::Done(out) = out else { panic!("done") };
+        assert!(out.contains("разрешено на сессию"), "allow: {out}");
+        assert_eq!(st.ws_allow.len(), 1);
+        // список и сброс
+        let out = run(&mut st, "allow").unwrap();
+        assert!(out.contains("/etc"), "список allowlist: {out}");
+        let out = run(&mut st, "allow clear").unwrap();
+        assert!(out.contains("сброшен"), "clear: {out}");
+        assert!(st.ws_allow.is_empty());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_engine_grep_paths_checked() {
+        let (mut st, ws) = boundary_ws("grep");
+        // движковый grep с путём вне workspace — тоже Confirm
+        let out = run(&mut st, "grep root /etc/passwd").unwrap();
+        assert!(out.contains("не подтверждено"), "engine grep вне границы: {out}");
+        // внутри — не граница (файл ищется от process-cwd, но ⛔ нет)
+        let out = run(&mut st, "grep inside notes.txt").unwrap();
+        assert!(
+            !out.contains("⛔") && !out.contains("не подтверждено"),
+            "engine grep внутри — без границы: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_shell_c_payload_recursed() {
+        let (mut st, ws) = boundary_ws("shc");
+        // payload c кавычками и абсолютным путём — рекурсивный разбор
+        let out = run(&mut st, "bash -c \"cat '/etc/passwd'\"").unwrap();
+        assert!(out.contains("не подтверждено"), "bash -c с /etc: {out}");
+        // &&-цепочка: деструктивная часть ловится как Block
+        let out = run(&mut st, "bash -c \"ls && rm -rf /usr\"").unwrap();
+        assert!(out.contains("блокировка"), "bash -c с rm -rf /usr: {out}");
+        // подстановка $()
+        let out = run(&mut st, "bash -c \"echo $(cat /etc/shadow)\"").unwrap();
+        assert!(
+            out.contains("не подтверждено") || out.contains("блокировка"),
+            "подстановка $(cat /etc/shadow): {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_safe_devices_and_urls_pass() {
+        let (mut st, ws) = boundary_ws("dev");
+        let out = run(&mut st, "host echo x 2>/dev/null").unwrap();
+        assert!(!out.contains("⛔"), "2>/dev/null — не граница: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_agent_pty_paths_checked() {
+        let (mut st, ws) = boundary_ws("pty");
+        // vim с внешним путём: PTY судится с границей
+        let out = run(&mut st, "pty vim /etc/hosts").unwrap();
+        assert!(
+            out.contains("не подтверждено"),
+            "pty vim /etc/hosts = Confirm (неинтерактив — отказ): {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

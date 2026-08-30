@@ -12,10 +12,15 @@
 //! максимуму поверхности.
 
 use poler_engine::gateway::pipeline::parse_line;
-use poler_engine::gateway::sandbox::{judge_pipeline, Policy};
+use poler_engine::gateway::sandbox::{judge_pipeline_ws, Policy, WsGuard};
 use std::io::BufRead;
 
 fn main() {
+    // v0.24.0: POLER_JUDGE_WS — корень workspace для аудита границы
+    // (без переменной судится без границы — legacy-режим).
+    let ws = std::env::var("POLER_JUDGE_WS")
+        .ok()
+        .map(|p| WsGuard::new(std::path::Path::new(&p)));
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = match line {
@@ -30,7 +35,7 @@ fn main() {
             Err(e) => format!("PARSE-ERR\t{e}"),
             Ok(p) => {
                 let host: Vec<usize> = (0..p.segments.len()).collect();
-                match judge_pipeline(&p, &host) {
+                match judge_pipeline_ws(&p, &host, ws.as_ref()) {
                     Policy::Allow => "ALLOW\t—".to_string(),
                     Policy::Confirm(w) => format!("CONFIRM\t{w}"),
                     Policy::Block(w) => format!("BLOCK\t{w}"),

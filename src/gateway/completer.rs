@@ -172,6 +172,8 @@ fn engine_command_list() -> &'static Vec<String> {
             "weblens", "license", "cd", "pwd", "clear", "host", "help", "version", "quit",
             // v0.23.0
             "workspace", "grant", "pty",
+            // v0.24.0
+            "allow",
         ]
         .iter()
         .map(|s| s.to_string())
