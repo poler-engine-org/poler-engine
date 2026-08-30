@@ -175,6 +175,8 @@ impl McpServer {
             "poler_crawl" => self.tool_crawl(&args),
             "poler_fetch" => self.tool_fetch(&args),
             "poler_search" => self.tool_local_search(&args),
+            "poler_grep" => self.tool_grep(&args),
+            "poler_chunk" => self.tool_chunk(&args),
             "poler_gmail" => self.tool_gmail(&args),
             "poler_drive" => self.tool_drive(&args),
             "poler_nlm" => self.tool_nlm(&args),
@@ -406,6 +408,103 @@ impl McpServer {
         }
         out.push_str("\n(полные сцены/K-hop граф — CLI: poler-engine <path> -q «…» --format ai-json)");
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // poler_grep: точный поиск в семантике grep (слой 0 Native Retrieval)
+    // -----------------------------------------------------------------
+    fn tool_grep(&self, args: &Value) -> Result<String, String> {
+        use crate::retrieval as nr;
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент pattern обязателен")?
+            .to_string();
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let mode = if args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false) {
+            nr::GrepMode::Regex
+        } else {
+            nr::GrepMode::Literal
+        };
+        let output = match args.get("output").and_then(|v| v.as_str()).unwrap_or("content") {
+            "count" => nr::GrepOutput::Count,
+            "list" => nr::GrepOutput::ListMatching,
+            "list_nonmatching" => nr::GrepOutput::ListNonMatching,
+            _ => nr::GrepOutput::Content,
+        };
+        let config = nr::GrepConfig {
+            pattern,
+            mode,
+            case_insensitive: args
+                .get("ignore_case")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            before: args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            after: args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            max_count: args
+                .get("max_count")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            output,
+            include_hidden: false,
+            respect_ignore: true,
+        };
+        let report = nr::grep_run(&[PathBuf::from(path)], &config)
+            .map_err(|e| format!("grep: {e}"))?;
+        if args.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("сериализация: {e}"));
+        }
+        let mut out = nr::render_text(&report, false);
+        out.push_str(&format!(
+            "\n[poler-grep] файлов: {}, с совпадениями: {}, строк: {}, время: {} мс\n",
+            report.stats.files_scanned,
+            report.stats.files_matched,
+            report.stats.lines_matched,
+            report.stats.elapsed_ms
+        ));
+        if !report.stats.errors.is_empty() {
+            out.push_str(&format!("\nошибки обхода: {}\n", report.stats.errors.len()));
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // poler_chunk: RAG-нарезка документа на чанки с якорями (слой B)
+    // -----------------------------------------------------------------
+    fn tool_chunk(&self, args: &Value) -> Result<String, String> {
+        use crate::retrieval as nr;
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент path (файл) обязателен")?;
+        let target = PathBuf::from(path);
+        if !target.is_file() {
+            return Err(format!("не файл или не найден: {path}"));
+        }
+        let text = std::fs::read_to_string(&target)
+            .map_err(|e| format!("прочитать {path}: {e}"))?;
+        let config = nr::ChunkConfig {
+            target_tokens: args
+                .get("target_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(nr::DEFAULT_TARGET_TOKENS as u64) as usize,
+            overlap_tokens: args
+                .get("overlap_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(nr::DEFAULT_OVERLAP_TOKENS as u64) as usize,
+            ..Default::default()
+        };
+        let format = nr::ChunkFormat::detect(&target);
+        let report = nr::chunk_document(&text, format, &config);
+        if args.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("сериализация: {e}"));
+        }
+        Ok(nr::render_chunks_text(&report, path))
     }
 
     // -----------------------------------------------------------------
@@ -701,6 +800,51 @@ K-hop связи сущностей. Работает и по веб-кэшу po
                     "top": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20}
                 },
                 "required": ["path", "query"]
+            }
+        }),
+        json!({
+            "name": "poler_grep",
+            "description": "Точный поиск в семантике grep: ВСЕ совпадения по файлам, \
+без индекса, гарантия полноты («ноль значит ноль»). Обход с .gitignore (ripgrep-класс), \
+контекст -A/-B, счётчики, exit-статус в тексте. Замена внешнего grep/ripgrep: \
+используй для точных строк, имён функций, конфигов — когда нужна ПОЛНОТА, \
+а не релевантность (для релевантности бери poler_search/poler_web_search). \
+С json=true возвращает машинный отчёт: byte_offset строк, байтовые диапазоны \
+вхождений, статистика — для верификации и навигации по файлу.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Искомая строка или regex (см. флаг regex)"},
+                    "path": {"type": "string", "default": ".", "description": "Файл или корень обхода"},
+                    "regex": {"type": "boolean", "default": false, "description": "PATTERN — регулярное выражение (grep -E)"},
+                    "ignore_case": {"type": "boolean", "default": false, "description": "Регистронезависимость, Unicode-fold"},
+                    "before": {"type": "integer", "default": 0, "minimum": 0, "maximum": 50, "description": "Строк контекста ДО (grep -B)"},
+                    "after": {"type": "integer", "default": 0, "minimum": 0, "maximum": 50, "description": "Строк контекста ПОСЛЕ (grep -A)"},
+                    "max_count": {"type": "integer", "minimum": 1, "description": "Останов после N совпавших строк на файл (grep -m)"},
+                    "output": {"type": "string", "enum": ["content", "count", "list", "list_nonmatching"], "default": "content"},
+                    "json": {"type": "boolean", "default": false, "description": "Машинно-читаемый отчёт вместо текста"}
+                },
+                "required": ["pattern"]
+            }
+        }),
+        json!({
+            "name": "poler_chunk",
+            "description": "RAG-нарезка документа на чанки с якорями: passage-уровень \
+вместо чтения файла целиком. Возвращает фрагменты с byte range, номерами строк, \
+breadcrumb заголовков и числом токенов. Формат определяется автоматически: \
+markdown (секции заголовков, code-fence не режется), код (границы строк, \
+никогда внутри строки), текст (абзацы → предложения → слова). Замена внешнего \
+RAG-конвейера chunking→retrieve: нарежь документ, прочитай релевантные куски \
+(найди их через poler_search/poler_grep), цитируй по byte range.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Файл документа (md/txt/код)"},
+                    "target_tokens": {"type": "integer", "default": 384, "minimum": 16, "maximum": 8192, "description": "Целевой размер чанка в токенах POLER"},
+                    "overlap_tokens": {"type": "integer", "default": 48, "minimum": 0, "maximum": 2048, "description": "Перекрытие соседних чанков"},
+                    "json": {"type": "boolean", "default": false, "description": "Машинно-читаемый отчёт вместо текста"}
+                },
+                "required": ["path"]
             }
         }),
         json!({

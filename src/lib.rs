@@ -56,6 +56,7 @@ pub mod parser;
 pub mod poler;
 pub mod psi;
 pub mod resonance;
+pub mod retrieval;
 pub mod shell;
 pub mod sources;
 pub mod streaming;

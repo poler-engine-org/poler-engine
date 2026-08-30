@@ -14,6 +14,74 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.20.0: Native Retrieval — grep-режим и RAG-чанки в одном бинарнике
+
+Движок — инструмент ИИ-агента, у которого всё под капотом. До v0.20.0
+агенту не хватало двух внешних инструментов: grep (полнота, без индекса)
+и RAG-конвейера нарезки (passage-уровень вместо целых документов).
+Оба вошли в бинарник — анализ эталонов (GNU grep, benbrandt/text-splitter,
+LangChain) и gap-таблица: `docs/native-retrieval-analysis.md`.
+**Ни одной новой зависимости** — `aho-corasick`, `regex`, `ignore`,
+`memchr`, `rayon` уже были в дереве.
+
+### Слой 0: точный поиск (`--grep`, семантика GNU grep)
+
+```bash
+poler-engine --grep "weblens_token" src/ --grep-before 1 --grep-after 1
+poler-engine --grep "fn [a-z_]+" src/ --grep-regex          # grep -E
+poler-engine --grep "токен" . --grep-i                       # Unicode-fold
+poler-engine --grep TODO . --grep-count                      # grep -c
+poler-engine --grep panic . --grep-list                      # grep -l
+poler-engine --grep secret . --grep-json | jq                # машинный отчёт
+```
+
+- **Полнота как гарантия**: все совпадения, «ноль значит ноль» —
+  живой прогон против GNU grep на `src/`: 1669 = 1669 строк, включая
+  кириллицу; скорость release-сборки — 23 мс против 18 мс у GNU grep
+  (разница — цена rayon-пула и полного отчёта в памяти).
+- Обход ripgrep-класса: .gitignore/.ignore уважаются, скрытые — по
+  `--grep-hidden`, симлинки не преследуются.
+- Контекст `-A/-B` с групповым разделителем `--` и слиянием слипшихся
+  групп — как у GNU grep.
+- Exit-коды для скриптов: 0 найдено / 1 пусто / 2 ошибка.
+- `--grep-json`: byte_offset строк, байтовые диапазоны вхождений,
+  статистика — агент верифицирует совпадения по диапазонам.
+
+### Слой B: RAG-чанки (`--chunk`, passage-уровень)
+
+```bash
+poler-engine --chunk FUTURE_ROADMAP.md                    # 25 чанков, breadcrumbs
+poler-engine --chunk book.md --chunk-size 512 --chunk-overlap 64
+poler-engine --chunk lib.rs --chunk-json | jq '.chunks[0]'
+```
+
+- Иерархия уровней (выше = целостнее): секция заголовка → абзац →
+  предложение → слово; для кода — блок между пустыми строками → строка
+  (никогда внутри строки); code-fence в markdown не режется.
+- Вместимость в токенах POLER (целевые 384, перекрытие 48), слияние
+  соседей до capacity, хвост меньше минимума приклеивается.
+- **Якоря для агента**: `text == original[byte_start..byte_end]` — точный
+  срез исходника; номера строк; breadcrumb заголовков; число токенов.
+
+### MCP-инструменты (9 теперь)
+
+`poler_grep` (полнота + JSON-отчёт) и `poler_chunk` (нарезка с якорями)
+добавлены к `poler_search`/`poler_web_search`/`poler_crawl`/`poler_fetch`/
+`poler_gmail`/`poler_drive`/`poler_nlm`. Рабочий цикл агента: нарежь
+документ `poler_chunk` → найди релевантные куски `poler_search`/
+`poler_grep` → процитируй по byte range.
+
+### Артефакты
+
+- `src/retrieval/{mod,grep,chunk}.rs` — 3 файла, ~1700 строк
+  (+43 unit-теста: контекст-группировка, exit-коды, бинарность,
+  gitignore, unicode-офсеты, breadcrumbs, инвариант точного среза,
+  code-fence, перекрытие).
+- `docs/native-retrieval-analysis.md` — gap-таблицы «GNU grep × RAG ×
+  poler-engine» с решениями по каждой функции.
+
+---
+
 ## v0.19.0: Browser Surface — 4 фикса краулера, --browser-index и WebLens (MV3)
 
 Фаза Dogfooding вскрыла UX-болячки веб-конвейера (живой аудит в
@@ -615,9 +683,9 @@ VCS-страницы в `web-index.db` — это обычные `WebDoc` со �
   Пока: `git clone URL path` в соседнем окне, затем `poler> gix log path`.
 - Git LFS pointer-resolve (`.gitattributes` + `version https://git-lfs/...`)
   — v0.17.0 (см. FUTURE_ROADMAP.md §6.3, шаг 3).
-- Hugging Face Hub (model cards + datasets) — v0.18.0 (`hf://` URL-схема).
-- DVC + Oxen.ai (data-versioning pointer files) — v0.19.0.
-- HugeSCM/Lit/ParamLake — v0.20.0+.
+- Hugging Face Hub (model cards + datasets) — v0.21.0 (`hf://` URL-схема).
+- DVC + Oxen.ai (data-versioning pointer files) — v0.22.0.
+- HugeSCM/Lit/ParamLake — v0.23.0+.
 
 ### Артефакты
 

@@ -135,6 +135,73 @@ struct Cli {
     #[arg(long = "web-lens-install", conflicts_with_all = ["web_lens", "mcp_http", "mcp", "shell", "tui", "crawl", "web_search", "browser_index"])]
     web_lens_install: bool,
 
+    // ---------- Native Retrieval: grep-режим + RAG-чанки (v0.20.0) ----------
+
+    /// ТОЧНЫЙ ПОИСК (grep-режим): ВСЕ совпадения PATTERN по файлам
+    /// (PATH или текущий каталог), без индекса, гарантия полноты.
+    /// Exit-коды как у grep: 0 — найдено, 1 — пусто, 2 — ошибка.
+    #[arg(long = "grep", value_name = "PATTERN", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens", "web_lens_install", "chunk"])]
+    grep: Option<String>,
+
+    /// Регулярное выражение вместо фиксированной строки (grep -E).
+    #[arg(long = "grep-regex", requires = "grep")]
+    grep_regex: bool,
+
+    /// Регистронезависимость, Unicode-fold (grep -i).
+    #[arg(long = "grep-i", requires = "grep")]
+    grep_ignore_case: bool,
+
+    /// Строк контекста ПОСЛЕ совпадения (grep -A NUM).
+    #[arg(long = "grep-after", requires = "grep", default_value_t = 0)]
+    grep_after: usize,
+
+    /// Строк контекста ДО совпадения (grep -B NUM).
+    #[arg(long = "grep-before", requires = "grep", default_value_t = 0)]
+    grep_before: usize,
+
+    /// Только счётчик совпадений на файл (grep -c).
+    #[arg(long = "grep-count", requires = "grep")]
+    grep_count: bool,
+
+    /// Только пути файлов с совпадениями (grep -l).
+    #[arg(long = "grep-list", requires = "grep")]
+    grep_list: bool,
+
+    /// Только пути файлов БЕЗ совпадений (grep -L).
+    #[arg(long = "grep-list-nonmatching", requires = "grep")]
+    grep_list_nonmatching: bool,
+
+    /// Останов после N совпавших строк на файл (grep -m NUM).
+    #[arg(long = "grep-max-count", value_name = "NUM", requires = "grep")]
+    grep_max_count: Option<usize>,
+
+    /// Включить скрытые файлы (по умолчанию пропускаются, как ripgrep).
+    #[arg(long = "grep-hidden", requires = "grep")]
+    grep_hidden: bool,
+
+    /// Машинно-читаемый JSON вместо текста — byte offsets, диапазоны
+    /// вхождений, статистика (для ИИ-агента).
+    #[arg(long = "grep-json", requires = "grep")]
+    grep_json: bool,
+
+    /// RAG-ЧАНКИ: нарезать документ PATH на фрагменты с якорями
+    /// (byte range, номера строк, breadcrumb заголовков) —
+    /// passage-уровень для агента вместо чтения документа целиком.
+    #[arg(long = "chunk", requires = "path", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens", "web_lens_install", "grep"])]
+    chunk: bool,
+
+    /// Целевой размер чанка в токенах POLER [default: 384].
+    #[arg(long = "chunk-size", requires = "chunk", default_value_t = poler_engine::retrieval::DEFAULT_TARGET_TOKENS)]
+    chunk_size: usize,
+
+    /// Перекрытие соседних чанков в токенах [default: 48].
+    #[arg(long = "chunk-overlap", requires = "chunk", default_value_t = poler_engine::retrieval::DEFAULT_OVERLAP_TOKENS)]
+    chunk_overlap: usize,
+
+    /// Машинно-читаемый JSON вместо текста (для ИИ-агента).
+    #[arg(long = "chunk-json", requires = "chunk")]
+    chunk_json: bool,
+
     /// MCP-СЕРВЕР (Model Context Protocol): poler-engine как нативный
     /// инструмент LLM-агентов поверх stdio JSON-RPC.
     /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search /
@@ -1015,6 +1082,99 @@ fn run(cli: Cli) -> ExitCode {
             .unwrap_or_else(poler_engine::mcp_http::generate_token);
         let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db);
         return ExitCode::from(code as u8);
+    }
+
+    // ---------- v0.20.0: Native Retrieval — grep-режим (слой 0) ----------
+    if let Some(pattern) = cli.grep.clone() {
+        use poler_engine::retrieval as nr;
+        let output = if cli.grep_count {
+            nr::GrepOutput::Count
+        } else if cli.grep_list {
+            nr::GrepOutput::ListMatching
+        } else if cli.grep_list_nonmatching {
+            nr::GrepOutput::ListNonMatching
+        } else {
+            nr::GrepOutput::Content
+        };
+        let config = nr::GrepConfig {
+            pattern,
+            mode: if cli.grep_regex { nr::GrepMode::Regex } else { nr::GrepMode::Literal },
+            case_insensitive: cli.grep_ignore_case,
+            before: cli.grep_before,
+            after: cli.grep_after,
+            max_count: cli.grep_max_count,
+            output,
+            include_hidden: cli.grep_hidden,
+            respect_ignore: true,
+        };
+        // Корни поиска: позиционный PATH (может повторяться неявно —
+        // несколько аргументов clap не поддерживает, но PATH может быть
+        // каталогом) либо текущий каталог.
+        let roots: Vec<std::path::PathBuf> = match cli.path.clone() {
+            Some(p) => vec![p],
+            None => vec![std::path::PathBuf::from(".")],
+        };
+        match nr::grep_run(&roots, &config) {
+            Ok(report) => {
+                if cli.grep_json {
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(json) => println!("{json}"),
+                        Err(e) => {
+                            eprintln!("poler-grep: сериализация JSON: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    print!("{}", nr::render_text(&report, nr::stdout_is_tty()));
+                }
+                for err in &report.stats.errors {
+                    eprintln!("poler-grep: {err}");
+                }
+                // Ошибки обхода не меняют код (как у grep: trouble=2
+                // только для фатальных). Совпадения решают 0/1.
+                return ExitCode::from(report.exit_code() as u8);
+            }
+            Err(e) => {
+                eprintln!("poler-grep: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // ---------- v0.20.0: Native Retrieval — RAG-чанки (слой B) ----------
+    if cli.chunk {
+        use poler_engine::retrieval as nr;
+        let path = cli.path.clone().unwrap_or_default();
+        if !path.is_file() {
+            eprintln!("poler-chunk: путь не файл (или не найден): {}", path.display());
+            return ExitCode::from(2);
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("poler-chunk: прочитать {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        };
+        let config = nr::ChunkConfig {
+            target_tokens: cli.chunk_size,
+            overlap_tokens: cli.chunk_overlap,
+            ..Default::default()
+        };
+        let format = nr::ChunkFormat::detect(&path);
+        let report = nr::chunk_document(&text, format, &config);
+        if cli.chunk_json {
+            match serde_json::to_string_pretty(&report) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("poler-chunk: сериализация JSON: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            print!("{}", nr::render_chunks_text(&report, &path.display().to_string()));
+        }
+        return ExitCode::SUCCESS;
     }
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------

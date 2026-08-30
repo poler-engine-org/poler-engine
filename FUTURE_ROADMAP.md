@@ -217,11 +217,15 @@ API**, не забивая локальный диск сотнями гигаб
    человекочитаемые robots-сообщения, самовосстановление CDP),
    `--browser-index`, WebLens — расширение MV3, вшитое в бинарник
    (§8). ✅ shipped (2026-08-30)
-7. **v0.20.0 — Hugging Face Hub**: model cards + datasets API → влитие в
+7. **v0.20.0 — Native Retrieval**: grep-режим (слой 0: полнота, без
+   индекса, exit-коды GNU grep) + RAG-чанкер (слой B: passage-уровень
+   с якорями) + MCP-инструменты poler_grep/poler_chunk. Анализ трёх
+   библиотек — `docs/native-retrieval-analysis.md`. ✅ shipped (2026-08-30)
+8. **v0.21.0 — Hugging Face Hub**: model cards + datasets API → влитие в
    web-index.db как `hf://` URL-схема.
-8. **v0.21.0 — DVC + Oxen**: data-versioning pointer files, remote storage
+9. **v0.22.0 — DVC + Oxen**: data-versioning pointer files, remote storage
    resolve.
-9. **v0.22.0+ — HugeSCM/Lit/ParamLake**: наuje адаптеры для China-scale
+10. **v0.23.0+ — HugeSCM/Lit/ParamLake**: адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+

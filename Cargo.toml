@@ -1,6 +1,6 @@
 [package]
 name = "poler-engine"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -65,6 +65,9 @@ globset = "0.4"
 # v0.18.0: License Gate — офлайн-проверка ed25519-подписей лицензий PO1
 # (приватный мастер-ключ — офлайн у владельца, license-tool/, в поставку не входит)
 ed25519-dalek = "2"
+# v0.20.0: Native Retrieval — grep-режим и RAG-чанки. НОВЫХ зависимостей нет:
+# aho-corasick/regex/memchr/ignore/rayon уже стояли в дереве (grep-слой
+# собирается из готовых блоков — см. docs/native-retrieval-analysis.md)
 
 
 [dev-dependencies]
