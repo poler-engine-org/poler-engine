@@ -19,14 +19,25 @@ fn free_port() -> u16 {
 
 /// Прогнать команды в живом `poler-engine --gateway`, вернуть весь stdout.
 fn gateway_session(home: &std::path::Path, commands: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_poler-engine"))
-        .arg("--gateway")
+    gateway_session_env(home, commands, &[])
+}
+
+/// То же + дополнительное окружение (POLER_BOX_DOCKER и т.п.).
+fn gateway_session_env(
+    home: &std::path::Path,
+    commands: &str,
+    extra_env: &[(&str, &str)],
+) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_poler-engine"));
+    cmd.arg("--gateway")
         .env("HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn poler-engine --gateway");
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn poler-engine --gateway");
     // НЕТ POLER_STATE_DIR → состояние в tmp-home (изоляция)
     child
         .stdin
@@ -285,4 +296,76 @@ fn gateway_service_lifecycle_mcp() {
     }
 
     let _ = std::fs::remove_dir_all(&state);
+}
+
+// ---------------------------------------------------------------------------
+// 4. v0.25.0: Container Jail (box) в живом REPL
+// ---------------------------------------------------------------------------
+
+/// Честность без docker: статус/подъём/подсказки не падают, jail не поднимается.
+#[test]
+fn gateway_repl_v025_box_no_docker() {
+    let home = std::env::temp_dir().join(format!("poler-gw-box-it-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let script = "box status\n\
+                  box on\n\
+                  box on net=host\n\
+                  box zzz\n\
+                  version\n\
+                  quit\n";
+    let out = gateway_session_env(&home, script, &[("POLER_BOX_DOCKER", "/bin/false")]);
+
+    // статус: docker-строка + ожидаемое имя контейнера
+    assert!(out.contains("Container Jail ВЫКЛ"), "нет статуса ВЫКЛ: {out}");
+    assert!(out.contains("docker"), "нет строки docker: {out}");
+    assert!(out.contains("poler-box-"), "нет имени контейнера: {out}");
+    // подъём без docker — честная ошибка
+    assert!(
+        out.contains("docker недоступен"),
+        "box on без docker должен честно отказаться: {out}"
+    );
+    // net=host запрещён ещё на парсинге
+    assert!(out.contains("net=host"), "net=host должен быть отвергнут: {out}");
+    // неизвестная подкоманда — usage
+    assert!(out.contains("box on"), "usage подсказки нет: {out}");
+    // версия упоминает jail
+    assert!(out.contains("container-jail"), "версия без jail: {out}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// LIVE (POLER_BOX_LIVE=1 + настоящий docker): полный lifecycle jail —
+/// подъём, exec-плоскость внутри контейнера (маркер /.dockerenv), разбор.
+/// Игнорируется по умолчанию: тянет образ и трогает docker-демон машины.
+#[test]
+#[ignore = "live: требует POLER_BOX_LIVE=1 и рабочий docker-демон"]
+fn gateway_box_live_docker_lifecycle() {
+    if std::env::var("POLER_BOX_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("skip: POLER_BOX_LIVE!=1");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("poler-gw-box-live-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let script = "box on image=debian:bookworm-slim\n\
+                  box status\n\
+                  !ls /.dockerenv\n\
+                  !cat /etc/os-release\n\
+                  box off\n\
+                  quit\n";
+    let out = gateway_session(&home, script);
+
+    assert!(out.contains("Container Jail ВКЛ"), "jail не поднялся: {out}");
+    // /.dockerenv существует ТОЛЬКО внутри контейнера — доказательство
+    // того, что exec-плоскость исполнилась ВНУТРИ jail
+    assert!(
+        out.contains("/.dockerenv") && !out.contains("cannot access"),
+        "хост-команды не в jail (нет /.dockerenv): {out}"
+    );
+    // образ контейнера, а не хост-система
+    assert!(out.contains("debian"), "нет признаков образа debian: {out}");
+    assert!(out.contains("Container Jail ВЫКЛ"), "jail не разобран: {out}");
+
+    let _ = std::fs::remove_dir_all(&home);
 }

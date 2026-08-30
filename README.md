@@ -14,6 +14,53 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.25.0: Container Jail — жёсткая Docker-изоляция агентов (`box`)
+
+Живой кейс из эксплуатации v0.23/v0.24: агент (`agy`) в PTY-контуре
+дергает свой Bash-tool напрямую на хосте. PATH-shim медиация (v0.24)
+перехватывает вызовы через PATH/$SHELL, но хардкод `/bin/sh` и прямой
+execve не накрывает — userspace-фильтр в принципе не даёт гарантий.
+v0.25.0 решает класс **физически**: `box on` поднимает Docker-контейнер,
+и контуры 2/3 (host-команды и PTY-агенты) исполняются ВНУТРИ него —
+агент заперт, хост виден только как `/workspace` и `/home/poler`.
+
+### Модель изоляции
+
+- монтировки: `/workspace` ← корень проекта (rw; `wsro=1` — read-only) и
+  `/home/poler` ← персистентный home агентов (конфиги/токены переживают
+  `box off/on`); больше с хоста не смонтировано НИЧЕГО;
+- hardening: `--cap-drop ALL`, `no-new-privileges`, `--init`, лимиты
+  `--memory`/`--pids-limit`, `--stop-timeout 2`; docker-сокет не
+  пробрасывается — агент внутри не управляет демоном;
+- юзер по умолчанию — uid:gid владельца (файлы остаются его), опция
+  `user=root` — root только ВНУТРИ контейнера; сеть `bridge|none`
+  (`net=host` отвергается); образ по умолчанию `debian:bookworm-slim`,
+  для агентов — свой (`box on image=node:22-slim`);
+- вердикты сохраняются: деструктив — Block всегда; логическую границу
+  workspace для exec-плоскости заменяет контейнер; redirect-цели и
+  движковые файл-команды судятся с границей (они физически на хосте);
+  управление docker-демоном из шлюза при активном jail — Confirm;
+  при `box on` PATH-shim медиация отключается — контейнер заменяет её.
+
+### Использование
+
+```
+poler-engine --gateway
+poler ~/proj $ box on image=node:22-slim     # поднять jail (pull до 600 c)
+poler ~/proj $ agy                            # агент ВНУТРИ контейнера
+poler ~/proj $ box shell                      # шелл внутри jail
+poler ~/proj $ box status                     # контейнер/образ/монтировки
+poler ~/proj $ box off                        # разобрать (данные на хосте)
+```
+
+Без docker-демона `box on` честно отказывает — шлюз работает в режиме
+v0.24 (workspace-guard + медиация). Тесты: 957 (+26 к v0.24.0), включая
+инвариант «Block не зависит от jail», гейт docker-демона и live-lifecycle
+(`POLER_BOX_LIVE=1`). Adversarial-гейты: 139/139 + 79/79 + 14/14 + 8/8
+(новая волна 10 — box-честность).
+
+---
+
 ## v0.24.0: Workspace Boundary Guard & Mediated Agent Mode
 
 Живой кейс из эксплуатации v0.23.0: владелец запустил `agy` внутри

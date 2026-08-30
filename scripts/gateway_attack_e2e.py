@@ -13,6 +13,8 @@ judge → exec. Каждая строка помечается ожидание�
 
 v0.24.0: волна 8 — граница workspace (доступ вне корня = DENY в скрипте);
 волна 9 — батарея PATH-shim медиации (прямые вызовы __gateway-shim).
+v0.25.0: волна 10 — Container Jail (box): честность без docker-демона
+(POLER_BOX_DOCKER=/bin/false — без побочных эффектов на машину).
 """
 import os
 import subprocess
@@ -192,8 +194,49 @@ def main():
     print(f"легитимные файлы арены целы: {'✅' if arena_ok else '‼️'}")
 
     shim_ok = shim_battery(arena)
+    box_ok = box_battery(arena)
 
-    sys.exit(0 if failed == 0 and intact and shim_ok else 1)
+    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok else 1)
+
+
+def box_battery(arena):
+    """Волна 10 (v0.25.0): Container Jail — честность в отсутствие docker.
+
+    POLER_BOX_DOCKER=/bin/false — «сломанный» docker-клиент: ни демона,
+    ни побочных эффектов. Проверяем, что box-подсистема не падает,
+    честно отказывает и не поднимает jail в принципе.
+    """
+    print("\n════════ ВОЛНА 10: Container Jail без docker (честность) ════════")
+    cmds = "box status\nbox on\nbox on net=host\nbox on pids=9\nbox zzz\nbox off\nversion\nquit\n"
+    r = subprocess.run(
+        [BIN, "--gateway"],
+        input=cmds,
+        capture_output=True,
+        text=True,
+        cwd=arena,
+        env={**os.environ, "HOME": arena, "TERM": "dumb", "POLER_BOX_DOCKER": "/bin/false"},
+        timeout=60,
+    )
+    out = r.stdout
+
+    checks = [
+        # (описание, подстрока-ожидание)
+        ("статус: ВЫКЛ", "Container Jail ВЫКЛ"),
+        ("статус: строка docker", "docker:"),
+        ("статус: имя контейнера", "poler-box-"),
+        ("подъём без docker — честный отказ", "docker недоступен"),
+        ("net=host запрещён на парсинге", "net=host"),
+        ("pids вне диапазона — отказ", "pids"),
+        ("неизвестная подкоманда — usage", "box on"),
+        ("версия упоминает container-jail", "container-jail"),
+    ]
+    passed = failed = 0
+    for desc, needle in checks:
+        ok = needle in out
+        print(f"  {'OK ' if ok else '‼️ '} {desc:<45} → {'есть' if ok else 'НЕТ: ' + needle}")
+        passed, failed = passed + ok, failed + (not ok)
+    print(f"════════ ИТОГ волны 10: {passed}/{passed + failed} box-векторов ════════")
+    return failed == 0
 
 
 def shim_battery(arena):

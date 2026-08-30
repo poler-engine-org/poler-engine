@@ -57,6 +57,8 @@ fn is_executable(_p: &std::path::Path) -> bool {
 const SERVICE_SUBS: &[&str] = &["start", "stop", "restart", "status", "attach"];
 const SERVICE_NAMES: &[&str] = &["mcp", "weblens", "companion"];
 const WEBLENS_SUBS: &[&str] = &["start", "stop", "status"];
+/// v0.25.0: подкоманды Container Jail.
+const BOX_SUBS: &[&str] = &["on", "off", "status", "shell"];
 
 /// Комплетер Terminal Gateway.
 pub struct GatewayCompleter {
@@ -145,6 +147,11 @@ impl Completer for GatewayCompleter {
                     .filter(|s| s.starts_with(cur))
                     .map(|s| s.to_string())
                     .collect(),
+                "box" => BOX_SUBS
+                    .iter()
+                    .filter(|s| s.starts_with(cur))
+                    .map(|s| s.to_string())
+                    .collect(),
                 _ => Vec::new(),
             };
             if !subs.is_empty() {
@@ -174,6 +181,8 @@ fn engine_command_list() -> &'static Vec<String> {
             "workspace", "grant", "pty",
             // v0.24.0
             "allow",
+            // v0.25.0
+            "box",
         ]
         .iter()
         .map(|s| s.to_string())

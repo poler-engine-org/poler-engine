@@ -19,6 +19,7 @@
 //! Лицензия: banner ниже — Source-Available EULA v1.0 (TERMS.md).
 
 pub mod completer;
+pub mod containers;
 pub mod dispatch;
 pub mod hostexec;
 pub mod pipeline;
@@ -76,6 +77,9 @@ pub fn banner() -> String {
     ));
     s.push_str(&format!(
         "  {bold}🛡 workspace-guard{reset} — доступ вне корня проекта — только по подтверждению;\n   cd/workspace на выход — тоже; allow <путь> — сессионное исключение\n"
+    ));
+    s.push_str(&format!(
+        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker-контейнера: агент (agy/claude/…) заперт физически; box on — поднять\n"
     ));
     s.push('\n');
     s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
@@ -200,6 +204,13 @@ pub fn run_gateway(db_path: PathBuf, danger_allow_all: bool) -> ExitCode {
     }
 
     let _ = rl.save_history(&hist);
+    // v0.25.0: контейнер живёт своей жизнью (docker -d) — честно сказать
+    if let Some(jail) = &state.box_jail {
+        println!(
+            "📦 box jail {} продолжает работать (box off — разобрать)",
+            jail.name
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -227,6 +238,7 @@ mod tests {
         assert!(b.contains("host-os-proxy"));
         assert!(b.contains("pty-passthrough"), "v0.23.0: PTY-контур в баннере");
         assert!(b.contains("workspace-guard"), "v0.24.0: граница workspace в баннере");
+        assert!(b.contains("Container Jail"), "v0.25.0: box в баннере");
     }
 
     #[test]

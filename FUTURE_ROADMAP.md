@@ -253,12 +253,33 @@ API**, не забивая локальный диск сотнями гигаб
    Zero Silent Escalation; 904 теста, гейты 113/113 + 65/65.
    Архитектура: `docs/terminal-gateway-architecture.md` §6.
    ✅ shipped (2026-08-31)
+8c-quad. **v0.24.0 — Workspace Boundary Guard & Mediated Agent Mode**:
+   реакция на живой инцидент (агент внутри gateway читал /home и писал
+   /tmp без вопросов): WsGuard-граница во всех судьях (вне корня —
+   Confirm; Block-инварианты выше границы), рекурсивный
+   judge_shell_payload, ws_root≠cwd, `allow <PATH>`, PATH-shim медиация
+   агентов (`__gateway-shim`, отказ 126, телеметрия); 931 тест, гейты
+   139/139 + 79/79 + 14/14. Архитектура: §6.4–6.5.
+   ✅ shipped (2026-08-31)
+8c-quinque. **v0.25.0 — Container Jail (`box`)**: жёсткая Docker-
+   изоляция контуров 2/3 (host-os-proxy и pty-passthrough исполняются
+   ВНУТРИ контейнера через docker exec): /workspace + персистентный
+   /home/poler — единственные монтировки, cap-drop ALL +
+   no-new-privileges + mem/pids-лимиты, docker-сокет не пробрасывается;
+   Block-вердикты не зависят от jail, redirect-цели/движковые файл-
+   команды — с границей (они на хосте), docker-демон из шлюза — Confirm;
+   957 тестов (+26), гейты 139/139 + 79/79 + 14/14 + 8/8 (волна 10).
+   Архитектура: `docs/terminal-gateway-architecture.md` §6.6.
+   ✅ shipped (2026-08-31)
 8d. **v0.23.x — globbing в gateway** (globset уже в дереве): раскрытие
    `*.rs` в аргументах движковых команд.
-9. **v0.24.0 — Hugging Face Hub + DVC + Oxen**: model cards/datasets API
-   (`hf://`), data-versioning pointer files, remote storage
-   resolve.
-10. **v0.25.0+ — HugeSCM/Lit/ParamLake**: адаптеры для China-scale
+8e. **v0.25.x — тюнинг Container Jail**: CPU-shares/cgroup-v2, профили
+   образов агентов (agy/claude-ready), Landlock/seccomp-фолбэк для
+   машин без docker.
+9. **Hugging Face Hub + DVC + Oxen (сдвинуто релизами gateway)**:
+   model cards/datasets API (`hf://`), data-versioning pointer files,
+   remote storage resolve.
+10. **HugeSCM/Lit/ParamLake**: адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+

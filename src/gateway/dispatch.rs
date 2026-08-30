@@ -14,6 +14,7 @@
 //! Конвейеры смешивают контуры: `ls -la | chunk` (host→engine),
 //! `grep "fn " --stdin | wc -l` (engine→host).
 
+use super::containers;
 use super::hostexec::{self, EnvMode, HostLimits};
 use super::pipeline::{parse_line, Pipeline, Segment};
 use super::sandbox::{self, Policy};
@@ -64,6 +65,10 @@ pub struct GatewayState {
     /// движковые команды (grep/chunk/search) и подпроцессы видят один корень.
     /// Включается только в живом REPL: юнит-тесты не мутируют глобальный cwd.
     pub sync_cwd: bool,
+    /// v0.25.0: активный Container Jail — контуры 2/3 исполняются внутри
+    /// Docker-контейнера (`box on`); физическая изоляция вместо/поверх
+    /// логической границы workspace для exec-плоскости.
+    pub box_jail: Option<containers::BoxState>,
 }
 
 impl GatewayState {
@@ -79,6 +84,7 @@ impl GatewayState {
             danger_mode: false,
             ws_allow: Vec::new(),
             sync_cwd: false,
+            box_jail: None,
         }
     }
 
@@ -125,7 +131,7 @@ pub fn is_engine_command(name: &str) -> bool {
             | "gt" | "gix" | "notes" | "sources" | "grep" | "chunk" | "benchmark" | "service"
             | "attach" | "weblens" | "license" | "cd" | "pwd" | "clear" | "host" | "help"
             | "version" | "quit" | "exit" | "q" | "ver" | "workspace" | "grant" | "pty"
-            | "allow"
+            | "allow" | "box"
     )
 }
 
@@ -209,8 +215,15 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
             } else {
                 t0.clone()
             };
-            let guard = ws_guard(state);
-            let verdict = sandbox::judge_segment_ws(&inner, Some(&guard));
+            // v0.25.0: в jail-режиме логическую границу exec-плоскости
+            // заменяет физическая изоляция контейнера (redirect-цели и
+            // движковые файл-команды судятся с границей всегда — они на хосте)
+            let guard = if state.box_jail.is_some() {
+                None
+            } else {
+                Some(ws_guard(state))
+            };
+            let verdict = sandbox::judge_segment_ws(&inner, guard.as_ref());
             let proceed = if state.danger_mode {
                 if !verdict.is_allow() {
                     eprintln!("⚠ DANGER: sandbox отключён владельцем — PTY-команда исполняется без проверок");
@@ -232,6 +245,18 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                     "⛔ отклонено (не подтверждено): PTY-команда".into(),
                 );
             }
+            // v0.25.0: управление контейнерным демоном из PTY при активном
+            // jail — Confirm (docker run -v /:/host ломает изоляцию).
+            if state.box_jail.is_some()
+                && !state.danger_mode
+                && containers::is_daemon_ctl(&inner)
+            {
+                let why = "управление docker/podman-демоном хоста при активном Container Jail — может разрушить изоляцию";
+                if !resolve_confirm(state, why, interactive) {
+                    state.last_exit = 125;
+                    return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
+                }
+            }
             if !interactive {
                 // TUI без терминала зависает (живой кейс: agy на пайпах) —
                 // честный отказ вместо зависания; деструктив уже отрезан выше
@@ -249,7 +274,10 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                 .map(|s| s.rsplit('/').next().unwrap_or(s))
                 .unwrap_or("")
                 .to_string();
-            let mediation = if shim::is_agent_cmd(&base) {
+            // v0.25.0: в Container Jail медиация не нужна — агент физически
+            // заперт в контейнере, его shell-вызовы хост не видят; PATH-shim
+            // (хост-файлы) внутри контейнера в принципе недоступен.
+            let mediation = if state.box_jail.is_none() && shim::is_agent_cmd(&base) {
                 match shim::setup(&state.cwd, &state.ws_allow) {
                     Ok(m) => {
                         println!("🛡 Mediated Agent Mode: shell-вызовы агента проходят sandbox-гейт");
@@ -268,7 +296,17 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                 .iter()
                 .flat_map(|m| m.env.iter().cloned())
                 .collect();
-            let outcome = hostexec::run_pty(&inner, &state.limits, &state.cwd, &extra);
+            if let Some(jail) = &state.box_jail {
+                println!(
+                    "📦 Container Jail: сессия исполняется внутри контейнера {} — хост виден только как /workspace",
+                    jail.name
+                );
+            }
+            let pty_tokens: Vec<String> = match &state.box_jail {
+                Some(jail) => containers::wrap_pty_exec(jail, &inner, &state.cwd),
+                None => inner.clone(),
+            };
+            let outcome = hostexec::run_pty(&pty_tokens, &state.limits, &state.cwd, &extra);
             if let Some(m) = &mediation {
                 print!("{}", shim::telemetry(&m.log_file));
                 let _ = std::fs::remove_file(&m.log_file);
@@ -322,10 +360,19 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
     // конвейерах (`chunk x > pwn`, где pwn — симлинк в /etc): каноникализация
     // путей в judge_redirect_target раскрывает symlink-прокси.
     // v0.24.0: + граница workspace (движковый grep/chunk тоже читают файлы).
-    let guard = ws_guard(state);
+    // v0.25.0: redirect-цели судятся с границей ВСЕГДА — файл пишет сам
+    // движок НА ХОСТЕ (finish()), jail его не изолирует.
+    let full_guard = ws_guard(state);
+    // exec-плоскость (host-сегменты и PTY) в jail-режиме судится без
+    // логической границы — её заменяет физическая изоляция контейнера.
+    let exec_guard: Option<sandbox::WsGuard> = if state.box_jail.is_some() {
+        None
+    } else {
+        Some(ws_guard(state))
+    };
     if host_idx.is_empty() {
         if let Some(r) = &pipeline.redirect {
-            let verdict = sandbox::judge_redirect_target_ws(&r.path, Some(&guard));
+            let verdict = sandbox::judge_redirect_target_ws(&r.path, Some(&full_guard));
             if state.danger_mode {
                 if !verdict.is_allow() {
                     eprintln!("⚠ DANGER: sandbox отключён владельцем — редирект исполняется без проверок");
@@ -344,7 +391,7 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
     if !host_idx.is_empty() {
         // пересобираем pipeline с уже срезанными poler-префиксами
         let judged = rebuild_for_judge(&pipeline, &seg_tokens);
-        let verdict = sandbox::judge_pipeline_ws(&judged, &host_idx, Some(&guard));
+        let verdict = sandbox::judge_pipeline_ws(&judged, &host_idx, exec_guard.as_ref());
         if state.danger_mode {
             // danger-режим: не блокируем и не спрашиваем — только предупреждаем
             if !verdict.is_allow() {
@@ -366,11 +413,48 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
             }
         }
     }
+    // v0.25.0: управление контейнерным демоном из gateway при активном
+    // jail — Confirm: `docker run -v /:/host` может сломать изоляцию.
+    // В неинтерактиве — отказ (scripted-агент не управляет демоном).
+    if state.box_jail.is_some() && !state.danger_mode {
+        for &i in &host_idx {
+            if containers::is_daemon_ctl(&seg_tokens[i]) {
+                let why = "управление docker/podman-демоном хоста при активном Container Jail — может разрушить изоляцию";
+                if !resolve_confirm(state, why, interactive) {
+                    state.last_exit = 125;
+                    return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
+                }
+                break; // одного подтверждения достаточно
+            }
+        }
+    }
+    // v0.25.0: цель редиректа host-конвейера при активном jail судится с
+    // ПОЛНОЙ границей отдельно — файл пишет сам движок НА ХОСТЕ (finish()),
+    // контейнер эту запись не изолирует (в judge_pipeline_ws редирект идёт
+    // с exec_guard, которого в jail-режиме нет).
+    if state.box_jail.is_some() && !state.danger_mode && !host_idx.is_empty() {
+        if let Some(r) = &pipeline.redirect {
+            match sandbox::judge_redirect_target_ws(&r.path, Some(&full_guard)) {
+                Policy::Allow => {}
+                Policy::Block(why) => {
+                    state.last_exit = 2;
+                    return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
+                }
+                Policy::Confirm(why) => {
+                    if !resolve_confirm(state, &why, interactive) {
+                        state.last_exit = 125;
+                        return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
+                    }
+                }
+            }
+        }
+    }
     // v0.24.0: граница и для ДВИЖКОВЫХ сегментов с файл-аргументами
     // (grep/chunk/impact/crawl/benchmark/gh…): движок читает файлы нативно —
     // путь вне workspace без подтверждения нельзя. Команды-запросы
     // (search/nlm/notes…) и навигация (cd/workspace/allow) — исключены:
-    // у них свои ворота.
+    // у них свои ворота. v0.25.0: движок читает файлы НА ХОСТЕ — граница
+    // действует даже при активном Container Jail.
     if !state.danger_mode {
         const WS_CHECKED_ENGINE: &[&str] = &[
             "grep", "chunk", "impact", "benchmark", "crawl", "gh", "gl", "gt", "gix",
@@ -380,7 +464,7 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
             if !WS_CHECKED_ENGINE.contains(&cmd) || tokens.len() < 2 {
                 continue;
             }
-            if let Some(policy) = sandbox::boundary_policy_args(&tokens[1..], &guard) {
+            if let Some(policy) = sandbox::boundary_policy_args(&tokens[1..], &full_guard) {
                 if let Policy::Confirm(why) = policy {
                     if !resolve_confirm(state, &why, interactive) {
                         state.last_exit = 125;
@@ -426,8 +510,20 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                 }
             }
             Kind::Host => {
-                let outcome =
-                    hostexec::run(tokens, stdin_data.as_deref(), &state.limits, &state.cwd, &[]);
+                // v0.25.0: Container Jail — host-сегмент уходит ВНУТРИ
+                // контейнера (docker exec -i …); вердикт уже вынесен по
+                // исходным токенам ДО обёртки — инвариант сохранён.
+                let exec_tokens: Vec<String> = match &state.box_jail {
+                    Some(jail) => containers::wrap_host_exec(jail, tokens, &state.cwd),
+                    None => tokens.clone(),
+                };
+                let outcome = hostexec::run(
+                    &exec_tokens,
+                    stdin_data.as_deref(),
+                    &state.limits,
+                    &state.cwd,
+                    &[],
+                );
                 if !outcome.stderr.is_empty() {
                     stderr_out.push_str(&outcome.stderr);
                 }
@@ -635,6 +731,7 @@ fn run_engine(
         "workspace" => cmd_workspace(state, args, interactive).map_err(EngineFail::Msg),
         "grant" => cmd_grant(state, args, interactive).map_err(EngineFail::Msg),
         "allow" => cmd_allow(state, args, interactive).map_err(EngineFail::Msg),
+        "box" => cmd_box(state, args, interactive).map_err(EngineFail::Msg),
         "pty" => Err(EngineFail::Msg(
             "pty: укажите команду (pty vim main.rs) — TUI/IDE/агент на псевдотерминале".into(),
         )),
@@ -642,7 +739,7 @@ fn run_engine(
         "clear" => Ok("\x1b[2J\x1b[1;1H".into()),
         "help" | "?" => Ok(gateway_help()),
         "version" | "ver" | "v" => Ok(format!(
-            "poler-engine {} — Terminal Gateway v0.24.0 (двойной контур + PTY-passthrough + sudo-гейт + workspace-guard)\n",
+            "poler-engine {} — Terminal Gateway v0.25.0 (двойной контур + PTY + sudo-гейт + workspace-guard + container-jail)\n",
             env!("CARGO_PKG_VERSION")
         )),
         "quit" | "exit" | "q" => Err(EngineFail::Quit),
@@ -1272,6 +1369,8 @@ fn cmd_cd(
     if !canonical.is_dir() {
         return Err(format!("cd: {} не каталог", path.display()));
     }
+    // v0.25.0: прежний корень — ДО переноса границы (для предупреждения jail)
+    let old_root = state.ws_root.clone();
     // v0.24.0: выход ЗА ГРАНИЦУ workspace — только с подтверждения
     // владельца (в неинтерактиве — отказ: пайп-агент не должен уводить
     // корень). Навигация внутри (в т.ч. cd .. к корню) — свободна;
@@ -1294,6 +1393,14 @@ fn cmd_cd(
             .map_err(|e| format!("cd: chdir: {e}"))?;
     }
     state.cwd = canonical;
+    // v0.25.0: jail монтирует ПРЕЖНИЙ корень — предупреждаем (физическая
+    // монтировка не переехала; переподнять: box off && box on)
+    if state.box_jail.is_some() && old_root != state.ws_root {
+        return Ok(format!(
+            "⚠ box jail: контейнер продолжает монтировать {} (старый корень); box off && box on — переподнять на новый\n",
+            old_root.display()
+        ));
+    }
     Ok(String::new())
 }
 
@@ -1338,6 +1445,8 @@ fn cmd_workspace(
     if !canonical.is_dir() {
         return Err(format!("workspace: {} не каталог", path.display()));
     }
+    // v0.25.0: прежний корень — ДО переноса границы (для предупреждения jail)
+    let old_root = state.ws_root.clone();
     if !state.danger_mode && !canonical.starts_with(&state.ws_root) {
         let why = format!(
             "выход из workspace: {} → {}",
@@ -1356,6 +1465,14 @@ fn cmd_workspace(
     let moved = state.cwd != canonical;
     state.cwd = canonical;
     if moved {
+        // v0.25.0: jail монтирует прежний корень — как в cd
+        if state.box_jail.is_some() && old_root != state.ws_root {
+            return Ok(format!(
+                "workspace → {}\n⚠ box jail: контейнер продолжает монтировать {}; box off && box on — переподнять\n",
+                state.cwd.display(),
+                old_root.display()
+            ));
+        }
         Ok(format!(
             "workspace → {}\nдвижок и хостовые команды привязаны к новому корню; подпроцессы (в т.ч. агенты) стартуют отсюда\n",
             state.cwd.display()
@@ -1425,12 +1542,90 @@ fn cmd_allow(
 }
 
 // ---------------------------------------------------------------------------
+// Container Jail (v0.25.0): `box on/off/status/shell`
+// ---------------------------------------------------------------------------
+
+/// `box [status|on|off|shell]` — жёсткая Docker-изоляция контуров 2/3.
+///
+/// Живой кейс v0.23/v0.24: PATH-shim медиация агентов — best-effort (хардкод
+/// /bin/sh и прямой execve не перехватываются). Container Jail решает класс
+/// физически: host-команды и PTY-сессии исполняются ВНУТРИ контейнера
+/// (`docker exec`), хост доступен только как /workspace и /home/poler.
+fn cmd_box(
+    state: &mut GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
+    match args.first().map(|s| s.as_str()) {
+        None | Some("status") => Ok(containers::box_status_text(
+            state.box_jail.as_ref(),
+            &state.ws_root,
+        )),
+        Some("on") => {
+            // уже активен и жив? — не трогаем (идемпотентность)
+            if let Some(jail) = &state.box_jail {
+                if containers::box_running(&jail.name) == Some(true) {
+                    return Ok(format!(
+                        "📦 Container Jail уже активен: {} (box off — разобрать, box status — детали)\n",
+                        jail.name
+                    ));
+                }
+            }
+            let cfg = containers::parse_on_args(&args[1..])?;
+            let (jail, report) = containers::box_on(&state.ws_root, &cfg)?;
+            state.box_jail = Some(jail);
+            Ok(report)
+        }
+        Some("off") => {
+            let name = state
+                .box_jail
+                .as_ref()
+                .map(|j| j.name.clone())
+                .unwrap_or_else(|| containers::container_name(&state.ws_root));
+            let report = containers::box_off(&name)?;
+            if state
+                .box_jail
+                .as_ref()
+                .is_some_and(|j| j.name == name)
+            {
+                state.box_jail = None;
+            }
+            Ok(report)
+        }
+        Some("shell") => {
+            let Some(jail) = state.box_jail.clone() else {
+                return Ok("box shell: jail не активен — сначала box on\n".into());
+            };
+            if !interactive {
+                return Ok(
+                    "box shell: интерактивная сессия требует настоящего терминала (TTY)\n".into(),
+                );
+            }
+            // Команда — compile-time константа (не пользовательский ввод):
+            // границей исполнения здесь выступает сам контейнер.
+            let tokens = containers::box_shell_tokens();
+            let wrapped = containers::wrap_pty_exec(&jail, &tokens, &state.cwd);
+            println!("📦 Container Jail: шелл внутри контейнера {} (exit — вернуться в gateway)", jail.name);
+            let outcome = hostexec::run_pty(&wrapped, &state.limits, &state.cwd, &[]);
+            if let Some(e) = &outcome.spawn_error {
+                return Ok(format!("⚡ {e}"));
+            }
+            state.last_exit = outcome.code.unwrap_or(0);
+            Ok(outcome.render())
+        }
+        Some(other) => Err(format!(
+            "box: {other}? (box on [image=…] | off | status | shell)"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
 
 pub fn gateway_help() -> String {
     let mut s = String::from(
-        "POLER Terminal Gateway — единый терминальный шлюз (v0.24.0: PTY + workspace-guard + sudo-гейт)\n\
+        "POLER Terminal Gateway — единый терминальный шлюз (v0.25.0: + Container Jail)\n\
          ═════════════════════════════════════════════════════════════\n\
          Двойной контур: команды движка исполняются нативно (приоритет),\n\
          всё остальное — хостовая ОС в sandbox-режиме.\n\n",
@@ -1457,9 +1652,17 @@ pub fn gateway_help() -> String {
     s.push_str("  pty <команда…>              принудительный псевдотерминал\n");
     s.push_str("  авто-PTY: vim/htop/less/tmux/agy/claude… и bare-REPL (python3)\n");
     s.push_str("  (политика sandbox судится по той же команде — PTY ≠ обход)\n");
-    s.push_str("  v0.24.0 MEDIATED AGENT MODE: агенты (agy/claude/codex/…) —\n");
-    s.push_str("  их shell-вызовы (PATH/$SHELL) судятся гейтом; отказ = 126;\n");
-    s.push_str("  телеметрия после выхода; вызовы /bin/sh напрямую не видны\n\n");
+    s.push_str("  без jail: MEDIATED AGENT MODE — shell-вызовы агента через PATH-shim\n");
+    s.push_str("  судятся гейтом (отказ 126; /bin/sh-хардкод не виден — см. box)\n\n");
+    s.push_str("CONTAINER JAIL (v0.25.0 — жёсткая изоляция Docker):\n");
+    s.push_str("  box on [image=IMG] [net=bridge|none] [user=me|root]\n");
+    s.push_str("      [mem=2g] [pids=512] [wsro=0|1]   поднять jail: контуры 2/3\n");
+    s.push_str("      исполняются ВНУТРИ контейнера (docker exec); агент физически\n");
+    s.push_str("      заперт — хост виден только как /workspace и /home/poler\n");
+    s.push_str("  box status | box off        состояние | разобрать контейнер\n");
+    s.push_str("  box shell                   интерактивный шелл внутри jail\n");
+    s.push_str("  образ по умолчанию debian:bookworm-slim; для агентов — свой\n");
+    s.push_str("  (node/agy внутри); /home/poler персистентен (конфиги агентов)\n\n");
     s.push_str("WORKSPACE (v0.23.0 — корень проекта; v0.24.0 — граница):\n");
     s.push_str("  workspace [PATH]            показать/переключить корень проекта;\n");
     s.push_str("                              движок+хост+подпроцессы от одного cwd\n");
@@ -2087,5 +2290,202 @@ mod tests {
             "pty vim /etc/hosts = Confirm (неинтерактив — отказ): {out}"
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // =====================================================================
+    // v0.25.0: Container Jail (box)
+    // =====================================================================
+
+    /// Сериализация тестов, мутирующих POLER_BOX_DOCKER (env — процесс-глобал).
+    static DOCKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Фейковый jail: контейнер с нереалистичным именем — любые docker-exec
+    /// против него честно падают (нет контейнера/нет docker), что и проверяем.
+    fn jailed_state(tag: &str) -> (GatewayState, std::path::PathBuf) {
+        let ws = std::env::temp_dir().join(format!("poler-gw-box-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut st = state();
+        st.cwd = ws.clone();
+        st.ws_root = ws.clone();
+        st.box_jail = Some(super::super::containers::BoxState {
+            name: "poler-box-testfake".into(),
+            cfg: super::super::containers::BoxConfig::default(),
+            ws_root: ws.clone(),
+            home_dir: ws.join(".boxhome"),
+        });
+        (st, ws)
+    }
+
+    #[test]
+    fn box_status_honest() {
+        let _g = DOCKER_ENV_LOCK.lock().unwrap();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let mut st = state();
+        let out = run(&mut st, "box status").unwrap();
+        assert!(out.contains("box"), "статус без docker: {out}");
+        assert!(out.contains("docker"), "строка про docker: {out}");
+        assert!(out.contains("poler-box-"), "ожидаемое имя контейнера: {out}");
+        // и краткая форма
+        let out = run(&mut st, "box").unwrap();
+        assert!(out.contains("docker"), "box ≡ box status: {out}");
+        std::env::remove_var("POLER_BOX_DOCKER");
+    }
+
+    #[test]
+    fn box_on_without_docker_honest_error() {
+        let _g = DOCKER_ENV_LOCK.lock().unwrap();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let mut st = state();
+        let out = run(&mut st, "box on").unwrap();
+        assert!(
+            out.contains("docker недоступен") || out.contains("docker"),
+            "честная ошибка без docker: {out}"
+        );
+        assert!(st.box_jail.is_none(), "jail не должен подняться");
+        std::env::remove_var("POLER_BOX_DOCKER");
+    }
+
+    #[test]
+    fn box_on_bad_args_rejected_before_docker() {
+        // парсинг конфигурации — ДО пробы docker: net=host запрещён
+        let mut st = state();
+        let out = run(&mut st, "box on net=host").unwrap();
+        assert!(out.contains("⚡") && out.contains("host"), "net=host запрещён: {out}");
+        assert!(st.box_jail.is_none());
+        let out = run(&mut st, "box on mem=zzz").unwrap();
+        assert!(out.contains("⚡"), "mem=zzz: {out}");
+        let out = run(&mut st, "box on zzz=1").unwrap();
+        assert!(out.contains("⚡"), "неизвестный ключ: {out}");
+    }
+
+    #[test]
+    fn box_unknown_subcommand_usage() {
+        let mut st = state();
+        let out = run(&mut st, "box zzz").unwrap();
+        assert!(out.contains("⚡") && out.contains("box on"), "usage: {out}");
+    }
+
+    #[test]
+    fn host_routes_through_docker_when_jailed() {
+        let (mut st, ws) = jailed_state("route");
+        // несуществующий бинарник: без jail — «не удалось запустить zzz-…»;
+        // с jail — обёртка docker exec (упадёт с docker-ошибкой на фейке)
+        let out = run(&mut st, "zzz-not-a-command-inbox-42").unwrap();
+        assert!(
+            out.contains("docker") || out.contains("poler-box"),
+            "роутинг через docker exec: {out}"
+        );
+        // контроль без jail — обычная host-ошибка без docker
+        st.box_jail = None;
+        let out = run(&mut st, "zzz-not-a-command-inbox-42").unwrap();
+        assert!(
+            !out.contains("poler-box-testfake"),
+            "без jail обёртки быть не должно: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn daemon_ctl_gated_when_jailed() {
+        let (mut st, ws) = jailed_state("daemon");
+        // docker из gateway при активном jail — Confirm; неинтерактив = отказ
+        // (причём БЕЗ спавна docker — гейт срабатывает до исполнения)
+        let out = run(&mut st, "docker ps").unwrap();
+        assert!(out.contains("отклонено"), "docker ps в jail = Confirm: {out}");
+        assert!(out.contains("Container Jail"), "причина названа: {out}");
+        let out = run(&mut st, "podman run -v /:/x img").unwrap();
+        assert!(out.contains("отклонено"), "podman run: {out}");
+        // без jail — не гейтится (команда не исполняется: zzz-префикс)
+        st.box_jail = None;
+        let out = run(&mut st, "host docker-zzz-not-real").unwrap();
+        assert!(!out.contains("Container Jail"), "без jail гейта нет: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn boundary_relaxed_in_jail_for_exec_plane() {
+        let (mut st, ws) = jailed_state("relax");
+        // чтение пути вне ws ВНУТРИ jail: логической границы нет (её держит
+        // контейнер) — команда уходит в docker exec и честно падает на фейке,
+        // но это НЕ boundary-Confirm
+        let out = run(&mut st, "cat /etc/hostname-zzz-not-exist").unwrap();
+        assert!(
+            !out.contains("не подтверждено") && !out.contains("блокировка"),
+            "в jail exec-плоскость без логической границы: {out}"
+        );
+        // контроль без jail: тот же кат — boundary-Confirm → отказ
+        st.box_jail = None;
+        let out = run(&mut st, "cat /etc/hostname-zzz-not-exist").unwrap();
+        assert!(out.contains("не подтверждено"), "без jail — Confirm: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn destructive_still_blocked_inside_jail() {
+        let (mut st, ws) = jailed_state("destructive");
+        // инвариант: jail НЕ ослабляет Block-вердикты — rm -rf / блокируется
+        // и в jail-режиме (до любого docker exec)
+        let out = run(&mut st, "rm -rf /").unwrap();
+        assert!(out.contains("блокировка"), "rm -rf / блокируется в jail: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn redirect_target_still_guarded_in_jail() {
+        let (mut st, ws) = jailed_state("redirect");
+        // редирект пишет ДВИЖОК на хосте — граница действует и в jail
+        let out = run(&mut st, "echo x > /etc/passwd").unwrap();
+        assert!(out.contains("блокировка"), "> /etc/passwd — Block в jail: {out}");
+        // цель вне ws (но не системная) — Confirm; неинтерактив = отказ
+        let out = run(&mut st, "echo x > /tmp/poler-box-redirect-test.txt").unwrap();
+        assert!(
+            out.contains("не подтверждено") || out.contains("блокировка"),
+            "redirect вне ws в jail — Confirm: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn pty_in_jail_noninteractive_refuses_honestly() {
+        let (mut st, ws) = jailed_state("ptyrefuse");
+        let out = run(&mut st, "pty vim").unwrap();
+        assert!(
+            out.contains("настоящего терминала"),
+            "PTY без TTY — честный отказ и в jail: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn cd_outside_with_jail_warns_about_mount() {
+        let (mut st, ws) = jailed_state("cdwarn");
+        st.auto_yes = true; // подтверждение выхода границы — авто
+        let out = run(&mut st, "cd /tmp").unwrap();
+        assert!(
+            out.contains("box jail") && out.contains("продолжает монтировать"),
+            "предупреждение о монтировке: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn box_shell_requires_jail_and_tty() {
+        let mut st = state();
+        let out = run(&mut st, "box shell").unwrap();
+        assert!(out.contains("не активен"), "без jail — подсказка: {out}");
+        let (mut st2, ws) = jailed_state("shellnotty");
+        let out = run(&mut st2, "box shell").unwrap();
+        assert!(out.contains("настоящего терминала"), "неинтерактив — отказ: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn help_and_version_mention_box() {
+        let h = gateway_help();
+        assert!(h.contains("CONTAINER JAIL"), "секция box в help: {h}");
+        assert!(h.contains("box on"), "синтаксис box on: {h}");
+        let mut st = state();
+        let out = run(&mut st, "version").unwrap();
+        assert!(out.contains("container-jail"), "версия упоминает jail: {out}");
     }
 }
