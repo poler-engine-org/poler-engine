@@ -238,12 +238,27 @@ API**, не забивая локальный диск сотнями гигаб
    роялти 5% > $25k/квартал, non-circumvention Ed25519-гейта).
    Архитектура: `docs/terminal-gateway-architecture.md`.
    ✅ shipped (2026-08-30)
-8d. **v0.22.x — globbing в gateway** (globset уже в дереве): раскрытие
+8c-bis. **v0.22.1 — Sandbox Hardening**: adversarial-аудит по команде
+   владельца «ПОРОБУЙ РАЗЛИЧНЫЕ МЕТОДЫ АТАКИ»: корпус 113 векторов / 19
+   классов через judge-пробник (без исполнения) + живая E2E-батарея →
+   46 bypass-векторов v0.22.0 закрыто в sandbox v2 (fail-closed),
+   883 теста, гейты 113/113 + 56/56.
+   ✅ shipped (2026-08-30)
+8c-ter. **v0.23.0 — Interactive PTY Engine, Dynamic Workspace & Sudo
+   Privilege Gate**: PTY-passthrough (контур 3: posix_openpt/setsid/
+   TIOCSCTTY без новых зависимостей, авто-детект TUI/REPL, префикс
+   `pty`), workspace/cd с синхронизацией process-cwd, гранулярный
+   sudo-гейт (one-shot /dev/tty + лизинг `grant sudo Nm` кап 60 мин +
+   `--dangerously-allow-all` danger-режим с красным баннером);
+   Zero Silent Escalation; 904 теста, гейты 113/113 + 65/65.
+   Архитектура: `docs/terminal-gateway-architecture.md` §6.
+   ✅ shipped (2026-08-31)
+8d. **v0.23.x — globbing в gateway** (globset уже в дереве): раскрытие
    `*.rs` в аргументах движковых команд.
-9. **v0.23.0 — Hugging Face Hub + DVC + Oxen**: model cards/datasets API
+9. **v0.24.0 — Hugging Face Hub + DVC + Oxen**: model cards/datasets API
    (`hf://`), data-versioning pointer files, remote storage
    resolve.
-10. **v0.24.0+ — HugeSCM/Lit/ParamLake**: адаптеры для China-scale
+10. **v0.25.0+ — HugeSCM/Lit/ParamLake**: адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+

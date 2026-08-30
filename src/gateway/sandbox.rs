@@ -908,6 +908,14 @@ fn home_prefix() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/home".into())
 }
 
+/// Privilege-эскалация по тексту причины Confirm (v0.23.0): sudo-гейт
+/// dispatch различает «эскалация прав» и прочие подтверждения — лизинг
+/// `grant sudo` покрывает только эскалации. Конвенция: judge_privilege
+/// формирует причину с префиксом «эскалация прав».
+pub fn is_privilege_escalation(reason: &str) -> bool {
+    reason.starts_with("эскалация прав")
+}
+
 /// `~/x` → `/home/user/x`; прочее без изменений. Хвостовые `/` срезаются
 /// (кроме корня "/") — «~/» и «~» означают одно и то же.
 pub fn expand_home(p: &str) -> String {
@@ -1194,6 +1202,14 @@ mod tests {
         assert!(expand_home("~").starts_with("/home/") || expand_home("~").starts_with("/Users/"));
         assert!(expand_home("~/x").contains("/x"));
         assert_eq!(expand_home("/abs"), "/abs");
+    }
+
+    #[test]
+    fn privilege_escalation_detector() {
+        // sudo-гейт v0.23.0: конвенция префикса из judge_privilege
+        assert!(is_privilege_escalation("эскалация прав: sudo … — подтвердите осознанно"));
+        assert!(!is_privilege_escalation("рекурсивное удаление: ./build"));
+        assert!(!is_privilege_escalation("crontab — установка заданий"));
     }
 
     // =====================================================================

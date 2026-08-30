@@ -41,7 +41,7 @@ fn stdout_is_tty() -> bool {
 }
 
 /// Баннер запуска: версия, тир лицензии (Ed25519-гейт v0.18.0),
-/// EULA-условия (v0.22.0), подсказка контуров.
+/// EULA-условия (v0.22.0), контуры + PTY (v0.23.0).
 pub fn banner() -> String {
     let tty = stdout_is_tty();
     let (bold, dim, cyan, reset) = if tty {
@@ -70,9 +70,26 @@ pub fn banner() -> String {
     s.push_str(&format!(
         "  2 {dim}host-os-proxy{reset} — любые системные команды в sandbox (деструктивное блокируется)\n"
     ));
+    s.push_str(&format!(
+        "  3 {dim}pty-passthrough{reset} — TUI/IDE/агенты на живом терминале (vim · htop · agy · bare-REPL)\n"
+    ));
     s.push('\n');
     s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
     s
+}
+
+/// Красный баннер danger-режима (v0.23.0): печатается при старте с
+/// --dangerously-allow-all и при `set sandbox off`.
+pub fn danger_banner() -> String {
+    let tty = stdout_is_tty();
+    let (red, bold, reset) = if tty {
+        ("\x1b[31m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    format!(
+        "{red}{bold}☠ DANGER MODE: sandbox ПОЛНОСТЬЮ ОТКЛЮЧЁН ВЛАДЕЛЬЦЕМ.{reset}\n{red}Все команды, включая деструктивные, исполняются без проверок.\nВся ответственность за безопасность хоста лежит на операторе.{reset}\n\n"
+    )
 }
 
 /// Файл истории gateway (отдельный от внутреннего --shell).
@@ -81,8 +98,10 @@ fn history_path() -> PathBuf {
     PathBuf::from(home).join(".cache/poler-engine/gateway-history.txt")
 }
 
-/// Точка входа: `poler-engine --gateway`.
-pub fn run_gateway(db_path: PathBuf) -> ExitCode {
+/// Точка входа: `poler-engine --gateway [--dangerously-allow-all]`.
+/// `danger_allow_all` — явный отказ от sandbox владельцем (красный баннер,
+/// ответственность оператора; см. v0.23.0).
+pub fn run_gateway(db_path: PathBuf, danger_allow_all: bool) -> ExitCode {
     use rustyline::config::Configurer;
     use rustyline::error::ReadlineError;
     use rustyline::history::DefaultHistory;
@@ -115,9 +134,16 @@ pub fn run_gateway(db_path: PathBuf) -> ExitCode {
     let _ = rl.load_history(&hist);
 
     print!("{}", banner());
+    if danger_allow_all {
+        print!("{}", danger_banner());
+    }
     let _ = std::io::stdout().flush();
 
     let mut state = GatewayState::new(db_path);
+    state.danger_mode = danger_allow_all;
+    // живой REPL: workspace/cd двигают process-cwd (движковые команды
+    // и подпроцессы — от одного корня); юнит-тесты работают без синка
+    state.sync_cwd = true;
     println!(
         "{}",
         state.cwd.display()
@@ -126,7 +152,8 @@ pub fn run_gateway(db_path: PathBuf) -> ExitCode {
     let interactive = stdout_is_tty();
     loop {
         let cwd_short = shorten_cwd(&state.cwd);
-        let prompt = format!("poler {cwd_short} $ ");
+        let danger_mark = if state.danger_mode { " ☠DANGER" } else { "" };
+        let prompt = format!("poler {cwd_short}{danger_mark} $ ");
         let line = match rl.readline(&prompt) {
             Ok(l) => l,
             Err(ReadlineError::WindowResized) => continue, // SIGWINCH: перерисовать
@@ -194,6 +221,15 @@ mod tests {
         assert!(b.contains("dev@poler-engine.org"), "EULA-адрес в баннере обязателен");
         assert!(b.contains("engine-native"));
         assert!(b.contains("host-os-proxy"));
+        assert!(b.contains("pty-passthrough"), "v0.23.0: PTY-контур в баннере");
+    }
+
+    #[test]
+    fn danger_banner_warns_explicitly() {
+        let b = super::danger_banner();
+        assert!(b.contains("DANGER MODE"));
+        assert!(b.contains("ответственность"));
+        assert!(b.contains("без проверок"));
     }
 
     #[test]

@@ -82,6 +82,16 @@ BATTERY = [
     ("OK", "python3 --version"),
     ("OK", "env MY_VAR=42 echo env-ok"),
     ("OK", "service status"),
+    # --- Волна 7: v0.23.0 — PTY-префикс и привилегии (неинтерактив) ---
+    ("BLOCK", "pty rm -rf /"),
+    ("BLOCK", "pty rm -rf /usr"),
+    ("BLOCK", "pty python3 -c \"import os; os.system('rm -rf /usr')\""),
+    ("BLOCK", "pty env rm -rf /etc"),
+    ("DENY", "grant sudo 5m"),
+    ("DENY", "set sandbox off"),
+    ("OK", "pty vim notes.txt"),
+    ("OK", "workspace"),
+    ("OK", "set sandbox status"),
 ]
 
 

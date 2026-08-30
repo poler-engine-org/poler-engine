@@ -120,6 +120,59 @@ fn gateway_repl_sandbox_vectors() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. v0.23.0: workspace / sudo-гейт / PTY-политика в живом REPL (пайп)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gateway_repl_v023_gates() {
+    let home = std::env::temp_dir().join(format!("poler-gw-it3-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    // всё исполняется в неинтерактиве (пайп): ворота должны ЗАКРЫВАТЬСЯ
+    let script = "workspace\n\
+                  grant sudo 5m\n\
+                  set sandbox off\n\
+                  set sandbox status\n\
+                  pty rm -rf /\n\
+                  pty vim notes.txt\n\
+                  sudo apt update\n\
+                  grant\n\
+                  quit\n";
+    let out = gateway_session(&home, script);
+
+    // workspace без PATH — отчёт
+    assert!(out.contains("workspace:"), "нет отчёта workspace: {out}");
+    // sudo-лизинг из скрипта НЕ открывается (Zero Silent Escalation)
+    assert!(
+        out.contains("grant sudo: лизинг привилегий открывается только в интерактивной сессии"),
+        "лизинг открыт из неинтерактива: {out}"
+    );
+    // отключение sandbox из скрипта НЕ проходит
+    assert!(
+        out.contains("set sandbox off: отключение sandbox возможно только в интерактивной сессии"),
+        "sandbox выключен из неинтерактива: {out}"
+    );
+    // статус после отказов — sandbox по-прежнему активен
+    assert!(out.contains("sandbox: активен"), "sandbox выключен: {out}");
+    // деструктив под префиксом pty — блокируется (PTY ≠ обход sandbox)
+    assert!(out.contains("блокировка"), "pty rm -rf / не блокирован: {out}");
+    // TUI в неинтерактиве — честный отказ вместо зависания
+    assert!(
+        out.contains("требует настоящего терминала"),
+        "pty vim в пайпе должен дать отказ: {out}"
+    );
+    // sudo без лизинга — Confirm-ворота (отказ в неинтерактиве)
+    assert!(
+        out.contains("не подтверждено") || out.contains("привилегированная команда"),
+        "sudo прошёл без ворот: {out}"
+    );
+    // grant без аргументов — статус (лизинг не активен)
+    assert!(out.contains("sudo-лизинг не активен"), "нет статуса grant: {out}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
 // 3. Lifecycle MCP-сервиса на живом бинарнике
 // ---------------------------------------------------------------------------
 

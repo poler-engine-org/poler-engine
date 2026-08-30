@@ -170,6 +170,8 @@ fn engine_command_list() -> &'static Vec<String> {
             "search", "web", "stats", "nlm", "sync", "set", "crawl", "impact", "gh", "gl", "gt",
             "gix", "notes", "sources", "grep", "chunk", "benchmark", "service", "attach",
             "weblens", "license", "cd", "pwd", "clear", "host", "help", "version", "quit",
+            // v0.23.0
+            "workspace", "grant", "pty",
         ]
         .iter()
         .map(|s| s.to_string())

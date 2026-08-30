@@ -19,7 +19,7 @@ use super::pipeline::{parse_line, Pipeline, Segment};
 use super::sandbox::{self, Policy};
 use super::service;
 use crate::shell::{self, ShellState};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 /// Ошибка команд движка: сообщение ИЛИ выход (quit из делегированного шелла).
@@ -36,7 +36,7 @@ enum EngineFail {
 pub struct GatewayState {
     /// Внутренний шелл движка (search/nlm/notes/…) — делегация.
     pub shell: ShellState,
-    /// Рабочий каталог gateway (cd/pwd; хостовые команды стартуют отсюда).
+    /// Рабочий каталог gateway (cd/pwd/workspace; хостовые команды стартуют отсюда).
     pub cwd: PathBuf,
     /// Лимиты host-прокси (таймаут/кап/env).
     pub limits: HostLimits,
@@ -44,6 +44,18 @@ pub struct GatewayState {
     pub auto_yes: bool,
     /// Код возврата последней команды (для $-статуса).
     pub last_exit: i32,
+    /// v0.23.0: sudo-лизинг — окно, в котором privilege-Confirm
+    /// (sudo/su/doas/pkexec) не спрашивается. Открывается только
+    /// интерактивно (`grant sudo 5m`), сгорает по таймеру.
+    pub sudo_lease_until: Option<std::time::Instant>,
+    /// v0.23.0: danger-режим (--dangerously-allow-all / set sandbox off):
+    /// sandbox не блокирует и не спрашивает — только предупреждает.
+    /// Вся ответственность — на операторе (красный баннер при старте).
+    pub danger_mode: bool,
+    /// v0.23.0: синхронизировать process-cwd со state.cwd (workspace/cd) —
+    /// движковые команды (grep/chunk/search) и подпроцессы видят один корень.
+    /// Включается только в живом REPL: юнит-тесты не мутируют глобальный cwd.
+    pub sync_cwd: bool,
 }
 
 impl GatewayState {
@@ -54,6 +66,20 @@ impl GatewayState {
             limits: HostLimits::default(),
             auto_yes: false,
             last_exit: 0,
+            sudo_lease_until: None,
+            danger_mode: false,
+            sync_cwd: false,
+        }
+    }
+
+    /// Остаток sudo-лизинга (None — не активен или уже истёк).
+    pub fn sudo_lease_remaining(&self) -> Option<std::time::Duration> {
+        let until = self.sudo_lease_until?;
+        let now = std::time::Instant::now();
+        if until > now {
+            Some(until - now)
+        } else {
+            None
         }
     }
 }
@@ -77,13 +103,42 @@ pub fn is_engine_command(name: &str) -> bool {
         "search" | "web" | "stats" | "nlm" | "sync" | "set" | "crawl" | "impact" | "gh" | "gl"
             | "gt" | "gix" | "notes" | "sources" | "grep" | "chunk" | "benchmark" | "service"
             | "attach" | "weblens" | "license" | "cd" | "pwd" | "clear" | "host" | "help"
-            | "version" | "quit" | "exit" | "q" | "ver"
+            | "version" | "quit" | "exit" | "q" | "ver" | "workspace" | "grant" | "pty"
     )
 }
 
 /// Команды, которые осмысленно принимают stdin в конвейере.
 fn accepts_stdin(cmd: &str) -> bool {
     matches!(cmd, "grep" | "chunk" | "impact")
+}
+
+// ---------------------------------------------------------------------------
+// PTY-роутинг (v0.23.0): известные TUI и bare-REPL — авто-PTY в интерактиве
+// ---------------------------------------------------------------------------
+
+/// Полноэкранные TUI/IDE/агенты: без псевдотерминала зависают на пайпах
+/// (живой кейс из эксплуатации: agy внутри шлюза ждал PTY-рендер).
+const AUTO_PTY_CMDS: &[&str] = &[
+    "vim", "nvim", "vi", "nano", "micro", "emacs", "hx", "helix", "less", "more",
+    "htop", "top", "btop", "btm", "gtop", "gdu", "ncdu", "lazygit", "tig", "fzf",
+    "tmux", "screen", "mc", "watch", "agy", "claude", "codex", "gemini", "aider",
+];
+
+/// REPL-интерпретаторы: авто-PTY только в bare-виде (без аргументов —
+/// `python3`, `node`; с аргументами это обычный запуск файла/флага).
+const REPL_CMDS: &[&str] = &[
+    "python3", "python", "node", "deno", "irb", "pry", "sqlite3", "psql", "mysql",
+    "redis-cli", "bc", "lua", "luajit",
+];
+
+/// Кандидат на PTY по авто-детекции (без учёта interactive — его проверяет
+/// вызывающий). Базовое имя — как в sandbox-судье.
+fn is_auto_pty(tokens: &[String]) -> bool {
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    AUTO_PTY_CMDS.contains(&base) || (REPL_CMDS.contains(&base) && tokens.len() == 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +172,59 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
             return GatewayResult::Done(format!("⚡ парсинг: {e}"));
         }
     };
+
+    // v0.23.0: PTY-passthrough — интерактивные TUI/IDE/REPL получают
+    // настоящий псевдотерминал (raw mode, ресайз, Ctrl+C как байт).
+    // Только одиночный сегмент без редиректа; политика судится ПО ВНУТРЕННЕЙ
+    // команде — PTY это канал I/O, а не обход sandbox.
+    if pipeline.segments.len() == 1 && pipeline.redirect.is_none() {
+        let t0 = super::pipeline::strip_poler_prefix(&pipeline.segments[0].tokens, &is_engine_command);
+        let explicit = t0.first().map(|s| s.as_str()) == Some("pty") && t0.len() >= 2;
+        let auto = !explicit && interactive && !t0.is_empty() && is_auto_pty(&t0);
+        if explicit || auto {
+            let inner: Vec<String> = if explicit {
+                t0[1..].to_vec()
+            } else {
+                t0.clone()
+            };
+            let verdict = sandbox::judge_segment(&inner);
+            let proceed = if state.danger_mode {
+                if !verdict.is_allow() {
+                    eprintln!("⚠ DANGER: sandbox отключён владельцем — PTY-команда исполняется без проверок");
+                }
+                true
+            } else {
+                match verdict {
+                    Policy::Allow => true,
+                    Policy::Block(why) => {
+                        state.last_exit = 2;
+                        return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
+                    }
+                    Policy::Confirm(why) => resolve_confirm(state, &why, interactive),
+                }
+            };
+            if !proceed {
+                state.last_exit = 125;
+                return GatewayResult::Done(
+                    "⛔ отклонено (не подтверждено): PTY-команда".into(),
+                );
+            }
+            if !interactive {
+                // TUI без терминала зависает (живой кейс: agy на пайпах) —
+                // честный отказ вместо зависания; деструктив уже отрезан выше
+                return GatewayResult::Done(
+                    "pty: интерактивная сессия требует настоящего терминала (TTY); запустите poler-engine --gateway в терминале\n".into(),
+                );
+            }
+            let outcome = hostexec::run_pty(&inner, &state.limits, &state.cwd, &[]);
+            if let Some(e) = &outcome.spawn_error {
+                state.last_exit = 127;
+                return GatewayResult::Done(format!("⚡ {e}"));
+            }
+            state.last_exit = outcome.code.unwrap_or(0);
+            return GatewayResult::Done(outcome.render());
+        }
+    }
 
     // Классификация сегментов
     enum Kind {
@@ -158,7 +266,12 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
     // путей в judge_redirect_target раскрывает symlink-прокси.
     if host_idx.is_empty() {
         if let Some(r) = &pipeline.redirect {
-            if let Policy::Block(why) = sandbox::judge_redirect_target(&r.path) {
+            let verdict = sandbox::judge_redirect_target(&r.path);
+            if state.danger_mode {
+                if !verdict.is_allow() {
+                    eprintln!("⚠ DANGER: sandbox отключён владельцем — редирект исполняется без проверок");
+                }
+            } else if let Policy::Block(why) = verdict {
                 state.last_exit = 2;
                 return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
             }
@@ -167,25 +280,24 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
     if !host_idx.is_empty() {
         // пересобираем pipeline с уже срезанными poler-префиксами
         let judged = rebuild_for_judge(&pipeline, &seg_tokens);
-        match sandbox::judge_pipeline(&judged, &host_idx) {
-            Policy::Allow => {}
-            Policy::Block(why) => {
-                state.last_exit = 2;
-                return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
+        let verdict = sandbox::judge_pipeline(&judged, &host_idx);
+        if state.danger_mode {
+            // danger-режим: не блокируем и не спрашиваем — только предупреждаем
+            if !verdict.is_allow() {
+                eprintln!("⚠ DANGER: sandbox отключён владельцем — команда исполняется без проверок");
             }
-            Policy::Confirm(why) => {
-                // interactive — спросить; non-interactive — только auto_yes
-                let ok = if interactive {
-                    ask_confirm(&why, state.auto_yes)
-                } else {
-                    if !state.auto_yes {
-                        eprintln!("⚠ {why} — требуется подтверждение (в скрипте: set autoyes on)");
+        } else {
+            match verdict {
+                Policy::Allow => {}
+                Policy::Block(why) => {
+                    state.last_exit = 2;
+                    return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
+                }
+                Policy::Confirm(why) => {
+                    if !resolve_confirm(state, &why, interactive) {
+                        state.last_exit = 125;
+                        return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
                     }
-                    state.auto_yes
-                };
-                if !ok {
-                    state.last_exit = 125;
-                    return GatewayResult::Done(format!("⛔ отклонено (не подтверждено): {why}"));
                 }
             }
         }
@@ -213,7 +325,7 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
                         "⚡ команда {cmd} не принимает stdin из конвейера (принимают: grep, chunk, impact)"
                     ));
                 }
-                match run_engine(state, tokens, stdin_data.as_deref()) {
+                match run_engine(state, tokens, stdin_data.as_deref(), interactive) {
                     Ok(out) => {
                         final_out = out;
                         stdin_data = Some(final_out.clone());
@@ -327,11 +439,7 @@ fn rebuild_for_judge(orig: &Pipeline, seg_tokens: &[Vec<String>]) -> Pipeline {
 }
 
 /// Интерактивное подтверждение опасного действия.
-fn ask_confirm(reason: &str, auto_yes: bool) -> bool {
-    if auto_yes {
-        println!("⚠ auto-yes: {reason}");
-        return true;
-    }
+fn ask_confirm(reason: &str) -> bool {
     println!("⚠ {reason}");
     print!("исполнить? [yes/No] ");
     let _ = std::io::stdout().flush();
@@ -346,6 +454,67 @@ fn ask_confirm(reason: &str, auto_yes: bool) -> bool {
     }
 }
 
+/// Подтверждение на РЕАЛЬНОМ терминале владельца (/dev/tty): пайп-агент
+/// не может ответить за человека — его stdin не наш терминал
+/// (Zero Silent Escalation, v0.23.0). Нет /dev/tty — отказ.
+fn ask_confirm_tty(reason: &str) -> bool {
+    let mut tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("⚠ {reason} — нет доступа к /dev/tty для подтверждения; отказ");
+            return false;
+        }
+    };
+    let _ = writeln!(tty, "⚠ {reason}");
+    let _ = write!(tty, "разрешить? [yes/No] ");
+    let _ = tty.flush();
+    let mut reader = std::io::BufReader::new(tty);
+    let mut ans = String::new();
+    match reader.read_line(&mut ans) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => {
+            let a = ans.trim().to_lowercase();
+            a == "y" || a == "yes" || a == "д" || a == "да"
+        }
+    }
+}
+
+/// Confirm-ворота с учётом sudo-лизинга и auto-yes (v0.23.0).
+/// Привилегированные подтверждения (sudo/su/…) в интерактиве читаются
+/// с /dev/tty; в неинтерактиве их пропускает ТОЛЬКО активный лизинг
+/// (открытый интерактивно) или явный set autoyes on.
+fn resolve_confirm(state: &mut GatewayState, why: &str, interactive: bool) -> bool {
+    if state.auto_yes {
+        println!("⚠ auto-yes: {why}");
+        return true;
+    }
+    if sandbox::is_privilege_escalation(why) {
+        if let Some(rem) = state.sudo_lease_remaining() {
+            println!(
+                "🔓 sudo-лизинг активен (ещё {} с) — пропуск без запроса",
+                rem.as_secs()
+            );
+            return true;
+        }
+        if interactive {
+            return ask_confirm_tty(why);
+        }
+        eprintln!(
+            "⚠ {why} — привилегированная команда; в неинтерактиве допустимы только sudo-лизинг (интерактивно) или set autoyes on"
+        );
+        return false;
+    }
+    if interactive {
+        return ask_confirm(why);
+    }
+    eprintln!("⚠ {why} — требуется подтверждение (в скрипте: set autoyes on)");
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Контур 1: исполнение команд движка
 // ---------------------------------------------------------------------------
@@ -354,6 +523,7 @@ fn run_engine(
     state: &mut GatewayState,
     tokens: &[String],
     stdin: Option<&str>,
+    interactive: bool,
 ) -> Result<String, EngineFail> {
     let cmd = tokens.first().map(|s| s.as_str()).unwrap_or("");
     let args = &tokens[1..];
@@ -374,11 +544,16 @@ fn run_engine(
         "weblens" => cmd_weblens(args).map_err(EngineFail::Msg),
         "license" => Ok(crate::license::status_text()),
         "cd" => cmd_cd(state, args).map_err(EngineFail::Msg),
+        "workspace" => cmd_workspace(state, args).map_err(EngineFail::Msg),
+        "grant" => cmd_grant(state, args, interactive).map_err(EngineFail::Msg),
+        "pty" => Err(EngineFail::Msg(
+            "pty: укажите команду (pty vim main.rs) — TUI/IDE/агент на псевдотерминале".into(),
+        )),
         "pwd" => Ok(format!("{}\n", state.cwd.display())),
         "clear" => Ok("\x1b[2J\x1b[1;1H".into()),
         "help" | "?" => Ok(gateway_help()),
         "version" | "ver" | "v" => Ok(format!(
-            "poler-engine {} — Terminal Gateway v0.22.1 (двойной контур: engine-native + sandboxed host proxy)\n",
+            "poler-engine {} — Terminal Gateway v0.23.0 (двойной контур + PTY-passthrough + sudo-гейт)\n",
             env!("CARGO_PKG_VERSION")
         )),
         "quit" | "exit" | "q" => Err(EngineFail::Quit),
@@ -389,6 +564,7 @@ fn run_engine(
                     "hosttimeout" => return cmd_set_hosttimeout(state, args).map_err(EngineFail::Msg),
                     "hostenv" => return cmd_set_hostenv(state, args).map_err(EngineFail::Msg),
                     "autoyes" => return cmd_set_autoyes(state, args).map_err(EngineFail::Msg),
+                    "sandbox" => return cmd_set_sandbox(state, args, interactive).map_err(EngineFail::Msg),
                     _ => {}
                 }
             }
@@ -663,11 +839,9 @@ fn cmd_service(args: &[String]) -> Result<String, String> {
         "restart" => {
             let name = args.get(1).ok_or("service restart <имя> [bind]")?;
             let bind = args.get(2).map(|s| s.as_str());
-            if service::stop(name).is_ok() {
-                service::start(name, bind)
-            } else {
-                service::start(name, bind)
-            }
+            // stop не критичен для restart: мог не быть запущен
+            let _ = service::stop(name);
+            service::start(name, bind)
         }
         "attach" => {
             let name = args.get(1).ok_or("service attach <имя>")?;
@@ -858,13 +1032,137 @@ fn cmd_set_autoyes(state: &mut GatewayState, args: &[String]) -> Result<String, 
     Ok(format!("auto-подтверждение: {}\n", if state.auto_yes { "ВКЛ (осторожно!)" } else { "выкл" }))
 }
 
+/// `set sandbox on|off|status` (v0.23.0): явное управление sandbox.
+/// Отключение — только в интерактиве с подтверждением на /dev/tty
+/// (Zero Silent Escalation: пайп-агент не может выключить защиту молча).
+fn cmd_set_sandbox(
+    state: &mut GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
+    let v = args
+        .get(1)
+        .map(|s| s.as_str())
+        .ok_or("set sandbox on|off|status")?;
+    match v {
+        "status" => Ok(sandbox_status(state)),
+        "off" => {
+            if state.danger_mode {
+                return Ok("sandbox уже отключён (danger mode)\n".into());
+            }
+            if !interactive {
+                return Ok(
+                    "⛔ set sandbox off: отключение sandbox возможно только в интерактивной сессии (подтверждение на /dev/tty)\n"
+                        .into(),
+                );
+            }
+            if !ask_confirm_tty(
+                "ОТКЛЮЧИТЬ SANDBOX ПОЛНОСТЬЮ? Блокировки перестанут действовать; вся ответственность — на операторе",
+            ) {
+                return Ok("не подтверждено — sandbox остаётся активным\n".into());
+            }
+            state.danger_mode = true;
+            Ok(
+                "☠ DANGER MODE: sandbox отключён. Все команды исполняются без проверок. Ответственность — на операторе.\n"
+                    .into(),
+            )
+        }
+        "on" => {
+            state.danger_mode = false;
+            Ok("sandbox включён (Block/Confirm/Allow)\n".into())
+        }
+        other => Err(format!("set sandbox: {other}? (on|off|status)")),
+    }
+}
+
+/// Сводка режима безопасности для `set sandbox status`.
+fn sandbox_status(state: &GatewayState) -> String {
+    let sb = if state.danger_mode {
+        "ОТКЛЮЧЁН (danger mode — только предупреждения)"
+    } else {
+        "активен (Block/Confirm/Allow)"
+    };
+    let lease = match state.sudo_lease_remaining() {
+        Some(rem) => format!("активен, ещё {} с", rem.as_secs()),
+        None => "не активен".to_string(),
+    };
+    format!("sandbox: {sb}\nsudo-лизинг: {lease}\n")
+}
+
+/// `grant sudo <N|m|s|h>|off|status` (v0.23.0): временный лизинг
+/// привилегий — окно, в котором sudo/su-Confirm не спрашивается.
+/// Открывается ТОЛЬКО в интерактивной сессии; кап 60 минут; сгорает сам.
+fn cmd_grant(
+    state: &mut GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
+    match args.first().map(|s| s.as_str()) {
+        None | Some("status") => Ok(grant_status(state)),
+        Some("sudo") => match args.get(1).map(|s| s.as_str()) {
+            None => Ok(grant_status(state)),
+            Some("off") | Some("revoke") => {
+                if state.sudo_lease_until.take().is_some() {
+                    Ok("sudo-лизинг отозван\n".into())
+                } else {
+                    Ok("sudo-лизинг не активен\n".into())
+                }
+            }
+            Some(v) => {
+                if !interactive {
+                    return Ok(
+                        "⛔ grant sudo: лизинг привилегий открывается только в интерактивной сессии (владелец за терминалом)\n"
+                            .into(),
+                    );
+                }
+                let (secs, clamped) = parse_lease(v)?;
+                state.sudo_lease_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+                let cap_note = if clamped { " (кап 60 мин)" } else { "" };
+                Ok(format!(
+                    "🔓 sudo-лизинг активен: {v}{cap_note} — сгорит автоматически. Деструктивные команды (rm -rf /, dd of=/dev/*, reverse-shell…) по-прежнему БЛОКИРУЮТСЯ.\n"
+                ))
+            }
+        },
+        Some(other) => Err(format!("grant: {other}? (grant sudo <мин>m|off|status)")),
+    }
+}
+
+fn grant_status(state: &GatewayState) -> String {
+    match state.sudo_lease_remaining() {
+        Some(rem) => format!("sudo-лизинг активен: ещё {} с\n", rem.as_secs()),
+        None => "sudo-лизинг не активен (grant sudo 5m — открыть в интерактиве)\n".into(),
+    }
+}
+
+/// Парсер длительности лизинга: `5` → 300 с (минуты по умолчанию),
+/// `5m`/`90s`/`2h`; кап 60 минут (флаг clamped).
+fn parse_lease(v: &str) -> Result<(u64, bool), String> {
+    let (num, mult) = match v.chars().last() {
+        Some('m') => (&v[..v.len() - 1], 60u64),
+        Some('s') => (&v[..v.len() - 1], 1),
+        Some('h') => (&v[..v.len() - 1], 3600),
+        _ => (v, 60),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("grant sudo: не число: {v} (примеры: 5m, 90s, 2h)"))?;
+    if n == 0 {
+        return Err("grant sudo: нулевой лизинг".into());
+    }
+    let total = n.saturating_mul(mult);
+    if total > 3600 {
+        Ok((3600, true))
+    } else {
+        Ok((total, false))
+    }
+}
+
 fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
     let target = match args.first() {
         Some(p) => super::sandbox::expand_home(p),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            home
-        }
+        None => std::env::var("HOME").unwrap_or_else(|_| ".".into()),
     };
     let path = if target.starts_with('/') {
         PathBuf::from(&target)
@@ -877,8 +1175,52 @@ fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
     if !canonical.is_dir() {
         return Err(format!("cd: {} не каталог", path.display()));
     }
+    // v0.23.0: process-cwd следует за state.cwd — движковые и хостовые
+    // команды работают от одного корня (в REPL; тесты не мутируют глобал).
+    if state.sync_cwd {
+        std::env::set_current_dir(&canonical)
+            .map_err(|e| format!("cd: chdir: {e}"))?;
+    }
     state.cwd = canonical;
     Ok(String::new())
+}
+
+/// `workspace [PATH]` (v0.23.0): выбор корня проекта. Меняет state.cwd
+/// И process-cwd (движковые grep/chunk/search и подпроц-
+/// сы — от одного корня), обновляет приглашение; без PATH — отчёт.
+fn cmd_workspace(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
+    let Some(p) = args.first() else {
+        return Ok(format!(
+            "workspace: {}\nдвижковые (grep/chunk/search) и хостовые команды работают от этого корня; workspace <путь> — переключить\n",
+            state.cwd.display()
+        ));
+    };
+    let target = super::sandbox::expand_home(p);
+    let path = if target.starts_with('/') {
+        PathBuf::from(&target)
+    } else {
+        state.cwd.join(&target)
+    };
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("workspace: {}: {e}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("workspace: {} не каталог", path.display()));
+    }
+    if state.sync_cwd {
+        std::env::set_current_dir(&canonical)
+            .map_err(|e| format!("workspace: chdir: {e}"))?;
+    }
+    let moved = state.cwd != canonical;
+    state.cwd = canonical;
+    if moved {
+        Ok(format!(
+            "workspace → {}\nдвижок и хостовые команды привязаны к новому корню; подпроцессы (в т.ч. агенты) стартуют отсюда\n",
+            state.cwd.display()
+        ))
+    } else {
+        Ok(format!("workspace: {} (уже здесь)\n", state.cwd.display()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +1229,7 @@ fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
 
 pub fn gateway_help() -> String {
     let mut s = String::from(
-        "POLER Terminal Gateway — единый терминальный шлюз (v0.22.0, hardening v0.22.1)\n\
+        "POLER Terminal Gateway — единый терминальный шлюз (v0.23.0: PTY + workspace + sudo-гейт)\n\
          ═════════════════════════════════════════════════════════════\n\
          Двойной контур: команды движка исполняются нативно (приоритет),\n\
          всё остальное — хостовая ОС в sandbox-режиме.\n\n",
@@ -908,7 +1250,21 @@ pub fn gateway_help() -> String {
     s.push_str("  !grep / host grep           принудительно системный (а не движковый)\n");
     s.push_str("  БЛОКИРУЕТСЯ: rm -rf /, форк-бомбы, dd of=/dev/*, shutdown,\n");
     s.push_str("               curl|sh, > /dev/sd*, > /etc/*\n");
-    s.push_str("  ПОДТВЕРЖДАЕТСЯ: sudo/su, rm -r, dd\n\n");
+    s.push_str("  ПОДТВЕРЖДАЕТСЯ: sudo/su (на /dev/tty), rm -r, dd\n\n");
+    s.push_str("PTY-PASSTHROUGH (v0.23.0 — интерактивные TUI/IDE/агенты):\n");
+    s.push_str("  pty <команда…>              принудительный псевдотерминал\n");
+    s.push_str("  авто-PTY: vim/htop/less/tmux/agy/claude… и bare-REPL (python3)\n");
+    s.push_str("  (политика sandbox судится по той же команде — PTY ≠ обход)\n\n");
+    s.push_str("WORKSPACE (v0.23.0 — корень проекта):\n");
+    s.push_str("  workspace [PATH]            показать/переключить корень проекта;\n");
+    s.push_str("                              движок+хост+подпроцессы от одного cwd\n");
+    s.push_str("  cd PATH / pwd               быстрая навигация (тот же корень)\n\n");
+    s.push_str("ПРИВИЛЕГИИ (v0.23.0 — гранулярный sudo-гейт):\n");
+    s.push_str("  sudo <cmd>                  одноразово: подтверждение на /dev/tty\n");
+    s.push_str("  grant sudo 5m|90s|2h        временный лизинг (только интерактив,\n");
+    s.push_str("                              кап 60 мин, сгорает сам); grant sudo off\n");
+    s.push_str("  set sandbox on|off|status   danger-режим (off — только интерактив\n");
+    s.push_str("                              с подтверждением); --dangerously-allow-all\n\n");
     s.push_str("КОНВЕЙЕРЫ (любые комбинации контуров):\n");
     s.push_str("  ls -la src/ | chunk --size 200\n");
     s.push_str("  cat main.rs | impact main\n");
@@ -1154,5 +1510,203 @@ mod tests {
         let mut st = state();
         let out = run(&mut st, "printf 'a b c\\n' | poler grep b --stdin").unwrap();
         assert!(out.contains("a b c"), "poler-префикс должен срезаться: {out}");
+    }
+
+    // =====================================================================
+    // v0.23.0: PTY-роутинг, workspace, sudo-гейт, danger-режим
+    // =====================================================================
+
+    #[test]
+    fn pty_auto_detect_known_tui_and_repl() {
+        assert!(is_auto_pty(&["vim".into(), "main.rs".into()]));
+        assert!(is_auto_pty(&["htop".into()]));
+        assert!(is_auto_pty(&["/usr/bin/less".into(), "x.log".into()]));
+        assert!(is_auto_pty(&["agy".into()]));
+        // bare-REPL — кандидат; с аргументами — обычный запуск
+        assert!(is_auto_pty(&["python3".into()]));
+        assert!(!is_auto_pty(&["python3".into(), "script.py".into()]));
+        // не-TUI команды не перехватываются
+        assert!(!is_auto_pty(&["ls".into(), "-la".into()]));
+        assert!(!is_auto_pty(&["grep".into(), "x".into()]));
+        assert!(!is_auto_pty(&[]));
+    }
+
+    #[test]
+    fn pty_destructive_inner_command_blocked() {
+        // PTY — канал I/O, не обход sandbox: деструктив внутри pty режется
+        let mut st = state();
+        let out = run(&mut st, "pty rm -rf /").unwrap();
+        assert!(out.contains("блокировка"), "pty rm -rf / должен блокироваться: {out}");
+        let out = run(&mut st, "pty python3 -c \"import os; os.system('rm -rf /usr')\"").unwrap();
+        assert!(out.contains("блокировка"), "pty + интерпретатор-деструктив: {out}");
+    }
+
+    #[test]
+    fn pty_noninteractive_is_notice_not_spawn() {
+        // TUI без TTY не запускаем (зависал бы) — честный отказ
+        let mut st = state();
+        let out = run(&mut st, "pty vim x.rs").unwrap();
+        assert!(
+            out.contains("требует настоящего терминала"),
+            "неинтерактивный pty — отказ без спавна: {out}"
+        );
+        assert!(!out.contains("не удалось запустить"));
+    }
+
+    #[test]
+    fn pty_auto_not_triggered_noninteractive() {
+        // авто-PTY только в интерактиве: bare python3 в пайпе — обычный путь
+        let mut st = state();
+        // python3 с EOF на stdin мгновенно выходит (или отсутствует) —
+        // главное: НЕ сообщение про терминал
+        let _ = run(&mut st, "host echo ok");
+        let out = run(&mut st, "pty").unwrap();
+        // «pty» без команды — подсказка
+        assert!(out.contains("pty:"), "пустой pty — подсказка: {out}");
+    }
+
+    #[test]
+    fn workspace_report_and_switch() {
+        let mut st = state();
+        let out = run(&mut st, "workspace").unwrap();
+        assert!(out.contains("workspace:"), "отчёт без PATH: {out}");
+        let tmp = std::env::temp_dir().join(format!("poler-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = run(&mut st, &format!("workspace {}", tmp.display())).unwrap();
+        assert!(out.contains("workspace →"), "переключение: {out}");
+        assert_eq!(st.cwd, tmp.canonicalize().unwrap());
+        // несуществующий — ошибка
+        let out = run(&mut st, "workspace /no/such/dir/xyz").unwrap();
+        assert!(out.contains("⚡"));
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn workspace_syncs_process_cwd_when_enabled() {
+        let mut st = state();
+        st.sync_cwd = true;
+        let tmp = std::env::temp_dir().join(format!("poler-ws-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _ = run(&mut st, &format!("workspace {}", tmp.display())).unwrap();
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            tmp.canonicalize().unwrap(),
+            "process-cwd должен следовать за workspace"
+        );
+        // вежливость к параллельным тестам: вернуть cwd манифеста
+        let _ = std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn grant_sudo_refused_noninteractive() {
+        let mut st = state();
+        let out = run(&mut st, "grant sudo 5m").unwrap();
+        assert!(
+            out.contains("интерактивной сессии"),
+            "лизинг в неинтерактиве — отказ: {out}"
+        );
+        assert!(st.sudo_lease_until.is_none(), "лизинг не должен открыться");
+    }
+
+    #[test]
+    fn grant_lease_bypasses_privilege_confirm() {
+        // активный лизинг пропускает sudo-Confirm в неинтерактиве
+        let mut st = state();
+        st.sudo_lease_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(300));
+        let out = run(&mut st, "sudo true").unwrap();
+        assert!(
+            !out.contains("не подтверждено"),
+            "лизинг должен пропустить sudo: {out}"
+        );
+        // лизинг истёк — снова ворота
+        st.sudo_lease_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(st.sudo_lease_remaining().is_none());
+        let out = run(&mut st, "sudo true").unwrap();
+        assert!(
+            out.contains("не подтверждено"),
+            "истёкший лизинг не пропускает: {out}"
+        );
+    }
+
+    #[test]
+    fn grant_lease_does_not_bypass_destructive() {
+        // лизинг поднимает Confirm-ворота, но НЕ Block-вердикты
+        let mut st = state();
+        st.sudo_lease_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(300));
+        let out = run(&mut st, "sudo rm -rf /usr").unwrap();
+        assert!(out.contains("блокировка"), "Block не зависит от лизинга: {out}");
+    }
+
+    #[test]
+    fn grant_lease_parsing() {
+        assert_eq!(parse_lease("5").unwrap(), (300, false));
+        assert_eq!(parse_lease("5m").unwrap(), (300, false));
+        assert_eq!(parse_lease("90s").unwrap(), (90, false));
+        assert_eq!(parse_lease("1h").unwrap(), (3600, false));
+        assert_eq!(parse_lease("2h").unwrap(), (3600, true), "2h превышает кап 60 мин");
+        assert_eq!(parse_lease("999h").unwrap(), (3600, true), "кап 60 минут");
+        assert!(parse_lease("abc").is_err());
+        assert!(parse_lease("0").is_err());
+    }
+
+    #[test]
+    fn sandbox_off_refused_noninteractive() {
+        let mut st = state();
+        let out = run(&mut st, "set sandbox off").unwrap();
+        assert!(
+            out.contains("интерактивной сессии"),
+            "отключение sandbox в неинтерактиве — отказ: {out}"
+        );
+        assert!(!st.danger_mode, "danger-режим не включается из скрипта");
+        // повторно в danger-режиме — уже отключён
+        st.danger_mode = true;
+        let out = run(&mut st, "set sandbox off").unwrap();
+        assert!(out.contains("уже отключён"));
+        // включение обратно — всегда можно
+        let out = run(&mut st, "set sandbox on").unwrap();
+        assert!(out.contains("включён"));
+        assert!(!st.danger_mode);
+    }
+
+    #[test]
+    fn sandbox_status_report() {
+        let mut st = state();
+        let out = run(&mut st, "set sandbox status").unwrap();
+        assert!(out.contains("sandbox: активен"), "статус по умолчанию: {out}");
+        st.danger_mode = true;
+        let out = run(&mut st, "set sandbox status").unwrap();
+        assert!(out.contains("ОТКЛЮЧЁН"), "danger-статус: {out}");
+    }
+
+    #[test]
+    fn danger_mode_bypasses_block_with_warning() {
+        // Block-класс (kill PID 1) в danger-режиме исполняется без ⛔;
+        // в контейнере без root это безобидный EPERM
+        let mut st = state();
+        st.danger_mode = true;
+        let out = run(&mut st, "kill -9 1").unwrap();
+        assert!(
+            !out.contains("блокировка") && !out.contains("⛔"),
+            "danger-режим не блокирует: {out}"
+        );
+        // и Confirm-класс тоже не спрашивается
+        let out = run(&mut st, "rm -rf ./definitely-missing-dir-xyz").unwrap();
+        assert!(
+            !out.contains("не подтверждено"),
+            "danger-режим не спрашивает: {out}"
+        );
+    }
+
+    #[test]
+    fn help_lists_v023_features() {
+        let h = gateway_help();
+        assert!(h.contains("PTY-PASSTHROUGH"), "help: PTY: {h}");
+        assert!(h.contains("WORKSPACE"));
+        assert!(h.contains("grant sudo"));
+        assert!(h.contains("set sandbox"));
     }
 }

@@ -266,6 +266,13 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "license", "license_import", "semantic_expand", "import_browser_session"])]
     gateway: bool,
 
+    /// v0.23.0 DANGER OVERRIDE: полностью отключить sandbox Terminal
+    /// Gateway. Красный баннер при старте; блокировки и подтверждения
+    /// НЕ применяются — вся ответственность за безопасность хоста
+    /// ложится на оператора. Требует --gateway.
+    #[arg(long = "dangerously-allow-all", requires = "gateway")]
+    dangerously_allow_all: bool,
+
     /// Интерактивный REPL (poler> search/nlm/crawl/sync...).
     /// База web-index.db и NlmSession открываются ленимо и переиспользуются
     /// между командами (история в ~/.cache/poler-engine/shell-history.txt).
@@ -1209,7 +1216,7 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- Terminal Gateway: единый терминальный шлюз v0.22.0 ----------
     if cli.gateway {
         let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
-        return poler_engine::gateway::run_gateway(db_path);
+        return poler_engine::gateway::run_gateway(db_path, cli.dangerously_allow_all);
     }
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------

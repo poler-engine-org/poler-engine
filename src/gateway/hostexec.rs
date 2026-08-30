@@ -397,6 +397,334 @@ fn kill_group(child: &mut Child, _sig: Signal) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// PTY Passthrough (v0.23.0) — интерактивные TUI/IDE/REPL на живом терминале
+// ---------------------------------------------------------------------------
+
+/// Спавн команды на собственном псевдотерминале с прозрачной передачей I/O:
+/// хост-терминал переводится в raw mode, байты stdin↔master качаются
+/// насосом на poll(2), ресайз окна пробрасывается в PTY (TIOCSWINSZ),
+/// Ctrl+C идёт байтом 0x03 → line-discipline слейва сам превращает его в
+/// SIGINT для foreground-группы потомка. Транскрипт сессии накапливается
+/// в stdout (кап limits.output_cap — защита памяти).
+///
+/// Wall-timeout НЕ применяется: интерактивная сессия управляется владельцем
+/// (выход из TUI = конец сессии). Код возврата пробрасывается.
+///
+/// PTY — это только канал I/O: политику безопасности судит sandbox по
+/// той же команде ДО спавна (dispatch), здесь исполнения без вердикта нет.
+pub fn run_pty(
+    tokens: &[String],
+    limits: &HostLimits,
+    cwd: &Path,
+    extra_env: &[(String, String)],
+) -> HostOutcome {
+    clear_interrupt();
+    if tokens.is_empty() {
+        return HostOutcome {
+            spawn_error: Some("pty: пустая команда".into()),
+            ..Default::default()
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        pty_linux::run(tokens, limits, cwd, extra_env)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (limits, cwd, extra_env);
+        HostOutcome {
+            spawn_error: Some(
+                "pty: PTY-passthrough в этой сборке поддерживается только на Linux".into(),
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+/// Linux-реализация PTY: posix_openpt/grantpt/unlockpt/ptsname_r + setsid +
+/// TIOCSCTTY в pre_exec. Нулей новых зависимостей — тонкие обёртки над
+/// libc (как kill(2) выше), crossterm (уже в дереве) — только raw mode.
+#[cfg(target_os = "linux")]
+mod pty_linux {
+    use super::{filtered_env, kill_raw, EnvMode, HostLimits, HostOutcome, INTERRUPT};
+    use std::fs::{File, OpenOptions};
+    use std::io::{IsTerminal, Read, Write};
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    const O_RDWR: i32 = 2;
+    const O_NOCTTY: i32 = 0o400;
+    const TIOCSCTTY: u64 = 0x540E;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const POLLIN: i16 = 0x001;
+    const POLLHUP: i16 = 0x004;
+    const POLLERR: i16 = 0x008;
+    /// Тик насоса (мс) = poll-таймаут; ресайз проверяется раз в 5 тиков.
+    const TICK_MS: i32 = 100;
+    /// Дренаж хвоста вывода после выхода потомка (мс).
+    const DRAIN_MS: u64 = 300;
+
+    #[repr(C)]
+    struct WinSize {
+        row: u16,
+        col: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+
+    // Два typed-объявления одного C-символа ioctl: сигнатуры различаются
+    // типом третьего аргумента (TIOCSWINSZ — указатель, TIOCSCTTY — int).
+    // На x86_64/arm64 SysV ABI это корректные тонкие обёртки.
+    #[allow(clashing_extern_declarations)]
+    extern "C" {
+        fn posix_openpt(flags: i32) -> i32;
+        fn grantpt(fd: i32) -> i32;
+        fn unlockpt(fd: i32) -> i32;
+        fn ptsname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
+        fn setsid() -> i32;
+        #[link_name = "ioctl"]
+        fn ioctl_winsize(fd: i32, request: u64, arg: *mut WinSize) -> i32;
+        #[link_name = "ioctl"]
+        fn ioctl_int(fd: i32, request: u64, arg: i32) -> i32;
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    }
+
+    /// RAII-возврат терминала хоста в cooked mode (исключения/ранний выход).
+    struct RawGuard(bool);
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+    }
+
+    fn err_outcome(msg: String) -> HostOutcome {
+        HostOutcome {
+            spawn_error: Some(msg),
+            ..Default::default()
+        }
+    }
+
+    pub fn run(
+        tokens: &[String],
+        limits: &HostLimits,
+        cwd: &Path,
+        extra_env: &[(String, String)],
+    ) -> HostOutcome {
+        // 1) master PTY
+        let master_fd = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
+        if master_fd < 0 {
+            return err_outcome(format!("pty: posix_openpt: {}", std::io::Error::last_os_error()));
+        }
+        if unsafe { grantpt(master_fd) } != 0 || unsafe { unlockpt(master_fd) } != 0 {
+            return err_outcome(format!("pty: grantpt/unlockpt: {}", std::io::Error::last_os_error()));
+        }
+        let mut namebuf = [0u8; 64];
+        if unsafe { ptsname_r(master_fd, namebuf.as_mut_ptr(), namebuf.len()) } != 0 {
+            return err_outcome(format!("pty: ptsname_r: {}", std::io::Error::last_os_error()));
+        }
+        let slave_path = match std::ffi::CStr::from_bytes_until_nul(&namebuf) {
+            Ok(s) => s.to_string_lossy().into_owned(),
+            Err(_) => return err_outcome("pty: ptsname_r: путь без NUL".into()),
+        };
+
+        // 2) спавн: slave как stdio + setsid + TIOCSCTTY в pre_exec
+        let slave = match OpenOptions::new().read(true).write(true).open(&slave_path) {
+            Ok(f) => f,
+            Err(e) => return err_outcome(format!("pty: open {slave_path}: {e}")),
+        };
+        let slave_out = match slave.try_clone() {
+            Ok(f) => f,
+            Err(e) => return err_outcome(format!("pty: dup slave: {e}")),
+        };
+        let slave_err = match slave.try_clone() {
+            Ok(f) => f,
+            Err(e) => return err_outcome(format!("pty: dup slave: {e}")),
+        };
+
+        let mut cmd = Command::new(&tokens[0]);
+        cmd.args(&tokens[1..]).current_dir(cwd);
+        cmd.stdin(Stdio::from(slave))
+            .stdout(Stdio::from(slave_out))
+            .stderr(Stdio::from(slave_err));
+        match limits.env_mode {
+            EnvMode::Filtered => {
+                cmd.env_clear();
+                for (k, v) in filtered_env() {
+                    cmd.env(k, v);
+                }
+            }
+            EnvMode::Full => {}
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        // потомок: новая сессия, slave (fd 0) — управляющий терминал
+        unsafe {
+            cmd.pre_exec(|| {
+                if setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if ioctl_int(0, TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return err_outcome(format!(
+                    "не удалось запустить «{}» на PTY: {e}",
+                    tokens[0]
+                ))
+            }
+        };
+
+        // 3) master в owned File; raw mode хоста; начальный размер окна
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let live = std::io::stdout().is_terminal();
+        let raw_ok = crossterm::terminal::enable_raw_mode().is_ok();
+        let _raw_guard = RawGuard(raw_ok);
+        let mut last_size: Option<(u16, u16)> = None;
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            last_size = Some((cols, rows));
+            let mut ws = WinSize { row: rows, col: cols, xpixel: 0, ypixel: 0 };
+            unsafe { ioctl_winsize(master_fd, TIOCSWINSZ, &mut ws) };
+        }
+
+        // 4) насос: stdin→master, master→stdout (+ транскрипт с капом).
+        // stdin качаем ТОЛЬКО если это настоящий TTY: в живом REPL это
+        // терминал владельца (passthrough), а пайп/файл не трогаем —
+        // иначе PTY-сессия съест чужой поток ввода (скрипты, тесты).
+        let pump_stdin = std::io::stdin().is_terminal();
+        let cap = limits.output_cap;
+        let mut transcript: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        let mut stdin_open = pump_stdin;
+        let mut tick: u32 = 0;
+        let mut out_buf = std::io::stdout();
+
+        let append = |tr: &mut Vec<u8>, chunk: &[u8], trunc: &mut bool| {
+            if tr.len() + chunk.len() > cap {
+                let room = cap.saturating_sub(tr.len());
+                tr.extend_from_slice(&chunk[..room]);
+                *trunc = true;
+            } else {
+                tr.extend_from_slice(chunk);
+            }
+        };
+
+        let status = 'pump: loop {
+            let mut fds = [
+                PollFd { fd: 0, events: if stdin_open { POLLIN } else { 0 }, revents: 0 },
+                PollFd { fd: master_fd, events: POLLIN, revents: 0 },
+            ];
+            let n = unsafe { poll(fds.as_mut_ptr(), 2, TICK_MS) };
+            if n > 0 {
+                if stdin_open && fds[0].revents & (POLLIN | POLLHUP) != 0 {
+                    let mut buf = [0u8; 4096];
+                    match std::io::stdin().read(&mut buf) {
+                        Ok(0) => stdin_open = false,
+                        Ok(n) => {
+                            let _ = (&master).write_all(&buf[..n]);
+                        }
+                        Err(_) => stdin_open = false,
+                    }
+                }
+                if fds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+                    let mut buf = [0u8; 8192];
+                    match master.read(&mut buf) {
+                        Ok(0) => break 'pump child.wait().ok(),
+                        Ok(n) => {
+                            if live {
+                                let _ = out_buf.write_all(&buf[..n]);
+                                let _ = out_buf.flush();
+                            }
+                            append(&mut transcript, &buf[..n], &mut truncated);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break 'pump child.wait().ok(), // EIO: slave закрыт
+                    }
+                }
+            }
+            // SIGINT нам (не через raw-байт): переслать группе потомка
+            if INTERRUPT.load(Ordering::SeqCst) {
+                INTERRUPT.store(false, Ordering::SeqCst);
+                let _ = kill_raw(-(child.id() as i32), 2);
+            }
+            // ресайз окна хоста → PTY (каждые ~500 мс)
+            tick += 1;
+            if tick % 5 == 0 {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    if Some((cols, rows)) != last_size {
+                        last_size = Some((cols, rows));
+                        let mut ws = WinSize { row: rows, col: cols, xpixel: 0, ypixel: 0 };
+                        unsafe { ioctl_winsize(master_fd, TIOCSWINSZ, &mut ws) };
+                    }
+                }
+            }
+            // выход потомка → короткий дренаж хвоста и стоп
+            if let Some(st) = child.try_wait().unwrap_or(None) {
+                let drain_start = Instant::now();
+                while drain_start.elapsed() < Duration::from_millis(DRAIN_MS) {
+                    let mut pf = [PollFd { fd: master_fd, events: POLLIN, revents: 0 }];
+                    if unsafe { poll(pf.as_mut_ptr(), 1, 50) } > 0
+                        && pf[0].revents & (POLLIN | POLLHUP | POLLERR) != 0
+                    {
+                        let mut buf = [0u8; 8192];
+                        match master.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if live {
+                                    let _ = out_buf.write_all(&buf[..n]);
+                                    let _ = out_buf.flush();
+                                }
+                                append(&mut transcript, &buf[..n], &mut truncated);
+                            }
+                            Err(_) => break,
+                        }
+                    } else if pf[0].revents != 0 {
+                        break;
+                    }
+                }
+                break 'pump Some(st);
+            }
+        };
+
+        // 5) закрыть master, вернуть терминал в человеческий вид
+        drop(master);
+        if live {
+            // TUI мог спрятать курсор/войти в alt-screen — снимаем оба
+            let _ = out_buf.write_all(b"\x1b[?25h\x1b[?1049l");
+            let _ = out_buf.flush();
+        }
+
+        HostOutcome {
+            stdout: String::from_utf8_lossy(&transcript).to_string(),
+            stderr: String::new(),
+            code: status.and_then(|st| st.code()),
+            interrupted: false,
+            timed_out: false,
+            truncated,
+            spawn_error: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Тесты
 // ---------------------------------------------------------------------------
 
@@ -510,5 +838,72 @@ mod tests {
         let r = out.render();
         assert!(r.contains("⚠ stderr: oops"));
         assert!(r.contains("exit-код: 2"));
+    }
+
+    // ------- PTY Passthrough (v0.23.0) -------
+
+    #[test]
+    fn pty_echo_roundtrip() {
+        let lim = HostLimits::default();
+        let out = run_pty(
+            &["echo".into(), "pty-hello-42".into()],
+            &lim,
+            Path::new("."),
+            &[],
+        );
+        assert!(
+            out.spawn_error.is_none(),
+            "spawn_error: {:?}",
+            out.spawn_error
+        );
+        assert!(
+            out.stdout.contains("pty-hello-42"),
+            "транскрипт PTY должен содержать вывод: {:?}",
+            out.stdout
+        );
+        assert_eq!(out.code, Some(0));
+    }
+
+    #[test]
+    fn pty_exit_code_propagates() {
+        let lim = HostLimits::default();
+        let out = run_pty(
+            &["sh".into(), "-c".into(), "exit 3".into()],
+            &lim,
+            Path::new("."),
+            &[],
+        );
+        assert!(out.spawn_error.is_none());
+        assert_eq!(out.code, Some(3));
+    }
+
+    #[test]
+    fn pty_missing_binary_is_spawn_error() {
+        let lim = HostLimits::default();
+        let out = run_pty(
+            &["definitely-not-a-binary-xyz".into()],
+            &lim,
+            Path::new("."),
+            &[],
+        );
+        assert!(out.spawn_error.is_some());
+    }
+
+    #[test]
+    fn pty_isatty_inside_child() {
+        // дочерний процесс на PTY обязан видеть TTY (иначе TUI откажется)
+        let lim = HostLimits::default();
+        let out = run_pty(
+            &["sh".into(), "-c".into(), "tty".into()],
+            &lim,
+            Path::new("."),
+            &[],
+        );
+        assert!(out.spawn_error.is_none());
+        assert!(
+            out.stdout.contains("/dev/pts/"),
+            "tty внутри PTY: {:?}",
+            out.stdout
+        );
     }
 }
