@@ -99,6 +99,7 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// 16 случайных байт из /dev/urandom (или fallback на время).
+/// НЕ для криптографии: маски WS-фреймов и прочая некритичная энтропия.
 pub fn random_key_16() -> [u8; 16] {
     let mut buf = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -112,6 +113,19 @@ pub fn random_key_16() -> [u8; 16] {
             *b = ((t >> (i * 4)) & 0xFF) as u8 ^ (i as u8).wrapping_mul(31);
         }
     }
+    buf
+}
+
+/// Аудит-фикс №C3: криптостойкая энтропия с fail-closed-семантикой.
+/// Для OAuth-state и прочего критичного: предсказуемый fallback
+/// (время+счётчик) неприемлем — лучше упасть громко, чем выдать
+/// предсказуемый CSRF-токен. На Linux /dev/urandom есть всегда.
+pub fn secure_key_16() -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .expect("poler-engine: /dev/urandom недоступен — источник энтропии обязателен");
+    f.read_exact(&mut buf)
+        .expect("poler-engine: не удалось прочитать /dev/urandom");
     buf
 }
 
@@ -203,14 +217,17 @@ impl WsClient {
             let (opcode, fin, payload) = self.recv_frame()?;
             match opcode {
                 0x9 => {
-                    // ping -> pong
-                    let mask: [u8; 4] = random_key_16()[..4].try_into().unwrap();
-                    let mut pong = vec![0x8A, 0x80 | payload.len() as u8];
-                    pong.extend_from_slice(&mask);
-                    for (i, b) in payload.iter().enumerate() {
-                        pong.push(b ^ mask[i % 4]);
+                    // ping -> pong (только корректные пинги ≤ 125 байт:
+                    // для более длинных длина не влезает в один байт фрейма)
+                    if payload.len() <= 125 {
+                        let mask: [u8; 4] = random_key_16()[..4].try_into().unwrap();
+                        let mut pong = vec![0x8A, 0x80 | payload.len() as u8];
+                        pong.extend_from_slice(&mask);
+                        for (i, b) in payload.iter().enumerate() {
+                            pong.push(b ^ mask[i % 4]);
+                        }
+                        let _ = self.stream.write_all(&pong);
                     }
-                    let _ = self.stream.write_all(&pong);
                     continue;
                 }
                 0xA => continue, // pong
@@ -314,6 +331,14 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
         .and_then(|l| l.split(':').nth(1))
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
+    // Аудит-фикс №E1: потолок на заявленный Content-Length. Раньше
+    // vec![0u8; content_len] аллоцировался по заявлению сервера без
+    // ограничений — подставной процесс на свободном CDP-порту мог
+    // заставить движок аллоцировать гигабайты.
+    const HTTP_BODY_CAP: usize = 16 * 1024 * 1024;
+    if content_len > HTTP_BODY_CAP {
+        return Err("http: Content-Length превышает 16 МБ".into());
+    }
 
     // тело: Content-Length байт (или до EOF при chunked/отсутствии)
     let mut body = vec![0u8; content_len];

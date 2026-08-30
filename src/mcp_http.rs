@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -47,6 +47,11 @@ const BODY_CAP: usize = 8 * 1024 * 1024;
 /// Idle-таймаут keep-alive-соединения (между запросами).
 const IDLE: Duration = Duration::from_secs(65);
 
+/// Аудит-фикс №C2: ОБЩИЙ бюджет одного запроса (заголовки+тело). Раньше
+/// каждый read() сбрасывал 65-секундный таймаут — клиент-«капельница»
+/// держал слот неограниченно долго (slow-loris на всех MAX_CONNS слотах).
+const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
+
 // =====================================================================
 // Запуск
 // =====================================================================
@@ -54,6 +59,20 @@ const IDLE: Duration = Duration::from_secs(65);
 /// Запуск MCP-сервера по HTTP. Блокируется до ошибки акцептора
 /// (Ctrl+C убивает процесс штатно). Возвращает код процесса.
 pub fn run_http(bind: &str, token: &str, cdp_port: u16, wait_ms: u64, db_path: PathBuf) -> i32 {
+    // Аудит-фикс №B1: пустой/короткий --mcp-token (или POLER_MCP_TOKEN="")
+    // раньше означал, что ЛЮБОЙ запрос с пустым X-Poler-Token проходит
+    // проверку (token_eq("", "") == true). Fail-closed: слабый токен
+    // заменяется сгенерированным.
+    let generated;
+    let token = if token.trim().len() < 16 {
+        generated = generate_token();
+        eprintln!(
+            "poler-mcp-http: заданный токен пуст/короток (<16) — заменён сгенерированным (fail-closed)"
+        );
+        &generated
+    } else {
+        token
+    };
     // «8765» → «127.0.0.1:8765» (удобство: только порт без хоста)
     let bind = match bind.parse::<u16>() {
         Ok(port) => format!("127.0.0.1:{port}"),
@@ -100,6 +119,13 @@ fn serve(listener: TcpListener, server: Arc<McpServer>, token: &str) -> i32 {
                 false,
                 &[],
             );
+            // Аудит-фикс: доставить 503 до клиента. Раньше close() с
+            // непрочитанным телом запроса превращался в RST и ответ
+            // терялся. Теперь: полузакрытие записи (FIN) + добор буфера.
+            let _ = w.shutdown(std::net::Shutdown::Write);
+            let _ = w.set_read_timeout(Some(Duration::from_millis(50)));
+            let mut sink = [0u8; 1024];
+            while matches!(w.read(&mut sink), Ok(n) if n > 0) {}
             continue;
         }
         active.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +153,9 @@ fn handle_conn(stream: TcpStream, server: &McpServer, token: &str) {
     };
     let mut writer = stream;
     loop {
-        let req = match read_request(&mut reader, &mut writer) {
+        // Аудит-фикс №C2: бюджет на ВЕСЬ запрос, а не на один read()
+        let deadline = Instant::now() + REQUEST_DEADLINE;
+        let req = match read_request(&mut reader, &mut writer, deadline) {
             Ok(Some(r)) => r,
             // EOF/таймаут/битый запрос — тихо закрываем
             _ => return,
@@ -159,7 +187,11 @@ impl HttpRequest {
 }
 
 /// Прочитать один HTTP-запрос. Ok(None) — чистое закрытие/битое — оборвать.
-fn read_request(reader: &mut TcpStream, writer: &mut TcpStream) -> std::io::Result<Option<HttpRequest>> {
+fn read_request(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    deadline: Instant,
+) -> std::io::Result<Option<HttpRequest>> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 4096];
     // ---- заголовки: читаем до \r\n\r\n (или \n\n) ----
@@ -169,6 +201,11 @@ fn read_request(reader: &mut TcpStream, writer: &mut TcpStream) -> std::io::Resu
         }
         if buf.len() > HEADER_CAP {
             let _ = write_response(writer, 431, "Request Header Fields Too Large", "text/plain", b"", false, &[]);
+            return Ok(None);
+        }
+        // Аудит-фикс №C2: общий дедлайн — «капельница» больше не продлевает жизнь запросу
+        if Instant::now() >= deadline {
+            let _ = write_response(writer, 408, "Request Timeout", "text/plain", b"request deadline exceeded", false, &[]);
             return Ok(None);
         }
         let n = reader.read(&mut chunk)?;
@@ -237,6 +274,11 @@ fn read_request(reader: &mut TcpStream, writer: &mut TcpStream) -> std::io::Resu
         body.truncate(content_length);
     }
     while body.len() < content_length {
+        // Аудит-фикс №C2: дедлайн и на тело (dribble-атака)
+        if Instant::now() >= deadline {
+            let _ = write_response(writer, 408, "Request Timeout", "text/plain", b"request deadline exceeded", false, &[]);
+            return Ok(None);
+        }
         let n = reader.read(&mut chunk)?;
         if n == 0 {
             return Ok(None);
@@ -290,14 +332,39 @@ fn write_response(
         body.len(),
         if keep_alive { "keep-alive" } else { "close" },
     );
-    head.push_str("Access-Control-Allow-Origin: *\r\n");
-    for (k, v) in extra {
+    // Аудит-фикс №A2: Access-Control-Allow-Origin по умолчанию *, но при
+    // заданном POLER_MCP_ALLOWED_ORIGINS эхом отдаётся только совпавший Origin
+    // (значение передаётся через `extra` тем же именем заголовка).
+    match extra.iter().find(|(k, _)| *k == "Access-Control-Allow-Origin") {
+        Some((_, v)) => head.push_str(&format!("Access-Control-Allow-Origin: {v}\r\n")),
+        None => head.push_str("Access-Control-Allow-Origin: *\r\n"),
+    }
+    for (k, v) in extra.iter().filter(|(k, _)| *k != "Access-Control-Allow-Origin") {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.write_all(body)?;
     w.flush()
+}
+
+/// Аудит-фикс №A2: разрешённый CORS-Origin для этого запроса.
+/// None — список не задан (режим по умолчанию: * — туннель/WebLens).
+/// Some(origin) — Origin запроса входит в POLER_MCP_ALLOWED_ORIGINS.
+/// Some("null") не бывает: несовпавший Origin не получает ACAO вовсе.
+fn cors_allow_origin(req: &HttpRequest) -> Option<String> {
+    let allow = std::env::var("POLER_MCP_ALLOWED_ORIGINS").ok()?;
+    let origin = req.header("origin")?.to_string();
+    let list: Vec<String> = allow
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if list.contains(&origin) {
+        Some(origin)
+    } else {
+        None // без ACAO: браузер сам заблокирует чтение ответа
+    }
 }
 
 /// Маршрутизация запроса → ответ.
@@ -308,22 +375,19 @@ fn respond(w: &mut TcpStream, req: HttpRequest, server: &McpServer, token: &str)
         // Allow-Headers обязателен: fetch с Authorization/Content-Type
         // проходит preflight только при явном разрешении заголовков.
         "OPTIONS" => {
-            let _ = write_response(
-                w,
-                204,
-                "No Content",
-                "text/plain",
-                b"",
-                req.keep_alive,
-                &[
-                    ("Access-Control-Allow-Methods", "POST, GET, OPTIONS".to_string()),
-                    (
-                        "Access-Control-Allow-Headers",
-                        "Authorization, Content-Type, X-Poler-Token".to_string(),
-                    ),
-                    ("Access-Control-Max-Age", "86400".to_string()),
-                ],
-            );
+            // Аудит-фикс №A2: при заданном allowlist — эхо только доверенного Origin
+            let mut extra = vec![
+                ("Access-Control-Allow-Methods", "POST, GET, OPTIONS".to_string()),
+                (
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type, X-Poler-Token".to_string(),
+                ),
+                ("Access-Control-Max-Age", "86400".to_string()),
+            ];
+            if let Some(o) = cors_allow_origin(&req) {
+                extra.push(("Access-Control-Allow-Origin", o));
+            }
+            let _ = write_response(w, 204, "No Content", "text/plain", b"", req.keep_alive, &extra);
         }
         // smoke-проба туннеля: без токена, без данных
         "GET" if req.path == "/health" => {
@@ -350,6 +414,12 @@ fn respond(w: &mut TcpStream, req: HttpRequest, server: &McpServer, token: &str)
                         "message": "unauthorized: нужен заголовок Authorization: Bearer <token> (или X-Poler-Token)"}
                 })
                 .to_string();
+                let mut extra = vec![
+                    ("WWW-Authenticate", "Bearer realm=\"poler-engine\"".to_string()),
+                ];
+                if let Some(o) = cors_allow_origin(&req) {
+                    extra.push(("Access-Control-Allow-Origin", o));
+                }
                 let _ = write_response(
                     w,
                     401,
@@ -357,14 +427,18 @@ fn respond(w: &mut TcpStream, req: HttpRequest, server: &McpServer, token: &str)
                     "application/json",
                     body.as_bytes(),
                     req.keep_alive,
-                    &[("WWW-Authenticate", "Bearer realm=\"poler-engine\"".to_string())],
+                    &extra,
                 );
                 return;
             }
             match rpc_handle(server, &req.body) {
                 Some(resp) => {
                     let body = serde_json::to_string(&resp).unwrap_or_default();
-                    let _ = write_response(w, 200, "OK", "application/json", body.as_bytes(), req.keep_alive, &[]);
+                    let mut extra: Vec<(&str, String)> = Vec::new();
+                    if let Some(o) = cors_allow_origin(&req) {
+                        extra.push(("Access-Control-Allow-Origin", o));
+                    }
+                    let _ = write_response(w, 200, "OK", "application/json", body.as_bytes(), req.keep_alive, &extra);
                 }
                 // только уведомления — по JSON-RPC-конвенции ответа нет
                 None => {
@@ -418,10 +492,18 @@ fn check_auth(req: &HttpRequest, token: &str) -> bool {
     false
 }
 
-/// Сравнение за постоянное время (без раннего выхода по первому байту).
+/// Сравнение за постоянное время. Аудит-фикс №A3: длина тоже сворачивается
+/// в аккумулятор — нет раннего выхода по длине (утечка длины токена).
 fn token_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let n = a.len().max(b.len());
+    let mut acc = (a.len() ^ b.len()) as u8;
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 /// 32 hex-символа из /dev/urandom; fallback — splitmix64 (время+pid+счётчик).

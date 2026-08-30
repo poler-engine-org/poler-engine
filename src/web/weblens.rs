@@ -90,14 +90,35 @@ pub fn materialize_into(dir: &Path, endpoint: &str, token: &str) -> Result<PathB
         }
         std::fs::write(&dest, bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
     }
-    // config.json — единственный файл, НЕ вшитый в бинарник: endpoint+токен
+    // config.json — единственный файл, НЕ вшитый в бинарник: endpoint+токен.
+    // Аудит-фикс №H1: файл содержит MCP-токен — права 0600 с момента
+    // создания (раньше fs::write давал 0644: на multi-user-хостах с домашней
+    // директорией 0755 токен читали другие локальные пользователи).
     let cfg = serde_json::json!({
         "endpoint": endpoint,
         "token": token,
     });
     let cfg_path = dir.join("config.json");
-    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap_or_default())
-        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+    let cfg_body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&cfg_path)
+            .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+        f.write_all(cfg_body.as_bytes())
+            .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&cfg_path, &cfg_body)
+            .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+    }
     validate_mv3(dir)?;
     Ok(dir.to_path_buf())
 }

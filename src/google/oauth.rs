@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{gcp_tokens_path, read_http_head, tokens_path, write_http_response, GoogleHttp};
 use super::audit;
-use crate::web::cdp::random_key_16;
 
 pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 pub const DRIVE_READONLY: &str = "https://www.googleapis.com/auth/drive.readonly";
@@ -194,8 +193,13 @@ pub fn parse_query(q: &str) -> Vec<(String, String)> {
 }
 
 /// Случайный state (защита CSRF): 32 hex-символа.
+/// Аудит-фикс №C3: только криптостойкая энтропия — предсказуемый
+/// time-based fallback для CSRF-state неприемлем (fail-closed).
 pub fn random_state() -> String {
-    random_key_16().iter().map(|b| format!("{b:02x}")).collect()
+    crate::web::cdp::secure_key_16()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -347,13 +351,37 @@ impl StoredTokens {
     }
 }
 
-/// Сохранить токены по явному пути (права 0600 на unix).
+/// Сохранить токены по явному пути (права 0600 с момента создания).
+/// Аудит-фикс №C1: раньше fs::write создавал файл 0644 и только ПОСЛЕ
+/// записи делал chmod 600 — refresh_token лежал читаемым для других
+/// локальных пользователей в окне TOCTOU. Теперь файл создаётся сразу
+/// с нужными правами (O_CREAT с mode 0600) + fsync.
 pub fn save_tokens_at(path: &Path, t: &StoredTokens) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let json = serde_json::to_string_pretty(t).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &json).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    // существующий файл мог быть создан раньше с чужими правами — доводим
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

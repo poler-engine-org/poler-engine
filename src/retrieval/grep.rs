@@ -269,6 +269,19 @@ fn scan_file(path: &Path, matcher: &Matcher, config: &GrepConfig) -> FileScan {
         groups: Vec::new(),
         error: None,
     };
+    // Аудит-фикс №F1: размер по metadata ДО чтения. Раньше файл целиком
+    // попадал в память и только потом отбрасывался за превышение лимита —
+    // на rayon-пуле (16 потоков × гигантские файлы) это врыв RAM.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_FILE_BYTES {
+            scan.error = Some(format!(
+                "{}: {} байт > лимита {MAX_FILE_BYTES} — пропущен",
+                path.display(),
+                meta.len()
+            ));
+            return scan;
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {

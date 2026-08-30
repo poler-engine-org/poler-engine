@@ -51,6 +51,114 @@ fn cap_chars(s: &str, max: usize) -> (String, bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Аудит-фикс v0.21.0 (security hardening): ограждение MCP-инструментов.
+// Угроза: токен Bearer (туннель/логи/конфиг) даёт УДАЛЁННОМУ держателю
+// читать ЛЮБЫЕ локальные файлы (вкл. ~/.config/poler-engine/google_tokens.json
+// => угон Google-аккаунта) и ходить на внутренние адреса (SSRF).
+// ---------------------------------------------------------------------------
+
+/// Чистая (без env) проверка: лежит ли канонический `path` внутри одного из
+/// `roots`? Несуществующий путь — разрешён (ошибку отчётит сам инструмент,
+/// канонизации нет). Символические ссылки резолвятся — escape через symlink
+/// невозможен.
+pub fn path_allowed_under(path: &str, roots: &[PathBuf]) -> bool {
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return true; // нет файла — пусть инструмент честно скажет «не найден»
+    };
+    roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|r| target.starts_with(r))
+}
+
+/// Разрешён ли локальный путь для poler_grep / poler_chunk / poler_search
+/// по умолчанию: рабочая директория, веб-кэш и POLER_MCP_EXTRA_ROOTS.
+/// `POLER_MCP_ALLOW_ANY_PATH=1` возвращает прежнее поведение (доверенный
+/// локальный агент).
+pub fn mcp_path_allowed(path: &str) -> bool {
+    if std::env::var("POLER_MCP_ALLOW_ANY_PATH")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let mut roots: Vec<PathBuf> = vec![
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        web::web_cache_dir(),
+    ];
+    if let Ok(extra) = std::env::var("POLER_MCP_EXTRA_ROOTS") {
+        for r in extra.split(':').filter(|s| !s.is_empty()) {
+            roots.push(PathBuf::from(r));
+        }
+    }
+    path_allowed_under(path, &roots)
+}
+
+/// Чистая (без env) проверка хоста: блокируемый ли это адрес?
+/// Link-local 169.254.0.0/16 (вкл. cloud-metadata 169.254.169.254),
+/// 0.0.0.0/8, IPv6 fe80::/10 (link-local), fc00::/7 (ULA), ::
+/// и известные имена metadata-сервисов. RFC1918 и loopback НЕ блокируем:
+/// WebLens и локальная разработка ходят на 127.0.0.1.
+pub fn host_blocked_by_default(host: &str) -> bool {
+    const META_HOSTS: [&str; 3] = ["metadata.google.internal", "metadata.goog", "instance-data"];
+    let h = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if META_HOSTS.contains(&h.to_ascii_lowercase().as_str()) {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::Ipv4Addr>() {
+        let o = ip.octets();
+        return (o[0] == 169 && o[1] == 254) || o[0] == 0;
+    }
+    if let Ok(ip) = h.parse::<std::net::Ipv6Addr>() {
+        let s = ip.segments();
+        return (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xfe00) == 0xfc00 || ip.is_unspecified();
+    }
+    false // обычные домены — решение за Chromium (резолв и запрос)
+}
+
+/// Анти-SSRF-гейт для poler_fetch / poler_crawl. Отключение (наш собственный
+/// агент на доверенной машине): `POLER_MCP_ALLOW_PRIVATE_NET=1`.
+pub fn mcp_url_allowed(url: &str) -> Result<(), String> {
+    if std::env::var("POLER_MCP_ALLOW_PRIVATE_NET")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let host = url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // порт отрезаем только если он есть (rsplit_once без ':' даёт None)
+    let host = host
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or(host);
+    if host_blocked_by_default(&host) {
+        return Err(format!(
+            "SSRF-ограждение: хост {host} (link-local/metadata) заблокирован; \
+             POLER_MCP_ALLOW_PRIVATE_NET=1 снимает ограничение"
+        ));
+    }
+    Ok(())
+}
+
+/// Ограждение локального пути (общая ошибка для инструментов чтения файлов).
+fn guard_path(path: &str) -> Result<(), String> {
+    if mcp_path_allowed(path) {
+        return Ok(());
+    }
+    Err(format!(
+        "путь вне разрешённых корней MCP (cwd, веб-кэш, POLER_MCP_EXTRA_ROOTS); \
+         POLER_MCP_ALLOW_ANY_PATH=1 снимает ограничение: {path}"
+    ))
+}
+
 pub struct McpServer {
     cdp_port: u16,
     wait_ms: u64,
@@ -257,6 +365,8 @@ impl McpServer {
         if !seed.starts_with("http://") && !seed.starts_with("https://") {
             return Err(format!("seed_url должен быть http(s)://…, получено: {seed}"));
         }
+        // Аудит-фикс: анти-SSRF (169.254.169.254 и пр.) до подъёма Chromium
+        mcp_url_allowed(seed)?;
         let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
         let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
         let delay_ms = args.get("delay_ms").and_then(|v| v.as_u64()).unwrap_or(1000);
@@ -319,6 +429,8 @@ impl McpServer {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(format!("url должен быть http(s)://…, получено: {url}"));
         }
+        // Аудит-фикс: анти-SSRF (link-local/metadata) до подъёма Chromium
+        mcp_url_allowed(url)?;
         let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(self.wait_ms);
 
         web::ensure_chromium(self.cdp_port)?;
@@ -388,6 +500,8 @@ impl McpServer {
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or("аргумент query обязателен")?;
+        // Аудит-фикс: ограждение локальных путей (анти-экфильтрация)
+        guard_path(path)?;
         let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
         let target = PathBuf::from(path);
         if !target.exists() {
@@ -436,6 +550,8 @@ impl McpServer {
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or(".");
+        // Аудит-фикс: ограждение локальных путей (анти-экфильтрация)
+        guard_path(path)?;
         let mode = if args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false) {
             nr::GrepMode::Regex
         } else {
@@ -493,6 +609,8 @@ impl McpServer {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or("аргумент path (файл) обязателен")?;
+        // Аудит-фикс: ограждение локальных путей (анти-экфильтрация)
+        guard_path(path)?;
         let target = PathBuf::from(path);
         if !target.is_file() {
             return Err(format!("не файл или не найден: {path}"));
@@ -923,4 +1041,55 @@ account — профиль аккаунта; chat — вопрос к модел
             }
         }),
     ]
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn path_guard_allows_root_and_blocks_outside() {
+        let dir = std::env::temp_dir().join("poler-audit-guard");
+        let _ = std::fs::create_dir_all(&dir);
+        let inside = dir.join("secret.txt");
+        std::fs::write(&inside, b"x").unwrap();
+        // внутри корня — можно
+        assert!(path_allowed_under(
+            inside.to_str().unwrap(),
+            &[dir.clone()]
+        ));
+        // /etc/passwd — нельзя
+        assert!(!path_allowed_under("/etc/passwd", &[dir.clone()]));
+        // symlink-escape: ссылка внутри корня, цель снаружи — нельзя
+        let link = dir.join("escape-link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+        assert!(!path_allowed_under(link.to_str().unwrap(), &[dir]));
+    }
+
+    #[test]
+    fn net_guard_blocks_metadata_and_link_local() {
+        assert!(host_blocked_by_default("169.254.169.254"));
+        assert!(host_blocked_by_default("metadata.google.internal"));
+        assert!(host_blocked_by_default("metadata.goog"));
+        assert!(host_blocked_by_default("0.0.0.0"));
+        assert!(host_blocked_by_default("fe80::1"));
+        assert!(host_blocked_by_default("fd00::1"));
+        // легитимные цели — не блокируем
+        assert!(!host_blocked_by_default("litnet.com"));
+        assert!(!host_blocked_by_default("127.0.0.1")); // WebLens/локальная разработка
+        assert!(!host_blocked_by_default("192.168.1.1")); // домашняя сеть
+        assert!(!host_blocked_by_default("::1"));
+        assert!(!host_blocked_by_default("docs.rs"));
+    }
+
+    #[test]
+    fn net_guard_url_extraction_with_and_without_port() {
+        // регрессия: rsplit_once(':') без порта раньше давал пустой host
+        assert!(mcp_url_allowed("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(mcp_url_allowed("http://169.254.169.254:8080/x?y=1").is_err());
+        assert!(mcp_url_allowed("https://metadata.google.internal/computeMetadata/").is_err());
+        assert!(mcp_url_allowed("https://litnet.com/").is_ok());
+        assert!(mcp_url_allowed("http://127.0.0.1:8765/").is_ok());
+    }
 }

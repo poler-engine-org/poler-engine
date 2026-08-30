@@ -27,7 +27,7 @@
 //! подделать лицензию без приватного ключа — это задача дискретного
 //! логарифма на ed25519, а не «поменять байтик в файле».
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -189,7 +189,12 @@ pub fn parse_key(key: &str) -> Result<License, LicenseError> {
     let sig = Signature::from_bytes(&sig_arr);
 
     let vk = master_public_key()?;
-    vk.verify(&payload_b, &sig).map_err(|_| LicenseError::BadSignature)?;
+    // Аудит-фикс №D1: verify_strict вместо verify — отклоняет
+    // неканоничные (malleable) подписи: S >= l, small-order R/A.
+    // Для целостности лицензии достаточно и verify, но каноничность
+    // подписи — бесплатно закрывает целый класс атак на подписи.
+    vk.verify_strict(&payload_b, &sig)
+        .map_err(|_| LicenseError::BadSignature)?;
 
     let lic: License = serde_json::from_slice(&payload_b)
         .map_err(|e| LicenseError::BadPayload(e.to_string()))?;
