@@ -153,6 +153,17 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
         .filter(|(_, k)| matches!(k, Kind::Host))
         .map(|(i, _)| i)
         .collect();
+    // v0.22.1: цель редиректа проверяется ВСЕГДА — даже в чисто движковых
+    // конвейерах (`chunk x > pwn`, где pwn — симлинк в /etc): каноникализация
+    // путей в judge_redirect_target раскрывает symlink-прокси.
+    if host_idx.is_empty() {
+        if let Some(r) = &pipeline.redirect {
+            if let Policy::Block(why) = sandbox::judge_redirect_target(&r.path) {
+                state.last_exit = 2;
+                return GatewayResult::Done(format!("⛔ блокировка sandbox: {why}"));
+            }
+        }
+    }
     if !host_idx.is_empty() {
         // пересобираем pipeline с уже срезанными poler-префиксами
         let judged = rebuild_for_judge(&pipeline, &seg_tokens);
@@ -367,7 +378,7 @@ fn run_engine(
         "clear" => Ok("\x1b[2J\x1b[1;1H".into()),
         "help" | "?" => Ok(gateway_help()),
         "version" | "ver" | "v" => Ok(format!(
-            "poler-engine {} — Terminal Gateway v0.22.0 (двойной контур: engine-native + sandboxed host proxy)\n",
+            "poler-engine {} — Terminal Gateway v0.22.1 (двойной контур: engine-native + sandboxed host proxy)\n",
             env!("CARGO_PKG_VERSION")
         )),
         "quit" | "exit" | "q" => Err(EngineFail::Quit),
@@ -876,7 +887,7 @@ fn cmd_cd(state: &mut GatewayState, args: &[String]) -> Result<String, String> {
 
 pub fn gateway_help() -> String {
     let mut s = String::from(
-        "POLER Terminal Gateway — единый терминальный шлюз (v0.22.0)\n\
+        "POLER Terminal Gateway — единый терминальный шлюз (v0.22.0, hardening v0.22.1)\n\
          ═════════════════════════════════════════════════════════════\n\
          Двойной контур: команды движка исполняются нативно (приоритет),\n\
          всё остальное — хостовая ОС в sandbox-режиме.\n\n",
