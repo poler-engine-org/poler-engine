@@ -6,7 +6,7 @@
 updated_utc: 2026-08-30T09:40:00Z
 repo: poler-engine
 branch: main
-commit: HEAD сессии v0.21.0 Hardening & Precision Upgrade (4 задачи владельца: CodeSymbolIdentity, Triage Layer, Semantic Bridge, Benchmark Suite)
+commit: 22a332a (v0.21.0 Hardening & Precision: CodeSymbolIdentity + Triage Layer + Semantic Bridge + Benchmark Suite + фикс чанкера)
 tag: v0.17.6 (релизные теги — не на каждый патч; v0.18.0 License Gate; v0.19.0 Browser Surface; v0.20.0 Native Retrieval; v0.21.0 Hardening & Precision)
 pushed: true
 remote: https://github.com/poler-engine-org/poler-engine.git (репо ПЕРЕНЕСЁН в оргу poler-engine-org 2026-08-29; старые URL Kotokvit/* редиректят; второй репо орги — poler-engine-org/POLER-Quantum-RS, тоже private)
