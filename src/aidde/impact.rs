@@ -1,20 +1,41 @@
-//! Двунаправленный impact-анализ и Impact Passport.
+//! Двунаправленный impact-анализ и Impact Passport (v0.21: Triage Layer).
 //!
 //! **Upstream** (кто зависит от меня): BFS по обратным рёбрам call graph —
 //! все функции и файлы, которые сломаются при изменении символа.
 //! **Downstream** (от кого завишу я): BFS по прямым рёбрам — все скрытые
 //! зависимости самого символа.
 //!
+//! v0.21 формализует два РАЗНЫХ класса знаний паспорта:
+//!
+//! * **[`StructuralRelations`]** — доказанные графом вызовы. Каждое ребро
+//!   взято из AST-скана call graph (caller → callee на конкретной строке
+//!   файла). Это доказательство, воспроизводимое и проверяемое.
+//! * **[`TriageAlert`]** — Triage Layer: эвристический СИГНАЛ ВНИМАНИЯ,
+//!   а не псевдо-доказательство. Маркеры (`unsafe`, `.lock()`, `spawn` …)
+//!   ищутся подстрокой в теле определения; они говорят «сюда посмотреть»,
+//!   но не «здесь есть эффект». Сигнал тревоги ≠ факт.
+//!
+//! Почему их нельзя смешивать (урок аудита v0.20): смешанный список
+//! `side_effects` выглядел для агента одинаково достоверным — вызов из
+//! call graph и совпадение подстроки имели один статус. Формализация
+//! разделяет их на уровне типа: доказательства — в `structural_relations`,
+//! гипотезы — в `heuristic_triage_alerts`.
+//!
 //! Выход — самодостаточный паспорт для AI-агента:
-
+//!
 //! ```json
 //! {
 //!   "target_function": "engine::alloc_buffer",
 //!   "file": "src/engine/allocator.rs",
 //!   "lines": "120-145",
-//!   "upstream_dependents": [{"caller": "pipeline::decode", "file": "...", "line": 45}],
-//!   "downstream_dependencies": [{"callee": "memmap2::MmapMut", "file": "..."}],
-//!   "side_effects": ["Блокировка мьютекса ALLOC_MUTEX"],
+//!   "structural_relations": {
+//!     "upstream_dependents": [{"caller": "pipeline::decode", "file": "...", "line": 45}],
+//!     "downstream_dependencies": [{"callee": "memmap2::MmapMut", "file": "..."}]
+//!   },
+//!   "heuristic_triage_alerts": [
+//!     {"marker": "unsafe", "description": "Блок unsafe — снятые гарантии безопасности памяти",
+//!      "category": "memory_safety"}
+//!   ],
 //!   "danger_level_if_modified": "CRITICAL (затронет 14 файлов)"
 //! }
 //! ```
@@ -41,58 +62,136 @@ pub struct Dependency {
     pub file: String,
 }
 
+/// Категория эвристического сигнала Triage Layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageCategory {
+    /// Снятие гарантий безопасности памяти (`unsafe`).
+    MemorySafety,
+    /// Мьютексы, блокировки, порождение потоков/задач.
+    Concurrency,
+    /// Глобальное/разделяемое состояние (static, GLOBAL, RefCell).
+    GlobalState,
+    /// Файловый и прочий I/O.
+    Io,
+    /// Сетевые соединения и сокеты.
+    Network,
+    /// Управление процессом (exit, сигналы).
+    ProcessControl,
+    /// Побочный вывод (stdout/stderr).
+    Output,
+    /// Паники и аварийные завершения.
+    Panic,
+}
+
+impl TriageCategory {
+    /// Короткий человекочитаемый ярлык для CLI-вывода.
+    pub fn label(&self) -> &'static str {
+        match self {
+            TriageCategory::MemorySafety => "память/unsafe",
+            TriageCategory::Concurrency => "конкурентность",
+            TriageCategory::GlobalState => "глобальное состояние",
+            TriageCategory::Io => "ввод-вывод",
+            TriageCategory::Network => "сеть",
+            TriageCategory::ProcessControl => "процесс",
+            TriageCategory::Output => "вывод",
+            TriageCategory::Panic => "паника",
+        }
+    }
+}
+
+/// Один эвристический сигнал Triage Layer: СИГНАЛ ВНИМАНИЯ, не доказательство.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TriageAlert {
+    /// Маркер, найденный в теле (например `unsafe`, `.lock()`).
+    pub marker: String,
+    /// Человекочитаемое описание сигнала.
+    pub description: String,
+    /// Категория тревоги.
+    pub category: TriageCategory,
+}
+
+/// Официальная таблица Triage Layer (v0.21: бывшие SIDE_EFFECT_MARKERS).
+///
+/// Регулярные источники скрытых зависимостей, невидимых ни grep, ни
+/// векторному RAG. Совпадение маркера — повод посмотреть на код, но не
+/// утверждение о наличии эффекта (`.lock()` бывает в комментарии,
+/// `connect` — названием локальной переменной).
+const TRIAGE_MARKERS: &[(&str, &str, TriageCategory)] = &[
+    // ---- память / безопасность ----
+    ("unsafe", "Блок unsafe — снятые гарантии безопасности памяти", TriageCategory::MemorySafety),
+    // ---- конкурентность ----
+    ("Mutex", "Блокировка мьютекса", TriageCategory::Concurrency),
+    (".lock()", "Блокировка мьютекса", TriageCategory::Concurrency),
+    ("RwLock", "Блокировка чтения-записи", TriageCategory::Concurrency),
+    ("spawn", "Порождение потока/задачи", TriageCategory::Concurrency),
+    // ---- глобальное состояние ----
+    ("static mut", "Мутация глобального состояния", TriageCategory::GlobalState),
+    ("static ", "Доступ к глобальной статике", TriageCategory::GlobalState),
+    ("lazy_static", "Инициализация глобального состояния", TriageCategory::GlobalState),
+    ("GLOBAL", "Доступ к глобальному счётчику/состоянию", TriageCategory::GlobalState),
+    ("RefCell", "Внутренняя мутабельность (RefCell)", TriageCategory::GlobalState),
+    // ---- ввод-вывод ----
+    ("std::fs::", "Файловый I/O", TriageCategory::Io),
+    ("File::create", "Создание файла", TriageCategory::Io),
+    ("OpenOptions", "Открытие файла", TriageCategory::Io),
+    (".write(", "Запись в разделяемый ресурс", TriageCategory::Io),
+    // ---- сеть ----
+    ("socket", "Сетевой сокет", TriageCategory::Network),
+    ("TcpStream", "Сетевое соединение", TriageCategory::Network),
+    ("UdpSocket", "Сетевой сокет", TriageCategory::Network),
+    ("connect", "Сетевое соединение", TriageCategory::Network),
+    // ---- процесс / вывод / паника ----
+    ("process::exit", "Завершение процесса", TriageCategory::ProcessControl),
+    ("println!", "Вывод в stdout", TriageCategory::Output),
+    ("eprintln!", "Вывод в stderr", TriageCategory::Output),
+    ("panic!", "Паника", TriageCategory::Panic),
+];
+
+/// Triage-скан тела определения: все маркеры, найденные подстрокой.
+///
+/// Дедуп — по маркеру (один `unsafe` встречается в теле пять раз —
+/// сигнал всё равно один). Порядок — порядок таблицы `TRIAGE_MARKERS`
+/// (детерминизм для golden-тестов).
+pub fn triage_scan(body: &str) -> Vec<TriageAlert> {
+    TRIAGE_MARKERS
+        .iter()
+        .filter(|(m, _, _)| body.contains(m))
+        .map(|(m, d, c)| TriageAlert {
+            marker: m.to_string(),
+            description: d.to_string(),
+            category: *c,
+        })
+        .collect()
+}
+
+/// Доказанные графом отношения цели: upstream (кто зависит от меня)
+/// и downstream (от кого завишу я). Каждая запись — ребро call graph.
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuralRelations {
+    /// Кто вызывает цель (прямо или транзитивно в пределах глубины BFS).
+    pub upstream_dependents: Vec<Dependent>,
+    /// Кого вызывает цель (скрытые зависимости).
+    pub downstream_dependencies: Vec<Dependency>,
+}
+
+impl StructuralRelations {
+    pub fn is_empty(&self) -> bool {
+        self.upstream_dependents.is_empty() && self.downstream_dependencies.is_empty()
+    }
+}
+
 /// Impact Passport символа.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImpactReport {
     pub target_function: String,
     pub file: String,
     pub lines: String,
-    pub upstream_dependents: Vec<Dependent>,
-    pub downstream_dependencies: Vec<Dependency>,
-    pub side_effects: Vec<String>,
+    /// ДОКАЗАННЫЕ графом вызовы (call graph, воспроизводимо).
+    pub structural_relations: StructuralRelations,
+    /// ЭВРИСТИЧЕСКИЕ сигналы Triage Layer (внимание, не доказательство).
+    pub heuristic_triage_alerts: Vec<TriageAlert>,
     pub danger_level_if_modified: String,
-}
-
-/// Маркеры сайд-эффектов: регулярные источники скрытых зависимостей,
-/// которые не видны ни grep, ни векторному RAG.
-const SIDE_EFFECT_MARKERS: &[(&str, &str)] = &[
-    ("unsafe", "Блок unsafe — снятые гарантии безопасности памяти"),
-    ("Mutex", "Блокировка мьютекса"),
-    (".lock()", "Блокировка мьютекса"),
-    ("RwLock", "Блокировка чтения-записи"),
-    ("static mut", "Мутация глобального состояния"),
-    ("static ", "Доступ к глобальной статике"),
-    ("lazy_static", "Инициализация глобального состояния"),
-    ("GLOBAL", "Доступ к глобальному счётчику/состоянию"),
-    ("RefCell", "Внутренняя мутабельность (RefCell)"),
-    ("std::fs::", "Файловый I/O"),
-    ("File::create", "Создание файла"),
-    ("OpenOptions", "Открытие файла"),
-    (".write(", "Запись в разделяемый ресурс"),
-    ("spawn", "Порождение потока/задачи"),
-    ("socket", "Сетевой сокет"),
-    ("TcpStream", "Сетевое соединение"),
-    ("UdpSocket", "Сетевой сокет"),
-    ("connect", "Сетевое соединение"),
-    ("println!", "Вывод в stdout"),
-    ("eprintln!", "Вывод в stderr"),
-    ("panic!", "Паника"),
-    ("process::exit", "Завершение процесса"),
-];
-
-/// Публичная обёртка для SQLite-бэкенда.
-pub fn scan_side_effects_pub(body: &str) -> Vec<String> {
-    scan_side_effects(body)
-}
-
-fn scan_side_effects(body: &str) -> Vec<String> {
-    let mut out: Vec<String> = SIDE_EFFECT_MARKERS
-        .iter()
-        .filter(|(m, _)| body.contains(m))
-        .map(|(_, d)| d.to_string())
-        .collect();
-    out.dedup();
-    out
 }
 
 fn stem_of(file: &str) -> String {
@@ -137,8 +236,8 @@ pub fn impact_analysis(
         }
     };
 
-    // Тело определения (enclosing scope) для строк и сайд-эффектов.
-    let (lines, side_effects) = if def.file.is_empty() {
+    // Тело определения (enclosing scope) для строк и triage-сигналов.
+    let (lines, triage_alerts) = if def.file.is_empty() {
         ("extern".to_string(), Vec::new())
     } else {
         let text = std::fs::read_to_string(&def.file).ok()?;
@@ -146,7 +245,7 @@ pub fn impact_analysis(
         let scope = extract_enclosing_scope(&text, def.byte, lang);
         (
             format!("{}-{}", scope.start_line, scope.end_line),
-            scan_side_effects(&scope.text),
+            triage_scan(&scope.text),
         )
     };
 
@@ -231,6 +330,9 @@ pub fn impact_analysis(
     downstream.truncate(max_items);
 
     // ---------- Danger level ----------
+    // Считается ТОЛЬКО по доказанным структурным отношениям: эвристические
+    // triage-сигналы не участвуют (сигнал тревоги не может поднять градус
+    // опасности без доказательства зависимостей).
     let files: HashSet<&String> = upstream.iter().map(|d| &d.file).collect();
     let n = files.len();
     let danger = match n {
@@ -244,9 +346,11 @@ pub fn impact_analysis(
         target_function: format!("{}::{}", stem_of(&def.file), def.symbol),
         file: def.file.clone(),
         lines,
-        upstream_dependents: upstream,
-        downstream_dependencies: downstream,
-        side_effects,
+        structural_relations: StructuralRelations {
+            upstream_dependents: upstream,
+            downstream_dependencies: downstream,
+        },
+        heuristic_triage_alerts: triage_alerts,
         danger_level_if_modified: danger,
     })
 }
@@ -256,17 +360,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn side_effects_detected() {
-        let body = "unsafe { ALLOC_MUTEX.lock() }\nGLOBAL_GAUGE += 1;\nstd::fs::write(p, b)?;\n";
-        let fx = scan_side_effects(body);
-        assert!(fx.iter().any(|s| s.contains("unsafe")));
-        assert!(fx.iter().any(|s| s.contains("мьютекса")));
-        assert!(fx.iter().any(|s| s.contains("глобальному")));
-        assert!(fx.iter().any(|s| s.contains("файлового") || s.contains("Файловый")));
+    fn triage_markers_categorized() {
+        let body = "unsafe { ALLOC_MUTEX.lock() }\nGLOBAL_GAUGE += 1;\nstd::fs::write(p, b)?;\nTcpStream::connect(a)?;\nprocess::exit(1);\n";
+        let fx = triage_scan(body);
+        let cat_of = |m: &str| {
+            fx.iter()
+                .find(|a| a.marker == m)
+                .unwrap_or_else(|| panic!("маркер {m} не найден в {fx:?}"))
+                .category
+        };
+        assert_eq!(cat_of("unsafe"), TriageCategory::MemorySafety);
+        assert_eq!(cat_of(".lock()"), TriageCategory::Concurrency);
+        assert_eq!(cat_of("GLOBAL"), TriageCategory::GlobalState);
+        assert_eq!(cat_of("std::fs::"), TriageCategory::Io);
+        assert_eq!(cat_of("TcpStream"), TriageCategory::Network);
+        assert_eq!(cat_of("connect"), TriageCategory::Network);
+        assert_eq!(cat_of("process::exit"), TriageCategory::ProcessControl);
     }
 
     #[test]
-    fn clean_body_no_effects() {
-        assert!(scan_side_effects("let x = a + b;").is_empty());
+    fn triage_dedup_by_marker() {
+        // маркер встречается пять раз — сигнал один
+        let body = "unsafe {}\nunsafe {}\nunsafe {}\nunsafe {}\nunsafe {}\n";
+        let fx = triage_scan(body);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].marker, "unsafe");
+    }
+
+    #[test]
+    fn triage_order_deterministic() {
+        let body = "spawn(b);\nunsafe {}\nMutex::new(x);\n";
+        let fx = triage_scan(body);
+        // порядок = порядок таблицы TRIAGE_MARKERS, не порядок вхождения
+        let markers: Vec<&str> = fx.iter().map(|a| a.marker.as_str()).collect();
+        assert_eq!(markers, vec!["unsafe", "Mutex", "spawn"]);
+    }
+
+    #[test]
+    fn clean_body_no_alerts() {
+        assert!(triage_scan("let x = a + b;").is_empty());
+    }
+
+    #[test]
+    fn category_labels_non_empty() {
+        let body = "unsafe {} spawn(x); println!(\"a\"); panic!(\"b\"); eprintln!(\"c\");";
+        for a in triage_scan(body) {
+            assert!(!a.category.label().is_empty(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn passport_json_separates_proof_from_heuristics() {
+        // serde-форма паспорта: структурные отношения и triage-сигналы —
+        // РАЗНЫЕ ключи JSON (защита от регресса к смешанному side_effects)
+        let probe = ImpactReport {
+            target_function: "a::b".into(),
+            file: "a.rs".into(),
+            lines: "1-2".into(),
+            structural_relations: StructuralRelations {
+                upstream_dependents: vec![Dependent {
+                    caller: "caller".into(),
+                    file: "f.rs".into(),
+                    line: 3,
+                }],
+                downstream_dependencies: vec![Dependency { callee: "callee".into(), file: "g.rs".into() }],
+            },
+            heuristic_triage_alerts: vec![TriageAlert {
+                marker: "unsafe".into(),
+                description: "Блок unsafe".into(),
+                category: TriageCategory::MemorySafety,
+            }],
+            danger_level_if_modified: "LOW".into(),
+        };
+        let json = serde_json::to_string(&probe).unwrap();
+        assert!(json.contains("\"structural_relations\""), "{json}");
+        assert!(json.contains("\"upstream_dependents\""), "{json}");
+        assert!(json.contains("\"downstream_dependencies\""), "{json}");
+        assert!(json.contains("\"heuristic_triage_alerts\""), "{json}");
+        assert!(json.contains("\"memory_safety\""), "{json}");
+        assert!(!json.contains("side_effects"), "{json}");
+        assert!(!json.contains("\"category\":\"Concurrency\""), "{json}");
     }
 }

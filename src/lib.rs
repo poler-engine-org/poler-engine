@@ -44,6 +44,7 @@
 //! памяти ограничено словарём корпуса + одним временным индексом.
 
 pub mod aidde;
+pub mod bench;
 pub mod engine;
 pub mod google;
 pub mod graph;
@@ -70,9 +71,12 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use memmap2::Mmap;
 
-pub use aidde::{impact_analysis, Dependency, Dependent, ImpactReport, SymbolTable};
+pub use aidde::{
+    impact_analysis, triage_scan, Dependency, Dependent, ImpactReport, StructuralRelations,
+    SymbolTable, TriageAlert, TriageCategory,
+};
 pub use engine::{Engine, WatchEvent};
-pub use graph::EntityGraph;
+pub use graph::{CodeSymbolRef, EntityGraph, IdentityPolicy};
 pub use output::{render_markdown, render_simple, ContextAnchor, SearchResult};
 pub use parser::{
     detect_lang, extract_code_triples, extract_enclosing_scope, extract_triples, CodeLang,

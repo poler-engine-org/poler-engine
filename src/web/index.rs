@@ -21,6 +21,7 @@ use super::extract::{clean_text, snippet_for, title_from_text};
 use super::phrase::{decode_positions, encode_positions, parse_query, phrase_occurrences};
 use super::stem::tokenize_stem;
 use super::simhash::{near_duplicate, simhash};
+use crate::retrieval::semantic_bridge::{QueryExpansion, SemanticBridge};
 
 /// Веса POLER WebRank v1.
 pub const W_BM25: f64 = 0.55;
@@ -451,6 +452,64 @@ impl WebIndex {
         if q_terms.is_empty() {
             return Ok(Vec::new());
         }
+        let weighted: Vec<(String, f64)> = q_terms.iter().map(|t| (t.clone(), 1.0)).collect();
+        self.search_core(&weighted, qp.phrases, top_n, q_terms.len(), &q_terms)
+    }
+
+    /// Поиск с Semantic Bridge (v0.21, Задача 3): кросс-языковый сенсор
+    /// расширяет запрос (рус → англ корпус и обратно), кандидаты
+    /// подмешиваются в BM25 с весом ≤ 0.85, ранжирование остаётся
+    /// детерминированным WebRank. WHY-объяснение каждого расширения —
+    /// в возвращаемой [`QueryExpansion`] (объяснимость обязательна).
+    pub fn search_with_bridge(
+        &mut self,
+        query: &str,
+        top_n: usize,
+        bridge: &SemanticBridge,
+    ) -> rusqlite::Result<(Vec<WebHit>, QueryExpansion)> {
+        let qp = parse_query(query);
+        let q_terms = qp.all_terms();
+        if q_terms.is_empty() {
+            return Ok((Vec::new(), QueryExpansion::default()));
+        }
+        let expansion = bridge.expand(&q_terms);
+        let mut weighted: Vec<(String, f64)> =
+            q_terms.iter().map(|t| (t.clone(), 1.0)).collect();
+        for e in &expansion.expansions {
+            if !weighted.iter().any(|(t, _)| *t == e.candidate.term) {
+                weighted.push((e.candidate.term.clone(), e.bm25_weight));
+            }
+        }
+        // сниппет подсвечивает и кандидатов сенсора — видно, ЧТО нашлось
+        let mut snippet_terms = q_terms.clone();
+        for t in expansion.extra_terms() {
+            if !snippet_terms.contains(&t) {
+                snippet_terms.push(t);
+            }
+        }
+        let hits =
+            self.search_core(&weighted, qp.phrases, top_n, q_terms.len(), &snippet_terms)?;
+        Ok((hits, expansion))
+    }
+
+    /// Ядро поиска: scatter по ВЗВЕШЕННЫМ термам → gather → BM25 → WebRank.
+    ///
+    /// Родные термы запроса несут вес 1.0; сенсорные кандидаты Semantic
+    /// Bridge — ≤ 0.85 (сигнал сенсора всегда слабее прямого совпадения).
+    /// `phrases` — фразовые фильтры (только исходные термы, сенсор их не
+    /// трогает); `title_denom` — число исходных термов (кандидаты не
+    /// разбавляют title-буст); `snippet_terms` — подсветка сниппетов.
+    fn search_core(
+        &mut self,
+        weighted: &[(String, f64)],
+        phrases: Vec<Vec<String>>,
+        top_n: usize,
+        title_denom: usize,
+        snippet_terms: &[String],
+    ) -> rusqlite::Result<Vec<WebHit>> {
+        if weighted.is_empty() {
+            return Ok(Vec::new());
+        }
         // N — все страницы с postings (дубликаты тоже, они фильтруются на gather)
         let n_pages: u64 = self
             .conn
@@ -491,15 +550,14 @@ impl WebIndex {
             /// позиции только у фразовых термов (память не тратим зря)
             pos_blobs: HashMap<i64, Vec<u8>>,
             dfv: u64,
+            /// Вес терма: 1.0 — родной терм запроса, ≤ 0.85 — сенсорный
+            /// кандидат Semantic Bridge (v0.21).
+            weight: f64,
         }
-        let phrase_terms: HashSet<&str> = qp
-            .phrases
-            .iter()
-            .flatten()
-            .map(|s| s.as_str())
-            .collect();
-        let mut all_terms: Vec<TermPostings> = Vec::with_capacity(q_terms.len());
-        for term in &q_terms {
+        let phrase_terms: HashSet<&str> =
+            phrases.iter().flatten().map(|s| s.as_str()).collect();
+        let mut all_terms: Vec<TermPostings> = Vec::with_capacity(weighted.len());
+        for (term, weight) in weighted {
             let need_pos = phrase_terms.contains(term.as_str());
             let (postings, pos_blobs): (RawPostings, PosBlobs) = if need_pos {
                     let mut stmt = self.conn.prepare(
@@ -545,6 +603,7 @@ impl WebIndex {
                     postings,
                     pos_blobs,
                     dfv,
+                    weight: *weight,
                 });
             }
         }
@@ -569,7 +628,7 @@ impl WebIndex {
                 let dl = doclens.get(&pid).copied().unwrap_or(1.0).max(1.0);
                 let e = acc.entry(pid).or_insert([0.0; 3]);
                 let denom = tf as f64 + K1 * (1.0 - B + B * dl / avgdl);
-                e[0] += idf * tf as f64 * (K1 + 1.0) / denom.max(1e-9);
+                e[0] += t.weight * idf * tf as f64 * (K1 + 1.0) / denom.max(1e-9);
                 e[1] += tf as f64;
                 e[2] += title_tf.min(1) as f64;
             }
@@ -580,7 +639,7 @@ impl WebIndex {
         // где слова фразы разбросаны по тексту, из выдачи исключаются —
         // семантика точных цитат. Вхождения дают proximity-бонус к BM25.
         let mut phrase_occ_total: HashMap<i64, usize> = HashMap::new();
-        if !qp.phrases.is_empty() {
+        if !phrases.is_empty() {
             let by_term: HashMap<&str, &TermPostings> = all_terms
                 .iter()
                 .map(|t| (t.term.as_str(), t))
@@ -589,7 +648,7 @@ impl WebIndex {
             for (&pid, e) in &mut acc {
                 let mut total = 0usize;
                 let mut matched = true;
-                'phrases: for phrase in &qp.phrases {
+                'phrases: for phrase in &phrases {
                     let mut lists: Vec<Vec<u32>> = Vec::with_capacity(phrase.len());
                     let mut idf_sum = 0.0f64;
                     for t in phrase {
@@ -700,7 +759,7 @@ impl WebIndex {
             .map(|c| {
                 let bm25n = c.e[0] / max_bm25;
                 let prn = (1.0 + c.rank * 1000.0).ln() / (1.0 + max_pr * 1000.0).ln().max(1e-9);
-                let title_frac = c.e[2] / q_terms.len() as f64;
+                let title_frac = (c.e[2] / title_denom.max(1) as f64).min(1.0);
                 let eps = if c.doclen > 0 { c.e[1] / c.doclen as f64 } else { 0.0 };
                 let epsn = eps / max_eps;
                 let score = W_BM25 * bm25n
@@ -717,7 +776,7 @@ impl WebIndex {
                     title_frac,
                     density: eps,
                     phrase_occ: c.phrase_occ,
-                    snippet: snippet_for(&c.text, &q_terms, 240),
+                    snippet: snippet_for(&c.text, snippet_terms, 240),
                     doclen: c.doclen,
                     fetched_at: c.fetched_at,
                 }

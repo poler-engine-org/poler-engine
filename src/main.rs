@@ -83,8 +83,42 @@ struct Cli {
     web_wait_ms: u64,
 
     /// ВЕБ-ПОИСК: поиск по локальному веб-индексу (краулер --crawl).
+    /// v0.21: запрос автоматически расширяется Semantic Bridge (офлайн
+    /// сенсор ru↔en) — рус запрос находит англ корпус и обратно.
     #[arg(long = "web-search", conflicts_with_all = ["web", "crawl"])]
     web_search: Option<String>,
+
+    /// SEMANTIC BRIDGE (v0.21): показать кросс-языковое расширение запроса
+    /// офлайн-сенсором (кандидаты ru↔en + WHY + веса BM25) — без поиска.
+    #[arg(
+        long = "semantic-expand",
+        value_name = "QUERY",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "benchmark"
+        ]
+    )]
+    semantic_expand: Option<String>,
+
+    /// BENCHMARK (v0.21, Задача 4): автоматический бенчмарк-раннер —
+    /// Exact Retrieval (POLER grep vs ripgrep/grep, полнота + parity),
+    /// Explainable Lexical (BM25/WebRank + Semantic Bridge, golden top-1),
+    /// Passage (чанкер vs naive splitter, целостность предложений),
+    /// latency (мс) и RAM (VmHWM/VmRSS). Golden-регрессии — в cargo test.
+    #[arg(
+        long = "benchmark",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "semantic_expand"
+        ]
+    )]
+    benchmark: bool,
+
+    /// Сохранить JSON-отчёт бенчмарка в файл (с --benchmark).
+    #[arg(long = "benchmark-json", value_name = "PATH", requires = "benchmark")]
+    benchmark_json: Option<PathBuf>,
 
     /// Краулинг: PATH трактуется как seed-URL, страницы индексируются
     /// в веб-индекс (robots.txt, sitemap, SimHash-дедуп, PageRank).
@@ -509,12 +543,90 @@ fn print_result(res: &SearchResult, format: Format) {
     let _ = std::io::stdout().flush();
 }
 
+/// Человекочитаемый отчёт Benchmark Suite (v0.21, Задача 4).
+fn print_bench_report(res: &poler_engine::bench::BenchResults) {
+    use std::io::Write;
+    println!("POLER Engine Benchmark Suite v0.21");
+    println!("══════════════════════════════════════════════════");
+
+    println!("[1] Exact Retrieval — POLER Native Grep vs эталон");
+    println!(
+        "    корпус: {} файлов × {} строк (шаблон {})",
+        res.exact.files, res.exact.lines,
+        poler_engine::bench::NEEDLE
+    );
+    println!(
+        "    POLER grep:  {:8.1} мс — {} совпавших строк (ожидалось {}){}",
+        res.exact.poler_ms,
+        res.exact.poler_matched_lines,
+        res.exact.expected_matched_lines,
+        if res.exact.completeness_ok { " ✓ полнота" } else { " ✗ ПОТЕРИ" }
+    );
+    if let Some(r) = &res.exact.reference {
+        let parity = if res.exact.parity == Some(true) { "✓" } else { "✗" };
+        println!(
+            "    {}: {:8.1} мс — {} совпавших строк → parity {}",
+            r.name, r.ms, r.matched_lines, parity
+        );
+    } else {
+        println!("    эталон (ripgrep/grep) недоступен — parity пропущен");
+    }
+
+    println!();
+    println!("[2] Explainable Lexical — BM25 + WebRank + Semantic Bridge");
+    println!(
+        "    индексация {} страниц: {:.1} мс",
+        res.lexical.pages, res.lexical.index_ms
+    );
+    println!(
+        "    {} golden-запросов: {:.2} мс среднее",
+        res.lexical.queries, res.lexical.query_avg_ms
+    );
+    println!(
+        "    golden «{}» → {} {} (мост: +{} терма)",
+        res.lexical.golden_query,
+        res.lexical.golden_top1.as_deref().unwrap_or("-"),
+        if res.lexical.golden_ok { "✓" } else { "✗" },
+        res.lexical.bridge_expanded_terms
+    );
+
+    println!();
+    println!("[3] Passage Retrieval — POLER Chunker vs naive splitter");
+    println!("    документ: {} байт", res.passage.doc_bytes);
+    println!(
+        "    POLER chunker:  {:8.2} мс — {} чанков, целостность предложений {:.1}%",
+        res.passage.poler_ms, res.passage.poler_chunks, res.passage.poler_integrity_pct
+    );
+    println!(
+        "    naive splitter: {:8.2} мс — {} чанков, целостность предложений {:.1}%",
+        res.passage.naive_ms, res.passage.naive_chunks, res.passage.naive_integrity_pct
+    );
+
+    println!();
+    println!("[4] Resources");
+    if let Some(r) = &res.resources {
+        println!(
+            "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)",
+            r.vm_hwm_kb as f64 / 1024.0,
+            r.vm_rss_kb as f64 / 1024.0
+        );
+    } else {
+        println!("    RAM-снимок недоступен (не Linux)");
+    }
+    let _ = std::io::stdout().flush();
+}
+
 /// Вывод результатов веб-поиска в трёх форматах.
-fn print_web_hits(hits: &[poler_engine::web::WebHit], query: &str, format: Format) {
+fn print_web_hits(
+    hits: &[poler_engine::web::WebHit],
+    query: &str,
+    format: Format,
+    expansion: Option<&poler_engine::retrieval::QueryExpansion>,
+) {
     use std::io::Write;
     match format {
         Format::AiJson => {
-            let out = serde_json::json!({
+            let mut out = serde_json::json!({
                 "engine": "poler-engine",
                 "mode": "web-search",
                 "rank": "POLER WebRank v1 (0.55·BM25 + 0.15·PageRank + 0.20·title + 0.10·ε-density)",
@@ -522,15 +634,35 @@ fn print_web_hits(hits: &[poler_engine::web::WebHit], query: &str, format: Forma
                 "total": hits.len(),
                 "results": hits,
             });
+            if let Some(exp) = expansion {
+                if !exp.is_empty() {
+                    out["semantic_bridge"] = serde_json::to_value(exp).unwrap_or_default();
+                }
+            }
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         }
         Format::Simple => {
+            // WHY — в stderr: stdout остаётся чистым для пайпа
+            if let Some(exp) = expansion {
+                if !exp.is_empty() {
+                    eprintln!("{}", exp.why());
+                }
+            }
             for h in hits {
                 println!("{:.4}  {}  {}", h.score, h.url, h.title);
             }
         }
         Format::Md => {
             println!("# Веб-поиск: «{query}»\n");
+            if let Some(exp) = expansion {
+                if !exp.is_empty() {
+                    println!("## Semantic Bridge (WHY)\n");
+                    for l in exp.why_lines() {
+                        println!("- {l}");
+                    }
+                    println!();
+                }
+            }
             for (i, h) in hits.iter().enumerate() {
                 println!("## {}. {}\n", i + 1, if h.title.is_empty() { &h.url } else { &h.title });
                 println!("- URL: {}", h.url);
@@ -1456,6 +1588,68 @@ fn run(cli: Cli) -> ExitCode {
         };
     }
 
+    // ---------- Benchmark & Regression Suite (v0.21, Задача 4) ----------
+    if cli.benchmark {
+        let opts = poler_engine::bench::BenchOpts::default();
+        match poler_engine::bench::run_suite(&opts) {
+            Ok(res) => {
+                print_bench_report(&res);
+                if let Some(path) = &cli.benchmark_json {
+                    match serde_json::to_string_pretty(&res) {
+                        Ok(json) => match std::fs::write(path, json) {
+                            Ok(()) => eprintln!("poler-engine: бенчмарк-отчёт → {}", path.display()),
+                            Err(e) => {
+                                eprintln!("poler-engine: запись {}: {e}", path.display());
+                                return ExitCode::from(2);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("poler-engine: сериализация отчёта: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                // exit-код: golden-проверки полноты и моста обязаны быть зелёными
+                return if res.exact.completeness_ok && res.lexical.golden_ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Err(e) => {
+                eprintln!("poler-engine benchmark: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // ---------- Semantic Bridge: диагностика расширения запроса ----------
+    if let Some(query) = cli.semantic_expand.clone() {
+        if query.trim().is_empty() {
+            eprintln!("poler-engine: пустой --semantic-expand");
+            return ExitCode::from(2);
+        }
+        let bridge = poler_engine::retrieval::SemanticBridge::offline();
+        let terms = poler_engine::web::stem::tokenize_stem(&query);
+        let expansion = bridge.expand(&terms);
+        println!("Semantic Bridge — офлайн-сенсор кросс-языковых запросов (v0.21)");
+        println!("Запрос: «{query}»");
+        println!("Термы (стем-форма): {}", terms.join(", "));
+        println!();
+        if expansion.is_empty() {
+            println!("Расширений нет: сенсор не знает этих термов —");
+            println!("ранжирование останется чистым WebRank без кандидатов.");
+        } else {
+            println!("Расширения ({}):", expansion.expansions.len());
+            for line in expansion.why_lines() {
+                println!("  {line}");
+            }
+            println!();
+            println!("{}", expansion.why());
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // ---------- Веб-поиск: по локальному веб-индексу ----------
     if let Some(query) = cli.web_search.clone() {
         if query.trim().is_empty() {
@@ -1470,7 +1664,8 @@ fn run(cli: Cli) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let hits = match ix.search(&query, cli.top.max(1)) {
+        let bridge = poler_engine::retrieval::SemanticBridge::offline();
+        let (hits, expansion) = match ix.search_with_bridge(&query, cli.top.max(1), &bridge) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("poler-engine: web-search: {e}");
@@ -1479,12 +1674,17 @@ fn run(cli: Cli) -> ExitCode {
         };
         if cli.verbose {
             eprintln!(
-                "poler-engine web-search: «{query}» — {} результатов из {} страниц",
+                "poler-engine web-search: «{query}» — {} результатов из {} страниц{}",
                 hits.len(),
-                ix.page_count()
+                ix.page_count(),
+                if expansion.is_empty() {
+                    String::new()
+                } else {
+                    format!(", bridge: +{} терма-кандидата", expansion.extra_terms().len())
+                }
             );
         }
-        print_web_hits(&hits, &query, cli.format);
+        print_web_hits(&hits, &query, cli.format, Some(&expansion));
         return if hits.is_empty() {
             ExitCode::from(1)
         } else {

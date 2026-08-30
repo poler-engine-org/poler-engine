@@ -2,4 +2,4 @@
 
 pub mod entity_graph;
 
-pub use entity_graph::{EntityGraph, KnowledgeNode, RelationEdge};
+pub use entity_graph::{CodeSymbolRef, EntityGraph, IdentityPolicy, KnowledgeNode, RelationEdge};

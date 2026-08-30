@@ -496,8 +496,9 @@ fn aidde_impact_passport_upstream_downstream() {
         .expect("impact для core_fn");
 
     assert!(report.file.ends_with("core.rs"));
-    // upstream: mid (прямые) и top (транзитивно)
+    // upstream: mid (прямые) и top (транзитивно) — ДОКАЗАНО call graph
     let callers: Vec<&str> = report
+        .structural_relations
         .upstream_dependents
         .iter()
         .map(|d| d.caller.as_str())
@@ -510,6 +511,7 @@ fn aidde_impact_passport_upstream_downstream() {
     // downstream от top: mid и core_fn
     let down = poler_engine::aidde::impact_analysis(&table, "top", 3, 100).unwrap();
     let callees: Vec<&str> = down
+        .structural_relations
         .downstream_dependencies
         .iter()
         .map(|d| d.callee.as_str())
@@ -519,7 +521,7 @@ fn aidde_impact_passport_upstream_downstream() {
 }
 
 #[test]
-fn aidde_side_effects_reported() {
+fn aidde_triage_alerts_reported() {
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join("sys.rs"),
@@ -529,9 +531,16 @@ fn aidde_side_effects_reported() {
     let files = vec![dir.path().join("sys.rs")];
     let table = poler_engine::aidde::SymbolTable::build(&files, 1024 * 1024);
     let report = poler_engine::aidde::impact_analysis(&table, "alloc_buffer", 2, 100).unwrap();
-    assert!(report.side_effects.iter().any(|s| s.contains("unsafe")), "{:?}", report.side_effects);
-    assert!(report.side_effects.iter().any(|s| s.contains("мьютекса")), "{:?}", report.side_effects);
+    // v0.21: triage-сигналы — с маркером и категорией (не «сайд-эффекты»)
+    let alerts = &report.heuristic_triage_alerts;
+    assert!(alerts.iter().any(|a| a.marker == "unsafe" && a.category.label().contains("память")), "{alerts:?}");
+    assert!(alerts.iter().any(|a| a.marker == ".lock()" && a.category.label().contains("конкурент")), "{alerts:?}");
+    // эвристики не поднимают danger level: доказанных ЗАВИСИМЫХ нет → LOW
     assert_eq!(report.danger_level_if_modified, "LOW (прямых зависимых не найдено)");
+    // upstream пуст (никто не вызывает alloc_buffer); downstream от её тела
+    // есть (lock/write) — доказательства графом, отдельно от триажа
+    assert!(report.structural_relations.upstream_dependents.is_empty());
+    assert!(!report.structural_relations.downstream_dependencies.is_empty());
 }
 
 #[test]
@@ -543,9 +552,13 @@ fn aidde_python_cross_file() {
     let table = poler_engine::aidde::SymbolTable::build(&files, 1024 * 1024);
     let report = poler_engine::aidde::impact_analysis(&table, "process", 2, 100).unwrap();
     assert!(
-        report.upstream_dependents.iter().any(|d| d.caller == "run::run"),
+        report
+            .structural_relations
+            .upstream_dependents
+            .iter()
+            .any(|d| d.caller == "run::run"),
         "{:?}",
-        report.upstream_dependents
+        report.structural_relations.upstream_dependents
     );
 }
 

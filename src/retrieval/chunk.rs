@@ -509,6 +509,54 @@ pub fn chunk_document(text: &str, format: ChunkFormat, cfg: &ChunkConfig) -> Chu
         }
     }
 
+    // ---------- v0.21 hardening: никакого чанкового мусора ----------
+    // Жадная сборка максимизирует УРОВЕНЬ границы, а не объём: при абзацах
+    // ≈ target она оставляет (а) пустые чанки-разделители «\n\n» и
+    // (б) микро-чанки-островки (голый заголовок секции < min_tokens).
+    // Пост-проход: пустые выбрасываются, микро-приклеиваются к следующему
+    // куску ТОЙ ЖЕ секции (заголовок + первый абзац — классика RAG).
+    // Итог: merged.tokens < target + min_tokens (ограниченный перелимит),
+    // text по-прежнему точный срез исходника.
+    loop {
+        let mut changed = false;
+        let mut out: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        let mut i = 0usize;
+        while i < chunks.len() {
+            let mut c = chunks[i].clone();
+            // пустой (только пробелы) чанк информации не несёт — выброс
+            if c.tokens == 0 && c.text.trim().is_empty() {
+                i += 1;
+                changed = true;
+                continue;
+            }
+            // микро-чанк: слить со следующим куском той же секции
+            if c.tokens < cfg.min_tokens
+                && i + 1 < chunks.len()
+                && c.breadcrumb == chunks[i + 1].breadcrumb
+            {
+                let next = &chunks[i + 1];
+                c.byte_end = next.byte_end.max(c.byte_end);
+                c.text = text[c.byte_start..c.byte_end].to_string();
+                c.tokens = web_tokenize(&c.text).len();
+                c.line_end = line_of(text, c.byte_end.saturating_sub(1));
+                i += 2;
+                changed = true;
+                out.push(c);
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        chunks = out;
+        if !changed {
+            break;
+        }
+    }
+    // сквозная перенумерация после слияний/выбросов
+    for (idx, c) in chunks.iter_mut().enumerate() {
+        c.index = idx;
+    }
+
     ChunkReport { chunks, total_tokens, format, config: cfg }
 }
 

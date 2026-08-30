@@ -151,7 +151,8 @@ fn cmd_search(state: &mut ShellState, args: &[String]) -> CmdResult {
         Ok(ix) => ix,
         Err(e) => return CmdResult::Done(format!("❌ {e}")),
     };
-    let hits = match ix.search(&query, top) {
+    let bridge = crate::retrieval::SemanticBridge::offline();
+    let (hits, expansion) = match ix.search_with_bridge(&query, top, &bridge) {
         Ok(h) => h,
         Err(e) => return CmdResult::Done(format!("❌ web-search: {e}")),
     };
@@ -169,6 +170,13 @@ fn cmd_search(state: &mut ShellState, args: &[String]) -> CmdResult {
     } else {
         for (i, h) in hits.iter().enumerate() {
             out.push_str(&format_hit(i + 1, h, &query));
+        }
+    }
+    // Semantic Bridge WHY: кросс-языковые кандидаты сенсора видны агенту
+    if !expansion.is_empty() {
+        out.push_str("\n🔗 Semantic Bridge (WHY):\n");
+        for l in expansion.why_lines() {
+            out.push_str(&format!("   {l}\n"));
         }
     }
     state.set_output(out.clone());
@@ -844,23 +852,42 @@ fn cmd_impact(state: &mut ShellState, args: &[String]) -> CmdResult {
             s.push_str(&format!("   lines: {}\n", r.lines));
             s.push_str(&format!("   danger_level_if_modified: {}\n", r.danger_level_if_modified));
             s.push('\n');
-            s.push_str(&format!("⬆ upstream dependents ({}):\n", r.upstream_dependents.len()));
-            for d in &r.upstream_dependents {
+            s.push_str(&format!(
+                "🔗 structural relations — доказано call graph ({}/{}):\n",
+                r.structural_relations.upstream_dependents.len(),
+                r.structural_relations.downstream_dependencies.len()
+            ));
+            s.push_str(&format!(
+                "⬆ upstream dependents ({}):\n",
+                r.structural_relations.upstream_dependents.len()
+            ));
+            for d in &r.structural_relations.upstream_dependents {
                 s.push_str(&format!(
                     "   • {} (вызывает в {})\n",
                     d.caller, d.file
                 ));
             }
             s.push('\n');
-            s.push_str(&format!("⬇ downstream dependencies ({}):\n", r.downstream_dependencies.len()));
-            for d in &r.downstream_dependencies {
+            s.push_str(&format!(
+                "⬇ downstream dependencies ({}):\n",
+                r.structural_relations.downstream_dependencies.len()
+            ));
+            for d in &r.structural_relations.downstream_dependencies {
                 s.push_str(&format!("   • {} (вызывается из {})\n", d.callee, d.file));
             }
-            if !r.side_effects.is_empty() {
+            if !r.heuristic_triage_alerts.is_empty() {
                 s.push('\n');
-                s.push_str(&format!("⚠ side-effects ({}):\n", r.side_effects.len()));
-                for se in &r.side_effects {
-                    s.push_str(&format!("   • {se}\n"));
+                s.push_str(&format!(
+                    "⚠ triage layer — эвристические сигналы, НЕ доказательства ({}):\n",
+                    r.heuristic_triage_alerts.len()
+                ));
+                for a in &r.heuristic_triage_alerts {
+                    s.push_str(&format!(
+                        "   • [{}] {} — {}\n",
+                        a.category.label(),
+                        a.description,
+                        a.marker
+                    ));
                 }
             }
             s

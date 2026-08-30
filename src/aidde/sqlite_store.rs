@@ -273,8 +273,8 @@ pub fn impact_analysis_sqlite(
         }
     };
 
-    // Тело определения (сайд-эффекты) — только для локальных defs.
-    let (lines, side_effects) = if def.file.is_empty() {
+    // Тело определения (triage-сигналы) — только для локальных defs.
+    let (lines, triage_alerts) = if def.file.is_empty() {
         ("extern".to_string(), Vec::new())
     } else {
         let text = std::fs::read_to_string(&def.file).ok()?;
@@ -282,7 +282,7 @@ pub fn impact_analysis_sqlite(
         let scope = crate::parser::extract_enclosing_scope(&text, def.byte, lang);
         (
             format!("{}-{}", scope.start_line, scope.end_line),
-            crate::aidde::impact::scan_side_effects_pub(&scope.text),
+            crate::aidde::impact::triage_scan(&scope.text),
         )
     };
 
@@ -370,9 +370,11 @@ pub fn impact_analysis_sqlite(
         ),
         file: def.file.clone(),
         lines,
-        upstream_dependents: upstream,
-        downstream_dependencies: downstream,
-        side_effects,
+        structural_relations: crate::aidde::impact::StructuralRelations {
+            upstream_dependents: upstream,
+            downstream_dependencies: downstream,
+        },
+        heuristic_triage_alerts: triage_alerts,
         danger_level_if_modified: danger,
     })
 }
@@ -406,6 +408,7 @@ mod tests {
         let report =
             impact_analysis_sqlite(&store, "core_fn", 2, 100).expect("impact через sqlite");
         assert!(report
+            .structural_relations
             .upstream_dependents
             .iter()
             .any(|d| d.caller == "b::mid"));

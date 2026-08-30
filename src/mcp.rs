@@ -212,7 +212,10 @@ impl McpServer {
                 self.db_path
             ));
         }
-        let hits = ix.search(query, top).map_err(|e| e.to_string())?;
+        let bridge = crate::retrieval::SemanticBridge::offline();
+        let (hits, expansion) = ix
+            .search_with_bridge(query, top, &bridge)
+            .map_err(|e| e.to_string())?;
         if hits.is_empty() {
             return Ok(format!(
                 "Ничего не найдено по «{query}» (индекс: {} страниц). \
@@ -221,6 +224,15 @@ impl McpServer {
             ));
         }
         let mut out = format!("poler web-search «{query}»: {} из {} страниц\n\n", hits.len(), ix.page_count());
+        // Semantic Bridge WHY: агент обязан видеть, какие кандидаты сенсора
+        // подмешаны в выдачу (объяснимость — часть контракта инструмента)
+        if !expansion.is_empty() {
+            out.push_str("Semantic Bridge (кросс-языковое расширение, WHY):\n");
+            for l in expansion.why_lines() {
+                out.push_str(&format!("  {l}\n"));
+            }
+            out.push('\n');
+        }
         for (i, h) in hits.iter().enumerate() {
             out.push_str(&format!(
                 "{}. [{:.4}] {} — {}\n   {}\n\n",
@@ -742,7 +754,10 @@ fn tools_manifest() -> Vec<Value> {
             "name": "poler_web_search",
             "description": "Веб-поиск по постоянному индексу poler-engine (собирается poler_crawl). \
 Ранжирование WebRank: 0.55·BM25 + 0.15·PageRank + 0.20·title + 0.10·ε-плотность. \
-Кириллица стеммингуется (укр/рос падежи унифицируются). Возвращает score, URL, заголовок, сниппет.",
+Кириллица стеммингуется (укр/рос падежи унифицируются). Semantic Bridge (v0.21): \
+кросс-языковые запросы (рус→англ корпус и обратно) расширяются офлайн-словарём, \
+кандидаты подмешиваются с весом ≤0.85, ранжирование остаётся детерминированным, \
+WHY-объяснение включается в ответ. Возвращает score, URL, заголовок, сниппет.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -10,12 +10,17 @@
 //! * **Уровень 2** — call graph, разрешённый через таблицу символов
 //!   (межфайловые связи: `pipeline.rs` —вызывает→ `allocator.rs`);
 //! * **Уровень 3** — двунаправленный impact-анализ (BFS по прямым и
-//!   обратным рёбрам) + эвристики сайд-эффектов + danger level.
+//!   обратным рёбрам) + Triage Layer (v0.21: эвристические сигналы
+//!   внимания, формально отделённые от доказанных графом отношений)
+//!   + danger level.
 
 pub mod impact;
 pub mod sqlite_store;
 pub mod symbols;
 
-pub use impact::{impact_analysis, Dependency, Dependent, ImpactReport};
+pub use impact::{
+    impact_analysis, triage_scan, Dependency, Dependent, ImpactReport, StructuralRelations,
+    TriageAlert, TriageCategory,
+};
 pub use sqlite_store::{impact_analysis_sqlite, last_seg, SymbolStore};
 pub use symbols::{CallSite, Definition, ImportStmt, SymbolTable};
