@@ -50,6 +50,108 @@ pub const FEATURE_GMAIL: &str = "gmail";
 pub const FEATURE_DRIVE: &str = "drive";
 pub const FEATURE_NLM: &str = "nlm";
 
+// ---------- v0.22.0: Source-Available EULA (Unreal Engine модель) ----------
+
+/// Название лицензионной модели (LICENSE.md — юридический инструмент).
+pub const EULA_NAME: &str =
+    "POLER Custom Source-Available & Modification Disclosure License v1.0";
+/// Обязательный адрес раскрытия модификаций (Notification Clause, §4).
+pub const MODIFICATION_NOTICE_EMAIL: &str = "dev@poler-engine.org";
+/// Официальный репозиторий (для ссылок в баннере/CLI).
+pub const EULA_REPO_URL: &str = "https://github.com/poler-engine-org/poler-engine";
+
+/// ЕДИНЫЙ блок EULA-статуса: печатается в `--license`, в gateway-баннере
+/// и в команде `license` REPL (один источник правды — no drift).
+///
+/// Модель: Source-Available (Unreal Engine EULA precedent) — исходники
+/// открыты для изучения/сборки/модификации, но модификации при
+/// дистрибуции/деплое продукта подлежат обязательному уведомлению
+/// авторов (14 дней), редистрибуция ядра и обход Ed25519-гейта запрещены.
+pub fn eula_notice() -> String {
+    let mut s = String::new();
+    s.push_str(&format!("  Модель:       {EULA_NAME}\n"));
+    s.push_str(&format!(
+        "  Раскрытие:    модификации при дистрибуции/деплое — уведомить\n                {} в течение 14 дней (Notification Clause)\n",
+        MODIFICATION_NOTICE_EMAIL
+    ));
+    s.push_str("  Условия:      LICENSE.md · TERMS.md (в корне репозитория)\n");
+    s.push_str(&format!("  Репозиторий:  {EULA_REPO_URL}\n"));
+    s.push_str("  Запрещено:    редистрибуция ядра, обход Ed25519 License Gate\n");
+    s
+}
+
+/// Короткая строка для баннера запуска (одна строка, без блоков).
+pub fn eula_banner_line() -> String {
+    format!(
+        "Лицензия: {EULA_NAME} — модификации подлежат раскрытию → {MODIFICATION_NOTICE_EMAIL} (TERMS.md)"
+    )
+}
+
+/// Полный текст статуса лицензии как String (v0.22.0): один источник
+/// для CLI `--license` и команды `license` в Terminal Gateway.
+pub fn status_text() -> String {
+    let st = status();
+    let mut s = String::from("POLER Engine — лицензия\n\n");
+    match st.tier {
+        Tier::Trial => s.push_str(&format!(
+            "  Тир:         Trial — все функции, {} дн. осталось\n",
+            st.trial_days_left
+        )),
+        Tier::Community => s.push_str("  Тир:         Community (без лицензии)\n"),
+        Tier::Pro => s.push_str("  Тир:         Pro\n"),
+        Tier::Enterprise => s.push_str("  Тир:         Enterprise\n"),
+    }
+    if let Some(lic) = &st.license {
+        s.push_str(&format!(
+            "  Владелец:    {} <{}>\n",
+            lic.name, lic.email
+        ));
+        s.push_str(&format!("  Выдана:      {}\n", civil_date(lic.issued)));
+        if lic.expires == 0 {
+            s.push_str("  Срок:        бессрочно\n");
+        } else {
+            s.push_str(&format!(
+                "  Действует до: {}\n",
+                civil_date(lic.expires)
+            ));
+        }
+        if let Some(g) = st.grace_days_left {
+            if g > 0 {
+                s.push_str(&format!(
+                    "  ⚠ Истекла — grace-период: {g} дн., затем Community-лимиты\n"
+                ));
+            } else if st.tier == Tier::Community {
+                s.push_str("  ⚠ Истекла сверх grace — работаем на Community-лимитах\n");
+            }
+        }
+        if !lic.features.is_empty() {
+            s.push_str(&format!("  Функции:     {}\n", lic.features.join(", ")));
+        }
+    } else {
+        s.push_str("  Локальный поиск, резонанс, AIDDE, граф, TUI: БЕЗ лимитов\n");
+        for (feat, used) in &st.quota_used {
+            s.push_str(&format!(
+                "  Интеграция {feat}: {}/{} операций за 24 ч\n",
+                used, COMMUNITY_DAILY_OPS
+            ));
+        }
+        if st.trial_days_left > 0 {
+            s.push_str(&format!(
+                "  Trial полных функций: {} дн. осталось\n",
+                st.trial_days_left
+            ));
+        }
+    }
+    match &st.source {
+        Some(src) => s.push_str(&format!("  Источник:    {src}\n")),
+        None => s.push_str("  Источник:    лицензии нет\n"),
+    }
+    s.push_str("\n  Активация: poler-engine --license-import PO1.….….  (ключ одной строкой)\n");
+    s.push_str("\nLicensing (v0.22.0 — Source-Available, Unreal Engine EULA модель):\n");
+    s.push_str(&eula_notice());
+    s
+}
+
 // ---------- ошибки ----------
 
 #[derive(Debug, Clone, PartialEq, Eq)]

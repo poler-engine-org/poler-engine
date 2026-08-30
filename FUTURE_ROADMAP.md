@@ -221,11 +221,29 @@ API**, не забивая локальный диск сотнями гигаб
    индекса, exit-коды GNU grep) + RAG-чанкер (слой B: passage-уровень
    с якорями) + MCP-инструменты poler_grep/poler_chunk. Анализ трёх
    библиотек — `docs/native-retrieval-analysis.md`. ✅ shipped (2026-08-30)
-8. **v0.21.0 — Hugging Face Hub**: model cards + datasets API → влитие в
-   web-index.db как `hf://` URL-схема.
-9. **v0.22.0 — DVC + Oxen**: data-versioning pointer files, remote storage
+8. **v0.21.0 — Hardening & Precision**: CodeSymbolIdentity в EntityGraph,
+   Triage Layer в AIDDE (proof vs heuristic), Semantic Bridge (офлайн
+   ru↔en сенсор), Benchmark Suite. HF Hub — сдвинут (см. ниже).
+   ✅ shipped (2026-08-30)
+8b. **v0.21.1 — Security Hardening**: white-box аудит v0.21.0 (21 позиция,
+   2 HIGH), 12 патчей P1–P12 одним коммитом + security-гейты
+   audit_patch_verify 10/10 и audit_stress --hardened 46/46.
+   ✅ shipped (2026-08-30)
+8c. **v0.22.0 — Terminal Gateway + Source-Available EULA**: единый
+   терминальный шлюз (`--gateway`): двойной контур исполнения
+   (engine-native приоритет + sandboxed host proxy), конвейеры
+   host↔engine без /bin/sh, service/attach управление нижним слоем;
+   лицензия — POLER Custom Source-Available & Modification Disclosure
+   License v1.0 (модель Unreal Engine EULA: Notification Clause 14 дней,
+   роялти 5% > $25k/квартал, non-circumvention Ed25519-гейта).
+   Архитектура: `docs/terminal-gateway-architecture.md`.
+   ✅ shipped (2026-08-30)
+8d. **v0.22.x — globbing в gateway** (globset уже в дереве): раскрытие
+   `*.rs` в аргументах движковых команд.
+9. **v0.23.0 — Hugging Face Hub + DVC + Oxen**: model cards/datasets API
+   (`hf://`), data-versioning pointer files, remote storage
    resolve.
-10. **v0.23.0+ — HugeSCM/Lit/ParamLake**: адаптеры для China-scale
+10. **v0.24.0+ — HugeSCM/Lit/ParamLake**: адаптеры для China-scale
    монореп и AI-model versioning.
 
 ### 6.4. Архитектурное правило для v0.16+

@@ -1,11 +1,14 @@
 [package]
 name = "poler-engine"
-version = "0.21.1"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
 description = "AI-Native Topographical, Resonant and Graph Search Engine — successor to grep/ripgrep and blind vector RAG"
-license = "MIT OR Apache-2.0"
+# v0.22.0: POLER Custom Source-Available & Modification Disclosure
+# License v1.0 (модель Unreal Engine EULA) — см. LICENSE.md / TERMS.md.
+# SPDX не стандартизирует кастомные лицензии — используем license-file.
+license-file = "LICENSE.md"
 repository = "https://github.com/poler-engine/poler-engine"
 keywords = ["search", "retrieval", "graph", "rag", "cli"]
 categories = ["command-line-utilities", "text-processing"]

@@ -854,3 +854,76 @@ mod tests {
     }
 }
 
+/// v0.22.0: текст бенчмарк-отчёта как String (общий для CLI --benchmark
+/// и команды `benchmark` в Terminal Gateway). Перенесён из main.rs.
+pub fn report_text(res: &BenchResults) -> String {
+    let mut s = String::new();
+    s.push_str("POLER Engine Benchmark Suite\n");
+    s.push_str("══════════════════════════════════════════════════\n");
+
+    s.push_str("[1] Exact Retrieval — POLER Native Grep vs эталон\n");
+    s.push_str(&format!(
+        "    корпус: {} файлов × {} строк (шаблон {})\n",
+        res.exact.files, res.exact.lines, NEEDLE
+    ));
+    s.push_str(&format!(
+        "    POLER grep:  {:8.1} мс — {} совпавших строк (ожидалось {}){}\n",
+        res.exact.poler_ms,
+        res.exact.poler_matched_lines,
+        res.exact.expected_matched_lines,
+        if res.exact.completeness_ok { " ✓ полнота" } else { " ✗ ПОТЕРИ" }
+    ));
+    if let Some(r) = &res.exact.reference {
+        let parity = if res.exact.parity == Some(true) { "✓" } else { "✗" };
+        s.push_str(&format!(
+            "    {}: {:8.1} мс — {} совпавших строк → parity {}\n",
+            r.name, r.ms, r.matched_lines, parity
+        ));
+    } else {
+        s.push_str("    эталон (ripgrep/grep) недоступен — parity пропущен\n");
+    }
+
+    s.push('\n');
+    s.push_str("[2] Explainable Lexical — BM25 + WebRank + Semantic Bridge\n");
+    s.push_str(&format!(
+        "    индексация {} страниц: {:.1} мс\n",
+        res.lexical.pages, res.lexical.index_ms
+    ));
+    s.push_str(&format!(
+        "    {} golden-запросов: {:.2} мс среднее\n",
+        res.lexical.queries, res.lexical.query_avg_ms
+    ));
+    s.push_str(&format!(
+        "    golden «{}» → {} {} (мост: +{} терма)\n",
+        res.lexical.golden_query,
+        res.lexical.golden_top1.as_deref().unwrap_or("-"),
+        if res.lexical.golden_ok { "✓" } else { "✗" },
+        res.lexical.bridge_expanded_terms
+    ));
+
+    s.push('\n');
+    s.push_str("[3] Passage Retrieval — POLER Chunker vs naive splitter\n");
+    s.push_str(&format!("    документ: {} байт\n", res.passage.doc_bytes));
+    s.push_str(&format!(
+        "    POLER chunker:  {:8.2} мс — {} чанков, целостность предложений {:.1}%\n",
+        res.passage.poler_ms, res.passage.poler_chunks, res.passage.poler_integrity_pct
+    ));
+    s.push_str(&format!(
+        "    naive splitter: {:8.2} мс — {} чанков, целостность предложений {:.1}%\n",
+        res.passage.naive_ms, res.passage.naive_chunks, res.passage.naive_integrity_pct
+    ));
+
+    s.push('\n');
+    s.push_str("[4] Resources\n");
+    if let Some(r) = &res.resources {
+        s.push_str(&format!(
+            "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)\n",
+            r.vm_hwm_kb as f64 / 1024.0,
+            r.vm_rss_kb as f64 / 1024.0
+        ));
+    } else {
+        s.push_str("    RAM-снимок недоступен (не Linux)\n");
+    }
+
+    s
+}

@@ -47,6 +47,7 @@ pub mod aidde;
 pub mod bench;
 pub mod engine;
 pub mod google;
+pub mod gateway;
 pub mod graph;
 pub mod license;
 pub mod mcp;

@@ -259,6 +259,13 @@ struct Cli {
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
 
+    /// TERMINAL GATEWAY (v0.22.0): единый терминальный шлюз — двойной
+    /// контур исполнения (engine-native приоритет + sandboxed host proxy),
+    /// конвейеры host↔engine, service/attach управление нижним слоем.
+    /// Верхний уровень управления на Linux/macOS.
+    #[arg(long, conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "license", "license_import", "semantic_expand", "import_browser_session"])]
+    gateway: bool,
+
     /// Интерактивный REPL (poler> search/nlm/crawl/sync...).
     /// База web-index.db и NlmSession открываются ленимо и переиспользуются
     /// между командами (история в ~/.cache/poler-engine/shell-history.txt).
@@ -545,75 +552,7 @@ fn print_result(res: &SearchResult, format: Format) {
 
 /// Человекочитаемый отчёт Benchmark Suite (v0.21, Задача 4).
 fn print_bench_report(res: &poler_engine::bench::BenchResults) {
-    use std::io::Write;
-    println!("POLER Engine Benchmark Suite v0.21");
-    println!("══════════════════════════════════════════════════");
-
-    println!("[1] Exact Retrieval — POLER Native Grep vs эталон");
-    println!(
-        "    корпус: {} файлов × {} строк (шаблон {})",
-        res.exact.files, res.exact.lines,
-        poler_engine::bench::NEEDLE
-    );
-    println!(
-        "    POLER grep:  {:8.1} мс — {} совпавших строк (ожидалось {}){}",
-        res.exact.poler_ms,
-        res.exact.poler_matched_lines,
-        res.exact.expected_matched_lines,
-        if res.exact.completeness_ok { " ✓ полнота" } else { " ✗ ПОТЕРИ" }
-    );
-    if let Some(r) = &res.exact.reference {
-        let parity = if res.exact.parity == Some(true) { "✓" } else { "✗" };
-        println!(
-            "    {}: {:8.1} мс — {} совпавших строк → parity {}",
-            r.name, r.ms, r.matched_lines, parity
-        );
-    } else {
-        println!("    эталон (ripgrep/grep) недоступен — parity пропущен");
-    }
-
-    println!();
-    println!("[2] Explainable Lexical — BM25 + WebRank + Semantic Bridge");
-    println!(
-        "    индексация {} страниц: {:.1} мс",
-        res.lexical.pages, res.lexical.index_ms
-    );
-    println!(
-        "    {} golden-запросов: {:.2} мс среднее",
-        res.lexical.queries, res.lexical.query_avg_ms
-    );
-    println!(
-        "    golden «{}» → {} {} (мост: +{} терма)",
-        res.lexical.golden_query,
-        res.lexical.golden_top1.as_deref().unwrap_or("-"),
-        if res.lexical.golden_ok { "✓" } else { "✗" },
-        res.lexical.bridge_expanded_terms
-    );
-
-    println!();
-    println!("[3] Passage Retrieval — POLER Chunker vs naive splitter");
-    println!("    документ: {} байт", res.passage.doc_bytes);
-    println!(
-        "    POLER chunker:  {:8.2} мс — {} чанков, целостность предложений {:.1}%",
-        res.passage.poler_ms, res.passage.poler_chunks, res.passage.poler_integrity_pct
-    );
-    println!(
-        "    naive splitter: {:8.2} мс — {} чанков, целостность предложений {:.1}%",
-        res.passage.naive_ms, res.passage.naive_chunks, res.passage.naive_integrity_pct
-    );
-
-    println!();
-    println!("[4] Resources");
-    if let Some(r) = &res.resources {
-        println!(
-            "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)",
-            r.vm_hwm_kb as f64 / 1024.0,
-            r.vm_rss_kb as f64 / 1024.0
-        );
-    } else {
-        println!("    RAM-снимок недоступен (не Linux)");
-    }
-    let _ = std::io::stdout().flush();
+    print!("{}", poler_engine::bench::report_text(res));
 }
 
 /// Вывод результатов веб-поиска в трёх форматах.
@@ -759,52 +698,10 @@ fn print_drive_hits(hits: &[poler_engine::google::api::DriveHit], query: &str, f
 }
 
 /// v0.18.0: человекочитаемый статус лицензии (`--license`).
+/// v0.22.0: формат живёт в license::status_text() — единый источник
+/// для CLI и команды `license` в Terminal Gateway.
 fn print_license_status() -> ExitCode {
-    use poler_engine::license::{self, Status, Tier};
-
-    let st: Status = license::status();
-    println!("POLER Engine — лицензия");
-    println!();
-    match st.tier {
-        Tier::Trial => println!("  Тир:         Trial — все функции, {} дн. осталось", st.trial_days_left),
-        Tier::Community => println!("  Тир:         Community (без лицензии)"),
-        Tier::Pro => println!("  Тир:         Pro"),
-        Tier::Enterprise => println!("  Тир:         Enterprise"),
-    }
-    if let Some(lic) = &st.license {
-        println!("  Владелец:    {} <{}>", lic.name, lic.email);
-        println!("  Выдана:      {}", license::civil_date(lic.issued));
-        if lic.expires == 0 {
-            println!("  Срок:        бессрочно");
-        } else {
-            println!("  Действует до: {}", license::civil_date(lic.expires));
-        }
-        if let Some(g) = st.grace_days_left {
-            if g > 0 {
-                println!("  ⚠ Истекла — grace-период: {g} дн., затем Community-лимиты");
-            } else if st.tier == Tier::Community {
-                println!("  ⚠ Истекла сверх grace — работаем на Community-лимитах");
-            }
-        }
-        if !lic.features.is_empty() {
-            println!("  Функции:     {}", lic.features.join(", "));
-        }
-    } else {
-        println!("  Локальный поиск, резонанс, AIDDE, граф, TUI: БЕЗ лимитов");
-        for (feat, used) in &st.quota_used {
-            println!("  Интеграция {feat}: {}/{} операций за 24 ч", used, license::COMMUNITY_DAILY_OPS);
-        }
-        if st.trial_days_left > 0 {
-            println!("  Trial полных функций: {} дн. осталось", st.trial_days_left);
-        }
-    }
-    if let Some(src) = &st.source {
-        println!("  Источник:    {src}");
-    } else {
-        println!("  Источник:    лицензии нет");
-    }
-    println!();
-    println!("  Активация: poler-engine --license-import PO1.….….  (ключ одной строкой)");
+    print!("{}", poler_engine::license::status_text());
     ExitCode::SUCCESS
 }
 
@@ -1307,6 +1204,12 @@ fn run(cli: Cli) -> ExitCode {
             print!("{}", nr::render_chunks_text(&report, &path.display().to_string()));
         }
         return ExitCode::SUCCESS;
+    }
+
+    // ---------- Terminal Gateway: единый терминальный шлюз v0.22.0 ----------
+    if cli.gateway {
+        let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        return poler_engine::gateway::run_gateway(db_path);
     }
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------

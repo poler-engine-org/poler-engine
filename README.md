@@ -1,7 +1,7 @@
 # POLER-Engine
 
 [![CI](https://github.com/poler-engine-org/poler-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/poler-engine-org/poler-engine/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License: POLER Source-Available v1.0](https://img.shields.io/badge/license-POLER%20Source--Available%20v1.0-9b59b6.svg)](LICENSE.md)
 [![Rust 1.98](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](Cargo.toml)
 
 **AI-Native Topographical, Resonant and Graph Search Engine** — поисково-аналитический
@@ -11,6 +11,64 @@ RAG из архитектуры LLM-агентов.
 ```
 poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relations'
 ```
+
+---
+
+## v0.22.0: Terminal Gateway + Source-Available EULA
+
+Два взаимосвязанных изменения: **верхний уровень управления** (нативный
+терминальный шлюз поверх веб-GUI/Auth Companion/WebLens — «нижнего
+сервисного слоя») и **новая лицензионная модель** по прецеденту Unreal
+Engine EULA.
+
+### Terminal Gateway (`poler-engine --gateway`)
+
+Единое окно терминала (Linux/macOS) с **двойным контуром исполнения**:
+
+1. **Engine Native (приоритет)** — команды движка (`search`, `grep`,
+   `chunk`, `crawl`, `impact`, `nlm`, `notes`, `weblens`, `benchmark`…)
+   перехватываются и исполняются нативно внутри процесса, без спавна
+   внешних шеллов. `grep` здесь — POLER Native Grep (не `/bin/grep`;
+   системный — через `!grep` / `host grep`);
+2. **Controlled Host OS Proxy** — всё прочее исполняется в хостовой ОС
+   через **Sandboxed OS Subshell**: блок деструктивного (`rm -rf /`,
+   форк-бомбы, `dd of=/dev/*`, shutdown-семейство, `curl | sh`, запись
+   в `/dev/sd*` и `/etc/*`), подтверждение эскалаций (sudo/su, `rm -r`,
+   dd), кап вывода 16 МБ, таймаут 120 с, фильтр секретов из env.
+
+**Конвейеры смешивают контуры**: `ls -la | chunk --size 200`,
+`cat main.rs | impact main`, `grep "fn " --stdin | wc -l`,
+`ls | poler chunk` (префикс опционален). Без `/bin/sh` вообще —
+токенизацию делает движок, спавн прямой (класс shell-инъекций устранён).
+
+**Сервисный слой из шлюза**: `service start|stop|status|restart|attach`
+(mcp / weblens / companion), `attach mcp` — интерактивный JSON-RPC-клиент
+поверх живого MCP-сервера (`tools`, `call <tool> {json}`). Токен сервиса
+передаётся через env (не argv — не светится в `/proc/<pid>/cmdline`),
+живёт в 0600-файле.
+
+ANSI/VT100, SIGINT — SIGINT группе процессов с grace, SIGWINCH —
+перерисовка, история 5000 команд. Архитектура:
+`docs/terminal-gateway-architecture.md`.
+
+### Лицензия: Source-Available с раскрытием модификаций
+
+См. раздел «Лицензия» ниже, `LICENSE.md`, `TERMS.md`. `poler-engine
+--license` и баннер gateway показывают модель, тир и адрес раскрытия
+модификаций. `Cargo.toml` — `license-file = "LICENSE.md"`.
+
+### Ретроспектива v0.21.x (не вошла в README ранее)
+
+- **v0.21.0 Hardening & Precision**: CodeSymbolIdentity (Foo ≠ foo ≠ FOO,
+  module::name), Triage Layer в AIDDE (proof vs heuristic), Semantic
+  Bridge (офлайн ru↔en, WHY, §8.1 закрыта), Benchmark Suite (POLER grep
+  3.3 мс vs ripgrep 6.3 мс при parity 195=195), фикс чанкера; 783 теста;
+- **v0.21.1 Security Hardening**: white-box аудит v0.21.0 — 21 позиция
+  (0 Critical, 2 HIGH), 12 патчей P1–P12 одним коммитом: guard_path +
+  анти-SSRF в MCP (закрыт arbitrary file read и эксфильтрация
+  refresh_token), fail-closed пустой токен, REQUEST_DEADLINE 120 с,
+  атомарные 0600, CDP-капы; security-гейты `audit_patch_verify.py` 10/10
+  + `audit_stress.py --hardened` 46/46.
 
 ---
 
@@ -1867,4 +1925,20 @@ CI (`.github/workflows/ci.yml`): матрица ubuntu/macos, clippy с `-D warn
 
 ## Лицензия
 
-MIT OR Apache-2.0.
+**POLER Custom Source-Available & Modification Disclosure License v1.0**
+(модель Unreal Engine EULA, с v0.22.0; см. `LICENSE.md` — юридический
+инструмент, `TERMS.md` — практическая сводка):
+
+- исходники открыты для **изучения, локальной сборки и модификации**;
+- **обязательное уведомление** авторов (dev@poler-engine.org, 14 дней)
+  при дистрибуции/деплое продукта на **модифицированном** ядре
+  (Notification Clause);
+- публичная редистрибуция ядра и форков **запрещена**;
+- коммерческое использование — тиры Community/Pro/Enterprise +
+  роялти 5% выручки продукта свыше $25 000/квартал (safe harbor
+  $10 000/квартал);
+- обход Ed25519 License Gate — нарушение лицензии (автоматическое
+  прекращение).
+
+Снапшоты до v0.17.7 включительно остаются под MIT OR Apache-2.0.
+Статус в бинарнике: `poler-engine --license`.

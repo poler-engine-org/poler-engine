@@ -1,0 +1,207 @@
+//! # POLER Terminal Gateway (v0.22.0)
+//!
+//! **Unified Host Shell / Terminal REPL** — верхний уровень управления
+//! POLER Engine на Linux/macOS. Единое окно терминала с двойным контуром
+//! исполнения:
+//!
+//! 1. **Engine Native (приоритет)** — команды движка (`search`, `grep`,
+//!    `chunk`, `crawl`, `nlm`, `notes`, `weblens`, `impact`, `benchmark`…)
+//!    исполняются внутри процесса, без спавна внешних шеллов;
+//! 2. **Controlled Host OS Proxy** — прочие команды идут в хостовую ОС
+//!    через Sandboxed OS Subshell: блок деструктивного, подтверждение
+//!    эскалаций, кап вывода, таймаут, фильтр env.
+//!
+//! Конвейеры смешивают контуры (`ls | chunk`, `grep x --stdin | wc -l`),
+//! сервисный слой управляется командами `service`/`attach`.
+//!
+//! Запуск: `poler-engine --gateway`.
+//! Архитектура: docs/terminal-gateway-architecture.md.
+//! Лицензия: banner ниже — Source-Available EULA v1.0 (TERMS.md).
+
+pub mod completer;
+pub mod dispatch;
+pub mod hostexec;
+pub mod pipeline;
+pub mod sandbox;
+pub mod service;
+
+pub use dispatch::{exec_line, GatewayResult, GatewayState};
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+/// ANSI-подсветка только в tty (канон из v0.20.0 grep).
+fn stdout_is_tty() -> bool {
+    // избегаем новой зависимости: isatty через /proc/self/fd недоступен
+    // на macOS; используем TERM-эвристику + rustyline-контекст невозможен
+    // здесь. Практика движка: std::io::IsTerminal (stable с 1.70).
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+/// Баннер запуска: версия, тир лицензии (Ed25519-гейт v0.18.0),
+/// EULA-условия (v0.22.0), подсказка контуров.
+pub fn banner() -> String {
+    let tty = stdout_is_tty();
+    let (bold, dim, cyan, reset) = if tty {
+        ("\x1b[1m", "\x1b[2m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+    let st = crate::license::status();
+    let tier = match st.tier {
+        crate::license::Tier::Trial => format!("Trial ({} дн.)", st.trial_days_left),
+        crate::license::Tier::Community => "Community".to_string(),
+        crate::license::Tier::Pro => "Pro".to_string(),
+        crate::license::Tier::Enterprise => "Enterprise".to_string(),
+    };
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{bold}POLER Engine {} — Terminal Gateway{reset}\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    s.push_str(&format!("{cyan}Лицензия: {tier}.{reset} {}\n", crate::license::eula_banner_line()));
+    s.push('\n');
+    s.push_str("Контуры исполнения:\n");
+    s.push_str(&format!(
+        "  1 {bold}engine-native{reset} — search · grep · chunk · crawl · impact · nlm · notes · benchmark …\n"
+    ));
+    s.push_str(&format!(
+        "  2 {dim}host-os-proxy{reset} — любые системные команды в sandbox (деструктивное блокируется)\n"
+    ));
+    s.push('\n');
+    s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
+    s
+}
+
+/// Файл истории gateway (отдельный от внутреннего --shell).
+fn history_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".cache/poler-engine/gateway-history.txt")
+}
+
+/// Точка входа: `poler-engine --gateway`.
+pub fn run_gateway(db_path: PathBuf) -> ExitCode {
+    use rustyline::config::Configurer;
+    use rustyline::error::ReadlineError;
+    use rustyline::history::DefaultHistory;
+    use rustyline::Editor;
+
+    // SIGINT во время исполнения хостовых команд: флаг проверяет hostexec.
+    // Регистрация может «занять место» хендлера watcher-режима — но они
+    // не работают одновременно (gateway = самостоятельный режим).
+    let _ = ctrlc::set_handler(|| {
+        hostexec::INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let hist = history_path();
+    if let Some(parent) = hist.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut rl = match Editor::<completer::GatewayCompleter, DefaultHistory>::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("poler-gateway: rustyline init: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let _ = rl.set_max_history_size(5000);
+    let _ = rl.set_history_ignore_dups(true);
+    rl.set_completion_type(rustyline::config::CompletionType::List);
+    rl.set_auto_add_history(true);
+    rl.set_helper(Some(completer::GatewayCompleter::default()));
+    let _ = rl.load_history(&hist);
+
+    print!("{}", banner());
+    let _ = std::io::stdout().flush();
+
+    let mut state = GatewayState::new(db_path);
+    println!(
+        "{}",
+        state.cwd.display()
+    );
+
+    let interactive = stdout_is_tty();
+    loop {
+        let cwd_short = shorten_cwd(&state.cwd);
+        let prompt = format!("poler {cwd_short} $ ");
+        let line = match rl.readline(&prompt) {
+            Ok(l) => l,
+            Err(ReadlineError::WindowResized) => continue, // SIGWINCH: перерисовать
+            Err(ReadlineError::Interrupted) => {
+                hostexec::clear_interrupt();
+                println!("^C (сброс строки; quit — выход)");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("\nвыход (EOF)");
+                break;
+            }
+            Err(e) => {
+                eprintln!("poler-gateway: ошибка ввода: {e}");
+                break;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let _ = rl.add_history_entry(trimmed);
+
+        match exec_line(&mut state, trimmed, interactive) {
+            GatewayResult::Empty => continue,
+            GatewayResult::Quit => {
+                println!("до свидания ✌");
+                break;
+            }
+            GatewayResult::Done(out) => {
+                if !out.is_empty() {
+                    print!("{out}");
+                    if !out.ends_with('\n') {
+                        println!();
+                    }
+                }
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    let _ = rl.save_history(&hist);
+    ExitCode::SUCCESS
+}
+
+/// `~/projects/x` → `~/projects/x`; `/home/user/x` → `~/x` (компактный cwd).
+fn shorten_cwd(cwd: &std::path::Path) -> String {
+    let s = cwd.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && s.starts_with(&home) {
+            let rest = &s[home.len()..];
+            return format!("~{rest}");
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn banner_contains_license_and_circuits() {
+        let b = super::banner();
+        assert!(b.contains("Terminal Gateway"));
+        assert!(b.contains("Лицензия"));
+        assert!(b.contains("dev@poler-engine.org"), "EULA-адрес в баннере обязателен");
+        assert!(b.contains("engine-native"));
+        assert!(b.contains("host-os-proxy"));
+    }
+
+    #[test]
+    fn shorten_cwd_home_tilde() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let p = std::path::Path::new(&home).join("work");
+            assert_eq!(super::shorten_cwd(&p), "~/work");
+        }
+    }
+}

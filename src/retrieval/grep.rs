@@ -289,11 +289,24 @@ fn scan_file(path: &Path, matcher: &Matcher, config: &GrepConfig) -> FileScan {
             return scan;
         }
     };
-    let meta_len = bytes.len() as u64;
-    if meta_len > MAX_FILE_BYTES {
+    scan_bytes(&scan.path.clone(), &bytes, matcher, config)
+}
+
+/// v0.22.0 (Terminal Gateway): сканирование БУФЕРА из памяти (stdin
+/// конвейера) с той же семантикой контекста/бинарности, что и файлы.
+fn scan_bytes(name: &str, bytes: &[u8], matcher: &Matcher, config: &GrepConfig) -> FileScan {
+    let mut scan = FileScan {
+        path: name.to_string(),
+        binary: false,
+        matched_lines: 0,
+        occurrences: 0,
+        groups: Vec::new(),
+        error: None,
+    };
+    if bytes.len() as u64 > MAX_FILE_BYTES {
         scan.error = Some(format!(
-            "{}: {meta_len} байт > лимита {MAX_FILE_BYTES} — пропущен",
-            path.display()
+            "{name}: {} байт > лимита {MAX_FILE_BYTES} — пропущен",
+            bytes.len()
         ));
         return scan;
     }
@@ -484,6 +497,12 @@ pub fn grep_run(roots: &[PathBuf], config: &GrepConfig) -> Result<GrepReport, St
         .map(|p| scan_file(p, &matcher, config))
         .collect();
 
+    let report = assemble_report(scans, config, started);
+    Ok(report)
+}
+
+/// Сборка GrepReport из набора сканов (общая для grep_run и grep_buffer).
+fn assemble_report(scans: Vec<FileScan>, config: &GrepConfig, started: std::time::Instant) -> GrepReport {
     let mut report = GrepReport {
         pattern: config.pattern.clone(),
         output: config.output,
@@ -524,7 +543,18 @@ pub fn grep_run(roots: &[PathBuf], config: &GrepConfig) -> Result<GrepReport, St
         }
     }
     report.stats.elapsed_ms = started.elapsed().as_millis();
-    Ok(report)
+    report
+}
+
+/// v0.22.0 (Terminal Gateway): точный поиск по БУФЕРУ из памяти —
+/// stdin конвейера (`cat notes.md | poler grep TODO`). Та же семантика
+/// (контекст, бинарность, exit-коды), что и у файлового grep_run;
+/// `name` — псевдоним источника в выводе (обычно "stdin").
+pub fn grep_buffer(name: &str, text: &str, config: &GrepConfig) -> Result<GrepReport, String> {
+    let started = std::time::Instant::now();
+    let matcher = Matcher::build(config)?;
+    let scan = scan_bytes(name, text.as_bytes(), &matcher, config);
+    Ok(assemble_report(vec![scan], config, started))
 }
 
 /// Человекочитаемый рендер в семантике grep: `path:LINE:text`,
