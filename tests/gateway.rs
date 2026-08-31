@@ -481,3 +481,61 @@ fn gateway_repl_v027_root_broker_no_docker() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// 7. v0.28.0: рут по паролю + builtin-охотник в живом REPL (без docker)
+// ---------------------------------------------------------------------------
+
+/// Честность v0.28.0 без docker-демона: passwd из скрипта — отказ (ZSE),
+/// clear — работает, builtin-охота без jail — честный отказ, валидация
+/// аргументов ДО jail-гейта, версия и статус упоминают новые контуры.
+#[test]
+fn gateway_repl_v028_password_builtin_no_docker() {
+    let home = std::env::temp_dir().join(format!("poler-gw-v028-it-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let script = "box sudo passwd\n\
+                  box sudo passwd --clear\n\
+                  box sudo passwd zzz\n\
+                  box sudo status\n\
+                  box hunt start --mode builtin\n\
+                  box hunt start --mode builtin --interval 1\n\
+                  box hunt status\n\
+                  box hunt stop\n\
+                  box sudo zzz\n\
+                  version\n\
+                  quit\n";
+    let out = gateway_session_env(&home, script, &[("POLER_BOX_DOCKER", "/bin/false")]);
+
+    // выдача пароля скриптом — ZSE-отказ (агент не выдаёт себе рут)
+    assert!(
+        out.contains("только в интерактивной"),
+        "passwd из скрипта обязан отказать: {out}"
+    );
+    // clear без заданного пароля — честно
+    assert!(out.contains("не был задан"), "clear без пароля: {out}");
+    // мусорный флаг — ошибка синтаксиса
+    assert!(out.contains("флаги: --clear"), "мусорный флаг: {out}");
+    // статус упоминает пароль-режим
+    assert!(out.contains("режим пароля"), "статус без пароль-режима: {out}");
+    // builtin-охота без jail — честный отказ
+    assert!(
+        out.contains("jail не активен") || out.contains("docker"),
+        "builtin без jail/docker: {out}"
+    );
+    // валидация аргументов ДО jail-гейта
+    assert!(
+        out.contains("интервал 10..=600"),
+        "interval=1 обязан быть syntax-ошибкой до jail: {out}"
+    );
+    // usage упоминает passwd
+    assert!(out.contains("zzz? (box sudo"), "usage sudo: {out}");
+    assert!(out.contains("passwd"), "usage без passwd: {out}");
+    // версия упоминает v0.28.0-фичи
+    assert!(
+        out.contains("sudo-passwd") && out.contains("builtin-hunter"),
+        "версия без v0.28.0-фич: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

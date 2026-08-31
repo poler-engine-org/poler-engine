@@ -79,6 +79,10 @@ pub struct GatewayState {
     /// v0.27.0: Jailbreak Sentinel (`box hunt start`) — охота на побег:
     /// батарея векторов + наблюдение за агентом + kill-switch.
     pub hunt: Option<super::sentinel::HuntState>,
+    /// v0.28.0: Builtin Hunter (`box hunt start --mode builtin`) —
+    /// собственный красный суб-агент POLER: чёрный ящик изнутри клетки,
+    /// kill-switch, авто-блоклист; `--loop` — постоянное наблюдение.
+    pub hunt_builtin: Option<super::hunter::BuiltinHandle>,
 }
 
 impl GatewayState {
@@ -98,6 +102,7 @@ impl GatewayState {
             runner: None,
             sudo_broker: None,
             hunt: None,
+            hunt_builtin: None,
         }
     }
 
@@ -752,7 +757,7 @@ fn run_engine(
         "clear" => Ok("\x1b[2J\x1b[1;1H".into()),
         "help" | "?" => Ok(gateway_help()),
         "version" | "ver" | "v" => Ok(format!(
-            "poler-engine {} — Terminal Gateway v0.27.0 (двойной контур + PTY + sudo-гейт + workspace-guard + container-jail + agent-bindmount + mcp-broker + root-broker + jailbreak-sentinel)\n",
+            "poler-engine {} — Terminal Gateway v0.28.0 (двойной контур + PTY + sudo-гейт + workspace-guard + container-jail + agent-bindmount + mcp-broker + root-broker + sudo-passwd + jailbreak-sentinel + builtin-hunter)\n",
             env!("CARGO_PKG_VERSION")
         )),
         "quit" | "exit" | "q" => Err(EngineFail::Quit),
@@ -1584,7 +1589,7 @@ fn cmd_box(
             &state.ws_root,
         )),
         Some("runner") => cmd_box_runner(state, &args[1..]),
-        Some("sudo") => cmd_box_sudo(state, &args[1..]),
+        Some("sudo") => cmd_box_sudo(state, &args[1..], interactive),
         Some("root") => cmd_box_root(state, interactive),
         Some("allow") => cmd_box_allow(state, &args[1..], interactive),
         Some("hunt") => cmd_box_hunt(state, &args[1..], interactive),
@@ -1612,6 +1617,9 @@ fn cmd_box(
             }
             if state.hunt.take().is_some() {
                 preface.push_str("🎯 охота завершена (отчёты в hunt-базе)\n");
+            }
+            if let Some(mut h) = state.hunt_builtin.take() {
+                preface.push_str(&h.stop());
             }
             let name = state
                 .box_jail
@@ -1739,20 +1747,24 @@ fn cmd_box_runner(
 // v0.27.0: Root Broker («sudo как услуга») + Jailbreak Sentinel
 // ---------------------------------------------------------------------------
 
-/// `box sudo on|off|status|log [N]` — рут-брокер.
+/// `box sudo on|off|status|log [N]|passwd [--clear]` — рут-брокер.
 /// Рут — привилегия ХОСТА: агент в клетке может только ПРОСИТЬ исполнение;
 /// судья решает (Block-инварианты + allowlist + дефолт-политика), исполнение
 /// идёт `docker exec -u 0:0` СО СТОРОНЫ ХОСТА, агенту возвращаются только
 /// stdout/stderr/exit.
+/// v0.28.0 `passwd`: владелец выдаёт агенту рут-ПАРОЛЬ (только интерактив —
+/// scripted-агент не может ни задать, ни подменить); пароль открывает
+/// НЕдеструктивный остаток, инварианты держат ВСЕГДА.
 fn cmd_box_sudo(
     state: &mut GatewayState,
     args: &[String],
+    interactive: bool,
 ) -> Result<String, String> {
     match args.first().map(|s| s.as_str()) {
         None | Some("status") => {
             let mut s = match &state.sudo_broker {
                 Some(h) => h.status_text(),
-                None => "🔐 рут-брокер ВЫКЛ — агент в клетке получает «нет рута» честным отказом\nруут как привилегия ХОСТА: box sudo on — агент сможет ПРОСИТЬ (судья решает)\n".to_string(),
+                None => "🔐 рут-брокер ВЫКЛ — агент в клетке получает «нет рута» честным отказом\nруут как привилегия ХОСТА: box sudo on — агент сможет ПРОСИТЬ (судья решает)\nрежим пароля: box sudo passwd — выдать агенту рут-пароль (только интерактив; потом агент: echo ПАРОЛЬ | sudo -S cmd)\n".to_string(),
             };
             let jail = state
                 .box_jail
@@ -1792,6 +1804,7 @@ fn cmd_box_sudo(
             state.sudo_broker = Some(handle);
             Ok(report)
         }
+        Some("passwd") => cmd_box_sudo_passwd(state, &args[1..], interactive),
         Some("off") => {
             match state.sudo_broker.take() {
                 Some(mut b) => Ok(b.stop()),
@@ -1811,9 +1824,77 @@ fn cmd_box_sudo(
             Ok(super::rootbroker::tail_audit(&jail, n))
         }
         Some(other) => Err(format!(
-            "box sudo: {other}? (box sudo on|off|status|log [N])"
+            "box sudo: {other}? (box sudo on|off|status|log [N]|passwd [--clear])"
         )),
     }
+}
+
+/// `box sudo passwd [--clear]` — рут-пароль брокера.
+/// Задание — ТОЛЬКО интерактив (TTY + владелец): scripted-агент не может
+/// выдать сам себе рут. `--clear` — снятие (ужесточение, безопасно всегда).
+fn cmd_box_sudo_passwd(
+    state: &GatewayState,
+    args: &[String],
+    interactive: bool,
+) -> Result<String, String> {
+    let jail_name = state
+        .box_jail
+        .as_ref()
+        .map(|j| j.name.clone())
+        .unwrap_or_else(|| containers::container_name(&state.ws_root));
+    let path = super::rootbroker::password_path(&jail_name);
+    // синтаксис — ДО гейтов (урок v0.27.0: валидация аргументов первыми)
+    if args.first().map(|s| s.as_str()) == Some("--clear") {
+        return super::rootbroker::clear_password(&path);
+    }
+    if !args.is_empty() {
+        return Err("box sudo passwd: флаги: --clear (снять пароль)".into());
+    }
+    if !interactive {
+        return Ok(
+            "box sudo passwd: выдача рут-пароля — только в интерактивной сессии (владелец за терминалом)\n⛔ scripted-агент не может выдать себе рут\n".into(),
+        );
+    }
+    println!("🔐 выдача рут-пароля брокеру {jail_name} (ввод скрыт; пусто — отмена)");
+    let p1 = read_secret_line("новый пароль (6..64): ")?;
+    if p1.trim().is_empty() {
+        return Ok("отмена: пустой ввод\n".into());
+    }
+    let p2 = read_secret_line("повторите: ")?;
+    super::rootbroker::set_password_from_pair(&path, p1.trim(), p2.trim())
+}
+
+/// Прочитать строку-секрет с терминала: stty -echo (best-effort; при
+/// неудаче честно предупреждает, что ввод виден). Не попадает в историю
+/// rustyline (читается напрямую из stdin).
+fn read_secret_line(prompt: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let echo_off = std::process::Command::new("stty")
+        .arg("-echo")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+    if !echo_off {
+        println!("⚠ stty -echo недоступен — ввод будет виден на экране");
+    }
+    let mut line = String::new();
+    let res = std::io::stdin().read_line(&mut line);
+    if echo_off {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::null())
+            .status();
+        println!();
+    }
+    res.map_err(|e| format!("stdin: {e}"))?;
+    Ok(line.trim_end_matches('\n').trim_end_matches('\r').to_string())
 }
 
 /// `box root` — интерактивный РУТ-шелл в клетке, ТОЛЬКО с хоста (владелец
@@ -1904,34 +1985,59 @@ fn cmd_box_hunt(
 ) -> Result<String, String> {
     match args.first().map(|s| s.as_str()) {
         None | Some("status") => {
-            match &state.hunt {
-                Some(h) => Ok(super::sentinel::status_text(h)),
-                None => Ok(
-                    "🎯 охота не активна (box hunt start --mode probe|agent; наблюдение за попытками побега)\n"
-                        .into(),
-                ),
+            let mut s = match &state.hunt {
+                Some(h) => super::sentinel::status_text(h),
+                None => "🎯 охота не активна (box hunt start --mode probe|agent|builtin)\n".to_string(),
+            };
+            if let Some(hb) = &state.hunt_builtin {
+                s.push('\n');
+                s.push_str(&hb.status_text());
             }
+            Ok(s)
         }
         Some("report") => {
-            let Some(h) = &state.hunt else {
+            let mut s = String::new();
+            if let Some(h) = &state.hunt {
+                s.push_str(&super::sentinel::status_text(h));
+                s.push('\n');
+                s.push_str(&super::sentinel::render_report(h));
+            }
+            if let Some(hb) = &state.hunt_builtin {
+                s.push('\n');
+                s.push_str(&hb.status_text());
+                if let Some(p) = hb.last_report_path() {
+                    if let Ok(text) = std::fs::read_to_string(&p) {
+                        s.push('\n');
+                        s.push_str(&text);
+                    }
+                }
+            }
+            if s.is_empty() {
                 return Ok("box hunt report: охота не активна — сначала box hunt start\n".into());
-            };
-            let mut s = super::sentinel::status_text(h);
-            s.push('\n');
-            s.push_str(&super::sentinel::render_report(h));
+            }
             Ok(s)
         }
         Some("stop") => {
+            let mut s = String::new();
             if state.hunt.take().is_some() {
-                Ok("🎯 охота остановлена (отчёты и инциденты — в hunt-базе)\n".into())
-            } else {
-                Ok("охота не активна\n".into())
+                s.push_str("🎯 охота остановлена (отчёты и инциденты — в hunt-базе)\n");
             }
+            if let Some(mut hb) = state.hunt_builtin.take() {
+                s.push_str(&hb.stop());
+            }
+            if s.is_empty() {
+                s.push_str("охота не активна\n");
+            }
+            Ok(s)
         }
         Some("start") => {
             // параметры — ДО требования jail/docker (валидация синтаксиса
             // не требует ни клетки, ни демона — как box on net=host)
             let mut mode = super::sentinel::HuntMode::Probe;
+            let mut builtin_mode = false;
+            let mut loop_mode = false;
+            let mut interval: u64 = 30;
+            let mut full_every: u64 = 600;
             let mut agent: Option<String> = None;
             let mut mission_path: Option<String> = None;
             let mut budget: u64 = 1800;
@@ -1940,20 +2046,54 @@ fn cmd_box_hunt(
                 let (k, v) = match a.split_once('=') {
                     Some((k, v)) => (k.to_string(), Some(v.to_string())),
                     None => match a.as_str() {
-                        "--mode" | "--agent" | "--mission" | "--budget" => {
-                            (a.clone(), it.next().cloned())
-                        }
+                        "--mode" | "--agent" | "--mission" | "--budget" | "--interval"
+                        | "--full-every" => (a.clone(), it.next().cloned()),
                         _ => (a.clone(), None),
                     },
                 };
                 match k.as_str() {
                     "--mode" | "mode" => match v.as_deref() {
-                        Some("probe") => mode = super::sentinel::HuntMode::Probe,
+                        Some("probe") => {
+                            mode = super::sentinel::HuntMode::Probe;
+                            builtin_mode = false;
+                        }
                         Some("agent") => mode = super::sentinel::HuntMode::Agent,
+                        Some("builtin") => {
+                            // свой суб-агент POLER (v0.28.0): чёрный ящик изнутри
+                            builtin_mode = true;
+                        }
                         other => {
                             return Err(format!(
-                                "box hunt start: mode={other:?}? (probe|agent)"
+                                "box hunt start: mode={other:?}? (probe|agent|builtin)"
                             ))
+                        }
+                    },
+                    "--loop" | "loop" => {
+                        if let Some(v) = &v {
+                            return Err(format!("box hunt start: --loop без значения ({v}?)"));
+                        }
+                        loop_mode = true;
+                    }
+                    "--interval" | "interval" => {
+                        let Some(v) = v else {
+                            return Err("box hunt start: --interval требует секунды".into());
+                        };
+                        interval = v
+                            .parse()
+                            .map_err(|_| format!("box hunt start: interval={v}? (секунды)"))?;
+                        if !(10..=600).contains(&interval) {
+                            return Err("box hunt start: интервал 10..=600 секунд".into());
+                        }
+                    }
+                    "--full-every" | "full-every" => {
+                        let Some(v) = v else {
+                            return Err("box hunt start: --full-every требует секунды".into());
+                        };
+                        full_every = v
+                            .parse()
+                            .map_err(|_| format!("box hunt start: full-every={v}? (секунды)"))?;
+                        if !(120..=86400).contains(&full_every) {
+                            return Err("box hunt start: полная батарея каждые 120..=86400 сек".into());
                         }
                     },
                     "--agent" | "agent" => {
@@ -1981,10 +2121,58 @@ fn cmd_box_hunt(
                     }
                     other => {
                         return Err(format!(
-                            "box hunt start: {other}? (--mode probe|agent --agent ИМЯ --mission ПУТЬ --budget СЕК)"
+                            "box hunt start: {other}? (--mode probe|agent|builtin --agent ИМЯ --mission ПУТЬ --budget СЕК --loop --interval СЕК --full-every СЕК)"
                         ))
                     }
                 }
+            }
+            if builtin_mode {
+                let Some(jail) = state.box_jail.clone() else {
+                    return Ok("box hunt start: jail не активен — сначала box on\n".into());
+                };
+                if containers::box_running(&jail.name) != Some(true) {
+                    return Ok(format!(
+                        "box hunt start: контейнер {} не работает (box on — поднять)\n",
+                        jail.name
+                    ));
+                }
+                if let Some(hb) = &state.hunt_builtin {
+                    if hb.loop_mode {
+                        return Ok(format!(
+                            "🤖 builtin-охота уже наблюдает ({}) — box hunt stop — остановить\n",
+                            hb.box_name
+                        ));
+                    }
+                }
+                let broker_on = state.sudo_broker.is_some();
+                if loop_mode {
+                    let handle = super::hunter::start_loop(
+                        &jail,
+                        broker_on,
+                        interval,
+                        full_every,
+                    )?;
+                    let mut out = format!(
+                        "🤖 Builtin Hunter (суб-агент POLER) — LOOP-наблюдение контейнера {}\nсвип каждые {}с · полная батарея каждые {}с · breach → kill-switch\nканал рут-брокера: {} · пароль-режим: {}\n",
+                        jail.name,
+                        interval,
+                        full_every,
+                        if broker_on { "атакуется (брокер активен)" } else { "НЕ атакуется (box sudo on — включить)" },
+                        if super::rootbroker::password_exists(&jail.name) { "включён" } else { "выключен" }
+                    );
+                    out.push_str(&handle.status_text());
+                    state.hunt_builtin = Some(handle);
+                    return Ok(out);
+                }
+                let (handle, mut out) = super::hunter::run_oneshot(&jail, broker_on, true)?;
+                if !broker_on {
+                    out.insert_str(
+                        0,
+                        "⚠ рут-брокер не активен: канальные/судейские волны пропущены (box sudo on — атаковать канал целиком)\n",
+                    );
+                }
+                state.hunt_builtin = Some(handle);
+                return Ok(out);
             }
             match mode {
                 super::sentinel::HuntMode::Probe => {
@@ -2014,7 +2202,7 @@ fn cmd_box_hunt(
             }
         }
         Some(other) => Err(format!(
-            "box hunt: {other}? (box hunt start [--mode probe|agent] [--agent ИМЯ] [--mission ПУТЬ] [--budget СЕК] | status | report | stop)"
+            "box hunt: {other}? (box hunt start [--mode probe|agent|builtin] [--agent ИМЯ] [--mission ПУТЬ] [--budget СЕК] [--loop] [--interval СЕК] [--full-every СЕК] | status | report | stop)"
         )),
     }
 }
@@ -2159,7 +2347,7 @@ fn hunt_agent(
 
 pub fn gateway_help() -> String {
     let mut s = String::from(
-        "POLER Terminal Gateway — единый терминальный шлюз (v0.27.0: + рут-брокер + jailbreak-sentinel)\n\
+        "POLER Terminal Gateway — единый терминальный шлюз (v0.28.0: + рут по паролю + builtin-hunter)\n\
          ═════════════════════════════════════════════════════════════\n\
          Двойной контур: команды движка исполняются нативно (приоритет),\n\
          всё остальное — хостовая ОС в sandbox-режиме.\n\n",
@@ -2188,7 +2376,7 @@ pub fn gateway_help() -> String {
     s.push_str("  (политика sandbox судится по той же команде — PTY ≠ обход)\n");
     s.push_str("  без jail: MEDIATED AGENT MODE — shell-вызовы агента через PATH-shim\n");
     s.push_str("  судятся гейтом (отказ 126; /bin/sh-хардкод не виден — см. box)\n\n");
-    s.push_str("CONTAINER JAIL (v0.25.0 — изоляция Docker; v0.26.0 — брокер; v0.27.0 — рут-брокер + sentinel):\n");
+    s.push_str("CONTAINER JAIL (v0.25.0 — изоляция; v0.26.0 — брокер; v0.27.0 — рут-брокер + sentinel; v0.28.0 — пароль + builtin-охотник):\n");
     s.push_str("  box on [image=IMG] [net=bridge|none] [user=me|root]\n");
     s.push_str("      [mem=2g] [pids=512] [wsro=0|1]   поднять jail: контуры 2/3\n");
     s.push_str("      исполняются ВНУТРИ контейнера (docker exec); агент физически\n");
@@ -2212,12 +2400,18 @@ pub fn gateway_help() -> String {
     s.push_str("                              docker exec -u 0 СО СТОРОНЫ ХОСТА;\n");
     s.push_str("                              агент рут НЕ держит, получает только\n");
     s.push_str("                              stdout/stderr/exit; аудит — на хосте\n");
+    s.push_str("  box sudo passwd [--clear]  v0.28.0: владелец выдаёт агенту рут-ПАРОЛЬ\n");
+    s.push_str("                              (только интерактив; 6..64; хеш 0600 на\n");
+    s.push_str("                              хосте). Агент: echo ПАРОЛЬ | sudo -S cmd —\n");
+    s.push_str("                              НЕдеструктивное разрешено; деструктив/\n");
+    s.push_str("                              побег/ядро — Deny ВСЕГДА; брут-форс:\n");
+    s.push_str("                              5 промахов → лок 60с (все попытки — в аудите)\n");
     s.push_str("  box root                    интерактивный рут-шелл ВНУТРИ клетки —\n");
     s.push_str("                              только владелец с хоста (интерактив)\n");
     s.push_str("  box allow sudo <glob>|--list|--reset  allowlist рут-запросов\n");
     s.push_str("                              (только интерактив; Block НЕ ослабляет)\n");
     s.push_str("  JAILBREAK SENTINEL (v0.27.0 — «посади агента и наблюдай»):\n");
-    s.push_str("  box hunt start [--mode probe|agent] [--agent ИМЯ]\n");
+    s.push_str("  box hunt start [--mode probe|agent|builtin] [--agent ИМЯ]\n");
     s.push_str("      [--mission ФАЙЛ] [--budget СЕК]\n");
     s.push_str("      probe — батарея 25+ векторов побега изнутри клетки (docker-\n");
     s.push_str("      сокет/release_agent/CapEff/…), escape → KILL-SWITCH (docker\n");
@@ -2226,6 +2420,18 @@ pub fn gateway_help() -> String {
     s.push_str("      токен в выводе = ДОКАЗАННЫЙ побег → kill-switch; вектор →\n");
     s.push_str("      патч + регрессионный тест («нашёл → закрыл»)\n");
     s.push_str("  box hunt status|report|stop  состояние | полный отчёт | стоп\n");
+    s.push_str("  BUILTIN HUNTER (v0.28.0 — СВОЙ суб-агент POLER, не agy):\n");
+    s.push_str("  box hunt start --mode builtin [--loop] [--interval 30]\n");
+    s.push_str("      [--full-every 600]      красная команда движка атакует РАЗВЁР-\n");
+    s.push_str("      НУТУЮ систему чёрным ящиком изнутри клетки (без исходни-\n");
+    s.push_str("      ков): судейские/канальные/граничные волны (16+ векторов:\n");
+    s.push_str("      escape-инструмент под маской пути, пути ядра, деструктив,\n");
+    s.push_str("      newline-инъекция, фаззинг протокола, replay, симлинк-\n");
+    s.push_str("      ловушка, усечение канала, подмена шима, брут-форс пароля,\n");
+    s.push_str("      flood) + escape-батарея sentinel + docker-inspect;\n");
+    s.push_str("      breach → KILL-SWITCH; anomaly → авто-блоклист брокера\n");
+    s.push_str("      («нашёл → закрыл» в рантайме); --loop — постоянное\n");
+    s.push_str("      наблюдение (свипы + периодические батареи, журнал)\n");
     s.push_str("  образ по умолчанию debian:bookworm-slim; ELF-агенты хоста\n");
     s.push_str("  работают без пересборки образа; скриптовые — image= с runtime\n\n");
     s.push_str("WORKSPACE (v0.23.0 — корень проекта; v0.24.0 — граница):\n");
@@ -3413,6 +3619,15 @@ mod tests {
     }
 
     #[test]
+    fn version_mentions_v028_features() {
+        let mut st = state();
+        let out = run(&mut st, "version").unwrap();
+        assert!(out.contains("sudo-passwd"), "версия без пароль-режима: {out}");
+        assert!(out.contains("builtin-hunter"), "версия без builtin-охотника: {out}");
+        assert!(out.contains("v0.28.0"), "версия без v0.28.0: {out}");
+    }
+
+    #[test]
     fn help_lists_sudo_root_hunt() {
         let h = gateway_help();
         assert!(h.contains("box sudo on|off|status"), "help без sudo: {h}");
@@ -3420,5 +3635,154 @@ mod tests {
         assert!(h.contains("box hunt start"), "help без hunt: {h}");
         assert!(h.contains("РУТ-БРОКЕР"), "help без секции рут-брокера: {h}");
         assert!(h.contains("JAILBREAK SENTINEL"), "help без секции sentinel: {h}");
+    }
+
+    #[test]
+    fn help_lists_passwd_and_builtin_hunter() {
+        let h = gateway_help();
+        assert!(h.contains("box sudo passwd"), "help без passwd: {h}");
+        assert!(h.contains("sudo -S"), "help без примера -S: {h}");
+        assert!(h.contains("BUILTIN HUNTER"), "help без секции builtin-охотника: {h}");
+        assert!(h.contains("--mode builtin"), "help без builtin-режима: {h}");
+        assert!(h.contains("--loop"), "help без loop: {h}");
+    }
+
+    // =====================================================================
+    // v0.28.0: Root Broker Password Mode + Builtin Hunter
+    // =====================================================================
+
+    #[test]
+    fn box_sudo_passwd_scripted_agent_refused() {
+        // ZSE-инвариант: scripted-агент НЕ может выдать себе рут-пароль
+        let (mut st, ws) = jailed_state("passwd");
+        let dir = std::env::temp_dir().join(format!("poler-pwcmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("POLER_POLICY_HOME", dir.to_str().unwrap());
+        let out = run(&mut st, "box sudo passwd").unwrap();
+        assert!(
+            out.contains("только в интерактивной"),
+            "скрипт не может задать пароль: {out}"
+        );
+        assert!(
+            !super::super::rootbroker::password_path("poler-box-testfake").exists(),
+            "пароль-файл не создан"
+        );
+        // мусорный флаг — ошибка
+        let out = run(&mut st, "box sudo passwd zzz").unwrap();
+        assert!(out.contains("⚡"), "мусорный флаг: {out}");
+        std::env::remove_var("POLER_POLICY_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn box_sudo_passwd_clear_is_tightening_anytime() {
+        // снятие пароля = ужесточение → доступно и неинтерактивно
+        let (mut st, ws) = jailed_state("pwclear");
+        let dir = std::env::temp_dir().join(format!("poler-pwclr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("POLER_POLICY_HOME", dir.to_str().unwrap());
+        let pw_path = super::super::rootbroker::password_path("poler-box-testfake");
+        // пароля нет → честно
+        let out = run(&mut st, "box sudo passwd --clear").unwrap();
+        assert!(out.contains("не был задан"), "пустой clear: {out}");
+        // задан → снят
+        super::super::rootbroker::set_password_from_pair(&pw_path, "abc123", "abc123").unwrap();
+        let out = run(&mut st, "box sudo passwd --clear").unwrap();
+        assert!(out.contains("ВЫКЛ"), "снятие: {out}");
+        assert!(!pw_path.exists());
+        std::env::remove_var("POLER_POLICY_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn box_sudo_status_mentions_password_mode() {
+        let mut st = state();
+        let out = run(&mut st, "box sudo status").unwrap();
+        assert!(out.contains("режим пароля"), "статус упоминает пароль-режим: {out}");
+        assert!(
+            out.contains("box sudo passwd"),
+            "подсказка команды passwd: {out}"
+        );
+    }
+
+    #[test]
+    fn box_hunt_builtin_bad_args_rejected_before_jail() {
+        // валидация аргументов — ДО требования jail/docker (урок v0.27.0)
+        let mut st = state(); // без jail: попади в гейт — скажет «jail не активен»
+        let out = run(&mut st, "box hunt start --mode builtin --interval 1").unwrap();
+        assert!(out.contains("интервал 10..=600"), "interval=1: {out}");
+        let out = run(&mut st, "box hunt start --mode builtin --full-every 10").unwrap();
+        assert!(out.contains("120..=86400"), "full-every=10: {out}");
+        let out = run(&mut st, "box hunt start --mode zzz").unwrap();
+        assert!(out.contains("probe|agent|builtin"), "mode=zzz: {out}");
+        let out = run(&mut st, "box hunt start --mode builtin --loop=zzz").unwrap();
+        assert!(out.contains("--loop"), "loop со значением: {out}");
+    }
+
+    #[test]
+    fn box_hunt_builtin_requires_jail_and_docker() {
+        let mut st = state();
+        let out = run(&mut st, "box hunt start --mode builtin").unwrap();
+        assert!(out.contains("jail не активен"), "без jail: {out}");
+        assert!(st.hunt_builtin.is_none());
+        // с фейковым jail, но без docker — честный отказ
+        let _g = docker_env_lock();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let (mut st2, ws) = jailed_state("bin");
+        let out = run(&mut st2, "box hunt start --mode builtin").unwrap();
+        assert!(
+            out.contains("не работает") || out.contains("docker"),
+            "без docker — честный отказ: {out}"
+        );
+        assert!(st2.hunt_builtin.is_none());
+        // loop-режим — те же гейты
+        let out = run(&mut st2, "box hunt start --mode builtin --loop").unwrap();
+        assert!(
+            out.contains("не работает") || out.contains("docker"),
+            "loop без docker: {out}"
+        );
+        std::env::remove_var("POLER_BOX_DOCKER");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn box_hunt_stop_clears_builtin_and_sentinel() {
+        let mut st = state();
+        let out = run(&mut st, "box hunt stop").unwrap();
+        assert!(out.contains("не активна"), "stop без охоты: {out}");
+    }
+
+    /// box off останавливает loop-наблюдение ДО docker-разбора (даже при
+    /// ошибке docker). Реальный loop-поток поднят на фейковом jail.
+    #[test]
+    fn box_off_stops_builtin_loop_before_docker_error() {
+        let _g = docker_env_lock();
+        let (mut st, ws) = jailed_state("offloop");
+        let dir = std::env::temp_dir().join(format!("poler-offloop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("POLER_AUDIT_HOME", dir.join("audit").to_str().unwrap());
+        std::env::set_var("POLER_POLICY_HOME", dir.join("policy").to_str().unwrap());
+        std::env::set_var("POLER_HUNT_HOME", dir.join("hunt").to_str().unwrap());
+        // loop с большим full_every: батарея не стартует — только свипы
+        let jail = st.box_jail.clone().unwrap();
+        let handle = super::super::hunter::start_loop(&jail, false, 60, 86400).unwrap();
+        st.hunt_builtin = Some(handle);
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let _ = run(&mut st, "box off"); // docker упадёт — но охота уже снята
+        assert!(
+            st.hunt_builtin.is_none(),
+            "loop-наблюдение обязано быть снято до docker-ошибки"
+        );
+        std::env::remove_var("POLER_BOX_DOCKER");
+        std::env::remove_var("POLER_AUDIT_HOME");
+        std::env::remove_var("POLER_POLICY_HOME");
+        std::env::remove_var("POLER_HUNT_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

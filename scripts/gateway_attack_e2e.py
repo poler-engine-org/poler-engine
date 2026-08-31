@@ -197,8 +197,9 @@ def main():
     box_ok = box_battery(arena)
     broker_ok = broker_battery(arena)
     root_ok = root_battery(arena)
+    passwd_ok = passwd_battery(arena)
 
-    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok and broker_ok and root_ok else 1)
+    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok and broker_ok and root_ok and passwd_ok else 1)
 
 
 def root_battery(arena):
@@ -270,6 +271,81 @@ def root_battery(arena):
     print(f"  {'OK ' if ok else '‼️ '} {'allowlist НЕ создан скриптом (гейт)':<45} → {'чисто' if ok else 'ЗАПИСАН!' }")
     passed, failed = passed + (1 if ok else 0), failed + (0 if ok else 1)
     print(f"════════ ИТОГ волны 12: {passed}/{passed + failed} векторов ════════")
+    return failed == 0
+
+
+def passwd_battery(arena):
+    """Волна 13 (v0.28.0): рут-ПАРОЛЬ + builtin-охотник — честность без docker.
+
+    REPL без docker (POLER_BOX_DOCKER=/bin/false): scripted-агент НЕ может
+    выдать себе рут-пароль (passwd — только интерактив, ZSE); clear —
+    ужесточение (работает всегда); builtin-охота честно требует jail/docker;
+    валидация аргументов ДО jail-гейта; пароль-файл/блоклист НЕ создаются
+    скриптом; версия и help упоминают новые контуры.
+    """
+    print("\n════════ ВОЛНА 13: рут-пароль + builtin-hunter (v0.28.0) ════════")
+    policy_home = os.path.join(arena, "policy-v28")
+    audit_home = os.path.join(arena, "audit-v28")
+    cmds = (
+        "box sudo passwd\n"
+        "box sudo passwd zzz\n"
+        "box sudo passwd --clear\n"
+        "box sudo status\n"
+        "box hunt start --mode builtin\n"
+        "box hunt start --mode builtin --loop\n"
+        "box hunt start --mode builtin --interval 1\n"
+        "box hunt start --mode builtin --full-every 10\n"
+        "box hunt start --mode zzz\n"
+        "box hunt stop\n"
+        "help\n"
+        "version\n"
+        "quit\n"
+    )
+    r = subprocess.run(
+        [BIN, "--gateway"],
+        input=cmds,
+        capture_output=True,
+        text=True,
+        cwd=arena,
+        env={**os.environ, "HOME": arena, "TERM": "dumb", "POLER_BOX_DOCKER": "/bin/false",
+             "POLER_POLICY_HOME": policy_home, "POLER_AUDIT_HOME": audit_home},
+        timeout=60,
+    )
+    out = r.stdout
+    checks = [
+        ("passwd из скрипта — ОТКАЗ (ZSE: агент не выдаёт себе рут)", "только в интерактивной"),
+        ("passwd мусорный флаг — syntax-ошибка", "флаги: --clear"),
+        ("passwd clear без пароля — честно", "не был задан"),
+        ("sudo status: строка режима пароля", "режим пароля"),
+        ("sudo status: подсказка passwd", "box sudo passwd"),
+        ("builtin без jail — честный отказ", "jail не активен"),
+        ("builtin --loop без jail — честный отказ", "jail не активен"),
+        ("builtin interval=1 — syntax ДО jail-гейта", "интервал 10..=600"),
+        ("builtin full-every=10 — syntax ДО jail-гейта", "120..=86400"),
+        ("hunt mode=zzz — usage с builtin", "probe|agent|builtin"),
+        ("hunt stop без охоты — честно", "не активна"),
+        ("help: секция BUILTIN HUNTER", "BUILTIN HUNTER"),
+        ("help: box sudo passwd", "box sudo passwd"),
+        ("help: sudo -S пример", "sudo -S"),
+        ("help: --mode builtin", "--mode builtin"),
+        ("version: sudo-passwd", "sudo-passwd"),
+        ("version: builtin-hunter", "builtin-hunter"),
+        ("version: v0.28.0", "v0.28.0"),
+    ]
+    passed = failed = 0
+    for desc, needle in checks:
+        ok = needle in out
+        print(f"  {'OK ' if ok else '‼️ '} {desc:<52} → {'есть' if ok else 'НЕТ: ' + needle}")
+        passed, failed = passed + ok, failed + (not ok)
+    # scripted-агент не создал НИ пароль, НИ блоклист в policy-базе
+    leaked = (
+        os.path.isdir(policy_home)
+        and any(f.endswith((".passwd", ".blocklist")) for f in os.listdir(policy_home))
+    )
+    ok = not leaked
+    print(f"  {'OK ' if ok else '‼️ '} {'пароль/блоклист НЕ созданы скриптом':<52} → {'чисто' if ok else 'ЗАПИСАНЫ!'}")
+    passed, failed = passed + (1 if ok else 0), failed + (0 if ok else 1)
+    print(f"════════ ИТОГ волны 13: {passed}/{passed + failed} векторов ════════")
     return failed == 0
 
 

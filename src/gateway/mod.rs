@@ -22,6 +22,7 @@ pub mod completer;
 pub mod containers;
 pub mod dispatch;
 pub mod hostexec;
+pub mod hunter;
 pub mod pipeline;
 pub mod rootbroker;
 pub mod sandbox;
@@ -81,7 +82,7 @@ pub fn banner() -> String {
         "  {bold}🛡 workspace-guard{reset} — доступ вне корня проекта — только по подтверждению;\n   cd/workspace на выход — тоже; allow <путь> — сессионное исключение\n"
     ));
     s.push_str(&format!(
-        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker: агент заперт физически; агенты пробрасываются без установки (ro); runner — контур исполнения MCP-брокера (poler_box_exec); 🔐 рут-брокер (box sudo — рут остаётся у хоста, агент только просит); 🎯 jailbreak-sentinel (box hunt — наблюдение за попытками побега + kill-switch)\n"
+        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker: агент заперт физически; агенты пробрасываются без установки (ro); runner — контур исполнения MCP-брокера (poler_box_exec); 🔐 рут-брокер (box sudo — рут остаётся у хоста, агент просит; box sudo passwd — рут по паролю владельца); 🎯 jailbreak-sentinel + 🤖 builtin-hunter (box hunt — свой красный суб-агент POLER атакует клетку чёрным ящиком изнутри; kill-switch)\n"
     ));
     s.push('\n');
     s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
@@ -211,6 +212,10 @@ pub fn run_gateway(db_path: PathBuf, danger_allow_all: bool) -> ExitCode {
     if let Some(mut b) = state.sudo_broker.take() {
         println!("{}", b.stop());
     }
+    // v0.28.0: builtin-охота (loop-наблюдение) останавливается тоже
+    if let Some(mut h) = state.hunt_builtin.take() {
+        println!("{}", h.stop());
+    }
     // v0.25.0: контейнер живёт своей жизнью (docker -d) — честно сказать
     if let Some(jail) = &state.box_jail {
         println!(
@@ -250,6 +255,8 @@ mod tests {
         assert!(b.contains("poler_box_exec"), "v0.26.0: MCP-брокер в баннере");
         assert!(b.contains("рут-брокер"), "v0.27.0: рут-брокер в баннере");
         assert!(b.contains("jailbreak-sentinel"), "v0.27.0: sentinel в баннере");
+        assert!(b.contains("builtin-hunter"), "v0.28.0: builtin-охотник в баннере");
+        assert!(b.contains("box sudo passwd"), "v0.28.0: пароль-режим в баннере");
     }
 
     #[test]
