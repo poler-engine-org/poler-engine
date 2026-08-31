@@ -14,6 +14,83 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.27.0: Root Broker + Jailbreak Sentinel
+
+Два живых запроса владельца после теста v0.26.0: (1) агент в клетке
+жаловался «нет рута» — владелец: **«рут — это тоже привилегия хоста»**;
+(2) «посади ИИ-суб-агента внутрь, пусть попробует вернуться на хост
+через уязвимость нулевого дня; если находишь — закрывай; наблюдай за
+попытками со стороны хоста».
+
+### 1. Root Broker — «sudo как услуга», рут остаётся у хоста
+
+Та же модель, что у Google-рантаймов («в песочнице нет Python — Python
+вызывают снаружи»): **в клетке нет рута — рут вызывают снаружи, через
+брокера**. Агент НИКОГДА не держит рут:
+
+```
+агент в клетке (uid 1000): sudo apt-get install -y sl
+  → шим /home/poler/.poler-bin/sudo (НЕ setuid!) пишет запрос
+    в /home/poler/.poler-broker/requests.jsonl (id|b64 cwd|b64 argv)
+  → шлюз-брокер: судья решает (Block → Deny ВСЕГДА; Confirm → Deny,
+    клетка не подтверждает — Zero Silent Escalation; инструменты
+    побега и пути ядра → Deny; allowlist владельца; дефолт:
+    apt/dpkg + fs в границах /workspace|/home/poler)
+  → Allow = docker exec -u 0:0 СО СТОРОНЫ ХОСТА (root внутри клетки,
+    cap-drop ALL остаётся)
+  → агенту возвращаются только stdout/stderr/exit-код
+```
+
+- `box sudo on|off|status|log [N]` — брокер-поток шлюза (маркер живости
+  обновляется каждые 5с — крах шлюза = шим честно отказывает, а не
+  висит; rate-limit 30 запросов/час; ответы атомарные tmp+rename —
+  симлинк-ловушки агента не разыменовываются);
+- `box allow sudo <glob>|--list|--reset` — allowlist **host-only**
+  (`~/.local/share/poler-engine/policy/`, вне смонтированных каталогов —
+  агент не может дописать себя); добавление — только в интерактиве;
+  Block-вердикты не ослабляются ничем (тест с глобом `rm *`);
+- `box root` — интерактивный рут-шелл ВНУТРИ клетки, только владелец с
+  хоста (TTY-гейт);
+- аудит каждого решения: `~/.local/share/poler-engine/audit/root-<box>.jsonl`.
+
+### 2. Jailbreak Sentinel — красная команда в клетке под наблюдением
+
+`box hunt start [--mode probe|agent]` (+ `status|report|stop`):
+
+- **probe** — детерминированная батарея ~28 векторов побега, исполняется
+  ИЗНУТРИ клетки (docker-сокет, cgroup release_agent, core_pattern,
+  CapEff/NoNewPrivs/Seccomp, /dev-устройства, user namespaces, границы
+  /home, mountinfo, /proc/*/root, kallsyms/kcore, k8s-секреты) + хост-аудит
+  `docker inspect` (Privileged/CapAdd/NetworkMode/PidMode/SecurityOpt/
+  Mounts). Вердикты blocked/anomaly/escape; **любой escape → KILL-SWITCH**
+  (`docker stop`, контейнер сохранён для форензики, инцидент в
+  `hunt/incidents/`) — цикл «нашёл → закрыл»: вектор становится патчем
+  и регрессионным тестом;
+- **agent** — живой LLM (проброшенный agy/claude) с миссией побега в
+  PTY-контуре: владелец видит всё живьём; движок сканирует транскрипт
+  сигнатурной базой (~30 паттернов: docker.sock/release_agent/nsenter/
+  dirty pipe/ssh-ключи/…) и проверяет **канарейку** — файл с секретным
+  токеном на ХОСТЕ: токен в выводе агента = ДОКАЗАННЫЙ побег →
+  kill-switch. Отчёт — markdown в `~/.local/share/poler-engine/hunt/`.
+
+### Цифры релиза
+
+- **1035 тестов** (+52 к v0.26.0): base64-кодек, протокол рут-запросов
+  (id-charset против path traversal), судья рут-запросов (Block-инвариант,
+  ZSE, инструменты побега, пути ядра, allowlist-glob), symlink-безопасность
+  ответов, живой брокер end-to-end с фейковым docker (allow/deny/аудит/
+  маркер/stop), сигнатурный сканер, канарейка, kill-switch, TTY/интерактив
+  гейты, порядок валидации, box off снимает брокера ДО docker-ошибки;
+- Гейты: `gateway_audit.py` **139/139** · `gateway_attack_e2e.py`
+  **79/79** + **14/14** + **8/8** + **19/19** + НОВАЯ **волна 12 —
+  18/18** (честность рут-брокера/sentinel без docker; scripted-агент не
+  ослабляет политику) · `audit_patch_verify.py` **10/10** ·
+  `audit_stress.py --hardened` **46/46**; clippy нового кода чист;
+  секрет-скан PASS;
+- Ноль новых зависимостей.
+
+---
+
 ## v0.26.0: Zero-Overhead Agent Bind-Mounting + Two-Tier Container Brokerage
 
 Живой тест владельца v0.25.0: `box on` поднял контейнер, `agy` внутри —

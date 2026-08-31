@@ -58,7 +58,7 @@ const SERVICE_SUBS: &[&str] = &["start", "stop", "restart", "status", "attach"];
 const SERVICE_NAMES: &[&str] = &["mcp", "weblens", "companion"];
 const WEBLENS_SUBS: &[&str] = &["start", "stop", "status"];
 /// v0.25.0: подкоманды Container Jail.
-const BOX_SUBS: &[&str] = &["on", "off", "status", "shell", "runner"];
+const BOX_SUBS: &[&str] = &["on", "off", "status", "shell", "runner", "sudo", "root", "hunt", "allow"];
 
 /// Комплетер Terminal Gateway.
 pub struct GatewayCompleter {

@@ -664,7 +664,8 @@ pub fn box_home_base() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Дренаж потока в фон (pull-прогресс может превысить буфер пайпа).
-fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+/// pub(crate): переиспользуется rootbroker-ом (docker exec -u 0).
+pub(crate) fn drain_pipe(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut v: Vec<u8> = Vec::new();
         let mut buf = [0u8; 8192];
@@ -685,7 +686,8 @@ fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> 
 
 /// Выполнить docker <args> с таймаутом. Успех = exit 0, возврат stdout.
 /// НЕ env_clear: клиенту нужны PATH/DOCKER_HOST/XDG_RUNTIME_DIR.
-fn docker_cmd(args: &[&str], timeout: Duration) -> Result<String, String> {
+/// pub(crate): переиспользуется sentinel-ом (host-аудит/kill-switch).
+pub(crate) fn docker_cmd(args: &[&str], timeout: Duration) -> Result<String, String> {
     let bin = docker_bin();
     let mut cmd = Command::new(&bin);
     cmd.args(args)
@@ -695,8 +697,8 @@ fn docker_cmd(args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut child: Child = cmd
         .spawn()
         .map_err(|e| format!("не удалось запустить «{bin}»: {e} (docker установлен?)"))?;
-    let t_out = child.stdout.take().map(drain);
-    let t_err = child.stderr.take().map(drain);
+    let t_out = child.stdout.take().map(drain_pipe);
+    let t_err = child.stderr.take().map(drain_pipe);
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -813,6 +815,14 @@ pub fn docker_run_argv(name: &str, cfg: &BoxConfig, ws_root: &Path, home_dir: &P
     v.push("-e".into());
     v.push(format!("HOME={HOME_MOUNT}"));
     v.push("-e".into());
+    // v0.27.0: шимы рут-брокера (sudo) и батареи sentinel — первыми в PATH:
+    // агент в клетке зовёт «sudo …» → уходит брокеру шлюза, а не в образ
+    v.push(format!(
+        "PATH={}:{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        super::rootbroker::POLER_BIN_MOUNT,
+        "/usr/local/bin"
+    ));
+    v.push("-e".into());
     // брокер-контекст для процессов внутри: агент видит, что он в box,
     // и знает контейнерный корень workspace
     v.push(format!("POLER_WORKSPACE={WS_MOUNT}"));
@@ -895,6 +905,32 @@ pub fn wrap_pty_exec(jail: &BoxState, tokens: &[String], host_cwd: &Path) -> Vec
     v
 }
 
+/// v0.27.0: обёртка РУТ-шелла с хоста (`box root`): `docker exec -it -u 0:0`.
+/// Рут — привилегия хоста: интерактивный вход возможен ТОЛЬКО владельцем
+/// из шлюза; изнутри клетки этой команды нет.
+pub fn wrap_root_pty_exec(_jail: &BoxState, tokens: &[String], _host_cwd: &Path) -> Vec<String> {
+    let mut v: Vec<String> = vec![
+        docker_bin(),
+        "exec".into(),
+        "-it".into(),
+        "-u".into(),
+        "0:0".into(),
+        "-w".into(),
+        "/".into(),
+    ];
+    v.extend(tokens.iter().cloned());
+    v
+}
+
+/// `box root` — константа (не ввод пользователя): root-шелл в клетке.
+pub fn box_root_tokens() -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "exec bash -l 2>/dev/null || exec sh".into(),
+    ]
+}
+
 /// `box shell` — интерактивный шелл внутри jail. Константа (не ввод
 /// пользователя): bash при наличии, иначе sh; судья не нужен — граница
 /// здесь сам контейнер (полезная нагрузка не содержит пользовательских
@@ -961,6 +997,11 @@ pub fn box_on(ws_root: &Path, cfg: &BoxConfig) -> Result<(BoxState, String), Str
             home_dir: box_home_base().join(&name),
         };
         let verb = if running { "принят работающий" } else { "стартован остановленный" };
+        // v0.27.0: шимы рут-брокера — и при adopt (идемпотентно, лечит подмену)
+        let shim_note = match super::rootbroker::deploy_shims(&jail.home_dir) {
+            Ok(()) => String::new(),
+            Err(e) => format!("\n⚠ рут-шимы не развёрнуты: {e}"),
+        };
         let agents_line = if agents_label.is_empty() {
             String::new()
         } else {
@@ -969,7 +1010,7 @@ pub fn box_on(ws_root: &Path, cfg: &BoxConfig) -> Result<(BoxState, String), Str
         return Ok((
             jail,
             format!(
-                "📦 Container Jail ВКЛ — {verb} контейнер {name} (образ {image})\nконтуры 2/3 исполняются внутри; конфигурация контейнера неизменна до box off/on (проброс агентов обновится после пересоздания){agents_line}\n"
+                "📦 Container Jail ВКЛ — {verb} контейнер {name} (образ {image})\nконтуры 2/3 исполняются внутри; конфигурация контейнера неизменна до box off/on (проброс агентов обновится после пересоздания)\nруут-брокер: box sudo on — агент сможет ПРОСИТЬ рут (судья решает, исполнение со стороны хоста){shim_note}{agents_line}\n"
             ),
         ));
     }
@@ -1011,6 +1052,9 @@ pub fn box_on(ws_root: &Path, cfg: &BoxConfig) -> Result<(BoxState, String), Str
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
     }
+    // v0.27.0: шимы рут-брокера (sudo) + маркеры канала — до старта контейнера
+    super::rootbroker::deploy_shims(&home)
+        .map_err(|e| format!("рут-шимы {}: {e}", home.display()))?;
     let run_args = docker_run_argv(&name, &cfg, &canon, &home);
     let refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
     docker_cmd(&refs, Duration::from_secs(600))
@@ -1668,6 +1712,50 @@ mod tests {
         assert_eq!(t[1], "-c");
         // константа без пользовательского ввода — границей является контейнер
         assert_eq!(t[2], "exec bash 2>/dev/null || exec sh");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.27.0: рут-брокер — PATH шимов + root-exec обёртка
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn docker_run_argv_puts_polbin_first_in_path() {
+        let cfg = BoxConfig::default();
+        let v = docker_run_argv("poler-box-x", &cfg, Path::new("/ws"), Path::new("/home"));
+        let path_entry = v.iter().find(|s| s.starts_with("PATH=")).expect("PATH= в env");
+        assert!(
+            path_entry.starts_with(&format!("PATH={}", crate::gateway::rootbroker::POLER_BIN_MOUNT)),
+            "шим-каталог первым в PATH: {path_entry}"
+        );
+        assert!(path_entry.contains("/usr/local/bin"), "системный PATH сохранён: {path_entry}");
+    }
+
+    #[test]
+    fn wrap_root_pty_exec_shape() {
+        let _g = docker_env_test_lock();
+        let j = fake_jail();
+        let tokens = box_root_tokens();
+        let w = wrap_root_pty_exec(&j, &tokens, Path::new("/tmp/polertest-ws"));
+        assert_eq!(&w[1..3], &["exec".to_string(), "-it".into()]);
+        // рут-флаги контейнера
+        assert!(w.windows(2).any(|p| p == ["-u".to_string(), "0:0".into()]), "-u 0:0: {w:?}");
+        assert!(w.windows(2).any(|p| p == ["-w".to_string(), "/".into()]), "cwd /: {w:?}");
+        // хвост = константные токены насквозь
+        assert_eq!(&w[w.len() - 3..], &["sh".to_string(), "-c".into(), "exec bash -l 2>/dev/null || exec sh".to_string()]);
+        // POLER_BOX_DOCKER-override действует и на рут-обёртку
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let w2 = wrap_root_pty_exec(&j, &tokens, Path::new("/tmp/polertest-ws"));
+        std::env::remove_var("POLER_BOX_DOCKER");
+        assert_eq!(w2[0], "/bin/false", "override рут-обёртки: {w2:?}");
+    }
+
+    #[test]
+    fn box_root_tokens_constant() {
+        let t = box_root_tokens();
+        assert_eq!(t[0], "sh");
+        assert_eq!(t[1], "-c");
+        assert!(t[2].contains("bash"), "bash при наличии: {t:?}");
+        assert!(t[2].contains("|| exec sh"), "фолбэк на sh: {t:?}");
     }
 
     #[test]

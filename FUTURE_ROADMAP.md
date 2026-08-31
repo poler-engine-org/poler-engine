@@ -292,6 +292,28 @@ API**, не забивая локальный диск сотнями гигаб
 8f. **v0.26.x — сопровождение брокера**: прокидывание runtime-
    зависимостей ELF-агентов (ldd-резолв glibc/библиотек), автосборка
    минимальных образов агентов, CPU-shares runner, Landlock-фолбэк.
+8c-septem. **v0.27.0 — Root Broker + Jailbreak Sentinel**: «sudo как
+   услуга» — рут остаётся привилегией ХОСТА: агент в клетке зовёт шим
+   `sudo`, шим пишет запрос в файловый канал (/home/poler/.poler-broker),
+   шлюз судит (Block → Deny всегда; Confirm → Deny ZSE; инструменты
+   побега/пути ядра → Deny; allowlist host-only + дефолт apt/dpkg/
+   fs-границы) и исполняет docker exec -u 0 СО СТОРОНЫ ХОСТА — агент
+   рут не держит ни секунды (команды box sudo on|off|status|log,
+   box allow sudo, box root — интерактивный рут-шелл в клетке для
+   владельца); Jailbreak Sentinel — «посади агента и наблюдай»:
+   probe-батарея ~28 векторов побега изнутри клетки + хост-аудит
+   docker inspect, любой escape → KILL-SWITCH (docker stop, форензика
+   сохранена, инцидент в hunt/incidents); agent-режим — живой LLM с
+   миссией побега под наблюдением: сигнатуры транскрипта + канарейка
+   (токен на хосте в выводе = доказанный побег) → kill-switch;
+   цикл «нашёл → закрыл» (вектор → патч + регрессионный тест).
+   1035 тестов (+52), гейты 139/139 + 79/79 + 14/14 + 8/8 + 19/19 +
+   18/18 (волна 12). Архитектура: `docs/terminal-gateway-architecture.md`
+   §6.9–6.10. ✅ shipped (2026-08-31)
+8g. **v0.27.x — сопровождение рут-брокера/sentinel**: живой перехват
+   транскрипта охоты в поток (сейчас скан пост-фактум), docker diff в
+   форензике agent-режима, капабилити-профиль для postinst (opt-in),
+   сетевые сигнатуры побега, поллинг канала через inotify.
 9. **Hugging Face Hub + DVC + Oxen (сдвинуто релизами gateway)**:
    model cards/datasets API (`hf://`), data-versioning pointer files,
    remote storage resolve.

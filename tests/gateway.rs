@@ -424,3 +424,60 @@ fn gateway_repl_v026_broker_no_docker() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// 6. v0.27.0: рут-брокер + jailbreak-sentinel в живом REPL (без docker)
+// ---------------------------------------------------------------------------
+
+/// Честность v0.27.0 без docker-демона: sudo/hunt/root/allow отказывают
+/// осмысленно, версия и статус упоминают новые контуры. Детерминированно
+/// (POLER_BOX_DOCKER=/bin/false).
+#[test]
+fn gateway_repl_v027_root_broker_no_docker() {
+    let home = std::env::temp_dir().join(format!("poler-gw-v027-it-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let script = "box sudo status\n\
+                  box sudo on\n\
+                  box sudo log\n\
+                  box root\n\
+                  box allow sudo cargo *\n\
+                  box hunt status\n\
+                  box hunt start\n\
+                  box hunt report\n\
+                  box sudo zzz\n\
+                  version\n\
+                  quit\n";
+    let out = gateway_session_env(&home, script, &[("POLER_BOX_DOCKER", "/bin/false")]);
+
+    // sudo-плоскость: статус ВЫКЛ, подъём честно отказывает (нет jail/docker)
+    assert!(out.contains("рут-брокер ВЫКЛ"), "нет статуса ВЫКЛ: {out}");
+    assert!(
+        out.contains("jail не активен") || out.contains("docker"),
+        "sudo on без jail/docker — честный отказ: {out}"
+    );
+    assert!(out.contains("руут-аудит") || out.contains("аудит"), "sudo log работает: {out}");
+    // box root без jail — отказ
+    assert!(out.contains("box root: jail не активен"), "root без jail: {out}");
+    // allow из неинтерактива — отказ (scripted-агент не ослабляет политику)
+    assert!(
+        out.contains("только в интерактивной"),
+        "allow sudo в скрипте обязан отказать: {out}"
+    );
+    // hunt: не активна + старт честно отказывает
+    assert!(out.contains("охота не активна"), "hunt status: {out}");
+    assert!(
+        out.contains("jail не активен") || out.contains("docker"),
+        "hunt start без jail: {out}"
+    );
+    assert!(out.contains("охота не активна"), "hunt report без охоты: {out}");
+    // usage на мусорную подкоманду
+    assert!(out.contains("zzz? (box sudo"), "usage: {out}");
+    // версия упоминает v0.27.0
+    assert!(
+        out.contains("root-broker") && out.contains("jailbreak-sentinel"),
+        "версия без v0.27.0-фич: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

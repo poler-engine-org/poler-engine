@@ -196,8 +196,81 @@ def main():
     shim_ok = shim_battery(arena)
     box_ok = box_battery(arena)
     broker_ok = broker_battery(arena)
+    root_ok = root_battery(arena)
 
-    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok and broker_ok else 1)
+    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok and broker_ok and root_ok else 1)
+
+
+def root_battery(arena):
+    """Волна 12 (v0.27.0): Root Broker + Jailbreak Sentinel — честность без docker.
+
+    REPL без docker (POLER_BOX_DOCKER=/bin/false): рут-брокер/sentinel/
+    box root/allow обязаны отказывать осмысленно (jail/docker/TTY-гейты);
+    scripted-агент НЕ может ослаблять рут-политику (box allow sudo —
+    только интерактив); allowlist-файл вне смонтированных каталогов;
+    версия упоминает root-broker + jailbreak-sentinel.
+    """
+    print("\n════════ ВОЛНА 12: рут-брокер + jailbreak-sentinel (v0.27.0) ════════")
+    policy_home = os.path.join(arena, "policy")
+    audit_home = os.path.join(arena, "audit")
+    cmds = (
+        "box sudo status\n"
+        "box sudo on\n"
+        "box sudo off\n"
+        "box sudo log\n"
+        "box root\n"
+        "box allow sudo cargo *\n"
+        "box allow sudo --list\n"
+        "box hunt status\n"
+        "box hunt start\n"
+        "box hunt start --mode agent --budget 999999\n"
+        "box hunt zzz\n"
+        "help\n"
+        "version\n"
+        "quit\n"
+    )
+    r = subprocess.run(
+        [BIN, "--gateway"],
+        input=cmds,
+        capture_output=True,
+        text=True,
+        cwd=arena,
+        env={**os.environ, "HOME": arena, "TERM": "dumb", "POLER_BOX_DOCKER": "/bin/false",
+             "POLER_POLICY_HOME": policy_home, "POLER_AUDIT_HOME": audit_home},
+        timeout=60,
+    )
+    out = r.stdout
+    checks = [
+        ("sudo-статус: ВЫКЛ по умолчанию", "рут-брокер ВЫКЛ"),
+        ("sudo-статус: философия — рут у хоста", "привилегия ХОСТА"),
+        ("sudo on без jail — честный отказ", "jail не активен"),
+        ("sudo off без брокера — честно", "не активен"),
+        ("sudo log — пустой аудит честно", "аудит"),
+        ("box root без jail — отказ", "box root: jail не активен"),
+        ("allow sudo из скрипта — ОТКАЗ (ZSE-агент)", "только в интерактивной"),
+        ("hunt status — не активна", "охота не активна"),
+        ("hunt start без jail — отказ", "jail не активен"),
+        ("hunt budget вне 60..7200 — отказ", "бюджет"),
+        ("hunt zzz — usage", "zzz? (box hunt"),
+        ("help: секция РУТ-БРОКЕР", "РУТ-БРОКЕР"),
+        ("help: секция JAILBREAK SENTINEL", "JAILBREAK SENTINEL"),
+        ("help: box sudo on|off|status", "box sudo on|off|status"),
+        ("help: box hunt start", "box hunt start"),
+        ("version: root-broker", "root-broker"),
+        ("version: jailbreak-sentinel", "jailbreak-sentinel"),
+    ]
+    passed = failed = 0
+    for desc, needle in checks:
+        ok = needle in out
+        print(f"  {'OK ' if ok else '‼️ '} {desc:<45} → {'есть' if ok else 'НЕТ: ' + needle}")
+        passed, failed = passed + ok, failed + (not ok)
+    # политика не пишется из скрипта (allow-гейт сработал)
+    policy_written = os.path.isdir(policy_home) and any(os.scandir(policy_home))
+    ok = not policy_written
+    print(f"  {'OK ' if ok else '‼️ '} {'allowlist НЕ создан скриптом (гейт)':<45} → {'чисто' if ok else 'ЗАПИСАН!' }")
+    passed, failed = passed + (1 if ok else 0), failed + (0 if ok else 1)
+    print(f"════════ ИТОГ волны 12: {passed}/{passed + failed} векторов ════════")
+    return failed == 0
 
 
 def broker_battery(arena):

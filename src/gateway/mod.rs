@@ -23,7 +23,9 @@ pub mod containers;
 pub mod dispatch;
 pub mod hostexec;
 pub mod pipeline;
+pub mod rootbroker;
 pub mod sandbox;
+pub mod sentinel;
 pub mod service;
 pub mod shim;
 
@@ -79,7 +81,7 @@ pub fn banner() -> String {
         "  {bold}🛡 workspace-guard{reset} — доступ вне корня проекта — только по подтверждению;\n   cd/workspace на выход — тоже; allow <путь> — сессионное исключение\n"
     ));
     s.push_str(&format!(
-        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker: агент (agy/claude/…) заперт физически; хостовые агенты пробрасываются внутрь без установки (ro); runner — контур исполнения MCP-брокера (poler_box_exec); box on — поднять\n"
+        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker: агент заперт физически; агенты пробрасываются без установки (ro); runner — контур исполнения MCP-брокера (poler_box_exec); 🔐 рут-брокер (box sudo — рут остаётся у хоста, агент только просит); 🎯 jailbreak-sentinel (box hunt — наблюдение за попытками побега + kill-switch)\n"
     ));
     s.push('\n');
     s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
@@ -204,6 +206,11 @@ pub fn run_gateway(db_path: PathBuf, danger_allow_all: bool) -> ExitCode {
     }
 
     let _ = rl.save_history(&hist);
+    // v0.27.0: рут-брокер не переживает шлюз (маркер живости протухнет сам,
+    // но чистый stop честнее); контейнер живёт своей жизнью (docker -d)
+    if let Some(mut b) = state.sudo_broker.take() {
+        println!("{}", b.stop());
+    }
     // v0.25.0: контейнер живёт своей жизнью (docker -d) — честно сказать
     if let Some(jail) = &state.box_jail {
         println!(
@@ -241,6 +248,8 @@ mod tests {
         assert!(b.contains("Container Jail"), "v0.25.0: box в баннере");
         assert!(b.contains("runner"), "v0.26.0: runner-брокер в баннере");
         assert!(b.contains("poler_box_exec"), "v0.26.0: MCP-брокер в баннере");
+        assert!(b.contains("рут-брокер"), "v0.27.0: рут-брокер в баннере");
+        assert!(b.contains("jailbreak-sentinel"), "v0.27.0: sentinel в баннере");
     }
 
     #[test]
