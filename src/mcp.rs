@@ -288,6 +288,8 @@ impl McpServer {
             "poler_gmail" => self.tool_gmail(&args),
             "poler_drive" => self.tool_drive(&args),
             "poler_nlm" => self.tool_nlm(&args),
+            "poler_box_exec" => self.tool_box_exec(&args),
+            "poler_box_status" => self.tool_box_status(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -864,6 +866,211 @@ impl McpServer {
             )),
         }
     }
+
+    // -----------------------------------------------------------------
+    // poler_box_exec (v0.26.0): двухконтурный брокер — команда агента
+    // судится sandbox-судьёй и исполняется ВНУТРИ изолированного
+    // контейнера (runner → box), результат возвращается текстом.
+    // -----------------------------------------------------------------
+    fn tool_box_exec(&self, args: &Value) -> Result<String, String> {
+        use crate::gateway::{containers, hostexec, pipeline, sandbox};
+
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент command обязателен (одиночная команда; кавычки — как в шлюзе)")?
+            .to_string();
+        if command.trim().is_empty() {
+            return Err("command пуст".into());
+        }
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120)
+            .clamp(1, 600);
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string();
+        if !matches!(target.as_str(), "auto" | "runner" | "box") {
+            return Err(format!("target={target}? (auto | runner | box)"));
+        }
+
+        // Разбор тем же лексером, что и REPL шлюза: кавычки раскрываются,
+        // /bin/sh НЕ участвует (argv насквозь — нет класса shell-инъекций)
+        let pl = pipeline::parse_line(&command)
+            .map_err(|e| format!("не удалось разобрать команду: {e}"))?;
+
+        // Вердикт ДО исполнения (контур 2 схемы) — по ВСЕМУ конвейеру:
+        // exec-плоскость в контейнере судится без логической границы (её
+        // держит контейнер — та же семантика, что у шлюза в jail), но
+        // Block-инварианты (деструктив, привилегии, форк-бомбы, remote-exec)
+        // действуют ВСЕГДА; Confirm из MCP не подтверждается в принципе
+        // (Zero Silent Escalation — подтверждает только владелец).
+        let all_host: Vec<usize> = (0..pl.segments.len()).collect();
+        match sandbox::judge_pipeline_ws(&pl, &all_host, None) {
+            sandbox::Policy::Allow => {}
+            sandbox::Policy::Block(why) => {
+                return Err(format!("⛔ блокировка sandbox: {why}"));
+            }
+            sandbox::Policy::Confirm(why) => {
+                return Err(format!(
+                    "⛔ {why} — подтверждение доступно только владельцу в шлюзе \
+                     (allow <путь> / grant sudo); MCP-агент подтвердить не может"
+                ));
+            }
+        }
+
+        // Исполнение — только одиночная команда (без конвейера/редиректа):
+        // брокер возвращает stdout/stderr целиком, конвейеры собираются
+        // агентом из нескольких вызовов (bash -c '…' допустим — payload
+        // судится рекурсивно тем же судьёй выше).
+        if pl.segments.len() > 1 {
+            return Err(
+                "конвейеры не поддерживаются: вызывайте части отдельными вызовами poler_box_exec \
+                 (bash -c '…' допустим — payload судится рекурсивно тем же судьёй)"
+                    .into(),
+            );
+        }
+        if pl.redirect.is_some() {
+            return Err(
+                "редиректы не поддерживаются: stdout/stderr и так возвращаются целиком".into(),
+            );
+        }
+        let tokens = pl
+            .segments
+            .first()
+            .map(|s| s.tokens.clone())
+            .unwrap_or_default();
+        if tokens.is_empty() {
+            return Err("пустая команда".into());
+        }
+
+        // Discovery по workspace: сервис mcp НЕ разделяет память с gateway —
+        // корень приходит через POLER_WORKSPACE (шлюз выставляет при
+        // `service start mcp`), контейнеры находятся по docker-labels.
+        let ws = std::env::var("POLER_WORKSPACE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            });
+        containers::docker_probe().map_err(|e| {
+            format!("docker недоступен: {e} (box runner on / box on — поднять контур исполнения в шлюзе)")
+        })?;
+
+        let runner = containers::runner_state_for_ws(&ws);
+        let boxj = containers::box_state_for_ws(&ws);
+        let (wrapped, target_name, target_kind) = match target.as_str() {
+            "runner" => {
+                let r = runner.ok_or(
+                    "runner-контейнер не работает — box runner on (net=none, только /workspace)",
+                )?;
+                let name = r.name.clone();
+                (containers::wrap_runner_exec(&r, &tokens, &ws), name, "runner")
+            }
+            "box" => {
+                let j = boxj.ok_or("box-контейнер не работает — box on")?;
+                let name = j.name.clone();
+                (containers::wrap_host_exec(&j, &tokens, &ws), name, "box")
+            }
+            _ => {
+                // auto: runner (жёстче: без сети, без home) → box → отказ
+                if let Some(r) = runner {
+                    let name = r.name.clone();
+                    (containers::wrap_runner_exec(&r, &tokens, &ws), name, "runner")
+                } else if let Some(j) = boxj {
+                    let name = j.name.clone();
+                    (containers::wrap_host_exec(&j, &tokens, &ws), name, "box")
+                } else {
+                    return Err(
+                        "нет работающего контура исполнения: box runner on (предпочтительно) или box on"
+                            .into(),
+                    );
+                }
+            }
+        };
+
+        let limits = hostexec::HostLimits {
+            timeout_secs,
+            ..Default::default()
+        };
+        let outcome = hostexec::run(&wrapped, None, &limits, &ws, &[]);
+        if let Some(e) = &outcome.spawn_error {
+            return Err(format!("не удалось запустить docker-клиент: {e}"));
+        }
+        let code = outcome
+            .code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "убит сигналом".into());
+        let mut out = format!(
+            "двухконтурный брокер: исполнено в {target_kind} {target_name} · exit {code}\n"
+        );
+        out.push_str(&format!("--- stdout ---\n{}", outcome.stdout));
+        if !outcome.stderr.is_empty() {
+            out.push_str(&format!("--- stderr ---\n{}", outcome.stderr));
+        }
+        if outcome.truncated {
+            out.push_str("(вывод обрезан по капу)\n");
+        }
+        if outcome.timed_out {
+            out.push_str(&format!("(таймаут {timeout_secs}s — процесс убит)\n"));
+        }
+        if outcome.interrupted {
+            out.push_str("(прервано)\n");
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // poler_box_status (v0.26.0): состояние jail-стека для workspace
+    // -----------------------------------------------------------------
+    fn tool_box_status(&self, _args: &Value) -> Result<String, String> {
+        use crate::gateway::containers;
+        let ws = std::env::var("POLER_WORKSPACE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            });
+        let mut s = String::new();
+        match containers::docker_probe() {
+            Ok(v) => s.push_str(&format!("docker: сервер {v}\n")),
+            Err(e) => {
+                return Ok(format!(
+                    "docker: недоступен ({e})\nконтуры исполнения не подняты: box on / box runner on — в шлюзе (poler_box_exec требует контура исполнения)\n"
+                ))
+            }
+        }
+        match containers::box_state_for_ws(&ws) {
+            Some(j) => {
+                let agents = if j.cfg.agent_names.is_empty() {
+                    "—".to_string()
+                } else {
+                    j.cfg.agent_names.join(",")
+                };
+                s.push_str(&format!(
+                    "box {}: работает · образ {} · агенты (ro-проброс): {agents}\n",
+                    j.name, j.cfg.image
+                ));
+            }
+            None => s.push_str(&format!(
+                "box {}: не работает (box on в шлюзе — контуры 2/3 в контейнере)\n",
+                containers::container_name(&ws)
+            )),
+        }
+        match containers::runner_state_for_ws(&ws) {
+            Some(r) => s.push_str(&format!(
+                "runner {}: работает · образ {} · net {} · только /workspace\n",
+                r.name, r.cfg.image, r.cfg.net
+            )),
+            None => s.push_str(&format!(
+                "runner {}: не работает (box runner on — сюда poler_box_exec исполняет команды; net=none)\n",
+                containers::runner_name(&ws)
+            )),
+        }
+        s.push_str("poler_box_exec: target=auto → runner, при его отсутствии box; деструктив блокируется судьёй до исполнения\n");
+        Ok(s)
+    }
 }
 
 fn tools_manifest() -> Vec<Value> {
@@ -1040,6 +1247,43 @@ account — профиль аккаунта; chat — вопрос к модел
                 "required": ["action"]
             }
         }),
+        json!({
+            "name": "poler_box_exec",
+            "description": "Двухконтурный брокер (v0.26.0): исполняет команду В ИЗОЛИРОВАННОМ \
+Docker-контейнере и возвращает stdout/stderr/exit-код. Схема: мозг агента \
+(ты) → шлюз POLER (sandbox-судья: деструктив — Block ДО исполнения, \
+подтверждения из MCP не принимаются в принципе) → контур исполнения \
+(runner: net=none, только /workspace, без home; при его отсутствии — box). \
+Одна команда без конвейеров и редиректов (кавычки — как в шлюзе; \
+bash -c '…' допустим — payload судится рекурсивно). Путь к хост-системе \
+НЕ существует физически: хост виден только как /workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Команда (например: cargo build или python3 script.py)"},
+                    "timeout_secs": {"type": "integer", "default": 120, "minimum": 1, "maximum": 600},
+                    "target": {
+                        "type": "string",
+                        "enum": ["auto", "runner", "box"],
+                        "default": "auto",
+                        "description": "auto: runner (жёстче) → box"
+                    }
+                },
+                "required": ["command"]
+            }
+        }),
+        json!({
+            "name": "poler_box_status",
+            "description": "Состояние Container Jail для текущего workspace: \
+box-контейнер (контуры 2/3, проброшенные агенты) и runner (контур \
+исполнения poler_box_exec: net=none, только /workspace). Вызывай перед \
+poler_box_exec, чтобы понять, поднят ли контур исполнения.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
     ]
 }
 
@@ -1091,5 +1335,214 @@ mod audit_tests {
         assert!(mcp_url_allowed("https://metadata.google.internal/computeMetadata/").is_err());
         assert!(mcp_url_allowed("https://litnet.com/").is_ok());
         assert!(mcp_url_allowed("http://127.0.0.1:8765/").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod box_broker_tests {
+    use super::*;
+
+    /// Сериализация env-мутаций (POLER_BOX_DOCKER / POLER_WORKSPACE) —
+    /// общий лок с containers/dispatch-тестами.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::gateway::containers::docker_env_test_lock()
+    }
+
+    fn server() -> McpServer {
+        McpServer::new(9222, 10, PathBuf::from("/nonexistent-poler-test.db"))
+    }
+
+    /// Фейковый docker-клиент: пишет argv в лог-файл (env POLER_FAKE_LOG),
+    /// отвечает на version/inspect/exec. Эмулирует РАБОТАЮЩИЙ daemon,
+    /// у которого подняты и box, и runner (inspect → true).
+    fn fake_docker(tag: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("poler-mcp-fake-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let log = base.join("docker-calls.log");
+        let script = base.join("fake-docker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POLER_FAKE_LOG\"\ncase \"$1\" in\n  version) echo '31.0.0-fake'; exit 0;;\n  inspect) echo 'true'; exit 0;;\n  exec) echo 'fake-exec-output'; exit 0;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    #[test]
+    fn manifest_contains_box_broker_tools() {
+        let m = tools_manifest();
+        let names: Vec<&str> = m
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"poler_box_exec"), "нет poler_box_exec: {names:?}");
+        assert!(names.contains(&"poler_box_status"), "нет poler_box_status: {names:?}");
+        // входы описаны
+        let exec = m.iter().find(|t| t.get("name").and_then(|v| v.as_str()) == Some("poler_box_exec")).unwrap();
+        let req = exec.pointer("/inputSchema/required").unwrap();
+        assert!(req.to_string().contains("command"), "required: {req}");
+    }
+
+    #[test]
+    fn tools_call_routing_unknown_and_known() {
+        let srv = server();
+        let r = srv.dispatch(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 7,
+            "method": "tools/call",
+            "params": {"name": "poler_box_status", "arguments": {}}
+        }));
+        let r = r.expect("ответ есть");
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains("poler_box_exec"), "статус упоминает брокера: {text}");
+    }
+
+    #[test]
+    fn box_exec_without_docker_honest_error() {
+        let _g = env_lock();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let r = server().tool_box_exec(&json!({"command": "ls"}));
+        std::env::remove_var("POLER_BOX_DOCKER");
+        assert!(r.is_err(), "без docker — отказ: {r:?}");
+        let e = r.unwrap_err();
+        assert!(e.contains("docker"), "ошибка упоминает docker: {e}");
+        assert!(e.contains("box"), "подсказка box runner on / box on: {e}");
+    }
+
+    #[test]
+    fn box_exec_args_validation() {
+        let srv = server();
+        // нет command
+        let e = srv.tool_box_exec(&json!({})).unwrap_err();
+        assert!(e.contains("command"), "{e}");
+        // пустой
+        assert!(srv.tool_box_exec(&json!({"command": "   "})).is_err());
+        // мусорный target
+        let e = srv.tool_box_exec(&json!({"command": "ls", "target": "host"})).unwrap_err();
+        assert!(e.contains("target"), "{e}");
+        // конвейер не поддерживается
+        let e = srv.tool_box_exec(&json!({"command": "ls | wc -l"})).unwrap_err();
+        assert!(e.contains("конвейеры"), "{e}");
+        // редирект не поддерживается
+        let e = srv.tool_box_exec(&json!({"command": "ls > out.txt"})).unwrap_err();
+        assert!(e.contains("редирект"), "{e}");
+    }
+
+    #[test]
+    fn box_exec_destructive_blocked_before_any_docker_exec() {
+        let _g = env_lock();
+        let (docker, log) = fake_docker("destructive");
+        let ws = log.parent().unwrap().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::env::set_var("POLER_BOX_DOCKER", &docker);
+        std::env::set_var("POLER_FAKE_LOG", &log);
+        std::env::set_var("POLER_WORKSPACE", &ws);
+
+        // деструктив: Block ДО исполнения — docker exec не вызывается вовсе
+        for destructive in ["rm -rf /", "dd if=/dev/zero of=/dev/sda", ":(){ :|:& };:"] {
+            let r = server().tool_box_exec(&json!({"command": destructive}));
+            assert!(r.is_err(), "{destructive} — обязан быть Block: {r:?}");
+            let e = r.unwrap_err();
+            assert!(e.contains("блокировка"), "{destructive}: {e}");
+        }
+        let log_content = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!log_content.contains("exec"), "docker exec не должен был вызываться: {log_content}");
+
+        std::env::remove_var("POLER_BOX_DOCKER");
+        std::env::remove_var("POLER_FAKE_LOG");
+        std::env::remove_var("POLER_WORKSPACE");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[test]
+    fn box_exec_confirm_denied_zero_silent_escalation() {
+        let _g = env_lock();
+        let (docker, log) = fake_docker("confirm");
+        let ws = log.parent().unwrap().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::env::set_var("POLER_BOX_DOCKER", &docker);
+        std::env::set_var("POLER_FAKE_LOG", &log);
+        std::env::set_var("POLER_WORKSPACE", &ws);
+
+        // sudo: Confirm — MCP-агент подтвердить не может → отказ (не исполнение!)
+        let r = server().tool_box_exec(&json!({"command": "sudo apt update"}));
+        assert!(r.is_err(), "sudo из MCP — отказ: {r:?}");
+        let e = r.unwrap_err();
+        assert!(e.contains("владельцу"), "подсказка о владельце: {e}");
+        let log_content = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!log_content.contains("exec"), "sudo не исполнялся: {log_content}");
+
+        std::env::remove_var("POLER_BOX_DOCKER");
+        std::env::remove_var("POLER_FAKE_LOG");
+        std::env::remove_var("POLER_WORKSPACE");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[test]
+    fn box_exec_allowed_runs_in_runner_and_returns_output() {
+        let _g = env_lock();
+        let (docker, log) = fake_docker("allow");
+        let ws = log.parent().unwrap().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::env::set_var("POLER_BOX_DOCKER", &docker);
+        std::env::set_var("POLER_FAKE_LOG", &log);
+        std::env::set_var("POLER_WORKSPACE", &ws);
+
+        // target=auto: runner поднят (inspect → true) → исполнение в runner
+        let r = server().tool_box_exec(&json!({"command": "python3 build.py --flag"}));
+        assert!(r.is_ok(), "разрешённая команда: {r:?}");
+        let out = r.unwrap();
+        assert!(out.contains("runner"), "цель — runner: {out}");
+        assert!(out.contains("poler-runner-"), "имя runner: {out}");
+        assert!(out.contains("fake-exec-output"), "stdout вернулся: {out}");
+        assert!(out.contains("exit 0"), "exit-код: {out}");
+
+        // argv дошёл насквозь (кавычки раскрыты лексером шлюза)
+        let log_content = std::fs::read_to_string(&log).unwrap();
+        let exec_line = log_content
+            .lines()
+            .find(|l| l.starts_with("exec"))
+            .expect("docker exec вызван");
+        assert!(exec_line.contains("-i"), "пайповый режим: {exec_line}");
+        assert!(exec_line.contains("POLER_RUNNER=1"), "брокер-контекст: {exec_line}");
+        assert!(exec_line.contains("python3"), "argv насквозь: {exec_line}");
+        assert!(exec_line.contains("build.py"), "argv насквозь: {exec_line}");
+        assert!(exec_line.contains("--flag"), "argv насквозь: {exec_line}");
+        assert!(!exec_line.contains("-it"), "без TTY: {exec_line}");
+
+        // явный target=box — тоже работает (inspect=true у фейка)
+        let r = server().tool_box_exec(&json!({"command": "ls", "target": "box"}));
+        assert!(r.is_ok());
+        assert!(r.unwrap().contains("box"));
+
+        std::env::remove_var("POLER_BOX_DOCKER");
+        std::env::remove_var("POLER_FAKE_LOG");
+        std::env::remove_var("POLER_WORKSPACE");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[test]
+    fn box_status_reports_containers_with_fake_docker() {
+        let _g = env_lock();
+        let (docker, log) = fake_docker("status");
+        let ws = log.parent().unwrap().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::env::set_var("POLER_BOX_DOCKER", &docker);
+        std::env::set_var("POLER_WORKSPACE", &ws);
+
+        let out = server().tool_box_status(&json!({})).unwrap();
+        assert!(out.contains("docker"), "{out}");
+        assert!(out.contains("box poler-box-"), "box-строка: {out}");
+        assert!(out.contains("работает"), "inspect=true → работает: {out}");
+        assert!(out.contains("runner poler-runner-"), "runner-строка: {out}");
+        assert!(out.contains("poler_box_exec"), "подсказка брокера: {out}");
+
+        std::env::remove_var("POLER_BOX_DOCKER");
+        std::env::remove_var("POLER_WORKSPACE");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 }

@@ -14,6 +14,80 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.26.0: Zero-Overhead Agent Bind-Mounting + Two-Tier Container Brokerage
+
+Живой тест владельца v0.25.0: `box on` поднял контейнер, `agy` внутри —
+честный `executable file not found in $PATH` (в базовом образе нет
+агентов). Владелец: «зачем собирать образ? зачем ставить дважды? движок
+уже на пк» — и сформулировал архитектуру облачных AI-рантаймов:
+«мозг агента отдельно, исполнение — отдельно, между ними брокер».
+
+### 1. Zero-Overhead Bind-Mounting — агенты без сборки образа
+
+`box on` автоматически находит хостовых CLI-агентов (agy/claude/codex/
+gemini/aider/… — PATH + `~/.local/bin` + `/usr/local/bin`; ELF-магия и
+shebang-классификация) и **пробрасывает их внутрь контейнера**:
+
+- бинарник → `/usr/local/bin/<имя>` **ro** — ноль копий, ноль слоёв,
+  ноль `docker build`, ноль двойной установки;
+- конфиги (`~/.gemini`, `~/.claude`, …) → `/home/poler/<имя>` **rw** —
+  авторизация живёт и обновляется, переживает `box off/on`;
+- скриптовые агенты (shebang node/python) — файл монтируется,
+  интерпретатор должен быть в образе (`box on image=node:22-slim`),
+  шлюз честно предупреждает;
+- политика: `agent=auto|none|имя1,имя2`, `nocfg=0|1`, ручной проброс
+  `mount=HOST[:CONT[:ro|rw]]` с жёстким deny-list: docker-сокет и
+  podman-сокет запрещены ВСЕГДА (вектор угона демона), системные корни
+  хоста (`/`, `/etc`, `/dev`, `/proc`, `/sys`, `/run`…) — запрещены,
+  цели контейнера — белый список `/usr/local/bin` / `/opt/poler` /
+  `/home/poler`, `/workspace` не расширяется, rw — только данные.
+
+Итог: `poler-engine --gateway` → `box on` → `agy` — запускается из уже
+установленного бинарника с готовой авторизацией, но физически заперт.
+
+### 2. Two-Tier Container Brokerage — «мозг → шлюз → runner»
+
+Фундаментальное разделение по модели Google Cloud / air-gapped runtimes:
+
+- **Контур 1 — мозг агента**: лёгкая среда (box или хост), без прямого
+  доступа к ОС; общается со шлюзом через MCP (JSON-RPC, Bearer);
+- **Контур 2 — шлюз POLER**: `sandbox`-судья выносит вердикт ДО
+  исполнения (деструктив — Block, привилегии — Confirm → из MCP
+  подтверждаться не может в принципе: Zero Silent Escalation);
+- **Контур 3 — runner** (`box runner on`): контейнер исполнения
+  `poler-runner-<fnv8(ws)>` — **net=none**, только `/workspace`, БЕЗ
+  `/home/poler` и агентов, cap-drop ALL + no-new-privileges + mem/pids;
+  stdout/stderr/exit-код возвращаются брокеру.
+
+Новые MCP-инструменты (stdio `--mcp` и HTTP `--mcp-http`):
+
+- **`poler_box_exec`** — исполнить команду агента в изолированном
+  контейнере (`target=auto|runner|box`; лексер шлюза, argv насквозь без
+  `/bin/sh`; конвейеры/редиректы — отдельные вызовы; `bash -c '…'`
+  допустим, payload судится рекурсивно);
+- **`poler_box_status`** — состояние jail-стека (box: образ/агенты,
+  runner: образ/net).
+
+Cross-process discovery: `service start mcp` передаёт сервису
+`POLER_WORKSPACE`, контейнеры находятся по детерминированным именам +
+docker-labels — брокер работает из отдельного процесса сервиса.
+
+### Цифры релиза
+
+- **983 теста** (+26 к v0.25.0): discovery/планировщик монтировок,
+  deny-list mount= (20+ векторов), argv box+runner, MCP-брокер с
+  фейковым docker (Block ДО вызова — проверяется логом), интеграционные
+  REPL-тесты без docker-демона;
+- Гейты: `gateway_audit.py` **139/139** · `gateway_attack_e2e.py`
+  **79/79** + **14/14** (shim) + **8/8** (box) + **19/19** (волна 11:
+  bind-mount + runner + живой MCP-брокер) · `audit_patch_verify.py`
+  **10/10** · `audit_stress.py --hardened` **46/46**; clippy нового кода
+  чист; секрет-скан PASS;
+- Ноль новых зависимостей; `POLER_BOX_DOCKER`-override теперь действует
+  и на exec-плоскость (тестируемость без демона).
+
+---
+
 ## v0.25.0: Container Jail — жёсткая Docker-изоляция агентов (`box`)
 
 Живой кейс из эксплуатации v0.23/v0.24: агент (`agy`) в PTY-контуре

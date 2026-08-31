@@ -195,8 +195,131 @@ def main():
 
     shim_ok = shim_battery(arena)
     box_ok = box_battery(arena)
+    broker_ok = broker_battery(arena)
 
-    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok else 1)
+    sys.exit(0 if failed == 0 and intact and shim_ok and box_ok and broker_ok else 1)
+
+
+def broker_battery(arena):
+    """Волна 11 (v0.26.0): bind-mount агентов + runner/MCP-брокер.
+
+    Часть A — REPL без docker (POLER_BOX_DOCKER=/bin/false): mount
+    deny-list обязан отказывать на ПАРСИНГЕ (до пробы docker): docker-сокет
+    (главный вектор угона демона), системные корни хоста, цели вне белого
+    списка, /workspace-расширение, неизвестные агенты. runner — честный
+    отказ без docker. Часть B — ЖИВОЙ MCP-сервер (--mcp, stdio JSON-RPC):
+    poler_box_exec с деструктивом обязан вернуть Block ДО docker;
+    poler_box_status без docker — isError/честный отчёт.
+    """
+    print("\n════════ ВОЛНА 11: bind-mount + runner/MCP-брокер (v0.26.0) ════════")
+    # host-путь для mount-векторов — легитимный файл арены (вне deny-корней):
+    # проверяем именно ЦЕЛИ контейнера (вне белого списка, /workspace)
+    mount_src = os.path.join(arena, "out.txt")
+    cmds = (
+        "box runner status\n"
+        "box runner on\n"
+        "box runner on net=host\n"
+        "box on mount=/var/run/docker.sock:/x/sock\n"
+        "box on mount=/:/host\n"
+        "box on mount=/proc:/opt/poler/proc\n"
+        f"box on mount={mount_src}:/etc/evil\n"
+        f"box on mount={mount_src}:/workspace/evil\n"
+        "box on agent=not-an-agent\n"
+        "box status\n"
+        "version\n"
+        "quit\n"
+    )
+    r = subprocess.run(
+        [BIN, "--gateway"],
+        input=cmds,
+        capture_output=True,
+        text=True,
+        cwd=arena,
+        env={**os.environ, "HOME": arena, "TERM": "dumb", "POLER_BOX_DOCKER": "/bin/false"},
+        timeout=60,
+    )
+    out = r.stdout
+
+    checks = [
+        # (описание, подстрока-ожидание)
+        ("runner: отчёт ВЫКЛ без подъёма", "runner: ВЫКЛ"),
+        ("runner: имя poler-runner-", "poler-runner-"),
+        ("runner on без docker — честный отказ", "docker недоступен"),
+        ("runner net=host — парсинг-отказ", "net=host"),
+        ("mount docker.sock — ОТКАЗ (угон демона)", "docker/podman не монтируется"),
+        ("mount / — системный корень запрещён", "системный корень"),
+        ("mount /proc — системный корень запрещён", "системный корень"),
+        ("mount → /etc/evil — вне белого списка", "вне белого списка"),
+        ("mount → /workspace/x — ws не расширяется", "запрещена"),
+        ("agent=неизвестный — парсинг-отказ", "неизвестный агент"),
+        ("box status: runner-секция", "runner:"),
+        ("box status: упоминание брокера", "poler_box_exec"),
+        ("version: agent-bindmount", "agent-bindmount"),
+        ("version: mcp-broker", "mcp-broker"),
+    ]
+    passed = failed = 0
+    for desc, needle in checks:
+        ok = needle in out
+        print(f"  {'OK ' if ok else '‼️ '} {desc:<45} → {'есть' if ok else 'НЕТ: ' + needle}")
+        passed, failed = passed + ok, failed + (not ok)
+    print(f"════════ ИТОГ волны 11 (REPL): {passed}/{passed + failed} векторов ════════")
+
+    # --- Часть B: живой MCP-сервер (stdio) — брокер судит ДО docker ---
+    mcp_passed = mcp_passed_n = 0
+    try:
+        rpc = (
+            '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":'
+            '{"name":"poler_box_exec","arguments":{"command":"rm -rf /"}}}\n'
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":'
+            '{"name":"poler_box_exec","arguments":{"command":"sudo apt update"}}}\n'
+            '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":'
+            '{"name":"poler_box_status","arguments":{}}}\n'
+        )
+        m = subprocess.run(
+            [BIN, "--mcp"],
+            input=rpc,
+            capture_output=True,
+            text=True,
+            cwd=arena,
+            env={
+                **os.environ,
+                "HOME": arena,
+                "TERM": "dumb",
+                "POLER_BOX_DOCKER": "/bin/false",
+                "POLER_WORKSPACE": arena,
+            },
+            timeout=60,
+        )
+        mout = m.stdout
+        mcp_checks = [
+            ("tools/list содержит poler_box_exec", '"poler_box_exec"' in mout),
+            ("tools/list содержит poler_box_status", '"poler_box_status"' in mout),
+            (
+                "poler_box_exec rm -rf / — Block (isError)",
+                '"блокировка' in mout or "блокировка" in mout,
+            ),
+            (
+                "poler_box_exec sudo — Confirm → отказ владельцу",
+                "владельцу" in mout,
+            ),
+            (
+                "poler_box_status — честный docker-отчёт",
+                "docker" in mout and "box runner on" in mout,
+            ),
+        ]
+        for desc, ok in mcp_checks:
+            print(f"  {'OK ' if ok else '‼️ '} MCP {desc:<42} → {'есть' if ok else 'НЕТ'}")
+            mcp_passed += 1 if ok else 0
+            mcp_passed_n += 1
+        failed += mcp_passed_n - mcp_passed
+        passed += mcp_passed
+    except Exception as e:  # noqa: BLE001 — батарея обязана пережить любой сбой
+        print(f"  ‼️  MCP-часть упала: {e}")
+        failed += 5
+
+    print(f"════════ ИТОГ волны 11: {passed}/{passed + failed} векторов ════════")
+    return failed == 0
 
 
 def box_battery(arena):

@@ -79,7 +79,7 @@ pub fn banner() -> String {
         "  {bold}🛡 workspace-guard{reset} — доступ вне корня проекта — только по подтверждению;\n   cd/workspace на выход — тоже; allow <путь> — сессионное исключение\n"
     ));
     s.push_str(&format!(
-        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker-контейнера: агент (agy/claude/…) заперт физически; box on — поднять\n"
+        "  {bold}📦 box — Container Jail{reset} — контуры 2/3 внутри Docker: агент (agy/claude/…) заперт физически; хостовые агенты пробрасываются внутрь без установки (ro); runner — контур исполнения MCP-брокера (poler_box_exec); box on — поднять\n"
     ));
     s.push('\n');
     s.push_str("help — список команд · quit — выход · docs/terminal-gateway-architecture.md\n");
@@ -239,6 +239,8 @@ mod tests {
         assert!(b.contains("pty-passthrough"), "v0.23.0: PTY-контур в баннере");
         assert!(b.contains("workspace-guard"), "v0.24.0: граница workspace в баннере");
         assert!(b.contains("Container Jail"), "v0.25.0: box в баннере");
+        assert!(b.contains("runner"), "v0.26.0: runner-брокер в баннере");
+        assert!(b.contains("poler_box_exec"), "v0.26.0: MCP-брокер в баннере");
     }
 
     #[test]

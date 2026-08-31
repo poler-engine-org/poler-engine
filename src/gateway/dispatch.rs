@@ -69,6 +69,9 @@ pub struct GatewayState {
     /// Docker-контейнера (`box on`); физическая изоляция вместо/поверх
     /// логической границы workspace для exec-плоскости.
     pub box_jail: Option<containers::BoxState>,
+    /// v0.26.0: активный runner — изолированный контур исполнения
+    /// MCP-брокера (`box runner on`): net=none, только /workspace.
+    pub runner: Option<containers::RunnerState>,
 }
 
 impl GatewayState {
@@ -85,6 +88,7 @@ impl GatewayState {
             ws_allow: Vec::new(),
             sync_cwd: false,
             box_jail: None,
+            runner: None,
         }
     }
 
@@ -723,7 +727,7 @@ fn run_engine(
             }
         }
         "benchmark" => cmd_benchmark(args).map_err(EngineFail::Msg),
-        "service" => cmd_service(args).map_err(EngineFail::Msg),
+        "service" => cmd_service(state, args).map_err(EngineFail::Msg),
         "attach" => cmd_attach(args).map_err(EngineFail::Msg),
         "weblens" => cmd_weblens(args).map_err(EngineFail::Msg),
         "license" => Ok(crate::license::status_text()),
@@ -739,7 +743,7 @@ fn run_engine(
         "clear" => Ok("\x1b[2J\x1b[1;1H".into()),
         "help" | "?" => Ok(gateway_help()),
         "version" | "ver" | "v" => Ok(format!(
-            "poler-engine {} — Terminal Gateway v0.25.0 (двойной контур + PTY + sudo-гейт + workspace-guard + container-jail)\n",
+            "poler-engine {} — Terminal Gateway v0.26.0 (двойной контур + PTY + sudo-гейт + workspace-guard + container-jail + agent-bindmount + mcp-broker)\n",
             env!("CARGO_PKG_VERSION")
         )),
         "quit" | "exit" | "q" => Err(EngineFail::Quit),
@@ -1009,13 +1013,17 @@ fn cmd_benchmark(args: &[String]) -> Result<String, String> {
 // service / attach / weblens — управление нижним слоем
 // ---------------------------------------------------------------------------
 
-fn cmd_service(args: &[String]) -> Result<String, String> {
+fn cmd_service(state: &GatewayState, args: &[String]) -> Result<String, String> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     match sub {
         "status" => Ok(service::status(args.get(1).map(|s| s.as_str()))),
         "start" => {
             let name = args.get(1).ok_or("service start <имя> [bind]")?;
             let bind = args.get(2).map(|s| s.as_str());
+            // v0.26.0: MCP-брокер (poler_box_exec) обязан знать корень
+            // workspace сессии — сервис наследует env родителя (Command по
+            // умолчанию наследует окружение), поэтому выставляем POLER_WORKSPACE
+            std::env::set_var("POLER_WORKSPACE", &state.ws_root);
             service::start(name, bind)
         }
         "stop" => {
@@ -1543,14 +1551,18 @@ fn cmd_allow(
 
 // ---------------------------------------------------------------------------
 // Container Jail (v0.25.0): `box on/off/status/shell`
+// v0.26.0: + `box runner on/off/status` (контур исполнения MCP-брокера),
+// `box on` пробрасывает хостовых агентов (zero-overhead bind-mount).
 // ---------------------------------------------------------------------------
 
-/// `box [status|on|off|shell]` — жёсткая Docker-изоляция контуров 2/3.
+/// `box [status|on|off|shell|runner …]` — жёсткая Docker-изоляция контуров 2/3.
 ///
 /// Живой кейс v0.23/v0.24: PATH-shim медиация агентов — best-effort (хардкод
 /// /bin/sh и прямой execve не перехватываются). Container Jail решает класс
 /// физически: host-команды и PTY-сессии исполняются ВНУТРИ контейнера
 /// (`docker exec`), хост доступен только как /workspace и /home/poler.
+/// v0.26.0: агентам НЕ нужен образ со всем софтом — их бинарники с хоста
+/// пробрасываются внутрь read-only (bind-mount), конфиги — rw в /home/poler.
 fn cmd_box(
     state: &mut GatewayState,
     args: &[String],
@@ -1559,8 +1571,10 @@ fn cmd_box(
     match args.first().map(|s| s.as_str()) {
         None | Some("status") => Ok(containers::box_status_text(
             state.box_jail.as_ref(),
+            state.runner.as_ref(),
             &state.ws_root,
         )),
+        Some("runner") => cmd_box_runner(state, &args[1..]),
         Some("on") => {
             // уже активен и жив? — не трогаем (идемпотентность)
             if let Some(jail) = &state.box_jail {
@@ -1582,13 +1596,30 @@ fn cmd_box(
                 .as_ref()
                 .map(|j| j.name.clone())
                 .unwrap_or_else(|| containers::container_name(&state.ws_root));
-            let report = containers::box_off(&name)?;
+            let mut report = containers::box_off(&name)?;
             if state
                 .box_jail
                 .as_ref()
                 .is_some_and(|j| j.name == name)
             {
                 state.box_jail = None;
+            }
+            // v0.26.0: box off разбирает и runner (единый стек jail)
+            let runner_name = state
+                .runner
+                .as_ref()
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| containers::runner_name(&state.ws_root));
+            match containers::runner_off(&runner_name) {
+                Ok(r) => {
+                    report.push_str(&r);
+                    state.runner = None;
+                }
+                Err(e) => {
+                    // docker мог быть доступен для box_off, но сломаться тут —
+                    // не глотаем молча, но и не рушим результат box off
+                    report.push_str(&format!("⚠ runner {runner_name}: {e}\n"));
+                }
             }
             Ok(report)
         }
@@ -1614,7 +1645,69 @@ fn cmd_box(
             Ok(outcome.render())
         }
         Some(other) => Err(format!(
-            "box: {other}? (box on [image=…] | off | status | shell)"
+            "box: {other}? (box on [image=…] | off | status | shell | runner on|off|status)"
+        )),
+    }
+}
+
+/// `box runner on [k=v…] | off | status` — изолированный контур исполнения
+/// (двухконтурный брокер v0.26.0): MCP-инструмент poler_box_exec направляет
+/// сюда команды агентов; net=none, только /workspace, без /home/poler.
+fn cmd_box_runner(
+    state: &mut GatewayState,
+    args: &[String],
+) -> Result<String, String> {
+    match args.first().map(|s| s.as_str()) {
+        None | Some("status") => {
+            let name = state
+                .runner
+                .as_ref()
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| containers::runner_name(&state.ws_root));
+            let mut s = String::new();
+            match &state.runner {
+                Some(r) => s.push_str(&format!(
+                    "runner: ВКЛ — контур исполнения MCP-брокера\nконтейнер {} · образ {} · net {} · только {}\n",
+                    r.name, r.cfg.image, r.cfg.net, containers::WS_MOUNT
+                )),
+                None => s.push_str(&format!(
+                    "runner: ВЫКЛ — poler_box_exec исполняет в box (если поднят) либо отказывает\nконтейнер {name} не активен в этой сессии (box runner on — поднять; box status — живой статус docker)\n"
+                )),
+            }
+            Ok(s)
+        }
+        Some("on") => {
+            if let Some(r) = &state.runner {
+                if containers::box_running(&r.name) == Some(true) {
+                    return Ok(format!(
+                        "🏃 runner уже активен: {} (box runner off — разобрать)\n",
+                        r.name
+                    ));
+                }
+            }
+            let cfg = containers::parse_runner_args(&args[1..])?;
+            let (runner, report) = containers::runner_on(&state.ws_root, &cfg)?;
+            state.runner = Some(runner);
+            Ok(report)
+        }
+        Some("off") => {
+            let name = state
+                .runner
+                .as_ref()
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| containers::runner_name(&state.ws_root));
+            let report = containers::runner_off(&name)?;
+            if state
+                .runner
+                .as_ref()
+                .is_some_and(|r| r.name == name)
+            {
+                state.runner = None;
+            }
+            Ok(report)
+        }
+        Some(other) => Err(format!(
+            "box runner: {other}? (box runner on [image=…] [net=none|bridge] [mem=1g] [pids=256] [wsro=0|1] | off | status)"
         )),
     }
 }
@@ -1625,7 +1718,7 @@ fn cmd_box(
 
 pub fn gateway_help() -> String {
     let mut s = String::from(
-        "POLER Terminal Gateway — единый терминальный шлюз (v0.25.0: + Container Jail)\n\
+        "POLER Terminal Gateway — единый терминальный шлюз (v0.26.0: + bind-mount агентов + MCP-брокер)\n\
          ═════════════════════════════════════════════════════════════\n\
          Двойной контур: команды движка исполняются нативно (приоритет),\n\
          всё остальное — хостовая ОС в sandbox-режиме.\n\n",
@@ -1654,15 +1747,26 @@ pub fn gateway_help() -> String {
     s.push_str("  (политика sandbox судится по той же команде — PTY ≠ обход)\n");
     s.push_str("  без jail: MEDIATED AGENT MODE — shell-вызовы агента через PATH-shim\n");
     s.push_str("  судятся гейтом (отказ 126; /bin/sh-хардкод не виден — см. box)\n\n");
-    s.push_str("CONTAINER JAIL (v0.25.0 — жёсткая изоляция Docker):\n");
+    s.push_str("CONTAINER JAIL (v0.25.0 — изоляция Docker; v0.26.0 — брокер):\n");
     s.push_str("  box on [image=IMG] [net=bridge|none] [user=me|root]\n");
     s.push_str("      [mem=2g] [pids=512] [wsro=0|1]   поднять jail: контуры 2/3\n");
     s.push_str("      исполняются ВНУТРИ контейнера (docker exec); агент физически\n");
     s.push_str("      заперт — хост виден только как /workspace и /home/poler\n");
-    s.push_str("  box status | box off        состояние | разобрать контейнер\n");
-    s.push_str("  box shell                   интерактивный шелл внутри jail\n");
-    s.push_str("  образ по умолчанию debian:bookworm-slim; для агентов — свой\n");
-    s.push_str("  (node/agy внутри); /home/poler персистентен (конфиги агентов)\n\n");
+    s.push_str("  box on agent=auto|none|имя1,имя2 · nocfg=0|1 — политика проброса\n");
+    s.push_str("      хостовых агентов; найденные agy/claude/… монтируются ro\n");
+    s.push_str("      в /usr/local/bin без установки (zero-overhead), конфиги —\n");
+    s.push_str("      rw в /home/poler (~/.gemini, ~/.claude — авторизация живёт)\n");
+    s.push_str("  box on mount=HOST[:CONT[:ro|rw]] — ручной проброс (белый список\n");
+    s.push_str("      целей; docker-сокет/системные корни — запрет на парсинге)\n");
+    s.push_str("  box runner on|off|status — контур исполнения MCP-брокера:\n");
+    s.push_str("      net=none, только /workspace, без home/агентов — туда\n");
+    s.push_str("      poler_box_exec исполняет команды агентов (двухконтурная\n");
+    s.push_str("      схема: мозг агента → шлюз POLER (судья) → runner)\n");
+    s.push_str("  box status | box off        состояние | разобрать (box off\n");
+    s.push_str("                              разбирает и runner) · box shell —\n");
+    s.push_str("                              интерактивный шелл внутри jail\n");
+    s.push_str("  образ по умолчанию debian:bookworm-slim; ELF-агенты хоста\n");
+    s.push_str("  работают без пересборки образа; скриптовые — image= с runtime\n\n");
     s.push_str("WORKSPACE (v0.23.0 — корень проекта; v0.24.0 — граница):\n");
     s.push_str("  workspace [PATH]            показать/переключить корень проекта;\n");
     s.push_str("                              движок+хост+подпроцессы от одного cwd\n");
@@ -2296,8 +2400,12 @@ mod tests {
     // v0.25.0: Container Jail (box)
     // =====================================================================
 
-    /// Сериализация тестов, мутирующих POLER_BOX_DOCKER (env — процесс-глобал).
-    static DOCKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Сериализация тестов, мутирующих POLER_BOX_DOCKER — ОБЩИЙ лок с
+    /// containers/mcp-тестами (env процесс-глобален, тесты параллельны;
+    /// v0.26.0: wrap_* тоже читают POLER_BOX_DOCKER).
+    fn docker_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::super::containers::docker_env_test_lock()
+    }
 
     /// Фейковый jail: контейнер с нереалистичным именем — любые docker-exec
     /// против него честно падают (нет контейнера/нет docker), что и проверяем.
@@ -2318,7 +2426,7 @@ mod tests {
 
     #[test]
     fn box_status_honest() {
-        let _g = DOCKER_ENV_LOCK.lock().unwrap();
+        let _g = docker_env_lock();
         std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
         let mut st = state();
         let out = run(&mut st, "box status").unwrap();
@@ -2333,7 +2441,7 @@ mod tests {
 
     #[test]
     fn box_on_without_docker_honest_error() {
-        let _g = DOCKER_ENV_LOCK.lock().unwrap();
+        let _g = docker_env_lock();
         std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
         let mut st = state();
         let out = run(&mut st, "box on").unwrap();
@@ -2484,8 +2592,146 @@ mod tests {
         let h = gateway_help();
         assert!(h.contains("CONTAINER JAIL"), "секция box в help: {h}");
         assert!(h.contains("box on"), "синтаксис box on: {h}");
+        assert!(h.contains("mount="), "синтаксис mount= в help: {h}");
+        assert!(h.contains("agent="), "политика agent= в help: {h}");
+        assert!(h.contains("box runner on"), "runner в help: {h}");
+        assert!(h.contains("poler_box_exec"), "MCP-брокер в help: {h}");
         let mut st = state();
         let out = run(&mut st, "version").unwrap();
         assert!(out.contains("container-jail"), "версия упоминает jail: {out}");
+        assert!(out.contains("agent-bindmount"), "версия упоминает bindmount: {out}");
+        assert!(out.contains("mcp-broker"), "версия упоминает брокера: {out}");
+    }
+
+    // =====================================================================
+    // v0.26.0: bind-mount агентов + runner (двухконтурный брокер)
+    // =====================================================================
+
+    #[test]
+    fn box_on_mount_deny_list_rejected_at_parse() {
+        // host-путь для проверок ЦЕЛЕЙ контейнера — легитимный temp-файл
+        // (вне системных корней), чтобы сработали именно контейнер-проверки
+        let good_ws = std::env::temp_dir().join(format!("poler-mnt-src-{}", std::process::id()));
+        std::fs::write(&good_ws, b"legit-data").unwrap();
+        let good = good_ws.display().to_string();
+        // docker-сокет / системные корни / цели вне белого списка — отказ
+        // ещё ДО пробы docker (парсинг k=v идёт первым)
+        let mut st = state();
+        for bad in [
+            "box on mount=/var/run/docker.sock:/x/sock",
+            "box on mount=/:/home/poler/root",
+            "box on mount=/etc:/opt/poler/etc",
+            "box on mount=/dev:/opt/poler/dev",
+            "box on mount=/nonexistent-xyz-123:/opt/poler/x",
+            &format!("box on mount={good}:/etc/evil"), // цель вне белого списка
+            &format!("box on mount={good}:/workspace/x"), // /workspace не расширяется
+            &format!("box on mount={good}:/usr/local/bin/agy:rw"), // rw-бинарник
+        ] {
+            let out = run(&mut st, bad).unwrap_or_default();
+            assert!(
+                out.contains("mount="),
+                "{bad} — должен быть парсинг-отказ: {out}"
+            );
+            assert!(!out.contains("Container Jail ВКЛ"), "{bad} не поднялся: {out}");
+        }
+        assert!(st.box_jail.is_none(), "jail не должен подняться");
+        let _ = std::fs::remove_file(&good_ws);
+    }
+
+    #[test]
+    fn box_on_agent_policy_parse() {
+        let mut st = state();
+        // неизвестный агент — отказ на парсинге (до docker)
+        let out = run(&mut st, "box on agent=not-an-agent").unwrap_or_default();
+        assert!(out.contains("agent=not-an-agent") || out.contains("неизвестный агент"), "{out}");
+        // известные имена проходят парсинг (дальше упадёт docker-проба без docker)
+        let _g = docker_env_lock();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let out = run(&mut st, "box on agent=agy,claude nocfg=1").unwrap_or_default();
+        assert!(out.contains("docker"), "дальше — честная docker-ошибка: {out}");
+        std::env::remove_var("POLER_BOX_DOCKER");
+    }
+
+    #[test]
+    fn box_runner_status_without_runner() {
+        let mut st = state();
+        let out = run(&mut st, "box runner status").unwrap();
+        assert!(out.contains("runner: ВЫКЛ"), "без runner — отчёт ВЫКЛ: {out}");
+        assert!(out.contains("poler-runner-"), "имя ожидаемого runner: {out}");
+        assert!(out.contains("box runner on"), "подсказка подъёма: {out}");
+        let out = run(&mut st, "box runner").unwrap();
+        assert!(out.contains("runner: ВЫКЛ"), "box runner ≡ box runner status: {out}");
+    }
+
+    #[test]
+    fn box_runner_on_without_docker_honest_error() {
+        let _g = docker_env_lock();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let mut st = state();
+        let out = run(&mut st, "box runner on").unwrap();
+        assert!(
+            out.contains("docker недоступен") || out.contains("docker"),
+            "runner on без docker — честная ошибка: {out}"
+        );
+        assert!(st.runner.is_none(), "runner не должен подняться");
+        // bad args — до docker
+        let out = run(&mut st, "box runner on net=host").unwrap();
+        assert!(out.contains("net=host"), "net=host отвергнут: {out}");
+        let out = run(&mut st, "box runner on zzz=1").unwrap();
+        assert!(out.contains("zzz"), "мусорный ключ отвергнут: {out}");
+        std::env::remove_var("POLER_BOX_DOCKER");
+    }
+
+    #[test]
+    fn box_runner_bad_subcommand_usage() {
+        let mut st = state();
+        let out = run(&mut st, "box runner zzz").unwrap_or_default();
+        assert!(out.contains("box runner"), "usage runner: {out}");
+        let out = run(&mut st, "box zzz").unwrap_or_default();
+        assert!(out.contains("box on"), "usage box: {out}");
+    }
+
+    #[test]
+    fn box_off_without_docker_reports_both() {
+        // box off без docker: честная ошибка docker, состояние не врёт
+        let _g = docker_env_lock();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let (mut st, ws) = jailed_state("offnodocker");
+        st.runner = Some(super::super::containers::RunnerState {
+            name: "poler-runner-testfake".into(),
+            cfg: super::super::containers::RunnerConfig::default(),
+            ws_root: ws.clone(),
+        });
+        let out = run(&mut st, "box off").unwrap();
+        assert!(out.contains("docker"), "честная docker-ошибка: {out}");
+        std::env::remove_var("POLER_BOX_DOCKER");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn runner_status_active_session() {
+        let (mut st, ws) = jailed_state("runnerst");
+        st.runner = Some(super::super::containers::RunnerState {
+            name: "poler-runner-testfake".into(),
+            cfg: super::super::containers::RunnerConfig::default(),
+            ws_root: ws.clone(),
+        });
+        let out = run(&mut st, "box runner status").unwrap();
+        assert!(out.contains("runner: ВКЛ"), "активный runner: {out}");
+        assert!(out.contains("poler-runner-testfake"), "имя: {out}");
+        assert!(out.contains("none"), "net none по умолчанию: {out}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn box_status_runner_section_present() {
+        // box status без docker — runner-секция присутствует (v0.26.0)
+        let _g = docker_env_lock();
+        std::env::set_var("POLER_BOX_DOCKER", "/bin/false");
+        let mut st = state();
+        let out = run(&mut st, "box status").unwrap();
+        assert!(out.contains("runner:"), "runner-секция в box status: {out}");
+        assert!(out.contains("poler-runner-"), "имя runner в статусе: {out}");
+        std::env::remove_var("POLER_BOX_DOCKER");
     }
 }

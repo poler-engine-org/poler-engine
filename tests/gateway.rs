@@ -369,3 +369,58 @@ fn gateway_box_live_docker_lifecycle() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// 5. v0.26.0: bind-mount агентов + runner/MCP-брокер в живом REPL (без docker)
+// ---------------------------------------------------------------------------
+
+/// Честность без docker: runner-подъём, mount deny-list (парсинг ДО docker),
+/// версия упоминает брокера. Полностью детерминированно (POLER_BOX_DOCKER=/bin/false).
+#[test]
+fn gateway_repl_v026_broker_no_docker() {
+    let home = std::env::temp_dir().join(format!("poler-gw-v026-it-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let script = "box runner status\n\
+                  box runner on\n\
+                  box on mount=/var/run/docker.sock:/x/sock\n\
+                  box on mount=/:/host\n\
+                  box on agent=zzz\n\
+                  box status\n\
+                  version\n\
+                  quit\n";
+    let out = gateway_session_env(&home, script, &[("POLER_BOX_DOCKER", "/bin/false")]);
+
+    // runner: отчёт без подъёма
+    assert!(out.contains("runner: ВЫКЛ"), "нет отчёта runner: {out}");
+    assert!(out.contains("poler-runner-"), "нет имени runner: {out}");
+    // runner on без docker — честная ошибка
+    assert!(
+        out.contains("docker недоступен"),
+        "runner on без docker должен честно отказаться: {out}"
+    );
+    // mount deny-list — отказ на ПАРСИНГЕ (до docker-пробы)
+    assert!(
+        out.contains("docker/podman не монтируется"),
+        "docker.sock обязан быть отвергнут: {out}"
+    );
+    assert!(
+        out.contains("системный корень"),
+        "монтировка / обязана быть отвергнута: {out}"
+    );
+    // неизвестный агент — отказ
+    assert!(
+        out.contains("неизвестный агент"),
+        "agent=zzz должен быть отвергнут: {out}"
+    );
+    // box status содержит runner-секцию
+    assert!(out.contains("runner:"), "нет runner-секции в статусе: {out}");
+    assert!(out.contains("poler_box_exec"), "статус без упоминания брокера: {out}");
+    // версия упоминает новые возможности
+    assert!(
+        out.contains("agent-bindmount") && out.contains("mcp-broker"),
+        "версия без v0.26.0-фич: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

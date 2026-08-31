@@ -276,6 +276,22 @@ API**, не забивая локальный диск сотнями гигаб
 8e. **v0.25.x — тюнинг Container Jail**: CPU-shares/cgroup-v2, профили
    образов агентов (agy/claude-ready), Landlock/seccomp-фолбэк для
    машин без docker.
+8c-sexto. **v0.26.0 — Zero-Overhead Agent Bind-Mounting + Two-Tier
+   Container Brokerage**: агенты хоста (agy/claude/codex/…) пробрасываются
+   в Container Jail автоматически (бинарники ro → /usr/local/bin, конфиги
+   rw → /home/poler) — без docker build и двойной установки; ручной
+   mount= с deny-list (docker-сокет/системные корни/белый список целей);
+   runner-контур исполнения poler-runner-<fnv8> (net=none, только
+   /workspace, без home/агентов) + MCP-брокер poler_box_exec/
+   poler_box_status (вердикт судьи ДО docker exec; Confirm из MCP не
+   подтверждается — Zero Silent Escalation; cross-process discovery по
+   POLER_WORKSPACE + docker-labels). 983 теста (+26), гейты 139/139 +
+   79/79 + 14/14 + 8/8 + 19/19 (волна 11). Архитектура:
+   `docs/terminal-gateway-architecture.md` §6.7–6.8.
+   ✅ shipped (2026-08-31)
+8f. **v0.26.x — сопровождение брокера**: прокидывание runtime-
+   зависимостей ELF-агентов (ldd-резолв glibc/библиотек), автосборка
+   минимальных образов агентов, CPU-shares runner, Landlock-фолбэк.
 9. **Hugging Face Hub + DVC + Oxen (сдвинуто релизами gateway)**:
    model cards/datasets API (`hf://`), data-versioning pointer files,
    remote storage resolve.
