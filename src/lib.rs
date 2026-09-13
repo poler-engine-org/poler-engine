@@ -201,6 +201,11 @@ pub struct ScanStats {
 
 /// Открывает файл через mmap и вызывает `f(text)`.
 /// Невалидный UTF-8 конвертируется lossy; пустые файлы дают `""`.
+///
+/// v2.0 Foundation (2.1): подсказка ядру `madvise(SEQUENTIAL)` — чтение
+/// файла предсказуемо последовательное (токенизация/стемминг всего
+/// буфера), ядро включает readahead и кэш-страницы не вытесняются
+/// случайными обходами других файлов.
 pub(crate) fn with_text<T>(path: &Path, max_bytes: u64, f: impl FnOnce(&str) -> T) -> Option<T> {
     let file = File::open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -211,6 +216,10 @@ pub(crate) fn with_text<T>(path: &Path, max_bytes: u64, f: impl FnOnce(&str) -> 
         return Some(f(""));
     }
     let mmap = unsafe { Mmap::map(&file) }.ok()?;
+    // Foundation 2.1: последовательный доступ — ядро начинает readahead,
+    // страницы маппинга читаются кластерами, а не по требованию.
+    // Ошибка не фатальна (некоторые ФС не поддерживают) — тихо продолжаем.
+    let _ = mmap.advise(memmap2::Advice::Sequential);
     let bytes = &mmap[..];
     let lossy;
     let text = match std::str::from_utf8(bytes) {

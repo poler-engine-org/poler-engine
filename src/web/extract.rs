@@ -42,9 +42,54 @@ fn floor_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-/// Определение языка по алфавиту: доля кириллицы против латиницы.
+/// Определение языка страницы: whatlang (байт-триграммы, 75 языков)
+/// с порогом уверенности, fallback — алфавитная эвристика кириллица/латиница.
+///
+/// v2.0 Foundation (2.2): было «доля кириллицы > 20% → ru, иначе en» —
+/// украинские страницы терялись в «ru», многоязычные размазывались.
+/// whatlang отличает ukr/rus/bel и ещё ~70 языков; уверенность ниже
+/// порога или короткий текст — старая эвристика. Поле `lang` — только
+/// метаданные для выдачи (принцип «инструмент не понимает контент»).
 pub fn detect_lang(text: &str) -> &'static str {
     let sample: String = text.chars().take(4000).collect();
+    // whatlang: определение по всему тексту; короткий/цифровой — None
+    if sample.chars().count() >= 16 {
+        if let Some(info) = whatlang::detect(&sample) {
+            // уверенность whatlang [0..1]: ниже порога не доверяем
+            if info.confidence() > 0.6 {
+                return lang_code(info.lang());
+            }
+        }
+    }
+    alphabet_fallback(&sample)
+}
+
+/// Двухбуквенный код для выдачи (совместимость со старым «ru»/«en»).
+fn lang_code(lang: whatlang::Lang) -> &'static str {
+    match lang {
+        whatlang::Lang::Ukr => "uk",
+        whatlang::Lang::Rus => "ru",
+        whatlang::Lang::Eng => "en",
+        whatlang::Lang::Deu => "de",
+        whatlang::Lang::Fra => "fr",
+        whatlang::Lang::Spa => "es",
+        whatlang::Lang::Ita => "it",
+        whatlang::Lang::Pol => "pl",
+        whatlang::Lang::Bel => "be",
+        whatlang::Lang::Cmn => "zh",
+        whatlang::Lang::Jpn => "ja",
+        whatlang::Lang::Kor => "ko",
+        whatlang::Lang::Tur => "tr",
+        whatlang::Lang::Por => "pt",
+        whatlang::Lang::Nld => "nl",
+        whatlang::Lang::Swe => "sv",
+        whatlang::Lang::Uzb => "uz",
+        _ => "xx",
+    }
+}
+
+/// Старая алфавитная эвристика (fallback при низкой уверенности whatlang).
+fn alphabet_fallback(sample: &str) -> &'static str {
     let mut cyr = 0usize;
     let mut lat = 0usize;
     for c in sample.chars() {
@@ -75,18 +120,14 @@ pub fn web_tokenize(s: &str) -> Vec<String> {
         })
         .collect::<String>()
         .to_lowercase();
+    // v2.0 Foundation (2.4): UAX#29 word boundaries вместо ручного
+    // накопления alphanumeric-символов. Для кириллицы/латиницы поведение
+    // идентично; выигрывают апострофные («don't» — одно слово), CJK
+    // (идеограммы сегментируются по словарю), деванагари и пр.
+    use unicode_segmentation::UnicodeSegmentation;
     let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in norm.chars() {
-        if c.is_alphanumeric() {
-            cur.push(c);
-        } else if !cur.is_empty() {
-            push_token(&mut out, &cur);
-            cur.clear();
-        }
-    }
-    if !cur.is_empty() {
-        push_token(&mut out, &cur);
+    for word in norm.unicode_words() {
+        push_token(&mut out, word);
     }
     out
 }
@@ -218,6 +259,9 @@ mod tests {
         assert_eq!(detect_lang("привет мир как дела"), "ru");
         assert_eq!(detect_lang("hello world how are you"), "en");
         assert_eq!(detect_lang("123 456"), "");
+        // v2.0 Foundation (2.2): whatlang отличает украинский от русского
+        let uk = detect_lang("українська мова це最美 скринька зі значеннями что це");
+        assert_eq!(uk, "uk", "украинский текст: {uk}");
     }
 
     #[test]

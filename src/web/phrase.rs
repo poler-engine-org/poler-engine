@@ -230,7 +230,8 @@ mod tests {
     fn parse_basic_quotes() {
         let qp = parse_query("\"rust async\" runtime");
         assert_eq!(qp.phrases, vec![vec!["rust".to_string(), "async".to_string()]]);
-        assert_eq!(qp.terms, vec!["runtime".to_string()]);
+        // v2.0: латиница стеммингуется Snowball («runtime» → «runtim»)
+        assert_eq!(qp.terms, vec!["runtim".to_string()]);
     }
 
     #[test]
@@ -246,7 +247,8 @@ mod tests {
         let qp = parse_query("\"gzip\" module");
         assert!(qp.phrases.is_empty());
         assert!(qp.terms.contains(&"gzip".to_string()));
-        assert!(qp.terms.contains(&"module".to_string()));
+        // v2.0: Snowball («module» → «modul»)
+        assert!(qp.terms.contains(&"modul".to_string()));
     }
 
     #[test]

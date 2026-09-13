@@ -1,12 +1,18 @@
-//! Лёгкий стеммер кириллицы (укр + рос) для веб-индекса.
+//! Стемминг для веб-индекса: кириллица (укр + рос) + латиница (Snowball).
 //!
 //! История бага: запрос «ініціац» давал 0 хитов — в тексте «ініціація»,
 //! «ініціації», «ініціацію»… Склонения славянских языков меняют окончания,
-//! и точный токен-матч слеп к словоформам. Snowball-стеммеры точнее, но
-//! тянут зависимость; здесь — suffix-stripping по курируемому списку
-//! окончаний с защитой минимальной длины основы:
+//! и точный токен-матч слеп к словоформам.
 //!
-//! * токены без кириллицы не трогаем (ownership == ownership);
+//! v2.0 Foundation (2.3), принцип «100% доработать заимствованное»:
+//! * кириллица — курируемый suffix-stripping с защитой минимальной длины
+//!   основы (uk+ru в одном корпусе; Snowball Russian не знает укр);
+//! * латиница — Snowball English из rust-stemmers (порт классического
+//!   Porter2): «running»→«run», «stories»→«stori» — латинские
+//!   словоформы больше не размазываются по индексу. Стеммер создаётся
+//!   один раз (OnceLock) — tokenize_stem зовётся на каждый документ.
+//!
+//! Инварианты кириллического стеммера:
 //! * основа после отрезания обязана иметь ≥ MIN_STEM символов
 //!   («мати» не превращается в «ма»);
 //! * до двух проходов (комбинации окончаний: «книгами» → «книг»).
@@ -46,9 +52,21 @@ fn is_cyr(c: char) -> bool {
     ('\u{0400}'..='\u{04FF}').contains(&c)
 }
 
-/// Стемминговая форма токена (кириллица → основа, прочее — как есть).
+/// Snowball English (Porter2), создаётся лениво один раз на процесс.
+fn snowball_en() -> &'static rust_stemmers::Stemmer {
+    static STEMMER: std::sync::OnceLock<rust_stemmers::Stemmer> = std::sync::OnceLock::new();
+    STEMMER.get_or_init(|| rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English))
+}
+
+/// Стемминговая форма токена: кириллица → кастомный uk+ru стеммер,
+/// латиница → Snowball English (v2.0 Foundation 2.3).
 pub fn stem_cyr(token: &str) -> String {
     if !token.chars().any(is_cyr) {
+        // латиница: Snowball English; некириллические не-латинские
+        // скрипты (CJK и пр.) Snowball не трогает — как есть
+        if token.chars().all(|c| c.is_ascii_alphabetic()) {
+            return snowball_en().stem(token).into_owned();
+        }
         return token.to_string();
     }
     let mut s = token.to_string();
@@ -83,6 +101,7 @@ pub fn stem_cyr(token: &str) -> String {
 
 /// Токенизация + стемминг: единый путь для индексации И запроса
 /// (урок бага «слайд-шоу»: разные токенизаторы → ноль хитов).
+/// v2.0: латиница стеммингуется Snowball English, кириллица — как раньше.
 pub fn tokenize_stem(s: &str) -> Vec<String> {
     crate::web::extract::web_tokenize(s)
         .into_iter()
@@ -118,9 +137,17 @@ mod tests {
     }
 
     #[test]
-    fn latin_untouched() {
+    fn latin_snowball_stems() {
+        // v2.0 Foundation (2.3): латиница — Snowball English (Porter2)
         assert_eq!(stem_cyr("ownership"), "ownership");
-        assert_eq!(stem_cyr("running"), "running");
+        assert_eq!(stem_cyr("running"), "run");
+        assert_eq!(stem_cyr("stories"), "stori");
+        assert_eq!(stem_cyr("generations"), "generat");
+        // словоформы унифицируются — раньше «running»/«runs» не совпадали
+        assert_eq!(stem_cyr("running"), stem_cyr("runs"));
+        assert_eq!(stem_cyr("stories"), stem_cyr("story"));
+        // CJK и прочие скрипты — как есть (Snowball их не покрывает)
+        assert_eq!(stem_cyr("日本語"), "日本語");
     }
 
     #[test]

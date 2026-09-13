@@ -210,13 +210,48 @@ impl WebIndex {
         };
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt =
-                tx.prepare("UPDATE terms SET positions = ?1 WHERE page_id = ?2 AND term = ?3")?;
+            // v2.0 Foundation (2.3): ПОЛНЫЙ переиндекс термов страницы, а не
+            // только позиции. Snowball-стемминг латиницы меняет термы
+            // («runtime» → «runtim»): старый UPDATE-подход оставлял строки
+            // с не-стемами без позиций, а новые стемы не вставлял — фразовый
+            // поиск по старым БД молча терял страницы. Путь идентичен upsert:
+            // те же tokenize_stem → position_map → tf/title_tf.
+            let mut del =
+                tx.prepare("DELETE FROM terms WHERE page_id = ?1")?;
+            let mut ins = tx.prepare(
+                "INSERT INTO terms(term, page_id, tf, title_tf, positions)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )?;
             for (id, text, title) in pages {
-                let positions = position_map(&tokenize_stem(&text), &tokenize_stem(&title));
-                for (term, pos) in &positions {
-                    let blob = encode_positions(pos);
-                    stmt.execute(params![blob, id, term])?;
+                let body = tokenize_stem(&text);
+                let ttl = tokenize_stem(&title);
+                let positions = position_map(&body, &ttl);
+                let mut tf: HashMap<&str, i64> = HashMap::new();
+                for t in &body {
+                    *tf.entry(t.as_str()).or_insert(0) += 1;
+                }
+                let mut title_tf: HashMap<&str, i64> = HashMap::new();
+                for t in &ttl {
+                    *title_tf.entry(t.as_str()).or_insert(0) += 1;
+                }
+                del.execute(params![id])?;
+                for (term, tf_v) in &tf {
+                    let ttf_v = title_tf.get(term).copied().unwrap_or(0);
+                    let blob = positions
+                        .get(*term)
+                        .map(|p| encode_positions(p))
+                        .unwrap_or_default();
+                    ins.execute(params![term, id, tf_v, ttf_v, blob])?;
+                }
+                // термы ТОЛЬКО заголовка (body пуст) — не терять
+                for (term, ttf_v) in &title_tf {
+                    if !tf.contains_key(*term) {
+                        let blob = positions
+                            .get(*term)
+                            .map(|p| encode_positions(p))
+                            .unwrap_or_default();
+                        ins.execute(params![term, id, 0, ttf_v, blob])?;
+                    }
                 }
             }
         }
@@ -894,8 +929,8 @@ pub fn content_hash(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // SimHash-дедуп работает по поверхностным формам (без стемминга)
-    use crate::web::extract::web_tokenize;
+    // SimHash-дедуп: токены — как в upsert (tokenize_stem, v2.0)
+    use crate::web::stem::tokenize_stem;
 
     fn doc(url: &str, title: &str, text: &str, links: Vec<&str>) -> WebDoc {
         WebDoc {
@@ -1070,19 +1105,17 @@ mod tests {
 
     #[test]
     fn simhash_duplicate_detection() {
+        // v2.0: simhash в upsert считается по СТЕММИРОВАННЫМ токенам
+        // (tokenize_stem, тот же путь что и термы) — тест использует его же.
         let mut ix = ix();
         let body = "the same long article body with many unique words like "
             .repeat(3);
-        ix.upsert_page(&doc(
-            "https://a.io/original",
-            "Original",
-            &format!("{body} alpha beta gamma delta epsilon zeta"),
-            vec![],
-        ))
-        .unwrap();
-        let toks = web_tokenize(&format!("{body} alpha beta gamma delta epsilon zeta"));
+        let text = format!("{body} alpha beta gamma delta epsilon zeta");
+        ix.upsert_page(&doc("https://a.io/original", "Original", &text, vec![]))
+            .unwrap();
+        let toks = tokenize_stem(&text);
         assert!(ix.find_duplicate("https://a.io/copy", &toks).is_some());
-        let other = web_tokenize("completely different content about gardening tools");
+        let other = tokenize_stem("completely different content about gardening tools");
         assert!(ix.find_duplicate("https://a.io/other", &other).is_none());
     }
 

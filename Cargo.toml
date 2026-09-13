@@ -63,6 +63,15 @@ globset = "0.4"
 # aho-corasick/regex/memchr/ignore/rayon уже стояли в дереве (grep-слой
 # собирается из готовых блоков — см. docs/native-retrieval-analysis.md)
 
+# v2.0 Foundation (Приоритет 2, PLAN_POLER_V2): бесплатные победы.
+# whatlang — определение языка (75 языков, байт-граммы с трешолдом уверенности);
+# rust-stemmers — Snowball-стеммеры (18 языков): латиница индексируется/запрашивается
+# через English Snowball, кириллица остаётся на проверенном кастомном uk+ru стеммере;
+# unicode-segmentation — UAX#29 word boundaries (правильные слова для CJK/апострофов).
+whatlang = "0.16"
+rust-stemmers = "1.2"
+unicode-segmentation = "1.11"
+
 
 [dev-dependencies]
 tempfile = "3.10"
