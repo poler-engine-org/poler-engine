@@ -15,14 +15,10 @@
 //! * `poler_fetch`      — открыть любой URL в реальном Chromium (CDP):
 //!   JS/SPA/Shadow DOM рендерятся, скрытые JSON API перехватываются;
 //! * `poler_search`     — локальный резонансный POLER-поиск (ε/R/сцены);
-//! * `poler_gmail`      — поиск в Gmail владельца через OAuth-токен
-//!   (readonly, одноразовый `--google-auth`, пароль не проходит через движок);
-//! * `poler_drive`      — файлы Google Drive через тот же OAuth-токен;
-//! * `poler_nlm`        — ноутбуки NotebookLM владельца через персистентный
-//!   профиль (протокол batchexecute, разведан из расширения NLMTools):
-//!   ноутбуки/источники/заметки/Studio, чат с моделью ноутбука и
-//!   медиа-канал (то, что API NLMTools не отдаёт — скачивает профильный
-//!   Chromium: картинки слайдов, скриншоты страниц).
+//! * `poler_box_exec` / `poler_box_status` — контейнерный jail (gateway).
+//!
+//! v2.0 (sovereign stack): poler_gmail / poler_drive / poler_nlm удалены
+//! вместе с Google/NotebookLM-интеграциями.
 //!
 //! Chromium поднимается автоматически при первом poler_crawl/poler_fetch
 //! (см. `web::ensure_chromium`).
@@ -39,23 +35,11 @@ use crate::{Engine, EngineConfig};
 /// контекстного окна агента (полный текст лежит в кэш-файле).
 const FETCH_TEXT_CAP: usize = 24 * 1024;
 
-/// Cap raw-JSON (заметки/аккаунт NotebookLM) в ответе poler_nlm.
-const NLM_JSON_CAP: usize = 16 * 1024;
-
-/// Безопасно усечь строку по границе символов.
-fn cap_chars(s: &str, max: usize) -> (String, bool) {
-    if s.chars().count() <= max {
-        (s.to_string(), false)
-    } else {
-        (s.chars().take(max).collect(), true)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Аудит-фикс v0.21.0 (security hardening): ограждение MCP-инструментов.
 // Угроза: токен Bearer (туннель/логи/конфиг) даёт УДАЛЁННОМУ держателю
-// читать ЛЮБЫЕ локальные файлы (вкл. ~/.config/poler-engine/google_tokens.json
-// => угон Google-аккаунта) и ходить на внутренние адреса (SSRF).
+// читать ЛЮБЫЕ локальные файлы (секреты, ключи, конфиги) и ходить на
+// внутренние адреса (SSRF).
 // ---------------------------------------------------------------------------
 
 /// Чистая (без env) проверка: лежит ли канонический `path` внутри одного из
@@ -285,9 +269,6 @@ impl McpServer {
             "poler_search" => self.tool_local_search(&args),
             "poler_grep" => self.tool_grep(&args),
             "poler_chunk" => self.tool_chunk(&args),
-            "poler_gmail" => self.tool_gmail(&args),
-            "poler_drive" => self.tool_drive(&args),
-            "poler_nlm" => self.tool_nlm(&args),
             "poler_box_exec" => self.tool_box_exec(&args),
             "poler_box_status" => self.tool_box_status(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
@@ -640,234 +621,6 @@ impl McpServer {
     }
 
     // -----------------------------------------------------------------
-    // poler_gmail: Gmail владельца (OAuth readonly-токен)
-    // -----------------------------------------------------------------
-    fn tool_gmail(&self, args: &Value) -> Result<String, String> {
-        // v0.18.0: License Gate (Community-квота на интеграции).
-        if !crate::license::gate_or_print(crate::license::FEATURE_GMAIL) {
-            return Err("Community-лимит Gmail исчерпан (50/24ч); локальный поиск без лимитов".into());
-        }
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-        let max = max.clamp(1, 50);
-        let hits = crate::google::api::gmail_search(query, max)?;
-        if hits.is_empty() {
-            return Ok(format!(
-                "0 писем по «{query}». Синтаксис Gmail: from:, subject:, \
-                 has:attachment, newer_than:7d, is:unread…"
-            ));
-        }
-        Ok(crate::google::api::format_mail_hits(&hits, query))
-    }
-
-    // -----------------------------------------------------------------
-    // poler_drive: файлы Google Drive (OAuth readonly-токен)
-    // -----------------------------------------------------------------
-    fn tool_drive(&self, args: &Value) -> Result<String, String> {
-        // v0.18.0: License Gate (Community-квота на интеграции).
-        if !crate::license::gate_or_print(crate::license::FEATURE_DRIVE) {
-            return Err("Community-лимит Drive исчерпан (50/24ч); локальный поиск без лимитов".into());
-        }
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-        let max = max.clamp(1, 50);
-        let hits = crate::google::api::drive_list(query, max)?;
-        if hits.is_empty() {
-            return Ok(format!(
-                "0 файлов по «{query}» (пустой запрос — недавние файлы)"
-            ));
-        }
-        Ok(crate::google::api::format_drive_hits(&hits, query))
-    }
-
-    // -----------------------------------------------------------------
-    // poler_nlm: NotebookLM владельца (персистентный профиль, без пароля)
-    // -----------------------------------------------------------------
-    fn tool_nlm(&self, args: &Value) -> Result<String, String> {
-        use crate::google::nlm::{self, NlmSession};
-
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or("аргумент action обязателен: notebooks | source | notes | artifacts | account | chat | media | shot | sync")?
-            .to_string();
-        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_owned);
-        let notebook_id = get("notebook_id");
-        let source_id = get("source_id");
-        let question = get("question");
-        let url = get("url");
-
-        match action.as_str() {
-            // ---- медиа-канал: профильный Chromium видит то, чего нет в API ----
-            "media" | "shot" => {
-                let url = url.ok_or_else(|| format!("action {action} требует аргумент url"))?;
-                if !url.starts_with("http://") && !url.starts_with("https://") {
-                    return Err(format!("url должен быть http(s)://…, получено: {url}"));
-                }
-                let mut s = NlmSession::open()?;
-                if action == "media" {
-                    let (bytes, ct) = s.fetch_media(&url)?;
-                    let path = nlm::save_media("poler-media", nlm::mime_ext(&ct), &bytes)?;
-                    Ok(format!(
-                        "медиа скачано профильным Chromium: {} ({} КБ, {})\nисточник: {url}\n\n\
-                         URL картинок слайдов приходит в action source (у контента с images).",
-                        path.display(),
-                        bytes.len() / 1024,
-                        ct
-                    ))
-                } else {
-                    s.load_page_raw(&url)?;
-                    let png = s.screenshot()?;
-                    let path = nlm::save_media("poler-shot", "png", &png)?;
-                    Ok(format!(
-                        "скриншот страницы: {} ({} КБ)\nстраница: {url}\n\n\
-                         PNG можно открыть или приложить к ответу владельцу — это канал \
-                         для контента, который текстовый batchexecute не отдаёт.",
-                        path.display(),
-                        png.len() / 1024
-                    ))
-                }
-            }
-
-            "notebooks" => {
-                let mut s = NlmSession::open()?;
-                let nbs = s.list_notebooks()?;
-                if nbs.is_empty() {
-                    return Ok(
-                        "0 ноутбуков у этого Google-аккаунта (создай на notebook.google.com)".to_string()
-                    );
-                }
-                Ok(format!(
-                    "NotebookLM: {} ноутбуков (аккаунт {}).\n\n{}\n\n\
-                     notebook_id нужен для action source/notes/artifacts/chat; source_id \
-                     и URL картинок — в списках источников выше.",
-                    nbs.len(),
-                    s.email.as_deref().unwrap_or("?"),
-                    nlm::format_notebooks(&nbs)
-                ))
-            }
-
-            "source" => {
-                let nb = notebook_id
-                    .ok_or("action source требует notebook_id (см. action notebooks)")?;
-                let src = source_id
-                    .ok_or("action source требует source_id (см. источники в action notebooks)")?;
-                let mut s = NlmSession::open()?;
-                let sc = s.load_source(&nb, &src)?;
-                Ok(nlm::format_source_content(&sc, &nb))
-            }
-
-            "notes" => {
-                let nb = notebook_id.ok_or("action notes требует notebook_id")?;
-                let mut s = NlmSession::open()?;
-                let v = s.notes(&nb)?;
-                let pretty = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-                let (out, truncated) = cap_chars(&pretty, NLM_JSON_CAP);
-                Ok(format!(
-                    "Заметки ноутбука {nb} (raw-JSON):\n\n{out}{}",
-                    if truncated { "\n…(обрезано для контекстного окна)" } else { "" }
-                ))
-            }
-
-            "artifacts" => {
-                let nb = notebook_id.ok_or("action artifacts требует notebook_id")?;
-                let mut s = NlmSession::open()?;
-                let arts = s.artifacts(&nb)?;
-                if arts.is_empty() {
-                    return Ok(
-                        "Studio пусто: у ноутбука нет аудио-обзоров/отчётов/квизов/миндмэпов".to_string()
-                    );
-                }
-                Ok(format!(
-                    "Studio-объекты ноутбука {nb}:\n\n{}",
-                    nlm::format_artifacts(&arts)
-                ))
-            }
-
-            "account" => {
-                let mut s = NlmSession::open()?;
-                let v = s.account()?;
-                let pretty = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-                let (out, truncated) = cap_chars(&pretty, NLM_JSON_CAP);
-                Ok(format!(
-                    "Аккаунт NotebookLM (raw-JSON):\n\n{out}{}",
-                    if truncated { "\n…(обрезано)" } else { "" }
-                ))
-            }
-
-            "chat" => {
-                let nb = notebook_id.ok_or("action chat требует notebook_id")?;
-                let q = question.ok_or("action chat требует question")?;
-                eprintln!("poler-mcp: nlm chat notebook={nb} q={q:?} (до 90 с)");
-                let mut s = NlmSession::open()?;
-                let answer = s.chat(&nb, &q)?;
-                Ok(format!("NotebookLM-ответ по источникам ноутбука {nb}:\n\n{answer}"))
-            }
-
-            "sync" => {
-                // Синк NotebookLM в web-index: заметки/источники/артефакты
-                // становятся страницами в общем индексе; --web-search после
-                // sync пробивает NLM-корпус наравне с проползенным вебом.
-                use crate::google::nlm_ingest;
-                use crate::web::{WebIndex, default_db_path};
-                let db_path = std::env::var("POLER_WEB_DB")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| default_db_path());
-                let mut ix = WebIndex::open(&db_path)
-                    .map_err(|e| format!("web-index {db_path:?}: {e}"))?;
-                let mut s = NlmSession::open()?;
-                Ok(match notebook_id {
-                    Some(nb) if !nb.is_empty() => {
-                        let nbs = s.list_notebooks().unwrap_or_default();
-                        let target = nbs.iter().find(|x| x.id == nb).cloned();
-                        match target {
-                            Some(nb_meta) => {
-                                let mut stats = nlm_ingest::IngestStats {
-                                    notebooks: 1,
-                                    ..Default::default()
-                                };
-                                if let Err(e) = nlm_ingest::ingest_notebook(&mut ix, &mut s, &nb_meta, &mut stats) {
-                                    stats.errors.push(format!("ingest_notebook {nb}: {e}"));
-                                }
-                                let _ = ix.recompute_pagerank(20);
-                                format!(
-                                    "NLM sync (notebook {nb}): {} страниц ({} new/changed, {} unchanged).                                      Ошибок: {}. После sync используй poler_web_search — NLM-корпус                                      влит в общий индекс (URL вида nlm://notebook/{nb}/…).",
-                                    stats.total_pages(),
-                                    stats.total_reindexed(),
-                                    stats.total_unchanged(),
-                                    stats.errors.len(),
-                                )
-                            }
-                            None => format!("ноутбук {nb} не найден в аккаунте (см. action notebooks)"),
-                        }
-                    }
-                    _ => {
-                        let stats = nlm_ingest::sync_all(&mut ix, &mut s)?;
-                        format!(
-                            "NLM sync (all): {} notebooks processed, {} страниц ({} new/changed,                              {} unchanged by Percolator-lite). Ошибок: {}.                              После sync используй poler_web_search — NLM-корпус влит в общий индекс.",
-                            stats.notebooks,
-                            stats.total_pages(),
-                            stats.total_reindexed(),
-                            stats.total_unchanged(),
-                            stats.errors.len(),
-                        )
-                    }
-                })
-            }
-
-            other => Err(format!(
-                "неизвестный action: {other} (доступны notebooks | source | notes | artifacts | account | chat | media | shot | sync)"
-            )),
-        }
-    }
-
-    // -----------------------------------------------------------------
     // poler_box_exec (v0.26.0): двухконтурный брокер — команда агента
     // судится sandbox-судьёй и исполняется ВНУТРИ изолированного
     // контейнера (runner → box), результат возвращается текстом.
@@ -1185,66 +938,6 @@ RAG-конвейера chunking→retrieve: нарежь документ, пр�
                     "json": {"type": "boolean", "default": false, "description": "Машинно-читаемый отчёт вместо текста"}
                 },
                 "required": ["path"]
-            }
-        }),
-        json!({
-            "name": "poler_gmail",
-            "description": "Поиск в Gmail владельца (OAuth 2.0, скоуп gmail.readonly — \
-только чтение). Запрос — нативный синтаксис Gmail: from:vasya, subject:отчёт, \
-has:attachment, newer_than:7d, is:unread, слова И-комбинируются. \
-Требует одноразовой авторизации владельца: poler-engine --google-auth \
-(пароль остаётся в браузере владельца, движок видит только токен).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Gmail-запрос; пусто — недавняя почта"},
-                    "max": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50}
-                },
-                "required": []
-            }
-        }),
-        json!({
-            "name": "poler_drive",
-            "description": "Файлы Google Drive владельца (OAuth 2.0, drive.readonly): \
-поиск по имени (пустой запрос — недавние). Возвращает имя, тип, размер, \
-дату изменения, прямую ссылку и file-id. Требует одноразовой авторизации \
-владельца: poler-engine --google-auth.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Часть имени файла; пусто — недавние"},
-                    "max": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50}
-                },
-                "required": []
-            }
-        }),
-        json!({
-            "name": "poler_nlm",
-            "description": "Ноутбуки NotebookLM владельца — БЕЗ пароля: движок говорит \
-на внутреннем протоколе NotebookLM (batchexecute, разведан из расширения \
-NLMTools) через персистентный профиль Chromium (одноразовый ручной логин: \
-poler-engine --google-browse https://notebook.google.com/). Действия (action): \
-notebooks — все ноутбуки с источниками (id, заголовки, типы, URL); source — \
-текст источника или URL картинок слайдов (медиа!); notes — сохранённые \
-заметки; artifacts — Studio-объекты (аудио-обзоры, отчёты, квизы, миндмэпы); \
-account — профиль аккаунта; chat — вопрос к модели ноутбука ПО ЕГО \
-ИСТОЧНИКАМ (RAG владельца, не общая модель); media — скачать медиа-URL \
-(картинки из source) в файл; shot — скриншот любой страницы NotebookLM \
-(медиа-канал: то, что текстовый API не отдаёт).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["notebooks", "source", "notes", "artifacts", "account", "chat", "media", "shot", "sync"],
-                        "description": "Режим работы"
-                    },
-                    "notebook_id": {"type": "string", "description": "id ноутбука — из action notebooks"},
-                    "source_id": {"type": "string", "description": "id источника — из списка источников ноутбука"},
-                    "question": {"type": "string", "description": "Вопрос для action chat (по источникам ноутбука)"},
-                    "url": {"type": "string", "description": "http(s)://… — медиа-URL (action media) или страница (action shot)"}
-                },
-                "required": ["action"]
             }
         }),
         json!({

@@ -1,8 +1,10 @@
 //! # Terminal Gateway: управление сервисным слоем (v0.22.0)
 //!
 //! `poler service start/stop/status/restart [name]` + `poler attach` —
-//! нижний слой (Service Substrate: MCP-HTTP, WebLens, Auth Companion)
+//! нижний слой (Service Substrate: MCP-HTTP, WebLens)
 //! управляется из единого терминального шлюза.
+//!
+//! v2.0: сервис Auth Companion удалён вместе с Google-интеграцией.
 //!
 //! Состояние: `~/.local/state/poler-engine/services/<name>.json` (+pid),
 //! логи: `~/.local/state/poler-engine/logs/<name>.log`. Сервис стартует
@@ -45,13 +47,6 @@ const SERVICES: &[ServiceDef] = &[
         args: |bind| vec!["--web-lens".into(), bind.to_string()],
         token_env: false, // токен WebLens управляется самим weblens-модулем (0600)
         default_bind: "127.0.0.1:8765",
-    },
-    ServiceDef {
-        name: "companion",
-        desc: "Auth Companion: изолированное окно логина Google (снапшот сессии 0600)",
-        args: |_bind| vec!["--auth-ui".into()],
-        token_env: false,
-        default_bind: "",
     },
 ];
 
@@ -446,7 +441,7 @@ mod tests {
         let names = service_names();
         assert!(names.contains(&"mcp"));
         assert!(names.contains(&"weblens"));
-        assert!(names.contains(&"companion"));
+        assert!(!names.contains(&"companion"), "v2.0: Auth Companion удалён");
     }
 
     #[test]
@@ -454,7 +449,7 @@ mod tests {
         let m = unknown_service("zzz");
         assert!(m.contains("mcp"));
         assert!(m.contains("weblens"));
-        assert!(m.contains("companion"));
+        assert!(!m.contains("companion"), "v2.0: Auth Companion удалён");
     }
 
     #[test]

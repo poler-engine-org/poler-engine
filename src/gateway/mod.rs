@@ -5,7 +5,7 @@
 //! исполнения:
 //!
 //! 1. **Engine Native (приоритет)** — команды движка (`search`, `grep`,
-//!    `chunk`, `crawl`, `nlm`, `notes`, `weblens`, `impact`, `benchmark`…)
+//!    `chunk`, `crawl`, `notes`, `weblens`, `impact`, `benchmark`…)
 //!    исполняются внутри процесса, без спавна внешних шеллов;
 //! 2. **Controlled Host OS Proxy** — прочие команды идут в хостовую ОС
 //!    через Sandboxed OS Subshell: блок деструктивного, подтверждение
@@ -45,8 +45,9 @@ fn stdout_is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
-/// Баннер запуска: версия, тир лицензии (Ed25519-гейт v0.18.0),
-/// EULA-условия (v0.22.0), контуры + PTY (v0.23.0).
+/// Баннер запуска: версия, EULA-условия (Source-Available),
+/// контуры + PTY.
+/// v2.0: тир лицензии удалён вместе с Ed25519-гейтом.
 pub fn banner() -> String {
     let tty = stdout_is_tty();
     let (bold, dim, cyan, reset) = if tty {
@@ -54,23 +55,16 @@ pub fn banner() -> String {
     } else {
         ("", "", "", "")
     };
-    let st = crate::license::status();
-    let tier = match st.tier {
-        crate::license::Tier::Trial => format!("Trial ({} дн.)", st.trial_days_left),
-        crate::license::Tier::Community => "Community".to_string(),
-        crate::license::Tier::Pro => "Pro".to_string(),
-        crate::license::Tier::Enterprise => "Enterprise".to_string(),
-    };
     let mut s = String::new();
     s.push_str(&format!(
         "{bold}POLER Engine {} — Terminal Gateway{reset}\n",
         env!("CARGO_PKG_VERSION")
     ));
-    s.push_str(&format!("{cyan}Лицензия: {tier}.{reset} {}\n", crate::license::eula_banner_line()));
+    s.push_str(&format!("{cyan}Лицензия: Sovereign (v2.0).{reset} {}\n", crate::license::eula_banner_line()));
     s.push('\n');
     s.push_str("Контуры исполнения:\n");
     s.push_str(&format!(
-        "  1 {bold}engine-native{reset} — search · grep · chunk · crawl · impact · nlm · notes · benchmark …\n"
+        "  1 {bold}engine-native{reset} — search · grep · chunk · crawl · impact · notes · benchmark …\n"
     ));
     s.push_str(&format!(
         "  2 {dim}host-os-proxy{reset} — системные команды в sandbox (деструктивное блокируется)\n"

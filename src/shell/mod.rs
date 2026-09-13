@@ -1,4 +1,4 @@
-//! # poler-shell v0.15.0 — интерактивный терминал poler-engine
+//! # poler-shell — интерактивный терминал poler-engine
 //!
 //! Две поверхности для человеческого удобства поверх существующих режимов
 //! движка (ядро `poler_engine::*` не трогается):
@@ -7,32 +7,29 @@
 //!    с Tab-completion и историей `↑/↓`, без перезапуска процесса:
 //!    ```text
 //!    poler> search "Касіопея Astra-Nic" --top 5
-//!    poler> nlm ask 704f2610... "Параметры Планковской геодезической"
-//!    poler> nlm sync 704f2610...
 //!    poler> stats
 //!    poler> set format json
 //!    poler> quit
 //!    ```
-//! 2. **TUI Dashboard `poler-engine --tui`** (ratatui + crossterm) — 3-панельный
-//!    layout: левая (ноутбуки), правая верх (поле ввода), правая нижняя
-//!    (результаты с прокруткой). Tab — смена фокуса, Esc — выход.
+//! 2. **TUI Dashboard `poler-engine --tui`** (ratatui + crossterm) — layout:
+//!    центр (chat + ввод), правая колонка (notes + sources).
+//!    Tab — смена фокуса, Esc — выход.
 //!
-//! ## Архитектурные инварианты v0.15.0
+//! ## Архитектурные инварианты
 //!
-//! - **Ноль изменений в ядре** — `poler_engine::*` остаётся как в v0.14.0.
-//!   Shell только заимствует `WebIndex`/`NlmSession`/`nlm_ingest`/`nlm::*`
-//!   и форматирует вывод для человека.
-//! - **Ленивое открытие ресурсов** — `WebIndex` и `NlmSession` открываются
-//!   только при первом использовании (первый `search`/`stats` открывает БД,
-//!   первый `nlm list/notes/...` открывает RPC-сессию). После этого
-//!   переиспользуются до выхода из шелла.
+//! - **Ноль изменений в ядре** — `poler_engine::*` остаётся как есть.
+//!   Shell только заимствует `WebIndex` и форматирует вывод для человека.
+//! - **Ленивое открытие ресурсов** — `WebIndex` открывается только при
+//!   первом использовании (первый `search`/`stats` открывает БД). После
+//!   этого переиспользуется до выхода из шелла.
 //! - **История команд** сохраняется в `~/.cache/poler-engine/shell-history.txt`
 //!   (до 2000 команд, max_history по умолчанию в rustyline).
-//! - **MCP `poler_nlm` 9 actions** из v0.14.0 остаются как есть (shell не
-//!   трогает MCP-сервер).
+//!
+//! v2.0: NLM/Google-интеграции удалены (суверенный стек) — см. PLAN_POLER_V2.
 
 pub mod commands;
 pub mod completer;
+pub mod confirm;
 pub mod doc_browser;
 pub mod help;
 pub mod mouse;
@@ -44,6 +41,28 @@ pub use commands::{dispatch, run_shell, tokenize, CmdResult};
 pub use state::{ShellState, OutputFormat};
 pub use tui::run_tui;
 
+/// Тихо открыть URL в браузере пользователя (xdg-open и аналоги).
+/// В песочнице/SSH xdg-open может отсутствовать — тогда URL просто
+/// печатается в терминал вызывающим кодом.
+///
+/// v2.0: перенесено из `google/mod.rs` при отвязке от Google — утилита
+/// общесистемная (открыть источник/ссылку), к облачным сервисам отношения
+/// не имеет.
+pub fn open_in_user_browser(url: &str) {
+    for opener in ["xdg-open", "sensible-browser", "x-www-browser"] {
+        if std::process::Command::new(opener)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;
@@ -51,8 +70,8 @@ mod integration_tests {
 
     #[test]
     fn tokenize_handles_quoted_args() {
-        let t = tokenize("nlm ask 704f \"вопрос с пробелами\"");
-        assert_eq!(t, vec!["nlm", "ask", "704f", "вопрос с пробелами"]);
+        let t = tokenize("search \"запрос с пробелами\" --top 5");
+        assert_eq!(t, vec!["search", "запрос с пробелами", "--top", "5"]);
     }
 
     #[test]

@@ -688,7 +688,6 @@ impl CdpSession {
     }
 
     /// Graceful-остановка браузера (CDP `Browser.close`).
-    /// Используется --google-browse: headless-инстанс уступает место оконному.
     pub fn close_browser(&mut self) -> Result<(), String> {
         self.command("Browser.close", "{}").map(|_| ())
     }

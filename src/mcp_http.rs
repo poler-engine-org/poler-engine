@@ -1,6 +1,6 @@
 //! MCP-сервер поверх HTTP (Streamable HTTP transport): тот же набор
 //! инструментов, что и в stdio-режиме (`--mcp`), но доступный УДАЛЁННОМУ
-//! агенту через туннель — без передачи паролей/куков Google наружу.
+//! агенту через туннель.
 //!
 //! `poler-engine --mcp-http 127.0.0.1:8765 --mcp-token <секрет>`
 //!
@@ -8,8 +8,8 @@
 //!   * Bearer-токен обязателен для POST / и /mcp (без него — 401);
 //!   * токен задаётся `--mcp-token`, env `POLER_MCP_TOKEN` или
 //!     генерируется при старте (32 hex из /dev/urandom);
-//!   * пароли/куки Google НЕ покидают машину: движок ходит в NotebookLM
-//!     своим персистентным профилем и отдаёт агенту только результаты;
+//!   * движок полностью локален (v2.0 sovereign stack): наружу идут
+//!     только ответы на MCP-запросы агента;
 //!   * наружу публикуется через туннель, например quick-tunnel
 //!     без аккаунта: `cloudflared tunnel --url http://127.0.0.1:8765`.
 //!
@@ -21,7 +21,7 @@
 //!
 //! Сеть: ручной HTTP/1.1 поверх std::net — ноль новых зависимостей,
 //! keep-alive + Expect: 100-continue (curl шлёт его на больших телах),
-//! поток на соединение (NLM-chat занимает до 90 с — акцептор не блокируется).
+//! поток на соединение (долгие инструменты не блокируют акцептор).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -621,27 +621,31 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_contains_nlm_and_fetch() {
+    fn tools_list_contains_grep_and_fetch() {
         let addr = start_server();
         let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = http(
             &addr,
             &format!("POST / HTTP/1.1\r\nHost: t\r\n{AUTH}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
         );
-        assert!(resp.contains("poler_nlm"), "{resp}");
+        assert!(resp.contains("poler_grep"), "{resp}");
         assert!(resp.contains("poler_fetch"), "{resp}");
+        assert!(resp.contains("poler_web_search"), "{resp}");
+        assert!(!resp.contains("poler_nlm"), "v2.0: NLM-инструмент удалён");
+        assert!(!resp.contains("poler_gmail"), "v2.0: Gmail-инструмент удалён");
+        assert!(!resp.contains("poler_drive"), "v2.0: Drive-инструмент удалён");
     }
 
     #[test]
     fn tools_call_roundtrip() {
         let addr = start_server();
-        let body = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"poler_nlm","arguments":{"action":"notebooks"}}}"#;
+        let body = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"poler_grep","arguments":{"pattern":"nonexistent-pattern-xyz","path":"."}}}"#;
         let resp = http(
             &addr,
             &format!("POST /mcp HTTP/1.1\r\nHost: t\r\n{AUTH}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
         );
-        // в тестовой среде нет Google-профиля → isError:true, но сам канал работает
-        assert!(resp.contains(r#""isError":"#), "{resp}");
+        // локальный grep выполняется без внешних зависимостей — канал работает
+        assert!(resp.contains(r#""isError":false"#), "{resp}");
         assert!(resp.contains(r#""content":"#), "{resp}");
     }
 

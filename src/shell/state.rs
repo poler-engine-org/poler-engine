@@ -1,18 +1,19 @@
 //! Shell-state: shared state for the interactive `poler>` REPL and `--tui`
-//! Dashboard. Holds lazily-opened `WebIndex` + `NlmSession` so multiple
-//! commands in one session reuse the same DB connection and NLM RPC session
-//! (saves ~1 s per command over the standalone CLI dispatch).
+//! Dashboard. Holds lazily-opened `WebIndex` so multiple commands in one
+//! session reuse the same DB connection (saves ~1 s per command over the
+//! standalone CLI dispatch).
 //!
-//! Архитектурный инвариант v0.15.0: ядро движка (`poler_engine::*`) не
+//! Архитектурный инвариант: ядро движка (`poler_engine::*`) не
 //! трогается — `Shell` только собирает указатели на существующие функции
 //! и форматирует вывод.
+//!
+//! v2.0 (sovereign stack): NlmSession удалён вместе с Google/NotebookLM.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::google::nlm::NlmSession;
 use crate::web::WebIndex;
-use crate::notes::{self, NoteSource};
+use crate::notes;
 use crate::sources;
 
 /// Путь к каталогу кэша poler-engine (`~/.cache/poler-engine/`).
@@ -29,16 +30,13 @@ pub fn history_path() -> PathBuf {
 /// Состояние одной интерактивной сессии `poler-shell`.
 ///
 /// `db_path` фиксируется при запуске (по умолчанию
-/// `crate::web::default_db_path()`); `WebIndex` и `NlmSession`
-/// открываются **лениво** — первый `search`/`stats`/`nlm sync` открывает БД,
-/// первый `nlm list/notes/...` открывает RPC-сессию. После этого
-/// переиспользуются до выхода из шелла.
+/// `crate::web::default_db_path()`); `WebIndex` и соединения к
+/// notes/sources открываются **лениво** — первый `search`/`stats` открывает
+/// БД. После этого переиспользуются до выхода из шелла.
 pub struct ShellState {
     db_path: PathBuf,
     /// Ленимо открываемый web-index. None = ещё не открывали.
     ix: Option<WebIndex>,
-    /// Ленимо открываемая сессия NotebookLM. None = ещё не открывали.
-    nlm: Option<NlmSession>,
     /// Ленимо открываемое соединение к poler_notes (та же БД, другая таблица).
     notes_conn: Option<rusqlite::Connection>,
     /// Ленимо открываемое соединение к poler_sources (та же БД).
@@ -49,10 +47,6 @@ pub struct ShellState {
     pub top: usize,
     /// Последний ответ команды (для TUI: правая нижняя панель показывает это).
     pub last_output: String,
-    /// v0.17.0: Последний ответ `nlm ask` для Ctrl+S → notes::add_note(source=ai-reply).
-    pub last_ai_reply: Option<(String, Option<String>)>,
-    /// v0.17.0: ID текущего активного ноутбука (после клика в TUI).
-    pub active_notebook_id: Option<String>,
 }
 
 /// Формат вывода, как в CLI `--format`.
@@ -75,14 +69,11 @@ impl ShellState {
         Self {
             db_path,
             ix: None,
-            nlm: None,
             notes_conn: None,
             sources_conn: None,
             format: OutputFormat::default(),
             top: 10,
             last_output: String::new(),
-            last_ai_reply: None,
-            active_notebook_id: None,
         }
     }
 
@@ -98,20 +89,16 @@ impl ShellState {
             vec![
                 "help", "quit", "exit", "?",
                 "search", "web", "stats",
-                "nlm", "sync",
                 "crawl", "impact",
                 "set", "version",
                 // v0.16.0: Unified VCS & Data Mesh
                 "gh", "gl", "gt", "gix",
                 // v0.17.0: Notes & Sources CRUD
                 "notes", "sources",
+                // v0.16.0: vcs-sync alias
+                "sync",
             ]
         })
-    }
-
-    /// Подкоманды `nlm ...` для Tab-completion.
-    pub fn nlm_subcommands() -> &'static [&'static str] {
-        &["list", "notes", "notes-sync", "artifacts", "source", "account", "ask", "sync", "shot", "media"]
     }
 
     /// v0.16.0: Подкоманды `gh`/`gl`/`gt` (одинаковые для всех REST-адаптеров).
@@ -136,7 +123,7 @@ impl ShellState {
 
     /// v0.17.0: Подкоманды `notes ...` для Tab-completion.
     pub fn notes_subcommands() -> &'static [&'static str] {
-        &["list", "add", "show", "edit", "rm", "save-from-ai"]
+        &["list", "add", "show", "edit", "rm"]
     }
 
     /// v0.17.0: Подкоманды `sources ...` для Tab-completion.
@@ -157,15 +144,6 @@ impl ShellState {
             self.ix = Some(ix);
         }
         Ok(self.ix.as_mut().expect("ix just set"))
-    }
-
-    /// Заимствовать `&mut NlmSession`, открыв ленимо если нужно.
-    pub fn ensure_nlm(&mut self) -> Result<&mut NlmSession, String> {
-        if self.nlm.is_none() {
-            let s = NlmSession::open().map_err(|e| format!("NlmSession::open: {e}"))?;
-            self.nlm = Some(s);
-        }
-        Ok(self.nlm.as_mut().expect("nlm just set"))
     }
 
     /// Установить формат вывода по имени.
@@ -198,101 +176,6 @@ impl ShellState {
             self.sources_conn = Some(sources::open(&self.db_path)?);
         }
         Ok(self.sources_conn.as_mut().expect("sources_conn just set"))
-    }
-
-    /// v0.17.0: Запомнить последний ответ `nlm ask` для последующего Ctrl+S.
-    /// Аргументы: (ответ, опц. notebook_id).
-    pub fn remember_ai_reply(&mut self, reply: impl Into<String>, notebook_id: Option<String>) {
-        self.last_ai_reply = Some((reply.into(), notebook_id));
-    }
-
-    /// v0.17.0: Сохранить последний AI-ответ как заметку (source=ai-reply).
-    /// Возвращает id новой заметки.
-    pub fn save_last_ai_reply_as_note(&mut self, title: &str) -> Result<i64, String> {
-        let (reply, nb) = self
-            .last_ai_reply
-            .clone()
-            .ok_or_else(|| "нет последнего AI-ответа (сначала выполните `nlm ask`)".to_string())?;
-        let conn = self.ensure_notes_conn()?;
-        notes::add_note(
-            conn,
-            title,
-            &reply,
-            &["ai-reply".into()],
-            NoteSource::AiReply,
-            nb.as_deref(),
-        )
-    }
-
-    /// v0.17.0: Установить активный ноутбук (после клика в TUI).
-    pub fn set_active_notebook(&mut self, id: Option<String>) {
-        self.active_notebook_id = id;
-    }
-
-    /// v0.17.0: Получить активный ноутбук.
-    pub fn active_notebook(&self) -> Option<&str> {
-        self.active_notebook_id.as_deref()
-    }
-}
-
-
-
-impl ShellState {
-    /// Одномоментно заимствовать `&mut WebIndex` и `&mut NlmSession` для
-    /// команд, которым нужны оба (например, `nlm sync`). Обходит ошибку
-    /// borrow-checker'а "cannot borrow state as mut twice" — внутри closure
-    /// оба `&mut` живут одновременно.
-    ///
-    /// Лениво открывает ресурсы при необходимости. Если один открылся, а
-    /// второй нет — оставляет первый открытым для последующих команд.
-    pub fn with_nlm_index<R, E>(
-        &mut self,
-        f: impl FnOnce(&mut WebIndex, &mut NlmSession) -> Result<R, E>,
-    ) -> Result<R, E>
-    where
-        E: From<String>,
-    {
-        if self.ix.is_none() {
-            match WebIndex::open(&self.db_path) {
-                Ok(i) => self.ix = Some(i),
-                Err(e) => return Err(format!("web-index {:?}: {e}", self.db_path).into()),
-            }
-        }
-        if self.nlm.is_none() {
-            match NlmSession::open() {
-                Ok(n) => self.nlm = Some(n),
-                Err(e) => return Err(format!("NlmSession::open: {e}").into()),
-            }
-        }
-        // take + put-back patern: безопасно получаем два &mut одновременно
-        let mut ix = self.ix.take().expect("ix just ensured");
-        let mut nlm = self.nlm.take().expect("nlm just ensured");
-        let r = f(&mut ix, &mut nlm);
-        self.ix = Some(ix);
-        self.nlm = Some(nlm);
-        r
-    }
-
-    /// Одномоментно заимствовать `&mut NlmSession` и `&mut Connection`
-    /// (poler_notes) для синхронизации заметок (`nlm notes-sync`, TUI).
-    /// Тот же take + put-back паттерн, что [`Self::with_nlm_index`].
-    pub fn with_nlm_notes<R>(
-        &mut self,
-        f: impl FnOnce(&mut NlmSession, &mut rusqlite::Connection) -> Result<R, String>,
-    ) -> Result<R, String> {
-        if self.nlm.is_none() {
-            let n = NlmSession::open().map_err(|e| format!("NlmSession::open: {e}"))?;
-            self.nlm = Some(n);
-        }
-        if self.notes_conn.is_none() {
-            self.notes_conn = Some(notes::open(&self.db_path)?);
-        }
-        let mut nlm = self.nlm.take().expect("nlm just ensured");
-        let mut conn = self.notes_conn.take().expect("notes_conn just ensured");
-        let r = f(&mut nlm, &mut conn);
-        self.nlm = Some(nlm);
-        self.notes_conn = Some(conn);
-        r
     }
 }
 
@@ -327,17 +210,9 @@ mod tests {
     fn commands_list_is_stable() {
         let cmds = ShellState::commands();
         assert!(cmds.contains(&"search"));
-        assert!(cmds.contains(&"nlm"));
+        assert!(cmds.contains(&"notes"));
         assert!(cmds.contains(&"quit"));
         assert!(cmds.contains(&"exit"));
-    }
-
-    #[test]
-    fn nlm_subcommands_complete_set() {
-        let sub = ShellState::nlm_subcommands();
-        assert!(sub.contains(&"list"));
-        assert!(sub.contains(&"notes"));
-        assert!(sub.contains(&"sync"));
-        assert!(sub.contains(&"ask"));
+        assert!(!cmds.contains(&"nlm"), "v2.0: nlm удалён");
     }
 }

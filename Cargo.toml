@@ -48,26 +48,17 @@ rustyline = "14"
 ureq = { version = "2.10", features = ["json"] }
 gix = { version = "0.66", default-features = false, features = ["blocking-http-transport-reqwest", "blocking-network-client", "worktree-mutation", "revision", "comfort"] }
 # v0.17.0: TUI Redesign (MiMo Code-style 4-pane + mouse + notes/sources CRUD)
-# v0.17.1: Companion Bridge — оф. NotebookLM Enterprise API как auxiliary I/O gateway
-# v0.17.2: (skipped — reserved marker; M2 real impl встроен в v0.17.3)
-# v0.17.3: Companion Bridge M2+M3+M4 — real GcpEnterpriseProvider calls + HybridProvider
-# v0.17.4: Transcript / Response View — лента чата nlm ask (окно F3 в TUI)
-#          routing+fallback + TUI Enter-handler на источнике + future-streaming-archives.md
-# v0.17.5: Security Hardening — confirmation gate (--yes/--dry-run) для write-операций,
-#          cookie-import только по явному согласию (--import-browser-session),
-#          shutdown headless-браузера при выходе, JSONL audit-лог (~/.config/poler-engine/audit.log)
-# v0.17.6: Auth Companion — --auth-ui: изолированное окно логина Google (Node.js
-#          scripts/auth-companion.js), снапшот сессии google_session.json (0600),
-#          No Host Snooping + Localhost Only + Auto-termination
-# arboard — системный буфер обмена (drag-select → Ctrl+Y копирование)
+# v0.17.5: Security Hardening — confirmation gate (--yes/--dry-run) для write-операций
+# v2.0 (sovereign stack): Google/NotebookLM/Gmail/Drive/OAuth удалены;
+# ed25519-dalek (License Gate) удалён вместе с гейтируемыми интеграциями —
+# локальные функции движка работают без ключей и лимитов.
+# arboard — системный буфер обмена (drag-select → Ctrl+Y копирование);
+# локальная утилита, оставлена (к облаку отношения не имеет)
 arboard = "3"
 # tui-textarea — встроенный редактор для Ctrl+N (новая заметка) прямо в TUI
 tui-textarea = "0.7"
 # globset — glob-паттерны для src/sources (фильтр по расширению/пути)
 globset = "0.4"
-# v0.18.0: License Gate — офлайн-проверка ed25519-подписей лицензий PO1
-# (приватный мастер-ключ — офлайн у владельца, license-tool/, в поставку не входит)
-ed25519-dalek = "2"
 # v0.20.0: Native Retrieval — grep-режим и RAG-чанки. НОВЫХ зависимостей нет:
 # aho-corasick/regex/memchr/ignore/rayon уже стояли в дереве (grep-слой
 # собирается из готовых блоков — см. docs/native-retrieval-analysis.md)
@@ -79,6 +70,7 @@ tempfile = "3.10"
 # Максимальная оптимизация: LTO по всему крейту, один CGU, strip символов.
 # Тесты гоняются в debug-профиле (`cargo test`), поэтому panic="abort"
 # в release не мешает тестовому харнессу.
+# v2.0 NOTE: RAM < 8GB → собирать с -j1 (codegen-units=1 + LTO тяжёлые).
 [profile.release]
 opt-level = 3
 lto = true

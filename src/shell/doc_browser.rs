@@ -11,11 +11,10 @@
 //! └────────────────┘              └──────────────┘              └────────────┘
 //! ```
 //!
-//! Три семейства источников:
+//! Локальные источники (v2.0: NLM-источники удалены вместе с Google):
 //!
 //! | Источник | Документы внутри |
 //! |---|---|
-//! | NLM-источник (ноутбук) | текст контента (RPC `hizoJc`) + слайды-медиа |
 //! | локальный `file`-каталог | файлы и подкаталоги (с «..» наверх) |
 //! | локальный `file`-файл | сам файл |
 //! | локальный `url` | страница (фетч `ureq` при открытии) |
@@ -28,7 +27,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::google::nlm::SourceContent;
 use crate::sources::{Source, SourceKind};
 
 /// Лимит тела документа для просмотрщика (2 МБ) — защита от гигантских
@@ -38,29 +36,18 @@ pub const MAX_DOC_BYTES: usize = 2 * 1024 * 1024;
 /// Максимум записей при листинге директории.
 pub const MAX_DIR_ENTRIES: usize = 500;
 
-/// Ссылка на источник в Sources panel — NLM или локальный (poler_sources).
+/// Ссылка на источник в Sources panel — локальный (poler_sources).
+/// v2.0: вариант `Nlm` удалён вместе с Google/NotebookLM.
 #[derive(Debug, Clone)]
 pub enum SourceRef {
-    /// Источник активного NLM-ноутбука.
-    Nlm {
-        nb_id: String,
-        src: crate::google::nlm::SourceMeta,
-    },
     /// Локальный источник из таблицы poler_sources.
     Local { src: Source },
 }
 
 /// Что открывает Doc Viewer, когда на документе нажали Enter/клик.
+/// v2.0: варианты `NlmText`/`NlmMedia` удалены вместе с Google/NotebookLM.
 #[derive(Debug, Clone)]
 pub enum DocKind {
-    /// Текст NLM-источника — контент берётся из кэша TUI (ключ `nb/src`).
-    NlmText {
-        nb_id: String,
-        src_id: String,
-        url: Option<String>,
-    },
-    /// Медиа (слайд): в терминале только URL + «o — открыть в браузере».
-    NlmMedia { url: String },
     /// Локальный файл — чтение с диска при открытии.
     LocalFile { path: PathBuf },
     /// Каталог — клик drill-down'ом уходит в новый листинг.
@@ -86,8 +73,6 @@ pub struct DocEntry {
 /// Иконка документа для списка.
 pub fn doc_icon(kind: &DocKind) -> &'static str {
     match kind {
-        DocKind::NlmText { .. } => "📜",
-        DocKind::NlmMedia { .. } => "🖼",
         DocKind::LocalFile { .. } => "📄",
         DocKind::LocalDir { .. } => "📁",
         DocKind::WebPage { .. } => "🌐",
@@ -120,40 +105,6 @@ fn info_entry(text: impl Into<String>, open_url: Option<String>) -> DocEntry {
             open_url,
         },
     }
-}
-
-/// Список документов NLM-источника: текст (если есть) + слайды-медиа.
-pub fn nlm_documents(nb_id: &str, sc: &SourceContent, src_url: Option<&str>) -> Vec<DocEntry> {
-    let mut docs = Vec::new();
-    if let Some(text) = &sc.content {
-        if !text.trim().is_empty() {
-            docs.push(DocEntry {
-                title: sc.title.clone(),
-                hint: format!("текст • {} симв.", text.chars().count()),
-                kind: DocKind::NlmText {
-                    nb_id: nb_id.to_string(),
-                    src_id: sc.id.clone(),
-                    url: src_url.map(str::to_string),
-                },
-            });
-        }
-    }
-    for (i, img) in sc.images.iter().enumerate() {
-        docs.push(DocEntry {
-            title: format!("Слайд {}", i + 1),
-            hint: "медиа".into(),
-            kind: DocKind::NlmMedia {
-                url: img.url.clone(),
-            },
-        });
-    }
-    if docs.is_empty() {
-        docs.push(info_entry(
-            "У источника нет ни текста, ни медиа (пустой ответ hizoJc).",
-            src_url.map(str::to_string),
-        ));
-    }
-    docs
 }
 
 /// Список документов локального источника (poler_sources).
@@ -609,53 +560,6 @@ mod tests {
         );
     }
 
-    // ---- nlm_documents ----
-
-    #[test]
-    fn nlm_documents_text_and_slides() {
-        let sc = SourceContent {
-            id: "src-1".into(),
-            title: "Мой PDF".into(),
-            kind: "PDF".into(),
-            content: Some("текст источника".into()),
-            images: vec![
-                crate::google::nlm::ImageRef {
-                    url: "https://lh3.googleusercontent.com/slide1".into(),
-                    id: None,
-                },
-                crate::google::nlm::ImageRef {
-                    url: "https://lh3.googleusercontent.com/slide2".into(),
-                    id: None,
-                },
-            ],
-        };
-        let docs = nlm_documents("nb-1", &sc, Some("https://example.com/doc"));
-        assert_eq!(docs.len(), 3);
-        assert_eq!(docs[0].title, "Мой PDF");
-        assert!(docs[0].hint.contains("симв."));
-        let DocKind::NlmText { nb_id, src_id, url } = &docs[0].kind else {
-            panic!()
-        };
-        assert_eq!((nb_id.as_str(), src_id.as_str()), ("nb-1", "src-1"));
-        assert_eq!(url.as_deref(), Some("https://example.com/doc"));
-        assert!(matches!(&docs[1].kind, DocKind::NlmMedia { url } if url.contains("slide1")));
-        assert_eq!(docs[1].title, "Слайд 1");
-    }
-
-    #[test]
-    fn nlm_documents_empty_is_info() {
-        let sc = SourceContent {
-            id: "src-2".into(),
-            title: "Пустой".into(),
-            kind: "Текст".into(),
-            content: None,
-            images: vec![],
-        };
-        let docs = nlm_documents("nb-1", &sc, None);
-        assert_eq!(docs.len(), 1);
-        assert!(matches!(docs[0].kind, DocKind::Info { .. }));
-    }
-
     // ---- read_local_document ----
 
     #[test]
@@ -760,15 +664,6 @@ mod tests {
             }),
             "ℹ"
         );
-        assert_eq!(
-            doc_icon(&DocKind::NlmText {
-                nb_id: String::new(),
-                src_id: String::new(),
-                url: None
-            }),
-            "📜"
-        );
-        assert_eq!(doc_icon(&DocKind::NlmMedia { url: String::new() }), "🖼");
     }
 
     #[test]

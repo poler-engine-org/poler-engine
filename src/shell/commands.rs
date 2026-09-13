@@ -5,12 +5,10 @@
 //! Синтаксис:
 //! ```text
 //! poler> search "Касіопея Astra-Nic Complex" --top 5
-//! poler> nlm list
-//! poler> nlm notes 704f2610-c02b-4ec1-9fc7-a3b72dde2af1
-//! poler> nlm ask 704f2610... "вопрос"
-//! poler> nlm sync                       # синк всех ноутбуков
-//! poler> nlm sync 704f2610...           # синк одного
 //! poler> stats                          # статистика web-index
+//! poler> crawl https://example.com      # обход сайта в индекс
+//! poler> sync vcs gh kotokvit           # синк VCS в индекс
+//! poler> notes add "Идея"               # локальные заметки
 //! poler> set format json                # переключить формат
 //! poler> set top 20                     # топ-K по умолчанию
 //! poler> help                           # список команд
@@ -20,8 +18,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::google::nlm;
-use crate::google::nlm_ingest;
 use crate::notes;
 use crate::sources;
 use crate::vcs::VcsAdapter;
@@ -81,7 +77,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "" => CmdResult::Empty,
         "quit" | "exit" | "q" => CmdResult::Quit,
         "help" | "?" => {
-            // v0.17.0: `help` без аргументов → overview; `help nlm ask` → детальная справка
+            // `help` без аргументов → overview; `help <topic>` → детальная справка
             if args.is_empty() {
                 CmdResult::Done(help::help_overview())
             } else {
@@ -90,12 +86,11 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
             }
         }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.17.6 — Auth Companion: --auth-ui изолированное окно логина Google + снапшот google_session.json; + Security Hardening: confirmation gate, cookie-import по согласию, shutdown headless, audit-лог)",
+            "poler-engine {} (poler-shell — v2.0 sovereign stack: без Google/NotebookLM, локальный поиск без лимитов)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
         "stats" => cmd_stats(state),
-        "nlm" => cmd_nlm(state, args),
         // v0.16.0: alias для subкоманд vcs-sync: `sync vcs github owner`
         "sync" => cmd_sync(state, args),
         "set" => cmd_set(state, args),
@@ -165,8 +160,8 @@ fn cmd_search(state: &mut ShellState, args: &[String]) -> CmdResult {
     ));
     if hits.is_empty() {
         out.push_str("ничего не найдено. Подсказки:\n");
-        out.push_str("  - выполните `nlm sync` чтобы влить NotebookLM-корпус\n");
-        out.push_str("  - или `poler-engine --crawl <URL>` в соседнем окне чтобы наполнить вебом\n");
+        out.push_str("  - наполните индекс: `crawl <URL>` здесь или poler-engine --crawl <URL>\n");
+        out.push_str("  - локальные файлы ищет poler-engine <PATH> -q <QUERY> / --grep\n");
     } else {
         for (i, h) in hits.iter().enumerate() {
             out.push_str(&format_hit(i + 1, h, &query));
@@ -216,304 +211,7 @@ fn cmd_stats(state: &mut ShellState) -> CmdResult {
 }
 
 // ---------------------------------------------------------------------------
-// nlm ... — делегация в NlmSession + nlm_ingest
 // ---------------------------------------------------------------------------
-
-fn cmd_nlm(state: &mut ShellState, args: &[String]) -> CmdResult {
-    if args.is_empty() {
-        return CmdResult::Done(
-            "nlm: укажите подкоманду (list | notes | notes-sync | artifacts | source | account | ask | sync)".into(),
-        );
-    }
-    // v0.18.0: License Gate — единая точка для всех nlm-подкоманд shell/TUI.
-    if !crate::license::gate_or_print(crate::license::FEATURE_NLM) {
-        return CmdResult::Done(
-            "⛔ Community-лимит NotebookLM исчерпан. Статус: license (в shell) или poler-engine --license".into(),
-        );
-    }
-    let sub = args[0].as_str();
-    let rest = &args[1..];
-
-    match sub {
-        "list" | "notebooks" => {
-            let s = match state.ensure_nlm() {
-                Ok(s) => s,
-                Err(e) => return CmdResult::Done(format!("❌ {e}")),
-            };
-            match s.list_notebooks() {
-                Ok(nbs) => {
-                    let mut out = String::new();
-                    out.push_str(&format!("📚 {} ноутбуков аккаунта:\n\n", nbs.len()));
-                    out.push_str(&nlm::format_notebooks(&nbs));
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm list: {e}")),
-            }
-        }
-        "notes" => {
-            let Some(nb) = rest.first() else {
-                return CmdResult::Done("nlm notes <NB_ID> — не указан ID ноутбука".into());
-            };
-            let s = match state.ensure_nlm() {
-                Ok(s) => s,
-                Err(e) => return CmdResult::Done(format!("❌ {e}")),
-            };
-            match s.list_notes_structured(nb) {
-                Ok(notes) => {
-                    let mut out = format!("📝 {} заметок в {nb} (без mind maps):\n\n", notes.len());
-                    for (i, n) in notes.iter().enumerate() {
-                        let preview: String = n
-                            .text
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(80)
-                            .collect();
-                        out.push_str(&format!("{}. {} — {}\n", i + 1, n.title, preview));
-                    }
-                    if notes.is_empty() {
-                        out.push_str("(заметок нет — mind maps не считаются)\n");
-                    }
-                    out.push_str("\nсинхронизировать в poler_notes: `nlm notes-sync <NB_ID>`\n");
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm notes: {e}")),
-            }
-        }
-        // M5: двусторонняя синхронизация заметок облако ↔ локально
-        // v0.17.5 confirmation gate: push в облако — только с --yes;
-        // --dry-run показывает план без выполнения; без флагов — безопасный
-        // PullOnly + превью ожидающих отправки заметок.
-        "notes-sync" | "nsync" => {
-            use crate::google::confirm::{env_yes, split_gate_flags};
-            use crate::google::nlm_notes_sync::{plan_notebook_sync, sync_notebook_notes_mode, SyncMode};
-            let (yes_flag, dry_run, positional) = split_gate_flags(rest);
-            let nb = match positional
-                .first()
-                .cloned()
-                .or_else(|| state.active_notebook_id.clone())
-            {
-                Some(id) => id,
-                None => {
-                    return CmdResult::Done(
-                        "nlm notes-sync <NB_ID> [--yes | --dry-run] — не указан ID (или выберите ноутбук в TUI)".into(),
-                    )
-                }
-            };
-            // 1) --dry-run: только план, ничего не выполняем
-            if dry_run {
-                return match state.with_nlm_notes(|sess, conn| plan_notebook_sync(sess, conn, &nb)) {
-                    Ok(plan) => {
-                        let out = format!(
-                            "🔍 DRY-RUN синка заметок {nb} (ничего не выполнено):\n{}\nВыполнить: nlm notes-sync {nb} --yes",
-                            plan.preview()
-                        );
-                        state.set_output(out.clone());
-                        CmdResult::Done(out)
-                    }
-                    Err(e) => CmdResult::Done(format!("❌ nlm notes-sync --dry-run: {e}")),
-                };
-            }
-            // 2) push разрешён только с --yes (или env POLER_YES — скрипты)
-            let mode = if yes_flag || env_yes() { SyncMode::Full } else { SyncMode::PullOnly };
-            match state.with_nlm_notes(|sess, conn| {
-                sync_notebook_notes_mode(sess, conn, &nb, mode)
-            }) {
-                Ok(rep) => {
-                    let mut out = format!("🔄 Синк заметок ноутбука {nb} ({}): {}\n",
-                        if mode == SyncMode::Full { "pull+push" } else { "только pull — push требует --yes" },
-                        rep.summary());
-                    for e in &rep.errors {
-                        out.push_str(&format!("  ⚠ {e}\n"));
-                    }
-                    if rep.pending_push > 0 {
-                        out.push_str(&format!(
-                            "\n🔒 {} локальных заметок готовы к отправке в облако.\n",
-                            rep.pending_push
-                        ));
-                        out.push_str("Просмотр: nlm notes-sync <NB_ID> --dry-run\n");
-                        out.push_str("Отправка: nlm notes-sync <NB_ID> --yes\n");
-                    } else {
-                        out.push_str("Заметки синхронизированы (облако — источник истины).\n");
-                    }
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm notes-sync: {e}")),
-            }
-        }
-        "artifacts" => {
-            let Some(nb) = rest.first() else {
-                return CmdResult::Done("nlm artifacts <NB_ID> — не указан ID ноутбука".into());
-            };
-            let s = match state.ensure_nlm() {
-                Ok(s) => s,
-                Err(e) => return CmdResult::Done(format!("❌ {e}")),
-            };
-            match s.artifacts(nb) {
-                Ok(arts) => {
-                    let mut out = String::new();
-                    out.push_str(&format!("🎨 {} Studio-артефактов в {nb}:\n\n", arts.len()));
-                    out.push_str(&nlm::format_artifacts(&arts));
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm artifacts: {e}")),
-            }
-        }
-        "source" => {
-            if rest.len() < 2 {
-                return CmdResult::Done(
-                    "nlm source <NB_ID> <SRC_ID> — нужно 2 аргумента".into(),
-                );
-            }
-            let (nb, src) = (rest[0].clone(), rest[1].clone());
-            let s = match state.ensure_nlm() {
-                Ok(s) => s,
-                Err(e) => return CmdResult::Done(format!("❌ {e}")),
-            };
-            match s.load_source(&nb, &src) {
-                Ok(sc) => {
-                    let out = nlm::format_source_content(&sc, &nb);
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm source: {e}")),
-            }
-        }
-        "account" => {
-            let s = match state.ensure_nlm() {
-                Ok(s) => s,
-                Err(e) => return CmdResult::Done(format!("❌ {e}")),
-            };
-            match s.account() {
-                Ok(v) => {
-                    let out = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into());
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm account: {e}")),
-            }
-        }
-        "ask" => {
-            if rest.len() < 2 {
-                return CmdResult::Done(
-                    "nlm ask <NB_ID> \"<question>\" — нужно 2 аргумента".into(),
-                );
-            }
-            let (nb, q) = (rest[0].clone(), rest[1..].join(" "));
-            let s = match state.ensure_nlm() {
-                Ok(s) => s,
-                Err(e) => return CmdResult::Done(format!("❌ {e}")),
-            };
-            match s.chat(&nb, &q) {
-                Ok(answer) => {
-                    // v0.17.0: Запомнить ответ для Ctrl+S (save_last_ai_reply_as_note)
-                    state.remember_ai_reply(answer.clone(), Some(nb.clone()));
-                    // v0.17.4: пара → лента чата (Transcript, F3 в TUI);
-                    // сбой записи не ломает команду — лента best-effort.
-                    if let Ok(conn) = state.ensure_notes_conn() {
-                        let _ = super::transcript::add_entry(conn, Some(&nb), &q, &answer);
-                    }
-                    let out = format!("💬 вопрос: {q}\n→ {answer}");
-                    state.set_output(out.clone());
-                    CmdResult::Done(out)
-                }
-                Err(e) => CmdResult::Done(format!("❌ nlm ask: {e}")),
-            }
-        }
-        "sync" => {
-            cmd_nlm_sync(state, rest)
-        }
-        "shot" | "media" => CmdResult::Done(format!(
-            "⚠ nlm {sub}: в шелле используйте `poler-engine --nlm-{sub} <URL>` — команда требует отдельной сессии"
-        )),
-        other => CmdResult::Done(format!(
-            "nlm: неизвестная подкоманда {other} (list|notes|artifacts|source|account|ask|sync)"
-        )),
-    }
-}
-
-fn cmd_nlm_sync(state: &mut ShellState, rest: &[String]) -> CmdResult {
-    // Два `&mut` из одного `state` нельзя借用 одновременно — берём both
-    // через closure-обёртку (см. `ShellState::with_nlm_index`).
-    if rest.is_empty() {
-        // синк всех ноутбуков
-        let res = state.with_nlm_index(nlm_ingest::sync_all);
-        match res {
-            Ok(stats) => {
-                let out = format_sync_stats(&stats, "all");
-                state.set_output(out.clone());
-                CmdResult::Done(out)
-            }
-            Err(e) => CmdResult::Done(format!("❌ nlm sync: {e}")),
-        }
-    } else {
-        // синк одного ноутбука
-        let nb_id = rest[0].clone();
-        let res = state.with_nlm_index(|ix, s| -> Result<_, String> {
-            let nbs = s.list_notebooks()?;
-            let target = nbs.iter().find(|x| x.id == nb_id).cloned();
-            let Some(nb_meta) = target else {
-                return Err(format!("ноутбук {nb_id} не найден в аккаунте"));
-            };
-            let mut stats = nlm_ingest::IngestStats {
-                notebooks: 1,
-                ..Default::default()
-            };
-            if let Err(e) = nlm_ingest::ingest_notebook(ix, s, &nb_meta, &mut stats) {
-                stats.errors.push(format!("ingest_notebook {nb_id}: {e}"));
-            }
-            let _ = ix.recompute_pagerank(20);
-            Ok(stats)
-        });
-        match res {
-            Ok(stats) => {
-                let out = format_sync_stats(&stats, "single");
-                state.set_output(out.clone());
-                CmdResult::Done(out)
-            }
-            Err(e) => CmdResult::Done(format!("❌ nlm sync: {e}")),
-        }
-    }
-}
-
-fn format_sync_stats(s: &nlm_ingest::IngestStats, scope: &str) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("🔄 NLM sync ({scope}): {} notebooks processed\n", s.notebooks));
-    out.push_str(&format!(
-        "  passports:   {} reindexed, {} unchanged\n",
-        s.notebooks_reindexed, s.notebooks_unchanged
-    ));
-    out.push_str(&format!(
-        "  sources:      {} reindexed, {} unchanged\n",
-        s.sources_reindexed, s.sources_unchanged
-    ));
-    out.push_str(&format!(
-        "  notes:        {} reindexed, {} unchanged\n",
-        s.notes_reindexed, s.notes_unchanged
-    ));
-    out.push_str(&format!(
-        "  artifacts:    {} reindexed, {} unchanged\n",
-        s.artifacts_reindexed, s.artifacts_unchanged
-    ));
-    out.push_str(&format!(
-        "  TOTAL:        {} pages ({} new/changed, {} skipped by Percolator-lite)\n",
-        s.total_pages(),
-        s.total_reindexed(),
-        s.total_unchanged()
-    ));
-    if !s.errors.is_empty() {
-        out.push_str(&format!("\n  errors ({}):\n", s.errors.len()));
-        for e in &s.errors {
-            out.push_str(&format!("    - {e}\n"));
-        }
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // set — переключение настроек шелла
@@ -551,7 +249,7 @@ fn cmd_set(state: &mut ShellState, args: &[String]) -> CmdResult {
 // Делегирует в poler_engine::web::cdp_fetcher + poler_engine::web::crawl::crawl
 // — те же функции, что и в standalone-режиме `poler-engine --crawl URL`. Однако
 // в шелле есть важное преимущество: WebIndex уже открыт (если был `search`/
-// `stats`/`nlm sync` ранее), и единственное новое состояние — это CDP-фечер.
+// `stats` ранее), и единственное новое состояние — это CDP-фечер.
 //
 // Синтаксис:
 //   crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N] [--wait-ms N]
@@ -674,7 +372,7 @@ fn cmd_crawl(state: &mut ShellState, args: &[String]) -> CmdResult {
     };
 
     // WebIndex открывается ленимо — внутри ensure_index(). reuse того же
-    // подключения, что и для search/stats/nlm-sync.
+    // подключения, что и для search/stats.
     let cfg = crate::web::CrawlConfig {
         max_pages,
         max_depth: depth,
@@ -1213,9 +911,9 @@ fn cmd_vcs_adapter(
 }
 
 /// `poler> sync vcs [gh|gl|gt|all] <OWNER>` — синк всех VCS-страниц в web-index.db.
-/// `poler> sync` без args — синоним для `nlm sync` (обратная совместимость v0.14).
+/// `poler> sync vcs ...` — делегация в vcs::sync_vcs (v2.0: NLM-синк удалён).
 fn cmd_sync(state: &mut ShellState, args: &[String]) -> CmdResult {
-    // Если первый аргумент — `vcs`, делегируем в vcs::sync_vcs; иначе — NLM sync.
+    // Если первый аргумент — `vcs`, делегируем в vcs::sync_vcs.
     if !args.is_empty() && args[0] == "vcs" {
         let scheme = args.get(1).and_then(|s| crate::vcs::VcsScheme::parse(s).ok());
         let owner = args.get(2).map(|s| s.as_str());
@@ -1242,8 +940,10 @@ fn cmd_sync(state: &mut ShellState, args: &[String]) -> CmdResult {
         state.set_output(out.clone());
         return CmdResult::Done(out);
     }
-    // fallback: `sync` без vcs → NLM sync (как в v0.14)
-    cmd_nlm(state, &["sync".into()])
+    // v2.0: NLM-sync удалён — `sync` без `vcs` больше ничего не делает
+    CmdResult::Done(
+        "sync: укажите схему — `sync vcs <gh|gl|gt|gix|all> [owner]` (NLM-синк удалён в v2.0)".into(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1042,7 @@ pub fn run_shell(db_path: PathBuf) -> ExitCode {
 fn cmd_notes(state: &mut ShellState, args: &[String]) -> CmdResult {
     if args.is_empty() {
         return CmdResult::Done(
-            "notes: укажите подкоманду (list | add | show | edit | rm | save-from-ai)".into(),
+            "notes: укажите подкоманду (list | add | show | edit | rm)".into(),
         );
     }
     let sub = args[0].as_str();
@@ -1429,7 +1129,7 @@ fn cmd_notes(state: &mut ShellState, args: &[String]) -> CmdResult {
         }
         "rm" => {
             // v0.17.5: удаление локальной заметки — с подтверждением --yes
-            use crate::google::confirm::{env_yes, split_gate_flags};
+            use super::confirm::{env_yes, split_gate_flags};
             let (yes_flag, _dry, positional) = split_gate_flags(rest);
             if positional.is_empty() {
                 return CmdResult::Done("notes rm <id> [--yes]".into());
@@ -1458,23 +1158,8 @@ fn cmd_notes(state: &mut ShellState, args: &[String]) -> CmdResult {
                 Err(e) => CmdResult::Done(format!("❌ {e}")),
             }
         }
-        "save-from-ai" => {
-            let title = if rest.is_empty() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| format!("AI reply @{}", d.as_secs()))
-                    .unwrap_or_else(|_| "AI reply".into());
-                now
-            } else {
-                rest.join(" ")
-            };
-            match state.save_last_ai_reply_as_note(&title) {
-                Ok(id) => CmdResult::Done(format!("✓ Сохранён AI-ответ как заметка #{id} «{title}»")),
-                Err(e) => CmdResult::Done(format!("❌ {e}")),
-            }
-        }
         other => CmdResult::Done(format!(
-            "notes: неизвестная подкоманда {other} (list|add|show|edit|rm|save-from-ai)"
+            "notes: неизвестная подкоманда {other} (list|add|show|edit|rm)"
         )),
     }
 }
@@ -1625,8 +1310,8 @@ mod tests {
 
     #[test]
     fn tokenize_single_quotes() {
-        let t = tokenize("nlm ask abc 'вопрос с пробелами'");
-        assert_eq!(t, vec!["nlm", "ask", "abc", "вопрос с пробелами"]);
+        let t = tokenize("notes add 'заметка с пробелами'");
+        assert_eq!(t, vec!["notes", "add", "заметка с пробелами"]);
     }
 
     #[test]
@@ -1700,7 +1385,7 @@ mod tests {
         match r {
             CmdResult::Done(out) => {
                 assert!(out.contains("search"));
-                assert!(out.contains("nlm sync"));
+                assert!(out.contains("sync vcs"));
                 assert!(out.contains("quit"));
                 // v0.15.1: help должен упоминать crawl и impact
                 assert!(out.contains("crawl"));
@@ -1811,18 +1496,12 @@ mod tests {
     }
 
     #[test]
-    fn cmd_nlm_notes_sync_hint_mentions_flags_v0175() {
-        // без NLM-сессии команда упадёт с ошибкой браузера — но подсказка
-        // о флагах должна присутствовать в тексте помощи
+    fn cmd_nlm_is_gone_in_v2() {
+        // v2.0: NLM-команда удалена — dispatcher отвечает «неизвестная команда»
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
-        let r = dispatch(&mut s, "nlm notes-sync");
+        let r = dispatch(&mut s, "nlm list");
         match r {
-            CmdResult::Done(out) => {
-                assert!(
-                    out.contains("--yes") || out.contains("--dry-run") || out.contains("NB_ID"),
-                    "подсказка о gate-флагах: {out}"
-                );
-            }
+            CmdResult::Done(out) => assert!(out.contains("неизвестная команда"), "{out}"),
             _ => panic!(),
         }
     }
@@ -1906,15 +1585,15 @@ mod tests {
 
     #[test]
     fn cmd_version_string_updated_for_v0171() {
-        // shadow test marker — used by other tests via name
-        // v0.17.5: Security Hardening — бейдж poler-shell обновлён.
+        // v2.0: sovereign stack — бейдж poler-shell обновлён.
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("0.17.6"));
+                assert!(out.contains("v2.0"));
                 assert!(out.contains("poler-shell"));
-                assert!(out.contains("Auth Companion"));
+                assert!(out.contains("sovereign"));
+                assert!(!out.contains("Auth Companion"), "v2.0: Google-интеграция удалена");
             }
             _ => panic!(),
         }
@@ -1927,7 +1606,7 @@ mod tests {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("0.17.6")),
+            CmdResult::Done(out) => assert!(out.contains("sovereign")),
             _ => panic!(),
         }
     }
@@ -2081,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_sync_vcs_no_scheme_gives_nlm_fallback_or_help() {
+    fn cmd_sync_vcs_no_scheme_does_not_panic() {
         // `sync vcs` без scheme → пробуем все 4 адаптера. gitea без GITEA_HOST
         // даст ошибку, но не должен паниковать. Тест проверяет только что
         // dispatch возвращает Done (не падает).
@@ -2097,13 +1776,12 @@ mod tests {
     }
 
     #[test]
-    fn cmd_sync_alone_falls_back_to_nlm() {
-        // `sync` без vcs — это синоним для `nlm sync` (обратная совместимость)
-        // без Chromium это даст ошибку, но в CmdResult::Done.
+    fn cmd_sync_alone_gives_v2_hint() {
+        // v2.0: `sync` без vcs — подсказка про схему (NLM-синк удалён)
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "sync");
         match r {
-            CmdResult::Done(_) => {} // OK — упало с ошибкой в Done
+            CmdResult::Done(out) => assert!(out.contains("sync vcs"), "{out}"),
             _ => panic!(),
         }
     }

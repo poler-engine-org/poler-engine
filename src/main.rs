@@ -6,6 +6,10 @@
 //! * веб-поиск для AI: `poler-engine --web-search <QUERY>` (по веб-индексу)
 //! * краулинг: `poler-engine <URL> --crawl [--crawl-depth N --crawl-max M]`
 //!
+//! v2.0 (sovereign stack): Google/NotebookLM/Gmail/Drive/OAuth-интеграции
+//! удалены. Движок полностью локален; внешний мир — только краулинг через
+//! CDP и MCP-инструменты для агентов.
+//!
 //! Коды выхода (grep-совместимые): 0 — есть совпадения, 1 — совпадений нет,
 //! 2 — ошибка.
 
@@ -159,7 +163,7 @@ struct Cli {
     /// БРАУЗЕРНЫЙ РЕЖИМ: материализует WebLens (расширение MV3), запускает
     /// оконный Chromium с уже установленным WebLens и держит MCP-сервер
     /// на 127.0.0.1:8765 (BIND как у --mcp-http, или только порт).
-    #[arg(long = "web-lens", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens_install", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    #[arg(long = "web-lens", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens_install"])]
     web_lens: Option<String>,
 
     /// Установить WebLens в ЕЖЕДНЕВНЫЙ браузер: материализует файлы
@@ -239,17 +243,16 @@ struct Cli {
     /// MCP-СЕРВЕР (Model Context Protocol): poler-engine как нативный
     /// инструмент LLM-агентов поверх stdio JSON-RPC.
     /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search /
-    /// poler_gmail / poler_drive.
+    /// poler_grep / poler_chunk / poler_box_exec / poler_box_status.
     #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact", "mcp_http", "mcp_token"])]
     mcp: bool,
 
     /// MCP-СЕРВЕР ПО HTTP (Streamable HTTP): тот же набор инструментов,
     /// что и --mcp, но для УДАЛЁННОГО агента — через туннель (например
     /// `cloudflared tunnel --url http://127.0.0.1:8765`). POST / или /mcp,
-    /// заголовок Authorization: Bearer <токен>. Пароли/куки Google наружу
-    /// не выходят: движок ходит в NotebookLM своим профилем.
+    /// заголовок Authorization: Bearer <токен>.
     /// BIND = «127.0.0.1:8765» (по умолчанию) или просто порт «8765».
-    #[arg(long = "mcp-http", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["mcp", "shell", "tui", "web_search", "crawl", "web_stats", "impact", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    #[arg(long = "mcp-http", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["mcp", "shell", "tui", "web_search", "crawl", "web_stats", "impact"])]
     mcp_http: Option<String>,
 
     /// Токен доступа для --mcp-http (или env POLER_MCP_TOKEN; без него
@@ -263,7 +266,7 @@ struct Cli {
     /// контур исполнения (engine-native приоритет + sandboxed host proxy),
     /// конвейеры host↔engine, service/attach управление нижним слоем.
     /// Верхний уровень управления на Linux/macOS.
-    #[arg(long, conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "license", "license_import", "semantic_expand", "import_browser_session"])]
+    #[arg(long, conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "license", "semantic_expand"])]
     gateway: bool,
 
     /// v0.23.0 DANGER OVERRIDE: полностью отключить sandbox Terminal
@@ -273,131 +276,24 @@ struct Cli {
     #[arg(long = "dangerously-allow-all", requires = "gateway")]
     dangerously_allow_all: bool,
 
-    /// Интерактивный REPL (poler> search/nlm/crawl/sync...).
-    /// База web-index.db и NlmSession открываются ленимо и переиспользуются
+    /// Интерактивный REPL (poler> search/crawl/notes/sync vcs...).
+    /// База web-index.db открывается лениво и переиспользуется
     /// между командами (история в ~/.cache/poler-engine/shell-history.txt).
-    #[arg(long = "shell", conflicts_with_all = ["tui", "mcp", "web_search", "crawl", "web_stats", "impact", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    #[arg(long = "shell", conflicts_with_all = ["tui", "mcp", "web_search", "crawl", "web_stats", "impact"])]
     shell: bool,
 
-    /// TUI Dashboard на ratatui (3 панели: ноутбуки | ввод | результаты).
+    /// TUI Dashboard на ratatui (панели: chat + ввод | notes + sources).
     /// Tab — смена фокуса, Esc — выход. Команды как в --shell.
-    #[arg(long = "tui", conflicts_with_all = ["shell", "mcp", "web_search", "crawl", "web_stats", "impact", "google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
+    #[arg(long = "tui", conflicts_with_all = ["shell", "mcp", "web_search", "crawl", "web_stats", "impact"])]
     tui: bool,
 
-    // ---------- Google-интеграция без пароля (v0.12.0) ----------
+    // ---------- License / EULA (v2.0: статус модели, без гейта) ----------
 
-    /// OAuth 2.0 loopback: согласие Google в ТВОЁМ браузере (пароль не
-    /// попадает в poler-engine), движок получает только узкие readonly-токены.
-    /// Нужен client_secret.json своего GCP-проекта (README, раздел v0.12.0).
-    #[arg(long = "google-auth", conflicts_with_all = ["google_gmail", "google_drive", "google_status", "google_browse", "google_fetch"])]
-    google_auth: bool,
-
-    /// Gmail-поиск по своему ящику (нужен одноразовый --google-auth).
-    /// QUERY — синтаксис Gmail: from:vasya has:attachment newer_than:7d …
-    /// Без QUERY — недавняя почта.
-    #[arg(long = "google-gmail", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["google_drive", "google_status", "google_browse", "google_fetch"])]
-    google_gmail: Option<String>,
-
-    /// Google Drive: файлы по имени (пустой QUERY — недавние).
-    #[arg(long = "google-drive", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["google_status", "google_browse", "google_fetch"])]
-    google_drive: Option<String>,
-
-    /// Состояние Google-токенов: скоупы, срок действия, аккаунт.
-    #[arg(long = "google-status", conflicts_with_all = ["google_browse", "google_fetch"])]
-    google_status: bool,
-
-    /// Открыть URL в браузере с ПЕРСИСТЕНТНЫМ профилем poler-engine
-    /// (для сервисов без API — NotebookLM и т.п.: логин один раз своими руками).
-    #[arg(long = "google-browse", value_name = "URL", conflicts_with_all = ["google_fetch"])]
-    google_browse: Option<String>,
-
-    /// Прочитать URL через персистентный профиль headless-ом:
-    /// контент авторизованных сервисов после логина через --google-browse.
-    #[arg(long = "google-fetch", value_name = "URL")]
-    google_fetch: Option<String>,
-
-    /// Дополнительные скоупы OAuth (через пробел), кроме gmail/drive readonly.
-    #[arg(long = "google-scopes", value_name = "SCOPES")]
-    google_scopes: Option<String>,
-
-    /// v0.17.5 (security): ЯВНЫЙ перенос Google-сессии из основного
-    /// браузера хоста (~/.config/chromium) в профиль движка. Спрашивает
-    /// [y/N], пишет audit-запись. По умолчанию перенос куков ЗАПРЕЩЁН
-    /// (раньше sync_host_chromium_profile тянул их молча).
-    #[arg(long = "import-browser-session", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui"])]
-    import_browser_session: bool,
-
-    /// v0.17.6: интерактивное окно авторизации Google (Auth Companion).
-    /// Node.js-мост поднимает Chromium с ИЗОЛИРОВАННЫМ профилем движка
-    /// (~/.cache/poler-engine/google-profile): логин и 2FA вводишь сам,
-    /// движок получает только итоговые куки сессии (google_session.json,
-    /// 0600) и закрывает окно за собой. Хост-браузер не трогается,
-    /// все эндпоинты — строго 127.0.0.1.
-    #[arg(long = "auth-ui", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "import_browser_session"])]
-    auth_ui: bool,
-
-    // ---------- License Gate (v0.18.0) ----------
-
-    /// Статус лицензии: тир, владелец, срок, квота Community.
-    /// Локальный поиск ВСЕГДА без лицензии; гейтятся только интеграции
-    /// Gmail/Drive/NotebookLM.
-    #[arg(long = "license", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "import_browser_session", "shell", "tui", "mcp", "mcp_http"])]
+    /// Статус лицензии и модель распространения (Source-Available EULA).
+    /// Локальный поиск и все функции движка — всегда без ограничений;
+    /// v2.0 не содержит ключей и гейтов.
+    #[arg(long = "license", conflicts_with_all = ["shell", "tui", "mcp", "mcp_http"])]
     license: bool,
-
-    /// Активация лицензии: PO1-ключ одной строкой ИЛИ путь к файлу с ним.
-    /// Подпись ed25519 проверяется ДО сохранения; файл — 0600.
-    #[arg(long = "license-import", value_name = "KEY|PATH", conflicts_with_all = ["google_auth", "google_gmail", "google_drive", "google_status", "google_browse", "google_fetch", "auth_ui", "import_browser_session", "shell", "tui", "mcp", "mcp_http"])]
-    license_import: Option<String>,
-
-    // ---------- NotebookLM через RPC-протокол NLMTools (v0.13.0) ----------
-
-    /// Все ноутбуки NotebookLM с источниками (RPC wXbhsf из протокола
-    /// NLMTools.com, сессия персистентного профиля — без пароля).
-    #[arg(long = "nlm-notebooks", conflicts_with_all = ["nlm_source", "nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
-    nlm_notebooks: bool,
-
-    /// Контент источника: текст и/или URL картинок слайдов (RPC hizoJc).
-    /// NOTEBOOK SRC — id из --nlm-notebooks.
-    #[arg(long = "nlm-source", value_names = ["NOTEBOOK", "SOURCE"], num_args = 2, conflicts_with_all = ["nlm_notes", "nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
-    nlm_source: Option<Vec<String>>,
-
-    /// Заметки ноутбука (RPC cFji9, raw-JSON).
-    #[arg(long = "nlm-notes", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_artifacts", "nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
-    nlm_notes: Option<String>,
-
-    /// Studio-объекты: аудио-обзоры, отчёты, квизы, миндмэпы (RPC gArtLc).
-    #[arg(long = "nlm-artifacts", value_name = "NOTEBOOK", conflicts_with_all = ["nlm_account", "nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
-    nlm_artifacts: Option<String>,
-
-    /// Аккаунт сессии NotebookLM (RPC ZwVcOc) — проверка логина профиля.
-    #[arg(long = "nlm-account", conflicts_with_all = ["nlm_chat", "nlm_media", "nlm_shot", "nlm_sync"])]
-    nlm_account: bool,
-
-    /// Спросить ноутбук: вопрос печатается в чат страницы, ответ
-    /// читается после стабилизации (UI-автоматизация, без пароля).
-    #[arg(long = "nlm-chat", value_names = ["NOTEBOOK", "QUESTION"], num_args = 2, conflicts_with_all = ["nlm_media", "nlm_shot", "nlm_sync"])]
-    nlm_chat: Option<Vec<String>>,
-
-    /// Скачать медиа-файл (картинка слайда и т.п.) авторизованным
-    /// профилем: poler-engine --nlm-media URL → poler-media-N.<ext>.
-    #[arg(long = "nlm-media", value_name = "URL", conflicts_with_all = ["nlm_shot", "nlm_sync"])]
-    nlm_media: Option<String>,
-
-    /// Скриншот страницы в профиле (PNG): медиа глазами юзера.
-    #[arg(long = "nlm-shot", value_name = "URL")]
-    nlm_shot: Option<String>,
-
-    /// Синк NotebookLM в web-index: --nlm-sync [NOTEBOOK_ID] вливает
-    /// заметки/источники/артефакты в общий индекс poler-engine —
-    /// дальше они находятся через --web-search наравне с вебом.
-    /// Без NOTEBOOK_ID — синк всех ноутбуков аккаунта.
-    #[arg(long = "nlm-sync", value_name = "NOTEBOOK_ID", num_args = 0..=1, default_missing_value = "")]
-    nlm_sync: Option<String>,
-
-    /// Максимум результатов Gmail/Drive [default: 10].
-    #[arg(long = "google-max", default_value_t = 10)]
-    google_max: usize,
-
     /// Разрешить краулеру переход на другие хосты.
     #[arg(long = "cross-site", default_value_t = false)]
     cross_site: bool,
@@ -626,378 +522,12 @@ fn print_web_hits(
     let _ = std::io::stdout().flush();
 }
 
-/// Вывод Gmail-выдачи в трёх форматах.
-fn print_mail_hits(hits: &[poler_engine::google::api::MailHit], query: &str, format: Format) {
-    use std::io::Write;
-    match format {
-        Format::AiJson => {
-            let out = serde_json::json!({
-                "engine": "poler-engine",
-                "mode": "google-gmail",
-                "auth": "OAuth 2.0 (gmail.readonly)",
-                "query": query,
-                "total": hits.len(),
-                "results": hits,
-            });
-            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-        }
-        Format::Simple => {
-            for h in hits {
-                let subj: String = h.subject.chars().take(60).collect();
-                let from: String = h.from.chars().take(30).collect();
-                println!("{}  {}  {}", h.date, from, subj);
-            }
-        }
-        Format::Md => {
-            println!("# Gmail: «{query}»\n");
-            for (i, h) in hits.iter().enumerate() {
-                let subj = if h.subject.is_empty() { "(без темы)" } else { &h.subject };
-                println!("## {}. {}\n", i + 1, subj);
-                println!("- От: {}", h.from);
-                println!("- Дата: {}", h.date);
-                println!("- ID: {} (поток {})\n", h.id, h.thread_id);
-                let sn: String = h.snippet.chars().take(240).collect();
-                println!("> {sn}\n");
-            }
-        }
-    }
-    let _ = std::io::stdout().flush();
-}
-
-/// Вывод Drive-выдачи в трёх форматах.
-fn print_drive_hits(hits: &[poler_engine::google::api::DriveHit], query: &str, format: Format) {
-    use std::io::Write;
-    match format {
-        Format::AiJson => {
-            let out = serde_json::json!({
-                "engine": "poler-engine",
-                "mode": "google-drive",
-                "auth": "OAuth 2.0 (drive.readonly)",
-                "query": query,
-                "total": hits.len(),
-                "results": hits,
-            });
-            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-        }
-        Format::Simple => {
-            for h in hits {
-                let name: String = h.name.chars().take(70).collect();
-                println!("{}  {}  {}", h.modified_time, h.mime_type, name);
-            }
-        }
-        Format::Md => {
-            println!("# Google Drive: «{query}»\n");
-            for (i, h) in hits.iter().enumerate() {
-                println!("## {}. {}\n", i + 1, h.name);
-                println!("- Тип: {}", h.mime_type);
-                println!("- Изменён: {}", h.modified_time);
-                if let Some(b) = h.size_bytes {
-                    println!("- Размер: {:.1} КБ", b as f64 / 1024.0);
-                }
-                if let Some(l) = &h.web_view_link {
-                    println!("- Ссылка: {l}");
-                }
-                println!("- ID: {}\n", h.id);
-            }
-        }
-    }
-    let _ = std::io::stdout().flush();
-}
-
-/// v0.18.0: человекочитаемый статус лицензии (`--license`).
-/// v0.22.0: формат живёт в license::status_text() — единый источник
+/// v0.18.0 → v2.0: человекочитаемый статус лицензии (`--license`).
+/// Формат живёт в license::status_text() — единый источник
 /// для CLI и команды `license` в Terminal Gateway.
 fn print_license_status() -> ExitCode {
     print!("{}", poler_engine::license::status_text());
     ExitCode::SUCCESS
-}
-
-/// NotebookLM-режимы (v0.13.0): RPC-протокол NLMTools поверх
-/// персистентного профиля. Сессия открывается один раз на вызов.
-fn run_nlm(cli: &Cli) -> ExitCode {
-    use poler_engine::google::nlm::{self, NlmSession};
-
-    // v0.18.0: License Gate — единая точка для всех --nlm-* режимов.
-    if !poler_engine::license::gate_or_print(poler_engine::license::FEATURE_NLM) {
-        return ExitCode::from(2);
-    }
-
-    let fail = |e: String| {
-        eprintln!("poler-engine nlm: {e}");
-        ExitCode::from(2)
-    };
-
-    // ---- медиа и скриншот не требуют полноценной RPC-сессии ноутбука ----
-    if let Some(url) = cli.nlm_shot.clone() {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return fail(format!("--nlm-shot ожидает URL, получено: {url}"));
-        }
-        let mut s = match NlmSession::open() {
-            Ok(s) => s,
-            Err(e) => return fail(e),
-        };
-        if let Err(e) = s.load_page_raw(&url) {
-            return fail(e);
-        }
-        return match s.screenshot() {
-            Ok(png) => match save_unique("poler-shot", "png", &png) {
-                Ok(path) => {
-                    println!("скриншот: {} ({} КБ)", path.display(), png.len() / 1024);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(e),
-            },
-            Err(e) => fail(e),
-        };
-    }
-
-    if let Some(url) = cli.nlm_media.clone() {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return fail(format!("--nlm-media ожидает URL, получено: {url}"));
-        }
-        let mut s = match NlmSession::open() {
-            Ok(s) => s,
-            Err(e) => return fail(e),
-        };
-        return match s.fetch_media(&url) {
-            Ok((bytes, ct)) => {
-                let ext = nlm::mime_ext(&ct);
-                match save_unique("poler-media", ext, &bytes) {
-                    Ok(path) => {
-                        println!("медиа: {} ({} КБ, {})", path.display(), bytes.len() / 1024, ct);
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => fail(e),
-                }
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    // ---- RPC-режимы ----
-    let mut s = match NlmSession::open() {
-        Ok(s) => s,
-        Err(e) => return fail(e),
-    };
-    if cli.verbose {
-        if let Some(email) = &s.email {
-            eprintln!("poler-engine nlm: сессия {email}");
-        }
-    }
-
-    if cli.nlm_notebooks {
-        return match s.list_notebooks() {
-            Ok(nbs) => {
-                if cli.format == Format::AiJson {
-                    let out = serde_json::json!({
-                        "engine": "poler-engine",
-                        "mode": "nlm-notebooks",
-                        "auth": "persistent profile (no password)",
-                        "protocol": "batchexecute (NLMTools)",
-                        "total": nbs.len(),
-                        "results": nbs,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-                } else {
-                    println!("{}", nlm::format_notebooks(&nbs));
-                }
-                if nbs.is_empty() {
-                    ExitCode::from(1)
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    if let Some(args) = cli.nlm_source.clone() {
-        let (nb, src) = (args[0].clone(), args[1].clone());
-        return match s.load_source(&nb, &src) {
-            Ok(sc) => {
-                if cli.format == Format::AiJson {
-                    let out = serde_json::json!({
-                        "engine": "poler-engine",
-                        "mode": "nlm-source",
-                        "notebook": nb,
-                        "source": sc,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-                } else {
-                    println!("{}", nlm::format_source_content(&sc, &nb));
-                }
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    if let Some(nb) = cli.nlm_notes.clone() {
-        return match s.notes(&nb) {
-            Ok(v) => {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    if let Some(nb) = cli.nlm_artifacts.clone() {
-        return match s.artifacts(&nb) {
-            Ok(arts) => {
-                if cli.format == Format::AiJson {
-                    let out = serde_json::json!({
-                        "engine": "poler-engine",
-                        "mode": "nlm-artifacts",
-                        "notebook": nb,
-                        "total": arts.len(),
-                        "results": arts,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-                } else {
-                    println!("{}", nlm::format_artifacts(&arts));
-                }
-                if arts.is_empty() {
-                    ExitCode::from(1)
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    if cli.nlm_account {
-        return match s.account() {
-            Ok(v) => {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    if let Some(args) = cli.nlm_chat.clone() {
-        let (nb, q) = (args[0].clone(), args[1].clone());
-        return match s.chat(&nb, &q) {
-            Ok(answer) => {
-                if cli.format == Format::AiJson {
-                    let out = serde_json::json!({
-                        "engine": "poler-engine",
-                        "mode": "nlm-chat",
-                        "notebook": nb,
-                        "question": q,
-                        "answer": answer,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-                } else {
-                    println!("{answer}");
-                }
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(e),
-        };
-    }
-
-    // ---------- v0.14: синк NotebookLM в web-index ----------
-    if let Some(nb) = cli.nlm_sync.clone() {
-        use poler_engine::google::nlm_ingest;
-        use poler_engine::web::WebIndex;
-        let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
-        let mut ix = match WebIndex::open(&db_path) {
-            Ok(ix) => ix,
-            Err(e) => return fail(format!("web-index {db_path:?}: {e}")),
-        };
-        return if nb.is_empty() {
-            // --nlm-sync без аргумента — все ноутбуки аккаунта
-            eprintln!("poler-engine nlm: синк всех ноутбуков в {db_path:?} (до RPC на источник)…");
-            match nlm_ingest::sync_all(&mut ix, &mut s) {
-                Ok(stats) => {
-                    if cli.format == Format::AiJson {
-                        let out = serde_json::json!({
-                            "engine": "poler-engine",
-                            "mode": "nlm-sync",
-                            "scope": "all",
-                            "stats": stats,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-                    } else {
-                        println!("{}", format_stats(&stats));
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(e),
-            }
-        } else {
-            // --nlm-sync NOTEBOOK_ID — один ноутбук
-            let nbs = s.list_notebooks().unwrap_or_default();
-            let target = nbs.iter().find(|x| x.id == nb).cloned();
-            match target {
-                Some(nb_meta) => {
-                    let mut stats = nlm_ingest::IngestStats {
-                        notebooks: 1,
-                        ..Default::default()
-                    };
-                    if let Err(e) = nlm_ingest::ingest_notebook(&mut ix, &mut s, &nb_meta, &mut stats) {
-                        stats.errors.push(format!("ingest_notebook {}: {e}", nb));
-                    }
-                    let _ = ix.recompute_pagerank(20);
-                    if cli.format == Format::AiJson {
-                        let out = serde_json::json!({
-                            "engine": "poler-engine",
-                            "mode": "nlm-sync",
-                            "scope": "single",
-                            "notebook": nb,
-                            "stats": stats,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-                    } else {
-                        println!("{}", format_stats(&stats));
-                    }
-                    ExitCode::SUCCESS
-                }
-                None => fail(format!("ноутбук {nb} не найден в аккаунте")),
-            }
-        };
-    }
-
-    fail("nlm: не выбран режим (см. --help)".to_string())
-}
-
-/// Сохранить байты в неиспользуемый файл poler-<prefix>-N.<ext> в CWD.
-/// Человекочитаемый отчёт о синке NLM в web-index.
-fn format_stats(s: &poler_engine::google::nlm_ingest::IngestStats) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("NLM sync: {} notebooks processed\n", s.notebooks));
-    out.push_str(&format!("  passports:   {} reindexed, {} unchanged\n",
-        s.notebooks_reindexed, s.notebooks_unchanged));
-    out.push_str(&format!("  sources:      {} reindexed, {} unchanged\n",
-        s.sources_reindexed, s.sources_unchanged));
-    out.push_str(&format!("  notes:        {} reindexed, {} unchanged\n",
-        s.notes_reindexed, s.notes_unchanged));
-    out.push_str(&format!("  artifacts:    {} reindexed, {} unchanged\n",
-        s.artifacts_reindexed, s.artifacts_unchanged));
-    out.push_str(&format!("  TOTAL:        {} pages ({} new/changed, {} skipped by Percolator-lite)\n",
-        s.total_pages(), s.total_reindexed(), s.total_unchanged()));
-    if !s.errors.is_empty() {
-        out.push_str(&format!("\n  errors ({}):\n", s.errors.len()));
-        for e in &s.errors {
-            out.push_str(&format!("    - {e}\n"));
-        }
-    }
-    out.push_str("\nТеперь web-search пробивает NLM-корпус наравне с вебом.\n");
-    out
-}
-
-fn save_unique(prefix: &str, ext: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
-    for n in 1..10_000 {
-        let p = std::path::PathBuf::from(format!("{prefix}-{n:02}.{ext}"));
-        if !p.exists() {
-            std::fs::write(&p, bytes).map_err(|e| format!("запись {}: {e}", p.display()))?;
-            return Ok(p);
-        }
-    }
-    Err("не найдено свободного имени для файла".to_string())
 }
 
 fn main() -> ExitCode {
@@ -1012,12 +542,7 @@ fn main() -> ExitCode {
         return ExitCode::from(poler_engine::gateway::shim::shim_main(&rest) as u8);
     }
     let cli = Cli::parse();
-    let code = run(cli);
-    // v0.17.5: headless google-браузер, поднятый ЭТИМ процессом, не должен
-    // переживать CLI и оставлять открытый CDP-порт без аутентификации.
-    // Headed-браузер (--google-browse) не трогаем — его закрывает владелец.
-    poler_engine::google::shutdown_owned_headless_browser();
-    code
+    run(cli)
 }
 
 fn run(cli: Cli) -> ExitCode {
@@ -1239,250 +764,9 @@ fn run(cli: Cli) -> ExitCode {
         return poler_engine::shell::run_tui(db_path);
     }
 
-    // ---------- v0.17.5: явный перенос сессии из основного браузера ----------
-    if cli.import_browser_session {
-        return match poler_engine::google::import_browser_session_interactive() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("poler-engine import-browser-session: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    // ---------- v0.17.6: Auth Companion — изолированное окно логина ----------
-    if cli.auth_ui {
-        return match poler_engine::google::auth_ui::run_auth_ui() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("poler-engine auth-ui: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    // ---------- v0.18.0: License Gate — статус и активация ----------
+    // ---------- License / EULA: статус модели ----------
     if cli.license {
         return print_license_status();
-    }
-    if let Some(k) = cli.license_import.clone() {
-        return match poler_engine::license::import(&k) {
-            Ok(lic) => {
-                println!("✓ Лицензия активирована");
-                println!("  Тир:       {}", lic.tier);
-                println!("  Владелец:  {} <{}>", lic.name, lic.email);
-                if lic.expires == 0 {
-                    println!("  Срок:      бессрочно");
-                } else {
-                    println!(
-                        "  Действует до: {} ({} дн.)",
-                        poler_engine::license::civil_date(lic.expires),
-                        lic.expires.saturating_sub(poler_engine::license::now_unix()) / 86400
-                    );
-                }
-                if !lic.features.is_empty() {
-                    println!("  Функции:   {}", lic.features.join(", "));
-                }
-                println!("  Сохранено: ~/.config/poler-engine/license.key (0600)");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("poler-engine license-import: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    // ---------- Google-сервисы: OAuth без пароля (v0.12.0) ----------
-    if cli.google_auth {
-        let extra: Vec<String> = cli
-            .google_scopes
-            .clone()
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default();
-        return match poler_engine::google::oauth::run_auth(&extra) {
-            Ok(t) => {
-                println!("\nГотово. Теперь доступны:");
-                println!("  poler-engine --google-gmail \"from:me newer_than:7d\"");
-                println!("  poler-engine --google-drive \"отчёт\"");
-                println!("  poler-engine --google-status");
-                println!("  poler-engine --nlm-notebooks  (NotebookLM — через профиль");
-                println!("   браузера движка, НЕ отдельный OAuth-скоуп)");
-                let _ = t;
-                // v0.17.7: гарантированный выход после успешного OAuth.
-                // Наблюдалось: при переиспользовании уже поднятого CDP-браузера
-                // (порт 9223 занят другим процессом) CLI изредка не завершался
-                // после печати результатов — вся работа сделана, токены
-                // сохранены, но процесс жил минутами. hard-exit надёжен для CLI.
-                // СВОЙ headless-браузер закрываем ЯВНО до exit: process::exit
-                // пропускает shutdown в main() (регресс v0.17.5 недопустима —
-                // CDP-порт без аутентификации не должен переживать CLI).
-                poler_engine::google::shutdown_owned_headless_browser();
-                use std::io::Write as _;
-                let _ = std::io::stdout().flush();
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("poler-engine google-auth: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    if let Some(url) = cli.google_browse.clone() {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            eprintln!("poler-engine: --google-browse ожидает URL, получено: {url}");
-            return ExitCode::from(2);
-        }
-        return match poler_engine::google::browse(&url) {
-            Ok(()) => {
-                println!("Браузер poler-engine открыт (персистентный профиль):");
-                println!("  {:?}", poler_engine::google::profile_dir());
-                println!("URL: {url}");
-                println!();
-                println!("Залогинься СВОИМИ руками — пароль остаётся между тобой и Google.");
-                println!("Сессия сохранится в профиль; дальше читай контент:");
-                println!("  poler-engine --google-fetch {url}");
-                println!("Окно браузера закрой сам, когда закончишь.");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("poler-engine google-browse: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    if let Some(url) = cli.google_fetch.clone() {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            eprintln!("poler-engine: --google-fetch ожидает URL, получено: {url}");
-            return ExitCode::from(2);
-        }
-        return match poler_engine::google::fetch_profiled(&url, cli.web_wait_ms) {
-            Ok(page) => {
-                if page.text.trim().is_empty() {
-                    eprintln!(
-                        "poler-engine google-fetch: пустой рендер (нет логина для этого сервиса? \
-                         см. --google-browse <URL>): {url}"
-                    );
-                    ExitCode::from(1)
-                } else {
-                    let max_chars = 20_000;
-                    let text = page.text.trim();
-                    let shown: String = text.chars().take(max_chars).collect();
-                    println!("# {url}\n");
-                    println!("{shown}");
-                    if text.chars().count() > max_chars {
-                        eprintln!(
-                            "… (обрезано до {max_chars} символов из {})",
-                            text.chars().count()
-                        );
-                    }
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => {
-                eprintln!("poler-engine google-fetch: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    if cli.google_status {
-        // Одна строка о тире — прозрачность лицензии рядом с OAuth-статусом.
-        let lst = poler_engine::license::status();
-        match &lst.license {
-            Some(lic) => eprintln!(
-                "Лицензия: {} ({}) — до {}",
-                lic.tier,
-                lic.name,
-                if lic.expires == 0 {
-                    "бессрочно".to_string()
-                } else {
-                    poler_engine::license::civil_date(lic.expires)
-                }
-            ),
-            None => eprintln!(
-                "Лицензия: {} (локальный поиск без лимитов)",
-                lst.tier.as_str()
-            ),
-        }
-        return match poler_engine::google::api::status() {
-            Ok(st) => {
-                println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("poler-engine google-status: {e}");
-                ExitCode::from(1)
-            }
-        };
-    }
-
-    if let Some(query) = cli.google_gmail.clone() {
-        if !poler_engine::license::gate_or_print(poler_engine::license::FEATURE_GMAIL) {
-            return ExitCode::from(2);
-        }
-        return match poler_engine::google::api::gmail_search(&query, cli.google_max.max(1)) {
-            Ok(hits) => {
-                if cli.verbose {
-                    eprintln!(
-                        "poler-engine gmail: «{query}» — {} писем",
-                        hits.len()
-                    );
-                }
-                print_mail_hits(&hits, &query, cli.format);
-                if hits.is_empty() {
-                    ExitCode::from(1)
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => {
-                eprintln!("poler-engine gmail: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    if let Some(query) = cli.google_drive.clone() {
-        if !poler_engine::license::gate_or_print(poler_engine::license::FEATURE_DRIVE) {
-            return ExitCode::from(2);
-        }
-        return match poler_engine::google::api::drive_list(&query, cli.google_max.max(1)) {
-            Ok(hits) => {
-                if cli.verbose {
-                    eprintln!(
-                        "poler-engine drive: «{query}» — {} файлов",
-                        hits.len()
-                    );
-                }
-                print_drive_hits(&hits, &query, cli.format);
-                if hits.is_empty() {
-                    ExitCode::from(1)
-                } else {
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(e) => {
-                eprintln!("poler-engine drive: {e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    // ---------- NotebookLM: RPC-протокол NLMTools без пароля (v0.13.0) ----------
-    if cli.nlm_notebooks
-        || cli.nlm_source.is_some()
-        || cli.nlm_notes.is_some()
-        || cli.nlm_artifacts.is_some()
-        || cli.nlm_account
-        || cli.nlm_chat.is_some()
-        || cli.nlm_media.is_some()
-        || cli.nlm_shot.is_some()
-        || cli.nlm_sync.is_some()
-    {
-        return run_nlm(&cli);
     }
 
     // ---------- Веб-индекс: статистика ----------

@@ -36,7 +36,7 @@ enum EngineFail {
 
 /// Состояние Terminal Gateway.
 pub struct GatewayState {
-    /// Внутренний шелл движка (search/nlm/notes/…) — делегация.
+    /// Внутренний шелл движка (search/notes/…) — делегация.
     pub shell: ShellState,
     /// Рабочий каталог gateway (cd/pwd/workspace; хостовые команды стартуют отсюда).
     pub cwd: PathBuf,
@@ -145,7 +145,7 @@ pub enum GatewayResult {
 pub fn is_engine_command(name: &str) -> bool {
     matches!(
         name,
-        "search" | "web" | "stats" | "nlm" | "sync" | "set" | "crawl" | "impact" | "gh" | "gl"
+        "search" | "web" | "stats" | "sync" | "set" | "crawl" | "impact" | "gh" | "gl"
             | "gt" | "gix" | "notes" | "sources" | "grep" | "chunk" | "benchmark" | "service"
             | "attach" | "weblens" | "license" | "cd" | "pwd" | "clear" | "host" | "help"
             | "version" | "quit" | "exit" | "q" | "ver" | "workspace" | "grant" | "pty"
@@ -470,7 +470,7 @@ pub fn exec_line(state: &mut GatewayState, line: &str, interactive: bool) -> Gat
     // v0.24.0: граница и для ДВИЖКОВЫХ сегментов с файл-аргументами
     // (grep/chunk/impact/crawl/benchmark/gh…): движок читает файлы нативно —
     // путь вне workspace без подтверждения нельзя. Команды-запросы
-    // (search/nlm/notes…) и навигация (cd/workspace/allow) — исключены:
+    // (search/notes…) и навигация (cd/workspace/allow) — исключены:
     // у них свои ворота. v0.25.0: движок читает файлы НА ХОСТЕ — граница
     // действует даже при активном Container Jail.
     if !state.danger_mode {
@@ -778,7 +778,7 @@ fn run_engine(
     }
 }
 
-/// Делегация во внутренний шелл движка (v0.15+): search/stats/nlm/notes/
+/// Делегация во внутренний шелл движка (v0.15+): search/stats/notes/
 /// sources/crawl/impact/gh/gl/gt/gix/sync/set… Слова с пробелами
 /// перекавычиваются — семантика аргументов сохраняется.
 fn delegate_shell(state: &mut GatewayState, tokens: &[String]) -> Result<String, EngineFail> {
@@ -1080,7 +1080,7 @@ fn cmd_weblens(args: &[String]) -> Result<String, String> {
 fn attach_session(name: &str) -> Result<String, String> {
     match name {
         "mcp" => attach_mcp(),
-        "weblens" | "companion" => tail_log(name),
+        "weblens" => tail_log(name),
         other => Err(format!(
             "attach: неизвестный сервис {other} ({})",
             service::service_names().join(", ")
@@ -2359,7 +2359,7 @@ pub fn gateway_help() -> String {
     s.push_str("  chunk [PATH|--stdin] [--size N] [--overlap N] [--json]\n");
     s.push_str("                              RAG-чанковка (секция→абзац→предложение)\n");
     s.push_str("  impact SYMBOL               AIDDE: подграф влияния символа\n");
-    s.push_str("  crawl URL / notes / nlm / sources / gh / gl / gt / gix / stats\n");
+    s.push_str("  crawl URL / notes / sources / gh / gl / gt / gix / stats\n");
     s.push_str("                              (делегация во внутренний шелл: help там же)\n");
     s.push_str("  benchmark [--json PATH]     бенчмарк-сьют движка\n");
     s.push_str("  license                     статус лицензии + EULA-условия\n\n");
@@ -2670,7 +2670,7 @@ mod tests {
         let out = run(&mut st, "service status").unwrap();
         assert!(out.contains("mcp"));
         assert!(out.contains("weblens"));
-        assert!(out.contains("companion"));
+        assert!(!out.contains("companion"), "v2.0: Auth Companion удалён");
     }
 
     #[test]

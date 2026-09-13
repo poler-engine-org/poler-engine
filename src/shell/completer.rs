@@ -1,12 +1,14 @@
 //! Tab-completion для REPL poler-shell. Реализует `rustyline::Completer`
-//! поверх списка команд `ShellState::commands()` + `nlm_subcommands()` +
-//! `set_keys()`. Завершает первое слово команды и подкоманды `nlm`/`set`.
+//! поверх списка команд `ShellState::commands()` + `set_keys()`.
+//! Завершает первое слово команды и подкоманды `set`/`notes`/`sources`/vcs.
+//!
+//! v2.0: NLM-подкоманды удалены вместе с Google/NotebookLM.
 
 use rustyline::completion::Completer;
 
 use super::state::ShellState;
 
-/// Комплетер poler-shell: завершает команды и подкоманды NLM/set.
+/// Комплетер poler-shell: завершает команды и подкоманды.
 pub struct PolerCompleter;
 
 impl Default for PolerCompleter {
@@ -19,8 +21,7 @@ static CMD_HINTS: &[(&str, &str)] = &[
     ("search", "search \"<query>\" [--top N]"),
     ("web", "web \"<query>\" [--top N]"),
     ("stats", "stats"),
-    ("nlm", "nlm list|notes|notes-sync|artifacts|source|account|ask|sync"),
-    ("sync", "sync (синк NLM) | sync vcs [gh|gl|gt] <OWNER>"),
+    ("sync", "sync vcs [gh|gl|gt|gix|all] [OWNER]"),
     ("crawl", "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]"),
     ("impact", "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]"),
     ("gh", "gh search|repos|commits|issues ... (GitHub REST)"),
@@ -55,22 +56,6 @@ pub fn complete_prefix(prefix: &str) -> (usize, Vec<String>) {
             .map(|c| (*c).to_string())
             .collect();
         return (prefix.len() - first.len(), cands);
-    }
-
-    // Команда `nlm` — завершаем подкоманду
-    if first == "nlm" {
-        let sub_prefix = if tokens.len() >= 2 && in_first_token {
-            tokens[1]
-        } else {
-            ""
-        };
-        let cands: Vec<String> = ShellState::nlm_subcommands()
-            .iter()
-            .filter(|s| s.starts_with(sub_prefix))
-            .map(|s| (*s).to_string())
-            .collect();
-        let replace_from = prefix.find("nlm ").map(|i| i + 4).unwrap_or(prefix.len());
-        return (replace_from, cands);
     }
 
     // Команда `set` — завершаем ключ
@@ -124,7 +109,7 @@ pub fn complete_prefix(prefix: &str) -> (usize, Vec<String>) {
         return (replace_from, cands);
     }
 
-    // v0.17.0: notes — завершаем подкоманду (list/add/show/edit/rm/save-from-ai)
+    // notes — завершаем подкоманду (list/add/show/edit/rm)
     if first == "notes" {
         let sub_prefix = if tokens.len() >= 2 && in_first_token {
             tokens[1]
@@ -358,20 +343,10 @@ mod tests {
     }
 
     #[test]
-    fn complete_nlm_subcommands() {
-        let (start, cands) = complete_prefix("nlm l");
-        assert!(cands.iter().any(|c| c == "list"));
-        assert!(!cands.iter().any(|c| c == "account"), "account doesn't start with 'l'");
-        assert!(start >= 4);
-    }
-
-    #[test]
-    fn complete_nlm_after_space() {
-        // "nlm " — пробел после nlm, ожидаем все подкоманды
-        let (_, cands) = complete_prefix("nlm ");
-        assert!(cands.iter().any(|c| c == "list"));
-        assert!(cands.iter().any(|c| c == "ask"));
-        assert!(cands.iter().any(|c| c == "sync"));
+    fn complete_nlm_is_gone_in_v2() {
+        // v2.0: NLM-команда удалена — подсказок нет
+        let (_, cands) = complete_prefix("nlm l");
+        assert!(cands.is_empty(), "v2.0: nlm-подкоманд больше нет: {cands:?}");
     }
 
     #[test]
@@ -414,7 +389,6 @@ mod tests {
         assert!(cands.iter().any(|c| c == "show"));
         assert!(cands.iter().any(|c| c == "edit"));
         assert!(cands.iter().any(|c| c == "rm"));
-        assert!(cands.iter().any(|c| c == "save-from-ai"));
     }
 
     #[test]
@@ -438,8 +412,9 @@ mod tests {
     #[test]
     fn complete_empty_line_returns_all_commands_full() {
         let (_, cands) = complete_prefix("");
-        assert!(cands.iter().any(|c| c == "nlm"));
+        assert!(!cands.iter().any(|c| c == "nlm"), "v2.0: nlm удалён");
         assert!(cands.iter().any(|c| c == "quit"));
+        assert!(cands.iter().any(|c| c == "notes"));
     }
 
     #[test]
@@ -461,10 +436,8 @@ mod tests {
     }
 
     #[test]
-    fn hint_for_nlm_command() {
-        let h = hint_for_line("nlm ");
-        assert!(h.is_some());
-        assert!(h.unwrap().contains("list"));
+    fn hint_for_nlm_is_none_in_v2() {
+        assert!(hint_for_line("nlm ").is_none(), "v2.0: nlm-подсказок больше нет");
     }
 
     // v0.15.1: crawl/impact completion tests

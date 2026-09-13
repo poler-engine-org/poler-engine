@@ -1,9 +1,9 @@
-//! Confirmation Gate (v0.17.5): Human-in-the-Loop для деструктивных операций.
+//! Confirmation Gate (v0.17.5 → v2.0): Human-in-the-Loop для
+//! деструктивных операций.
 //!
 //! Дизайн согласован с принципом «минимум удивления»:
 //!
-//! 1. **CLI-режим** (`poler-engine --nlm-…`, `--import-browser-session`):
-//!    интерактивный `[y/N]`-вопрос в терминал — stdin свободен.
+//! 1. **CLI-режим**: интерактивный `[y/N]`-вопрос в терминал — stdin свободен.
 //! 2. **Shell/TUI/MCP** (stdin занят rustyline / ratatui / JSON-RPC):
 //!    двухшаговое подтверждение — первый вызов показывает ПЛАН и просит
 //!    повторить команду с `--yes` (паттерн `terraform plan → apply`).
@@ -13,6 +13,10 @@
 //!
 //! Правило по умолчанию — ОТКАЗ: если ответ не распознан, stdin закрыт
 //! или нет TTY — операция НЕ выполняется.
+//!
+//! v2.0: перенесено из `google/confirm.rs` при отвязке от Google —
+//! утилита общесистемная (--yes/--dry-run для notes rm и др.), к
+//! облачным сервисам отношения не имеет.
 
 use std::io::BufRead;
 
@@ -121,10 +125,10 @@ mod tests {
 
     #[test]
     fn replan_hint_mentions_yes_and_dry_run() {
-        let h = replan_hint("nlm notes-sync nb-1", "3 заметки → облако");
+        let h = replan_hint("notes rm 5", "заметка «черновик»");
         assert!(h.contains("--yes"));
         assert!(h.contains("--dry-run"));
-        assert!(h.contains("3 заметки"));
+        assert!(h.contains("черновик"));
     }
 
     #[test]

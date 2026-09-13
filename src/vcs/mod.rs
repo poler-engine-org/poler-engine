@@ -186,9 +186,8 @@ pub struct VcsSyncStats {
 /// Реализации: [`github::GithubAdapter`], [`gitlab::GitlabAdapter`],
 /// [`gitea::GiteaAdapter`], [`local::GixAdapter`].
 ///
-/// Архитектурно аналогичен `google::nlm::NlmSession` из v0.13: каждый
-/// адаптер знает свой API-токен, базовый URL, и умеет листать страницы
-/// VCS-объектов. Влитие в `web-index.db` делается единым хелпером
+/// Каждый адаптер знает свой API-токен, базовый URL, и умеет листать
+/// страницы VCS-объектов. Влитие в `web-index.db` делается единым хелпером
 /// [`ingest::ingest_objects`] — адаптеры только отдают данные.
 pub trait VcsAdapter {
     /// Имя адаптера (`"github"`, `"gitlab"`, `"gitea"`, `"gix"`).
