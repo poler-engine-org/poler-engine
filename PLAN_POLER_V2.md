@@ -653,3 +653,349 @@ src/
 3. **Параллельно Фаза 3** (Vector Layer) — самая длинная, начать раньше
 4. **После Фазы 5** (IIR Fusion) — опубликовать research paper (это уникальный вклад)
 5. **Каждая фаза** — отдельный branch, тесты, benchmark vs предыдущая версия
+
+
+---
+
+# ЧАСТЬ B: АРХИТЕКТУРНЫЙ ТЕЗИС — ИНСТРУМЕНТ, НЕ ИИ
+
+> **Источник:** Диалог автора с DeepSeek, 2026-09-13
+> (`docs/research/dialogue_tool_vs_ai.md` — полный текст, 1192 строки)
+>
+> **Ключевой вывод автора:**
+> «Инструмент должен давать ИИ удобное взаимодействие с базой данных.
+> Не более. Ничего больше. Не понимать. Не анализировать. Не решать.
+> Индексировать. Находить. Отдавать. ИИ — понимает. Автор — творит.
+> Инструмент — служит.»
+
+## B.1. Чего poler-engine НЕ делает
+
+- ❌ **Не обучает модель.** Нет training loop, нет backprop, нет градиентов.
+- ❌ **Не создаёт новый ИИ.** Нет своей нейросети «с нуля».
+- ❌ **Не генерирует текст.** Нет генератора прозы.
+- ❌ **Не принимает решений.** Нет агента, который «думает сам».
+- ❌ **Не «понимает» контент.** Не знает, что такое «сцена», «голос Марты», «противоречие канону».
+- ❌ **Не понимает математику, физику, биологию, астрономию.**
+
+## B.2. Что poler-engine делает
+
+- ✅ **Даёт существующей LLM глаза и память.** Поиск по корпусу автора.
+- ✅ **Даёт ей верификацию.** Проверку «сходится ли канон» — через contradiction detection.
+- ✅ **Даёт ей граф.** Связи между сущностями, временные слои, сообщества.
+- ✅ **Даёт ей retrieval.** Четыре полосы поиска с онлайн-обучением весам.
+- ✅ **Индексирует всё, что дал автор.** Документы, схемы, расчёты, формулы, диалоги, заметки, хаос.
+- ✅ **Находит по запросу.** Точные чанки, byte-range, с метаданными.
+- ✅ **Отдаёт в удобном виде.** AI-Ready JSON, Markdown, Simple.
+- ✅ **Связывает по метаданным, не по смыслу.** Домен, тип, temporal layer.
+
+## B.3. Аналогия
+
+> GLM (агент) — это **мозг**. Он думает, пишет, рассуждает.
+>
+> POLER Engine — это **гиппокамп**. Часть мозга, которая хранит и извлекает
+> воспоминания. Мозг без гиппокампа не может вспомнить, что было вчера.
+> Модель без POLER не может вспомнить, что написано в 143 документах
+> канона — она выдумывает.
+
+## B.4. Как это работает на практике
+
+**Сейчас (без POLER v2):**
+```
+Ты: Напиши сцену, где Марта торгуется с Варго.
+GLM: [читает всё, что ты дал в промпте]
+     [пишет]
+     [может выдумать]
+Ты: Это не по канону, Марта так не говорит.
+GLM: Извини, перепишу.
+```
+
+**С POLER v2:**
+```
+Ты: Напиши сцену, где Марта торгуется с Варго.
+GLM: [вызывает POLER: search("Марта диалог транзакция")]
+     [получает: 12 точных чанков из канона, byte-range, с голосом Марты]
+     [вызывает POLER: contradiction_check("Марта Варго сцена 14")]
+     [получает: "конфликт с T-19: Марта уже отказала Варго"]
+     [пишет сцену с учётом канона]
+```
+
+## B.5. Разнородность — не проблема
+
+Автор: «куча документов, схемы, расчёты, математика, физика, биология, астрономия».
+
+Для инструмента это не проблема. Потому что:
+- Не нужно понимать, что это.
+- Нужно только знать, что это разное — и пометить.
+
+```
+domain=physics    → физика (формулы, расчёты)
+domain=canon      → канон (фиксированные факты мира)
+domain=math       → математика (уравнения, доказательства)
+domain=literature → литература (главы, сцены, диалоги)
+domain=economy    → экономика (схемы, пирамиды, мошенничество)
+domain=biology    → биология (расы, виды, эволюция)
+domain=astronomy  → астрономия (орбиты, расчёты, константы)
+```
+
+Retrieval фильтрует по домену. ИИ сам разберётся, что делать с физикой.
+Инструмент просто её отдаст.
+
+## B.6. Принцип разделения ответственности
+
+| Роль | Кто | Что делает |
+|---|---|---|
+| **Творит** | Автор | Пишет, создаёт, думает, строит карту мира |
+| **Понимает** | ИИ (GLM/Claude/GPT) | Читает, анализирует, генерирует, рассуждает |
+| **Служит** | POLER Engine | Индексирует, находит, отдаёт, связывает по метаданным |
+
+> «Не понимать. Не анализировать. Не решать.
+> Индексировать. Находить. Отдавать.
+> ИИ — понимает. Автор — творит. Инструмент — служит.»
+
+---
+
+# ЧАСТЬ C: СВОДНЫЕ ВЫЖИМКИ ИЗ 4 ИССЛЕДОВАТЕЛЬСКИХ ОТЧЁТОВ
+
+> Полные отчёты в `docs/research/`:
+> - `research_semantic_search.md` (483 строки, 36 KB)
+> - `research_code_agentic.md` (572 строки, 51 KB)
+> - `research_streaming_nlp.md` (793 строки, 57 KB)
+> - `research_rag_kg.md` (215 строк, 13 KB)
+> - `dialogue_tool_vs_ai.md` (1192 строки, 66 KB) — полный диалог с DeepSeek
+
+## C.1. Semantic Search — ключевые находки
+
+### SOTA 2026 = четырёхполосный конвейер
+
+| Полоса | Метод | Что делает | Rust наличие |
+|---|---|---|---|
+| 1 | BM25 + ε-density | Лексический поиск (poler уже имеет) | ✅ native |
+| 2 | SPLADE / DeepImpact | Learned sparse (BERT-генерируемые веса терминов) | ✅ через `ort` (ONNX) |
+| 3 | BGE-M3 dense | Плотные эмбеддинги (косинусное сходство) | ✅ `fastembed-rs` |
+| 4 | ColBERTv2 / PLAID | Multi-vector late interaction | ✅ `next-plaid` (pure Rust) |
+
+### BGE-M3 — прорыв 2026
+
+- **Одна модель, три выхода** (dense + sparse + ColBERT) из одного XLM-RoBERTa
+- 100+ языков (включая русский)
+- Заменяет Semantic Bridge poler-engine (hand-rolled 120 пар → нейросеть)
+
+### Что украсть
+
+| Инструмент | URL | Зачем | Rust |
+|---|---|---|---|
+| **fastembed-rs** | github.com/Anush008/fastembed-rs | BGE-M3 + nomic через ONNX | ✅ |
+| **usearch** | github.com/unum-cloud/usearch | HNSW с user-defined metrics | ✅ FFI |
+| **next-plaid** | docs.rs/next-plaid | Pure Rust PLAID (ColBERT) | ✅ native |
+| **lance** | github.com/lancedb/lance | Columnar vector format, mmap'd, IVF-PQ | ✅ native |
+| **RaBitQ** | SIGMOD 2024 paper | 1-bit квантование, 32× сжатие векторов | ⚠️ строим сами |
+| **ScaNN** | google-research | Anisotropic quantization, AVX-512 | ⚠️ алгоритм |
+
+### ★ Главная находка для poler-engine
+
+> Ни одна SOTA-система 2026 не делает **online lane-weight learning** через
+> резонансное накопление. poler-engine уже имеет `R_t = ε_t + φ·R_{t−1}` —
+> это ТОЧНО тот субстрат, который нужен для динамического fused retrieval.
+> **Это реальный research contribution.**
+
+---
+
+## C.2. Code Intelligence & Agentic — ключевые находки
+
+### tree-sitter → ast-grep (Rust rewrite)
+
+- ast-grep опубликовал **pure Rust rewrite** tree-sitter в 2026 — 30% быстрее C-версии
+- Incremental parsing: 5ms → 400μs на 100-LOC edit
+- S-expression query DSL с captures и predicates
+- **Заменяет** regex-based AST парсер poler-engine (753 LOC → tree-sitter)
+
+### Salsa — incremental computation (из rust-analyzer)
+
+- Pure Rust, MIT, production-ready
+- Query-граф: file edit → invalidate only downstream
+- **Заменяет** watcher mode (mtime/size cache → Salsa query graph)
+- Все AIDDE операции становятся Salsa queries
+
+### Aider repomap — PageRank over symbol graph
+
+- tree-sitter tags → symbol graph → personalized PageRank → token-budgeted tree
+- poler-engine **уже имеет PageRank** в `web/index.rs`
+- Нужен только tree-sitter tags + cross-wiring
+- **Идеальный map для LLM-агента** — показывает структуру репо в токен-бюджете
+
+### MCP v2 — full-spec
+
+- Текущий poler MCP: 6 tools (stdio + HTTP)
+- MCP full-spec: **resources + sampling + subscriptions**
+- File edits push context to LLM без tool calls
+- Streamable HTTP + OAuth 2.1
+
+### WASM plugins
+
+- Wasmtime + WASI Preview 2 + Component Model
+- 100μs cold-start sandbox (рядом с Docker)
+- Capability security model
+- Расширяемость без перекомпиляции
+
+### Agentic patterns
+
+- **ReAct** (Reasoning + Acting) — LLM рассуждает → вызывает инструмент → наблюдает → повторяет
+- **Reflexion** — self-reflection после каждой попытки
+- **Plan-and-Solve** — декомпозиция задачи
+- poler-engine может предоставить **интерфейс** для этих циклов через MCP
+
+### Differential dataflow
+
+- **DBSP** (VLDB 2023, `dbsp` Rust crate) — Z-sets, automatic IVM для любого SQL
+- **differential-dataflow** (McSherry) — heavyweight option
+- **Salsa × DD bridge** — novel composition, нет аналогов
+- Математически корректные инкременты
+
+---
+
+## C.3. Streaming, Compression & NLP — ключевые находки
+
+### FSST — киллер-примитив для поискового движка
+
+- **FSST** (Boncz, VLDB 2020) — Fast Static Symbol Table
+- 1-3 GB/s decode, random access к individual strings
+- `fsst-rs` (crates.io, pure Rust, zero-dependency)
+- **Применение:** inverted index token storage, doc store, URL/path strings, AIDDE symbol table
+- **Результат:** ~2× reduction in inverted-index RAM with zero query-time overhead
+- **Вердикт:** STEAL `fsst-rs`, integrate as transparent layer under `Box<str>` token storage
+
+### zstd-seekable — zero-storage архивы
+
+- `zeekstd` / `zstd-framed` — spec-perfect zstd-seekable в Rust
+- HTTP Range + `tokio-tar` + `warc` покрывают все типы архивов
+- **TARmageddon CVE (Oct 2025)** убил `async-tar` — использовать `tokio-tar`
+- **Вердикт:** STEAL zstd-seekable + `warc` + `tokio-tar`; BUILD `HttpRangeBlob` + `TarEntryIndex`
+
+### nomic-embed-text — Matryoshka embeddings
+
+- `fastembed-rs` + `ort` дают 14× speedup (Manticore 2026)
+- **nomic-embed-text-v1.5** имеет **Matryoshka** dims (64-768)
+- Ключевой enabler для binary-quantized HNSW + full-precision rerank
+- **Вердикт:** STEAL `fastembed-rs` + `ort` + `candle-core`; nomic v1.5 как primary model
+
+### RaBitQ — 1-bit vector quantization
+
+- **RaBitQ** (SIGMOD 2024) — random rotation + 1-bit = 32× compression
+- Теоретический error bound
+- Нет standalone Rust crate (LanceDB имеет built-in)
+- HNSW crates хранят float32 — убивает цель
+- **Вердикт:** BUILD RaBitQ + poler-native HNSW (~700 LOC)
+
+### DBSP — differential dataflow
+
+- **DBSP** (VLDB 2023, `dbsp` Rust crate) — Z-sets, automatic IVM
+- `differential-dataflow` (McSherry) — heavyweight
+- CRDTs (`yrs`) — только для multi-device sync
+- **Вердикт:** STEAL DBSP design; BUILD poler-flavored mini-DD (~600 LOC)
+
+### madvise — free 2× win
+
+- `madvise(SEQUENTIAL/RANDOM/WILLNEED)` — free 2× win (Tantivy использует)
+- `userfaultfd` + zstd-seekable bridge — novel poler opportunity
+- **Вердикт:** STEAL madvise patterns (~50 LOC); BUILD `LazyDecompressMmap` (~300 LOC)
+
+### ★ План "превзойти на порядок"
+
+> Ни одна 2026 система не комбинирует все шесть примитивов:
+> **zstd-seekable HTTP archives + FSST-compressed inverted index +
+> nomic-Matryoshka embeddings + RaBitQ + poler-native HNSW + DBSP
+> incremental refresh + madvise/userfaultfd mmap tuning.**
+> Каждый SOTA-валидирован индивидуально; stacking — даёт "1B vectors +
+> 100 TB streaming corpora in 16 GB RAM on CPU."
+
+---
+
+## C.4. RAG & Knowledge Graphs — ключевые находки
+
+### GraphRAG (Microsoft)
+
+- Hierarchical Leiden community detection + LLM community summaries
+- Local/global retrieval modes
+- Python-only (нет Rust)
+- **Адаптировать:** Leiden через `linfa-clustering` (pure Rust)
+
+### LightRAG
+
+- Dual-level (entity + keyword) retrieval
+- ~10× дешевле GraphRAG
+- Incremental index
+- Python-only
+- **Адаптировать:** dual-level retrieval pattern
+
+### HippoRAG
+
+- Hippocampal indexing theory
+- PageRank over personal KG for pattern completion
+- **poler-engine УЖЕ ИМЕЕТ PageRank** в `web/index.rs`
+- Нужен только cross-wiring: web graph → entity graph
+
+### GLiNER — zero-shot NER
+
+- BERT-encoder, ~0.3B params, beats ChatGPT on NER
+- **Rust: YES** — `gline-rs` crate (ONNX, Aug 2026)
+- GLiNER-Relex (May 2026) — joint NER + RE (relation extraction)
+- **Заменяет** regex-based SVO triple extraction
+
+### Contradiction detection
+
+- NLI cross-encoders + functional-relation rule mining + pairwise fact checking
+- poler-engine имеет temporal layers → temporal contradiction detection
+- **BUILD:** NLI cross-encoder на functional-relation conflicts
+
+### Incremental KG updates
+
+- DIAL-KG, CLKGE (continual learning)
+- Dirty-flag community re-clustering
+- **BUILD:** append-only log + dirty communities
+
+### Порядок построения (smallest → highest leverage)
+
+1. Edge provenance + schema ontology (no deps)
+2. Temporal edges (data-model change)
+3. PageRank retrieval prior (~20 lines)
+4. Leiden community detection
+5. Incremental update layer
+6. GLiNER via `gline-rs` (first neural extractor)
+7. NLI contradiction detector
+8. (Optional) REBEL/GLiNER-Relex for typed relations
+
+> **Bottom line:** Все 6 load-bearing SOTA ideas Rust-feasible today
+> (ONNX Runtime + petgraph + linfa) — no Python dependency required.
+
+---
+
+# ЧАСТЬ D: ПОЛНЫЙ ДИАЛОГ «ИНСТРУМЕНТ VS ИИ» — РЕФЕРЕНС
+
+> Полный текст (1192 строк) в `docs/research/dialogue_tool_vs_ai.md`
+>
+> **Краткое содержание:**
+>
+> 1. Автор скинул PLAN_POLER_V2 DeepSeek для анализа
+> 2. DeepSeek объяснил: poler-engine — это **инструмент для ИИ**, а не сам ИИ
+> 3. Автор подтвердил: «инструмент должен давать ИИ удобное взаимодействие
+>    с базой данных. Не более.»
+> 4. Ключевые тезисы:
+>    - Инструмент не понимает. Инструмент отдаёт. Понимает — ИИ.
+>    - Разнородность (физика/математика/биология/литература) — не проблема.
+>      Помечать домен, фильтровать по домену. ИИ сам разберётся.
+>    - Банальность — это сила. grep банален, работает 50 лет. SQL банален.
+>      POLER — тот же уровень. Банальный доступ к данным. Для ИИ.
+>    - Не «умный». Удобный.
+>    - Автор пишет, не думая о структуре. Сваливает всё в базу. Инструмент
+>      индексирует. ИИ спрашивает. Получает. Автор пишет дальше.
+>    - Единственное, что надо от автора — минимальные метки. Или вообще
+>      без меток (инструмент угадает по расширению/папке/содержимому).
+>
+> 5. **Принцип разделения ответственности:**
+>    - **Творит** — Автор (пишет, создаёт, думает, строит карту мира)
+>    - **Понимает** — ИИ (читает, анализирует, генерирует, рассуждает)
+>    - **Служит** — POLER Engine (индексирует, находит, отдаёт, связывает по метаданным)
+>
+> 6. **Этот принцип — КРИТЕРИЙ для всех решений в плане.** Если фаза
+>    доработки требует от poler-engine «понимать» контент — она нарушает
+>    принцип. Если фаза требует «индексировать и отдавать» — она соответствует.
