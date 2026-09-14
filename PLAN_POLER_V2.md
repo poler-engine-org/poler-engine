@@ -999,3 +999,372 @@ Retrieval фильтрует по домену. ИИ сам разберётся
 > 6. **Этот принцип — КРИТЕРИЙ для всех решений в плане.** Если фаза
 >    доработки требует от poler-engine «понимать» контент — она нарушает
 >    принцип. Если фаза требует «индексировать и отдавать» — она соответствует.
+
+
+---
+
+# ЧАСТЬ E: СУВЕРЕННЫЙ ML-ИНФЕРЕНС ЧЕРЕЗ POLER-QUANTUM-RS
+
+> **КРИТИЧЕСКОЕ АРХИТЕКТУРНОЕ РЕШЕНИЕ** (от автора, 2026-09-14)
+>
+> **Источник:** github.com/poler-engine-org/POLER-Quantum-RS
+>
+> **Принцип:** НИКАКИХ внешних ML-библиотек. НИКАКОГО ONNX Runtime.
+> НИКАКОГО C++ FFI. НИКАКИХ .onnx файлов. НИКАКИХ .so/.dll зависимостей.
+>
+> Один статический бинарь. Нативный Rust/Zig. SIMD/AVX2 на голом CPU.
+> Работает даже на голом железе без ОС.
+
+## E.1. ЧТО МЕНЯЕТСЯ В ПЛАНЕ
+
+### Было (PLAN_POLER_V2 оригинальный):
+
+```
+poler-engine → ONNX Runtime (ort) → .onnx модели (BGE-M3, SPLADE, GLiNER)
+             → C++ FFI (100 МБ внешняя библиотека)
+             → .onnx файлы (100-500 МБ каждый)
+             → зависимость от libonnxruntime.so
+```
+
+### Стало (ПРАВИЛЬНО):
+
+```
+poler-engine → POLER-Quantum-RS (pqc) → нативный Rust/Zig инференс
+             → .pqw форматы весов (POLER Quantum Weights)
+             → SIMD/AVX2 нативный код, без C++ FFI
+             → один статический бинарь, ноль внешних .so/.dll
+```
+
+### Сравнение:
+
+| Параметр | ONNX Runtime (ort) | POLER-Quantum-RS (pqc) |
+|---|---|---|
+| **Внешние зависимости** | libonnxruntime.so (~100 МБ C++) | **0** — нативный Rust |
+| **Формат весов** | .onnx (избыточные метаданные) | **.pqw** (POLER Quantum Weights, компактные, mmap) |
+| **Портативность** | ломается на голом железе | **работает даже без ОС** |
+| **Размер бинарника** | +100 МБ (C++ runtime) | **+0** (нативный код) |
+| **Скорость** | C++ через FFI (overhead) | **прямой SIMD/AVX2** |
+| **Суверенность** | нет (внешняя библиотека) | **100%** (наш код) |
+| **Проверка целостности** | нет | **Sha256/Checksum встроенный** |
+| **mmap загрузка** | нет | **да (ленивая)** |
+| **Квантувание** | внешнее | **нативное (trite.rs, trit_bloch.rs)** |
+
+## E.2. КАК РАБОТАЕТ НАТИВНЫЙ ИНФЕРЕНС
+
+### Конвейер GLiNER внутри POLER-Quantum-RS:
+
+```
+┌────────────────────────────┐
+│   Входной текст (абзац)     │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  Native UAX#29 Tokenizer   │  ← уже есть в poler-engine
+│  (Unicode, кириллица, 18  │
+│   языков, Snowball)        │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  POLER-Quantum-RS (pqc)    │  ← НАШ КОД, не ONNX
+│                            │
+│  ├─ statevector.rs         │  ← матричные преобразования
+│  ├─ complex.rs            │  ← комплексная арифметика
+│  ├─ trite.rs              │  ← тритные (ternary) структуры
+│  ├─ trit_bloch.rs         │  ← квантовые состояния
+│  ├─ syntax_unfolder.rs    │  ← развёртка синтаксиса
+│  └─ syntax_bridge.rs      │  ← мост к poler-engine
+│                            │
+│  Загружает .pqw веса:      │
+│  ├─ mmap (ленивая)        │
+│  ├─ Sha256 верификация    │
+│  └─ квантованные (int8/   │
+│     ternary)              │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  Результат: Spans          │
+│  ┌──────────────────────┐ │
+│  │ PERSON: "Вэнс"       │ │
+│  │ LOCATION: "Архисфера" │ │
+│  │ OBJECT: "Сейф-Био"   │ │
+│  │ CONCEPT: "σ_e=10"    │ │
+│  │ EVENT: "Force Close"  │ │
+│  └──────────────────────┘ │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  K-Hop Граф сущностей      │  ← уже есть в poler-engine
+│  (petgraph, temporal)     │
+└────────────────────────────┘
+```
+
+### Для векторных эмбеддингов (BGE-M3):
+
+```
+┌────────────────────────────┐
+│  Текст (чанк/документ)     │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  POLER-Quantum-RS (pqc)    │
+│                            │
+│  Transformer Encoder       │  ← нативный Rust, не ONNX
+│  (BERT-like, ~568M params) │
+│                            │
+│  Загружает .pqw веса:      │
+│  ├─ BGE-M3 weights         │
+│  ├─ mmap (ленивая)        │
+│  ├─ Sha256 верификация    │
+│  └─ квантованные (int8/   │
+│     ternary)              │
+│                            │
+│  SIMD/AVX2 матричные      │
+│  умножения на CPU          │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  Dense вектор (768-d)      │
+│  + Sparse вектор (BM25-like)│
+│  + ColBERT multi-vector    │
+│                            │
+│  → HNSW (poler-native)    │
+│  → RaBitQ 1-bit quantize   │
+│  → mmap store              │
+└────────────────────────────┘
+```
+
+### Для SPLADE (learned sparse):
+
+```
+Текст → POLER-Quantum-RS (pqc) → term→impact веса →
+  → существующий inverted index poler-engine
+  (заменяет BM25 idf·tf на learned_impact)
+```
+
+## E.3. ФОРМАТ .pqw (POLER QUANTUM WEIGHTS)
+
+> Заменяет .onnx. Наш формат. Наш код.
+
+```rust
+// .pqw формат (концептуальный)
+struct PqwHeader {
+    magic: [u8; 4],         // "PQW1"
+    version: u16,
+    model_type: ModelType,  // BGE_M3 / SPLADE / GLINER / REBEL
+    quantization: QuantType,// Int8 / Ternary / Float16 / RaBitQ
+    num_layers: u16,
+    hidden_size: u16,
+    num_heads: u8,
+    vocab_size: u32,
+    sha256: [u8; 32],      // целостность весов
+    mmap_offset: u64,      // для ленивой загрузки
+}
+
+struct PqwLayer {
+    layer_type: LayerType,  // Attention / FFN / Embedding / LayerNorm
+    weights: Vec<u8>,       // квантованные веса
+    shape: Vec<usize>,      // тензорная форма
+}
+```
+
+### Преимущества .pqw:
+
+1. **Компактность:** нет метаданных ONNX (ONNX ~500 МБ → .pqw ~150 МБ с int8)
+2. **mmap:** веса грузятся лениво по страницам, не вся модель в RAM
+3. **Sha256:** верификация целостности при загрузке
+4. **Квантувание:** int8 (4× сжатие), ternary (12× сжатие), RaBitQ (32× сжатие)
+5. **Наш код:** не зависим от Microsoft/ONNX Consortium
+
+## E.4. ИЗМЕНЕНИЯ В ФАЗАХ ПЛАНА
+
+### Фаза 3 (Vector Layer) — ИЗМЕНЕНА:
+
+| Было | Стало |
+|---|---|
+| `fastembed-rs` интеграция: BGE-M3 (dense + sparse) | **POLER-Quantum-RS: нативный BGE-M3 через .pqw** |
+| `ort` (ONNX Runtime) | **pqc (наш код, SIMD/AVX2)** |
+| .onnx модели (500 МБ) | **.pqw веса (150 МБ, int8)** |
+| Внешняя зависимость C++ | **Нативный Rust, 0 внешних .so** |
+
+### Фаза 4 (Learned Sparse — SPLADE) — ИЗМЕНЕНА:
+
+| Было | Стало |
+|---|---|
+| SPLADE ONNX inference через `ort` | **POLER-Quantum-RS: нативный SPLADE через .pqw** |
+| .onnx файл | **.pqw файл** |
+
+### Фаза 7 (KG Intelligence — GLiNER) — ИЗМЕНЕНА:
+
+| Было | Стало |
+|---|---|
+| GLiNER через `gline-rs` (ONNX) | **POLER-Quantum-RS: нативный GLiNER через .pqw** |
+| NLI через `ort` | **POLER-Quantum-RS: нативный NLI через .pqw** |
+| REBEL через `candle-transformers` | **POLER-Quantum-RS: нативный REBEL через .pqw** |
+
+### Все остальные фазы — БЕЗ ИЗМЕНЕНИЙ:
+
+- Фаза 1 (Foundation) — не зависит от ML
+- Фаза 2 (Compression) — не зависит от ML
+- Фаза 5 (IIR Fusion) — работает поверх векторов, не внутри
+- Фаза 6 (Code Intel) — tree-sitter/Salsa не ML
+- Фаза 8 (Streaming) — не зависит от ML
+- Фаза 9 (Agentic) — MCP/WASM не ML
+- Фаза 10 (Differential) — не ML
+
+## E.5. ОБНОВЛЁННЫЙ СПИСОК ЗАВИСИМОСТЕЙ
+
+### УДАЛИТЬ из Cargo.toml (больше не нужны):
+
+```toml
+# УДАЛИТЬ — заменено на POLER-Quantum-RS
+# fastembed = "4"           ← НЕТ (нативный инференс через pqc)
+# ort = "2"                 ← НЕТ (нет ONNX Runtime)
+# candle-core = "..."        ← НЕТ (нативный инференс через pqc)
+# gline-rs = "..."          ← НЕТ (нативный GLiNER через pqc)
+```
+
+### ДОБАВИТЬ в Cargo.toml:
+
+```toml
+# НОВОЕ — POLER-Quantum-RS (суверенный ML-инференс)
+[dependencies]
+poler-quantum = { path = "../POLER-Quantum-RS" }  # или git
+# или если как crate:
+# poler-quantum-core = "0.4"
+# poler-quantum-inference = "0.4"
+```
+
+### ОСТАВИТЬ (не ML, не зависят от ONNX):
+
+```toml
+# Оставить — не ML
+usearch = "0.8"         # HNSW vector search (C FFI, но лёгкая, не ML)
+next-plaid = "..."     # ColBERT (pure Rust, не ML inference)
+fsst = "0.1"           # Compression (не ML)
+zstd = "0.13"          # Compression (не ML)
+whatlang = "0.16"      # Language detection (не ML)
+rust-stemmers = "1.2"  # Stemming (не ML)
+tree-sitter = "0.22"  # Parsing (не ML)
+salsa = "0.18"         # Incremental computation (не ML)
+linfa-clustering = "0.7"  # Leiden (не ML inference, алгоритм)
+wasmtime = "20"        # WASM (не ML)
+tokio-tar = "0.3"      # Tar streaming (не ML)
+warc = "0.6"           # WARC (не ML)
+```
+
+## E.6. ФИНАЛЬНАЯ АРХИТЕКТУРА — ОДИН СТАТИЧЕСКИЙ БИНАРЬ
+
+```
+poler-engine (один статический бинарь)
+│
+├── src/                      ← poler-engine (поиск, граф, retrieval)
+│   ├── engine.rs             ← BM25 + ε + IIR + POLER[Ψ]
+│   ├── fusion/               ← 4-lane fusion
+│   ├── vectors/              ← HNSW, RaBitQ (хранение, не inference)
+│   ├── graph/                ← K-hop, Leiden, contradictions
+│   ├── retrieval/            ← grep, chunk, semantic bridge
+│   ├── tokenizer/            ← UAX#29, Snowball, whatlang
+│   ├── compression/          ← FSST, zstd, lz4
+│   ├── code/                 ← tree-sitter, Salsa, repomap
+│   ├── streaming_archives/   ← zstd-seekable, HTTP Range
+│   ├── agentic/              ← MCP v2, WASM, ReAct
+│   └── differential/         ← Salsa × DD
+│
+├── POLER-Quantum-RS (pqc)    ← НАШ ML-инференс, не ONNX
+│   ├── crates/pqc-core/      ← statevector, complex, trite, trit_bloch
+│   ├── crates/pqc-inference/ ← BGE-M3, SPLADE, GLiNER, NLI, REBEL
+│   ├── .pqw weights/         ← квантованные веса (mmap, Sha256)
+│   └── SIMD/AVX2 kernels     ← нативные матричные умножения
+│
+└── result:
+    ├── 0 внешних .so/.dll
+    ├── 0 внешних ML-библиотек
+    ├── 1 статический бинарь
+    ├── работает на голом железе без ОС
+    ├── SIMD/AVX2 на CPU
+    └── 100% суверенный стек
+```
+
+## E.7. ПОРЯДОК РЕАЛИЗАЦИИ (ОБНОВЛЁННЫЙ)
+
+### Новый Шаг 4.5: POLER-Quantum-RS Bridge (до Фазы 3)
+
+| Задача | Что | LOC |
+|---|---|---|
+| 4.5.1 | Создать bridge poler-engine ↔ POLER-Quantum-RS | ~200 |
+| 4.5.2 | Реализовать .pqw формат (header + mmap + Sha256) | ~300 |
+| 4.5.3 | Конвертер .onnx → .pqw (один раз, для каждой модели) | ~500 |
+
+### Фаза 3 (обновлённая): Vector Layer через pqc
+
+| Задача | Что | LOC |
+|---|---|---|
+| 3.1 | BGE-M3 инференс через pqc (не fastembed-rs) | ~400 |
+| 3.2 | Dense embeddings → HNSW (poler-native) | ~150 |
+| 3.3 | RaBitQ 1-bit quantization | ~700 |
+| 3.4 | ColBERT multi-vector через next-plaid | ~200 |
+| 3.5 | .pqw конвертация BGE-M3 + nomic | ~200 |
+
+### Фаза 4 (обновлённая): SPLADE через pqc
+
+| Задача | Что | LOC |
+|---|---|---|
+| 4.1 | SPLADE инференс через pqc (не ort) | ~200 |
+| 4.2 | Term-impacts в существующий inverted index | ~200 |
+| 4.3 | .pqw конвертация SPLADE | ~100 |
+
+### Фаза 7 (обновлённая): KG Intel через pqc
+
+| Задача | Что | LOC |
+|---|---|---|
+| 7.1 | GLiNER инференс через pqc (не gline-rs) | ~300 |
+| 7.2 | NLI contradiction detection через pqc | ~200 |
+| 7.3 | .pqw конвертация GLiNER + NLI | ~200 |
+
+## E.8. КОНВЕРСИЯ .onnx → .pqw
+
+> Один раз для каждой модели. Не в рантайме.
+
+```bash
+# Конвертация (один раз):
+poler-quantum convert --input bge-m3.onnx --output bge-m3.pqw --quantize int8
+poler-quantum convert --input splade.onnx --output splade.pqw --quantize ternary
+poler-quantum convert --input gliner.onnx --output gliner.pqw --quantize int8
+poler-quantum convert --input nli.onnx --output nli.pqw --quantize int8
+
+# Результат:
+# bge-m3.pqw   (~150 МБ, int8, mmap, Sha256)
+# splade.pqw   (~50 МБ, ternary, mmap, Sha256)
+# gliner.pqw   (~100 МБ, int8, mmap, Sha256)
+# nli.pqw      (~120 МБ, int8, mmap, Sha256)
+
+# Хранение: в .poler-engine/models/ или ~/.local/share/poler-engine/models/
+```
+
+## E.9. СВОДКА — ЧТО ИЗМЕНИЛОСЬ В ПЛАНЕ
+
+| Было (PLAN v1) | Стало (PLAN v2 + Part E) |
+|---|---|
+| fastembed-rs + ort (ONNX Runtime) | **POLER-Quantum-RS (pqc), нативный Rust** |
+| .onnx файлы (500 МБ, избыточные) | **.pqw файлы (150 МБ, квантованные, mmap, Sha256)** |
+| C++ FFI (libonnxruntime.so ~100 МБ) | **0 внешних .so, нативный SIMD/AVX2** |
+| gline-rs (ONNX GLiNER) | **pqc-native GLiNER** |
+| candle-core (HuggingFace ML) | **pqc-native (REBEL, NLI)** |
+| Зависимость от ONNX Consortium | **0 зависимостей, наш формат, наш код** |
+| Работает только на ОС с C++ runtime | **Работает на голом железе без ОС** |
+
+### КРИТЕРИЙ УСПЕХА:
+
+> `cargo build --release -j1` → **один статический бинарь**.
+> `ldd poler-engine` → **not a dynamic executable** (или только libc).
+> `poler-engine --semantic dense -q "Алексей"` → работает через pqc, не через ONNX.
+> `poler-engine --ner gliner -q "сущности"` → работает через pqc, не через ONNX.
+> Офлайн, без интернета, без API, без внешних библиотек.
+>
+> **Один бинарь. Ноль зависимостей. 100% суверенный.**
