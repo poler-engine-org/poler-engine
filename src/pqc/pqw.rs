@@ -686,6 +686,14 @@ impl TensorView<'_> {
         std::str::from_utf8(self.data).map_err(|_| "метаданные не utf-8".to_string())
     }
 
+    /// Сырые байты RAW-секции целиком (бинарные секции: `__tokenizer__`).
+    pub fn raw_bytes(&self) -> Result<&[u8], String> {
+        if self.dtype != Dtype::Raw {
+            return Err(format!("тензор {} не raw", self.name));
+        }
+        Ok(self.data)
+    }
+
     /// Строка эмбеддинга (gather): деквантует строку `r` в `out` —
     /// единообразно для int8/int4/f32 (embeddings-таблицы).
     pub fn gather_row(&self, r: usize, out: &mut [f32]) -> Result<(), String> {

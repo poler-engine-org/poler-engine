@@ -7,18 +7,25 @@
 //! уходят в RaBitQ-субстрат/HNSW как у любого другого эмбеддера:
 //! модель сменная, субстрат масштаба — неизменен.
 //!
+//! Токенизация: если в `.pqw` есть секция `__tokenizer__` (конвертер
+//! реальных весов BGE-M3) — настоящий Unigram/Metaspace-конвейер
+//! (`pqc::tokenizer`); для синтетических демо-моделей без секции —
+//! детерминированный хэш-двойник `hash_token_ids`.
+//!
 //! CLI: `poler-engine --semantic dense --model bge-m3.pqw -q "…"`.
 
 use std::path::Path;
 
 use super::Embedder;
 use crate::pqc::encoder::EncoderModel;
+use crate::pqc::tokenizer::UnigramTokenizer;
 use crate::pqc::hash_token_ids;
 
 /// Эмбеддер поверх `.pqw`-энкодера (BGE-M3-класс).
 pub struct PqwEmbedder {
     model: EncoderModel,
     vocab: u32,
+    tokenizer: Option<UnigramTokenizer>,
 }
 
 impl PqwEmbedder {
@@ -26,7 +33,33 @@ impl PqwEmbedder {
     pub fn open(path: &Path) -> Result<Self, String> {
         let model = EncoderModel::open(path)?;
         let vocab = model.view().header().vocab as u32;
-        Ok(Self { model, vocab })
+        let tokenizer = match model.view().tensor("__tokenizer__") {
+            Some(t) => Some(UnigramTokenizer::parse(t.raw_bytes()?)?),
+            None => None,
+        };
+        Ok(Self {
+            model,
+            vocab,
+            tokenizer,
+        })
+    }
+
+    /// Токенизация текста: настоящий Unigram или хэш-фолбэк.
+    pub fn token_ids(&self, text: &str) -> Vec<u32> {
+        match &self.tokenizer {
+            Some(tk) => tk.encode(text),
+            None => hash_token_ids(text, self.vocab),
+        }
+    }
+
+    /// Токенизатор, если модель несёт секцию `__tokenizer__`.
+    pub fn tokenizer(&self) -> Option<&UnigramTokenizer> {
+        self.tokenizer.as_ref()
+    }
+
+    /// Доступ к энкодеру (параллельное эмбеддингирование корпуса).
+    pub fn model(&self) -> &EncoderModel {
+        &self.model
     }
 }
 
@@ -45,16 +78,23 @@ impl Embedder for PqwEmbedder {
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
-        texts
-            .iter()
-            .map(|t| {
-                let ids = hash_token_ids(t, self.vocab);
-                if ids.is_empty() {
-                    return Err(format!("текст без UAX#29-слов: {t:?}"));
-                }
-                self.model.embed(&ids)
-            })
-            .collect()
+        // Энкодер ограничен max_pos (XLM-R: −2 на паддинг/сдвиг позиций).
+        let cap = self.model.view().header().max_pos as usize;
+        let cap = cap.saturating_sub(if self.model.view().header().xlmr_positions() {
+            2
+        } else {
+            0
+        });
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            let ids = self.token_ids(t);
+            if ids.is_empty() {
+                return Err(format!("текст без токенов: {t:?}"));
+            }
+            let ids = if ids.len() > cap { &ids[..cap] } else { &ids[..] };
+            out.push(self.model.embed(ids)?);
+        }
+        Ok(out)
     }
 }
 

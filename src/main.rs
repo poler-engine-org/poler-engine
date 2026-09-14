@@ -309,9 +309,23 @@ struct Cli {
     model: Option<PathBuf>,
 
     /// Семантический режим: dense = нативный энкодер из .pqw (через pqc,
-    /// не ONNX). Требует --model и -q.
+    /// не ONNX). Требует --model и -q. С --semantic-corpus — живой поиск
+    /// по каталогу/файлу (чанки → эмбеддинги → косинус → топ-N).
     #[arg(long = "semantic", value_name = "MODE")]
     semantic: Option<String>,
+
+    /// Корпус для --semantic dense (каталог или файл): чанкируются,
+    /// эмбеддятся нативным энкодером и ранжируются косинусом.
+    #[arg(long = "semantic-corpus", value_name = "PATH", requires = "semantic")]
+    semantic_corpus: Option<PathBuf>,
+
+    /// Сколько верхних результатов печатать в --semantic-corpus поиске.
+    #[arg(long = "semantic-limit", default_value_t = 5)]
+    semantic_limit: usize,
+
+    /// Потолок чанков для --semantic-corpus (равномерная выборка по корпусу).
+    #[arg(long = "semantic-max-chunks", default_value_t = 512)]
+    semantic_max_chunks: usize,
 
     /// LLM-генерация (Part F): local = нативный GLM-декодер из .pqw.
     /// remote/auto — мост к серверному GLM (Фаза 12.9, заглушка).
@@ -1338,6 +1352,8 @@ fn watch_mode(cli: Cli, config: EngineConfig, query: String, scan_target: PathBu
 
 /// `--semantic dense --model X.pqw -q "…"`: нативный энкодер (BGE-M3-класс)
 /// через pqc — mmap + Sha256 + weight-only int8/int4, без ONNX.
+/// С `--semantic-corpus PATH` — живой семантический поиск: чанки корпуса
+/// эмбеддятся тем же энкодером, ранжирование косинусом.
 fn run_semantic_native(mode: &str, cli: &Cli) -> i32 {
     if mode != "dense" {
         eprintln!(
@@ -1348,7 +1364,8 @@ fn run_semantic_native(mode: &str, cli: &Cli) -> i32 {
     let Some(model_path) = &cli.model else {
         eprintln!(
             "poler-engine: --semantic dense требует --model <path.pqw>\n  \
-             конвертер реальных весов (BGE-M3 → .pqw) — следующий кирпич;\n  \
+             конвертер реальных весов: python3 scripts/convert_hf_to_pqw.py \
+             --hf-dir <BGE-M3> --out models/bge-m3.pqw;\n  \
              проверить стек сейчас: poler-engine --pqw-selftest"
         );
         return 2;
@@ -1365,19 +1382,34 @@ fn run_semantic_native(mode: &str, cli: &Cli) -> i32 {
             return 2;
         }
     };
+
+    if let Some(corpus) = &cli.semantic_corpus {
+        return run_semantic_corpus_search(
+            &mut embedder,
+            corpus,
+            query,
+            cli.semantic_limit,
+            cli.semantic_max_chunks,
+        );
+    }
+
     let t0 = std::time::Instant::now();
     match embedder.embed_batch(&[query.as_str()]) {
         Ok(vs) => {
             let v = &vs[0];
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let head: Vec<String> = v.iter().take(8).map(|x| format!("{x:.4}")).collect();
+            let tok_info = match embedder.tokenizer() {
+                Some(tk) => format!("unigram-токенизатор: {} кусков", tk.vocab_size()),
+                None => "хэш-фолбэк (демо-модель без __tokenizer__)".to_string(),
+            };
             println!(
                 "pqw-native dense · dim={} · L2={norm:.4} · [{}] …",
                 v.len(),
                 head.join(" ")
             );
             println!(
-                "модель: {} · {:.1} мс · субстрат: RaBitQ 1-bit + HNSW готов принять векторы",
+                "модель: {} · {:.1} мс · {tok_info}",
                 embedder.name(),
                 t0.elapsed().as_secs_f64() * 1000.0
             );
@@ -1388,6 +1420,192 @@ fn run_semantic_native(mode: &str, cli: &Cli) -> i32 {
             2
         }
     }
+}
+
+/// Живой семантический поиск: корпус → чанки → эмбеддинги → косинус.
+fn run_semantic_corpus_search(
+    embedder: &mut poler_engine::vectors::pqw_bridge::PqwEmbedder,
+    corpus: &std::path::Path,
+    query: &str,
+    limit: usize,
+    max_chunks: usize,
+) -> i32 {
+    use poler_engine::vectors::Embedder as _;
+
+    let t0 = std::time::Instant::now();
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    if !collect_text_files(corpus, &mut files, 4096) {
+        return 2;
+    }
+    if files.is_empty() {
+        eprintln!("poler-engine: корпус пуст (текстовых файлов не найдено)");
+        return 2;
+    }
+
+    // Чанки: абзацы склеиваются до ~400 символов, длинные режутся.
+    let mut chunks: Vec<(String, String)> = Vec::new(); // (file, text)
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        for piece in text.split("\n\n") {
+            let p = piece.trim();
+            if p.chars().count() < 40 {
+                continue; // мусорные осколки пропускаем
+            }
+            if p.chars().count() <= 380 {
+                chunks.push((f.display().to_string(), p.to_string()));
+            } else {
+                // жёсткая нарезка длинных абзацев (~150 токенов на чанк)
+                let mut start = 0usize;
+                let cs: Vec<char> = p.chars().collect();
+                while start < cs.len() {
+                    let end = (start + 340).min(cs.len());
+                    let s: String = cs[start..end].iter().collect();
+                    chunks.push((f.display().to_string(), s));
+                    start = end;
+                }
+            }
+        }
+    }
+    if chunks.is_empty() {
+        eprintln!("poler-engine: в корпусе нет абзацев достаточной длины");
+        return 2;
+    }
+    // Равномерная выборка до max_chunks (корпус может быть огромным).
+    if chunks.len() > max_chunks {
+        let step = chunks.len() as f64 / max_chunks as f64;
+        let picked: Vec<(String, String)> = (0..max_chunks)
+            .map(|i| chunks[(i as f64 * step) as usize].clone())
+            .collect();
+        eprintln!(
+            "poler-engine: {} чанков → равномерная выборка {} (--semantic-max-chunks)",
+            chunks.len(),
+            max_chunks
+        );
+        chunks = picked;
+    }
+
+    eprintln!(
+        "корпус: {} файлов → {} чанков · эмбеддинг…",
+        files.len(),
+        chunks.len()
+    );
+    // Параллельно по чанкам (rayon): токенизация + forward — оба &self,
+    // mmap-веса разделяются всеми потоками.
+    let emb: &poler_engine::vectors::pqw_bridge::PqwEmbedder = &*embedder;
+    let cap = emb.model().view().header().max_pos as usize;
+    let cap = cap.saturating_sub(if emb.model().view().header().xlmr_positions() {
+        2
+    } else {
+        0
+    });
+    let vectors: Vec<Vec<f32>> = {
+        use rayon::prelude::*;
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let total = chunks.len();
+        let r = chunks
+            .par_iter()
+            .map(|(_, t)| {
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 25 == 0 {
+                    eprintln!("  эмбеддинг: {n}/{total}");
+                }
+                let mut ids = emb.token_ids(t);
+                if ids.len() > cap {
+                    ids.truncate(cap);
+                }
+                emb.model().embed(&ids)
+            })
+            .collect::<Result<Vec<_>, String>>();
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        }
+    };
+    let qv = match embedder.embed_batch(&[query]) {
+        Ok(v) => v.into_iter().next().unwrap(),
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+
+    let mut ranked: Vec<(usize, f32)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, v.iter().zip(&qv).map(|(a, b)| a * b).sum::<f32>()))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let dt = t0.elapsed().as_secs_f64();
+    println!(
+        "\nсемантический поиск · «{query}» · {} чанков за {dt:.1} с ({:.1} чанков/с)",
+        chunks.len(),
+        chunks.len() as f64 / dt.max(1e-9)
+    );
+    for (rank, &(i, score)) in ranked.iter().take(limit.max(1)).enumerate() {
+        let (file, text) = &chunks[i];
+        let snippet: String = text.chars().take(140).collect();
+        println!(
+            "\n{}. [cos {:.4}] {}",
+            rank + 1,
+            score,
+            file
+        );
+        println!("   {snippet}…");
+    }
+    0
+}
+
+/// Рекурсивный сбор текстовых файлов (без бинарных, ≤2 МБ).
+fn collect_text_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>, max: usize) -> bool {
+    let meta = match std::fs::metadata(root) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("poler-engine: корпус недоступен: {e}");
+            return false;
+        }
+    };
+    if meta.is_file() {
+        out.push(root.to_path_buf());
+        return true;
+    }
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, max: usize) {
+        if out.len() >= max {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            match std::fs::metadata(&p) {
+                Ok(m) if m.is_dir() => walk(&p, out, max),
+                Ok(m) if m.len() <= 2_000_000 && m.len() > 0 => {
+                    // пропускаем бинарные: NUL-байт в первой тысяче
+                    let mut head = [0u8; 1024];
+                    if let Ok(mut fh) = std::fs::File::open(&p) {
+                        use std::io::Read;
+                        if let Ok(n) = fh.read(&mut head) {
+                            if !head[..n].contains(&0) {
+                                out.push(p);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if out.len() >= max {
+                return;
+            }
+        }
+    }
+    walk(root, out, max);
+    true
 }
 
 /// `--llm local --model X.pqw -q "…"`: нативный GLM-декодер (RoPE + MQA +

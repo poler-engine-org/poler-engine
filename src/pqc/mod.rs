@@ -29,13 +29,16 @@
 //! crates/pqc-inference — отдельный кирпич после открытия репозитория.
 
 pub mod encoder;
+pub mod nfc_tables;
 pub mod pqw;
 pub mod selftest;
 pub mod sha256;
 pub mod tensor;
+pub mod tokenizer;
 
 pub use encoder::{EncoderModel, EncoderOut};
 pub use pqw::{ModelType, PqwBuilder, Quant, QuantizedWeightsView, TensorView};
+pub use tokenizer::UnigramTokenizer;
 
 /// FNV-1a — быстрый детерминированный хэш байтов.
 fn fnv1a(bytes: &[u8]) -> u64 {

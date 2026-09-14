@@ -129,14 +129,31 @@ RoPE + MQA/GQA + SwiGLU + KV-арена + MoE-роутер топ-k + greedy/tem
 top-p сэмплирование + UAX#29-детокенизатор), `src/ner/native_gliner.rs`
 (span-голова GLiNER), `src/vectors/pqw_bridge.rs` (PqwEmbedder → Embedder →
 RaBitQ-субстрат). CLI: `--pqw-selftest` (автономный цикл 6/6), `--semantic
-dense --model X.pqw`, `--llm local --model X.pqw`, `--ner gliner --model
-X.pqw`. Дифференциальные тесты против наивных fp32-эталонов: int8 cos>0.999,
-int4 >0.98, fp32 >0.9999; KV-инвариант побитовый; SHA-тамперинг ловится.
-**1044 теста зелёные (+56), ноль новых зависимостей.**
+dense --model X.pqw`, `--semantic-corpus PATH` (живой поиск по корпусу:
+чанки → нативные эмбеддинги → косинус), `--llm local --model X.pqw`, `--ner
+gliner --model X.pqw`. Дифференциальные тесты против наивных fp32-эталонов:
+int8 cos>0.999, int4 >0.98, fp32 >0.9999; KV-инвариант побитовый;
+SHA-тамперинг ловится.
 
-Дальше: кирпич 2.5 — конвертер реальных весов (safetensors/ONNX → .pqw,
-потоковая запись) + настоящий XLM-R-токенизатор + e2e `--semantic dense`
-на Eteryya → кирпич 3 (ColBERT/Matryoshka) → SPLADE → IIR-Resonance Fusion
+**Кирпич 2.5 (реальные веса) закрыт:** `scripts/convert_hf_to_pqw.py` —
+конвертер torch-zip (pytorch_model.bin) → `.pqw` int8/int4 ПОТОКОВО (блоки
+строк; RAM не растёт с моделью — тот же паттерн для 70B); маппинг XLM-R →
+конвенция pqw; встраивание токенизатора. `src/pqc/tokenizer.rs` — нативный
+XLM-R-токенизатор (Unigram-Viterbi + Metaspace + per-codepoint NFKC-таблица
++ NFC-композиция по сгенерированным таблицам `src/pqc/nfc_tables.rs`):
+**40/40 золотых текстов побитово = HF `tokenizers` v0.23.2** (снятых
+`scripts/extract_tokenizer_data.py`; интеграционный тест на реальной модели
+само-скипается без файла). BGE-M3 int8 573 МБ: послойный дифференциал с
+fp32-numpy-эталоном **cos ≥ 0.9999 на всех 24 слоях**, семантика
+**0.75/0.29 = fp32-эталон** (тест «связанный текст ближе постороннего»).
+Живой поиск: `--semantic dense --model models/bge-m3.pqw --semantic-corpus
+<ло́р> -q "…"` (rayon-параллельное эмбеддингирование). **1053 теста
+зелёные (+9), ноль новых зависимостей.**
+
+Дальше: DeBERTa-v3-спина (disentangled attention — все публичные GLiNER-
+чекпоинты на ней) + конвертер GLM (ChatGLM3-6B → .pqw int4, стримингово,
+Фаза 12.7; у владельца диск больше песочницы — конвертер уже в репо) →
+кирпич 3 (ColBERT/Matryoshka) → SPLADE → IIR-Resonance Fusion
 (уникальная инновация) → Code Intelligence (tree-sitter/Salsa) → KG
 (GLiNER-веса → .pqw, Leiden) → Streaming Archives → Agentic/MCP v2 →
 Differential Dataflow → .pqw/pqc bridge → **локальный GLM-3 6B/70B (Part F)**.

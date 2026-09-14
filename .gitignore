@@ -3,3 +3,4 @@ license-tool/target/
 Cargo.lock.bak
 *.profraw
 test-web.db
+models/

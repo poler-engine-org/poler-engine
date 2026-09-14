@@ -125,14 +125,19 @@ HashMap (250 нс против 90 нс на пробу) — на фоне mmap-�
   классификатор → sigmoid), `src/vectors/pqw_bridge.rs`
   (PqwEmbedder → трейт Embedder → RaBitQ-субстрат).
   CLI: `--pqw-selftest` (полный автономный цикл инференса: 6/6),
-  `--semantic dense --model X.pqw`, `--llm local --model X.pqw`,
+  `--semantic dense --model X.pqw`, `--semantic-corpus PATH` (живой
+  семантический поиск по корпусу), `--llm local --model X.pqw`,
   `--ner gliner --model X.pqw`.
-  Дифференциальные тесты: native int8-энкодер vs наивный fp32-эталон —
-  cos > 0.999 (int4 > 0.98, fp32 > 0.9999); инкрементальный GLM vs
-  fp32-эталон; KV-инвариант (перезапуск = побитово те же логиты);
-  SHA-256-тамперинг; 1044 теста зелёные (+56).
-  Следующий кирпич: конвертер реальных весов (BGE-M3 int8 → .pqw) +
-  настоящий XLM-R-токенизатор + e2e `--semantic dense` на Eteryya.
+  **Реальные веса (кирпич 2.5):** конвертер `scripts/convert_hf_to_pqw.py`
+  (torch-zip → .pqw int8/int4 потоково, ноль ML-зависимостей, numpy only)
+  + нативный XLM-R-токенизатор `src/pqc/tokenizer.rs` (Unigram-Viterbi +
+  Metaspace + NFKC-таблица + NFC-композиция, в RAW-секции `__tokenizer__`
+  внутри модели). BGE-M3 int8 (573 МБ): токенизатор — 40/40 текстов
+  побитово совпадают с HF `tokenizers`; послойный дифференциал с
+  fp32-numpy-эталоном cos ≥ 0.9999; семантика 0.75/0.29 (эталон fp32:
+  0.75/0.29); живой поиск по 153 МБ лора Eteryya. 1056 тестов зелёные (+12).
+  Следующий кирпич: DeBERTa-v3-спина (disentangled attention) для
+  реального GLiNER + конвертер GLM (ChatGLM3 → .pqw int4, Фаза 12.7).
 
 ---
 

@@ -102,6 +102,7 @@ layers.{i}.ffn_down_w  [hidden, intermediate]
 layers.{i}.ffn_{up,down}_b                   (опционально)
 layers.{i}.ffn_ln_gamma|beta
 final_ln_gamma|beta                         (опционально)
+__tokenizer__        RAW — Unigram-токенизатор (см. ниже, BGE-M3)
 ```
 
 Декодер (GLM-класс):
@@ -143,11 +144,38 @@ __labels__      raw utf-8, метки через '\n'
 
 ## Инструменты
 
+- `scripts/convert_hf_to_pqw.py` — **конвертер реальных весов** (E.8):
+  torch-zip `pytorch_model.bin` → `.pqw` int8/int4 потоково (блоки строк,
+  RAM не растёт с моделью), XLM-R-маппинг имён, встраивание токенизатора.
+  Требует numpy. Проверен на BAAI/bge-m3: 573 МБ, послойный дифференциал
+  с fp32-эталоном cos ≥ 0.9999, семантика 0.75/0.29 (совпадает с fp32).
+- `scripts/extract_tokenizer_data.py` — снятие таблицы нормализации и
+  золотых токенизаций с `tokenizers` (HF, эталон).
+- `scripts/gen_nfc_tables.py` — регенерация `src/pqc/nfc_tables.rs`.
 - `PqwBuilder` (`src/pqc/pqw.rs`) — сборка файла в RAM (синтетика,
-  тесты). Конвертер реальных весов (safetensors/ONNX → .pqw,
-  потоковая запись) — следующий кирпич (E.8).
+  тесты).
 - `poler-engine --pqw-selftest` — полный автономный цикл: генерация
   синтетических моделей → mmap+SHA-256 → инференс → сверка с эталоном.
+
+## Секция `__tokenizer__` (RAW, v1)
+
+Модель самодостаточна — токенизатор живёт внутри `.pqw`:
+
+```text
+"TOKR" u16 version=1 u8 algo(0=unigram) u8 flags(bit0=add_prefix_space)
+u32 unk_id bos_id eos_id pad_id mask_id (0xFFFFFFFF = нет)
+u32 vocab_size;   ×N { u16 len, bytes, f32 score }
+u32 specials_count; ×N { u16 len, bytes, u32 id }
+u32 norm_count;   ×N { u32 codepoint, u16 len, bytes }
+```
+
+Конвейер кодирования (портирован с `tokenizers` v0.23.2, сверен на 40
+текстах — 0 расхождений): raw-split по спец-токенам → нормализация
+(per-codepoint таблица = точная семантика Precompiled charsmap, затем
+NFC-композиция по `nfc_tables.rs`, затем коллапс `' {2,}'` → `' '`) →
+метаспейс (`' '` → `▁`, префикс `▁`) → Unigram-Viterbi (DP по байтам,
+unk = `min_score − 10` за один чар, `fuse_unk` — слияние подряд идущих
+unk) → обёртка `[bos, …, eos]`.
 
 ## Статус интеграции с POLER-Quantum-RS
 
