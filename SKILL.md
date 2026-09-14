@@ -107,9 +107,13 @@ poler-engine ~/eteryya -q "Алексей" --format ai-json | head -50
 Готово (v2.0): Шаг 1 — отвязка Google/NLM (суверенный стек); Шаг 2 Foundation —
 madvise/whatlang/Snowball/UAX#29 + **Teddy SIMD** (`retrieval/teddy.rs`: решёто
 якорных байтов pshufb + адаптивные якоря + быстрый фолд кириллицы; LeftmostLongest
-эквивалент AC — дифференциальные тесты; ASCII 2.7× быстрее AC, кириллица 2.15×).
+эквивалент AC — дифференциальные тесты; ASCII 2.7× быстрее AC, кириллица 2.15×);
+Шаг 3 — **Compression** (`src/compression/`: чистый порт FSST с compress-probe
+лукапами + `VocabArena` (словарь корпуса 4.1× плотнее HashMap), пер-файловые
+словари ID-парами 8×, lz4-парковка постингов, zstd doc store 26×; трейт
+`TermFreqs` — ε побитово совпадает между представлениями).
 
-Дальше: Compression (FSST/zstd/lz4) → Vector Layer (BGE-M3/usearch/RaBitQ) →
-SPLADE → IIR-Resonance Fusion (уникальная инновация) → Code Intelligence
+Дальше: Vector Layer (BGE-M3/usearch/RaBitQ — самая длинная фаза) → SPLADE →
+IIR-Resonance Fusion (уникальная инновация) → Code Intelligence
 (tree-sitter/Salsa) → KG (GLiNER/Leiden) → Streaming Archives → Agentic/MCP v2 →
 Differential Dataflow.
