@@ -146,7 +146,7 @@ impl Engine {
         let cleaner = PiiCleaner::new();
         let files = collect_files(target, &config);
         stats.files_scanned = files.len();
-        let ac = streaming::literal_ac(&query_tokens);
+        let pre = streaming::literal_prefilter(&query_tokens);
 
         // ---------- классификация файлов (incremental) ----------
         let prev = std::mem::take(&mut self.state).unwrap_or_default();
@@ -251,14 +251,14 @@ impl Engine {
         let (giants, normals) = streaming::split_giants(&to_process);
         let sink_mu = Mutex::new(sink);
         normals.par_iter().for_each(|p| {
-            if let Some(r) = streaming::pass1_file(p, &query_tokens, &config, &cleaner, &ac) {
+            if let Some(r) = streaming::pass1_file(p, &query_tokens, &config, &cleaner, &pre) {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         });
         // Гигантские файлы — строго последовательно: пик памяти ограничен
         // одним большим временным индексом.
         for p in &giants {
-            if let Some(r) = streaming::pass1_file(p, &query_tokens, &config, &cleaner, &ac) {
+            if let Some(r) = streaming::pass1_file(p, &query_tokens, &config, &cleaner, &pre) {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         }

@@ -18,8 +18,9 @@
 //!
 //! ```text
 //! files ──► [Проход 1, rayon] mmap → литеральный предфильтр
-//!              │   (kwset-техника GNU grep: aho-corasick ASCII CI /
-//!              │    lowercase-contains для кириллицы)
+//!              │   (Teddy SIMD, класс kwset/Teddy: решёто якорных байтов
+//!              │    pshufb + адаптивные якоря; ASCII CI / быстрый фолд
+//!              │    D0/D1 для кириллицы)
 //!              │    ├─ нет литерала → streaming counts (без индекса)
 //!              │    └─ есть литерал → временный FileTokens (zero-copy &str)
 //!              │         → глобальные частоты + позиции совпадений

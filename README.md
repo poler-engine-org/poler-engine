@@ -2036,7 +2036,11 @@ files ──► [Проход A, rayon] mmap → PII-mask → токенизац
   текст малых hit-файлов кэшируется между проходами (нет повторного regex-скана);
 * **HitRecord / ScenePayload** — тяжёлые payload (клон сцены, разбор троек)
   материализуются один раз на уникальную сцену и только для top-N якорей;
-* **aho-corasick** — мультитокен-поиск семантических маркеров (LeftmostLongest);
+* **Teddy SIMD** (v2.0) — мультитокен-литеральный предфильтр и поиск семантических маркеров
+  (LeftmostLongest, эквивалент AC — доказано дифференциальными тестами против crates.io
+  `aho-corasick`): решёто якорных байтов (pshufb по двум нибблам, AVX2/SSSE3) +
+  адаптивные якоря по априорной частоте байтов; ASCII-запросы — 2.7× быстрее AC
+  (1.6 ГБ/с), кириллица — быстрый фолд D0/D1 вместо to_lowercase (2.15×);
 * лексический сканер кода понимает строки, char-литералы (`'{'`!), raw-строки Rust
   (`r#"…"#`), комментарии и template-литералы JS с `${}` — скобки в них не считаются;
 * release-профиль: `opt-level=3`, `lto=true`, `codegen-units=1`, `panic="abort"`, `strip`.
@@ -2048,7 +2052,7 @@ files ──► [Проход A, rayon] mmap → PII-mask → токенизац
 
 | Источник | Файл/модуль | Техника | Внедрение в poler-engine |
 |---|---|---|---|
-| GNU grep 3.11 | `src/kwset.c` | Commentz-Walter: BM-сдвиги + AC-автомат, выбор исполнителя per-query | Литеральный SIMD-предфильтр `--fast`: aho-corasick по байтам **до** токенизации, файлы без ASCII-литерала отбраковываются (2.3× на разреженных корпусах) |
+| GNU grep 3.11 | `src/kwset.c` | Commentz-Walter: BM-сдвиги + AC-автомат, выбор исполнителя per-query | Литеральный SIMD-предфильтр `--fast`: Teddy-решёто (класс Hyperscan/ripgrep Teddy, clean-room, задача 2.5 v2.0) по байтам **до** токенизации, файлы без литерала отбраковываются |
 | ripgrep | `crates/ignore/src/walk.rs` | `WalkBuilder`: параллельный обход с .gitignore/.ignore/hidden | Обход каталогов — сам крейт `ignore` (код BurntSushi): `git_ignore`, `git_global`, `git_exclude`, `require_git(false)`, флаг `--hidden` |
 | ripgrep | `regex-automata` prefilter | literal prefilter: regex не запускается без якорного байта | PiiCleaner: отсутствие `@`/цифр (проверка `memchr`) пропускает email/IP/phone/card regex |
 | super-z-skills | `skills/_orchestrator/scripts/memory_graph.py` | SQLite-схема entities/relations с UNIQUE-констрейнтами | `--graph-export dump.sql`: дамп графа сущностей в этой же схеме, `sqlite3 graph.db < dump.sql` |
@@ -2243,8 +2247,9 @@ poler-engine/
   на лингвистическую точность;
 * потоковая схема v0.3 платит ~30–40% времени за двойную токенизацию
   (проходы 1 и 2) — сознательный размен памяти на скорость;
-* кириллические запросы проходят предфильтр через lowercase-копию текста
-  (одна аллокация на файл), ASCII — через SIMD aho-corasick без аллокаций;
+* кириллические запросы проходят предфильтр через быстрый фолд ASCII+кириллицы
+  (одна аллокация на файл, байт-в-байт ≈ to_lowercase), ASCII — через Teddy SIMD
+  без аллокаций,
 * AIDDE — лексический уровень (без полного парсера типов): разрешение
   перегрузок и trait-диспетчеризации недоступно;
 * в field-режиме семантический бонус не начисляется (он определён на уровне

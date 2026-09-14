@@ -21,6 +21,7 @@
 pub mod chunk;
 pub mod grep;
 pub mod semantic_bridge;
+pub mod teddy;
 
 pub use chunk::{
     chunk_document, render_chunks_text, Chunk, ChunkConfig, ChunkFormat, ChunkReport,
@@ -34,3 +35,4 @@ pub use semantic_bridge::{
     LexiconSensor, QueryExpansion, SemanticBridge, SemanticCandidate, SemanticSensor,
     TermExpansion, BRIDGE_TERM_WEIGHT,
 };
+pub use teddy::{Teddy, TeddyError, TeddyMatch, MAX_PATTERNS};

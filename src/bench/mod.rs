@@ -2,6 +2,9 @@
 //!
 //! Автоматический бенчмарк-раннер трёх контуров извлечения + ресурсы:
 //!
+//! * **Literal Prefilter** (v2.0, задача 2.5) — Teddy SIMD против
+//!   Aho-Corasick на литеральном предфильтре streaming-прохода 1
+//!   (полный скан без хитов — типичный случай отбраковки файла).
 //! * **Exact Retrieval** — POLER Native Grep против внешнего эталона
 //!   (ripgrep, при отсутствии — GNU grep; нет ни того ни другого —
 //!   прогон без эталона). Метрики: медиана latency (мс) и ПОЛНОТА —
@@ -82,6 +85,30 @@ pub struct ReferenceBench {
     pub matched_lines: usize,
 }
 
+/// Контур 0 (v2.0, задача 2.5): Teddy SIMD vs Aho-Corasick —
+/// литеральный предфильтр streaming-прохода 1.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrefilterBench {
+    /// Размер сканируемого корпуса (байт).
+    pub corpus_bytes: usize,
+    /// Число паттернов в прогоне.
+    pub patterns: usize,
+    /// ASCII, полный скан: Aho-Corasick ascii_case_insensitive (прежде).
+    pub ac_fullscan_ms: f64,
+    /// ASCII, полный скан: Teddy SIMD (теперь).
+    pub teddy_fullscan_ms: f64,
+    /// Ускорение Teddy vs AC (×).
+    pub speedup_x: f64,
+    /// Кириллица, полный скан: прежний путь (lowercase + N × contains).
+    pub cyr_old_ms: f64,
+    /// Кириллица, полный скан: новый путь (lowercase + Teddy).
+    pub cyr_teddy_ms: f64,
+    /// Ускорение на кириллице (×).
+    pub cyr_speedup_x: f64,
+    /// Хит-случай: AC / Teddy / contains согласны (все паттерны найдены).
+    pub agree: bool,
+}
+
 /// Контур 1: точный поиск.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExactBench {
@@ -138,6 +165,7 @@ pub struct ResourceBench {
 /// Полный отчёт прогона.
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchResults {
+    pub prefilter: PrefilterBench,
     pub exact: ExactBench,
     pub lexical: LexicalBench,
     pub passage: PassageBench,
@@ -184,6 +212,168 @@ fn median(vals: &mut [f64]) -> f64 {
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
+}
+
+// ---------------------------------------------------------------------------
+// Корпус 0 (v2.0, задача 2.5): Teddy vs AC — предфильтр
+// ---------------------------------------------------------------------------
+
+/// Генерирует смешанный ru/en корпус (~`target_bytes`, случайная
+/// капитализация — регистронезависимость честно нагружается).
+fn gen_prefilter_corpus(target_bytes: usize, seed: u64) -> String {
+    let mut rng = Rng::new(seed);
+    let ru = [
+        "система", "модуль", "резонанс", "токен", "поток", "поле",
+        "вектор", "сцена", "окно", "плотность", "индекс", "строка",
+        "файл", "текст", "запрос", "канал",
+    ];
+    let en = [
+        "runtime", "module", "engine", "stream", "buffer", "token",
+        "field", "vector", "window", "density", "index", "line",
+        "file", "text", "query", "lane",
+    ];
+    let mut s = String::with_capacity(target_bytes + 128);
+    while s.len() < target_bytes {
+        let words = 6 + rng.below(6);
+        for _ in 0..words {
+            let w = if rng.below(10) < 6 {
+                ru[rng.below(ru.len() as u64) as usize]
+            } else {
+                en[rng.below(en.len() as u64) as usize]
+            };
+            if rng.below(4) == 0 {
+                let mut c = w.chars();
+                if let Some(first) = c.next() {
+                    s.extend(first.to_uppercase());
+                    s.push_str(c.as_str());
+                }
+            } else {
+                s.push_str(w);
+            }
+            s.push(' ');
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Контур 0: полный скан корпуса паттернами, которых в нём НЕТ —
+/// типичный случай предфильтра (большинство файлов отбраковывается до
+/// токенизации, раннего выхода нет). Хит-случай проверяется на согласие
+/// результатов без таймингов (позиция первого вхождения флейкует).
+pub fn bench_prefilter(opts: &BenchOpts) -> Result<PrefilterBench, String> {
+    use crate::retrieval::teddy::Teddy;
+    use aho_corasick::AhoCorasick;
+
+    const CORPUS_BYTES: usize = 1_500_000;
+    let text = gen_prefilter_corpus(CORPUS_BYTES, SEED ^ 0x2E55);
+    let hay = text.as_bytes();
+
+    // Отсутствующие в корпусе паттерны (в т.ч. с частыми байтами —
+    // «abababab» честно грузит решёто Teddy кандидатами).
+    let ascii_miss: Vec<String> = [
+        "xyzzy", "qqqzzz", "wkwkwk", "abababab", "mmmdire", "fluxion",
+        "polyfill", "zenzizenzic",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let cyr_miss: Vec<String> = [
+        "кварц", "базальт", "гранит", "слюда", "ягель", "туф",
+        "долерит", "пегматит",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // ASCII: AC (прежний путь) vs Teddy (новый путь).
+    let ac = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&ascii_miss)
+        .map_err(|e| format!("AC: {e}"))?;
+    let miss_refs: Vec<&[u8]> = ascii_miss.iter().map(|s| s.as_bytes()).collect();
+    let teddy = Teddy::build_ascii_ci(&miss_refs).map_err(|e| format!("Teddy: {e}"))?;
+
+    let mut ac_times = Vec::with_capacity(opts.runs);
+    let mut ted_times = Vec::with_capacity(opts.runs);
+    let mut r_ac = false;
+    let mut r_ted = false;
+    for _ in 0..opts.runs {
+        let t = Instant::now();
+        r_ac = ac.find_iter(&text).next().is_some();
+        ac_times.push(ms(t));
+        let t = Instant::now();
+        r_ted = teddy.is_present(hay);
+        ted_times.push(ms(t));
+    }
+    if r_ac || r_ted {
+        return Err("паттерны miss-сета неожиданно найдены в корпусе".into());
+    }
+
+    // Кириллица: прежний путь (to_lowercase + N × contains) против
+    // нового (быстрый фолд ASCII+кириллицы + Teddy) — как в
+    // streaming::literal_present.
+    let cyr_refs: Vec<&[u8]> = cyr_miss.iter().map(|s| s.as_bytes()).collect();
+    let cyr_teddy = Teddy::build(&cyr_refs).map_err(|e| format!("Teddy cyr: {e}"))?;
+    let mut old_times = Vec::with_capacity(opts.runs);
+    let mut new_times = Vec::with_capacity(opts.runs);
+    let mut r_old = false;
+    let mut r_new = false;
+    for _ in 0..opts.runs {
+        let t = Instant::now();
+        let lower = text.to_lowercase();
+        r_old = cyr_miss.iter().any(|q| lower.contains(q.as_str()));
+        old_times.push(ms(t));
+        drop(lower);
+        let t = Instant::now();
+        match crate::retrieval::teddy::fold_ascii_cyrillic(hay) {
+            Some(folded) => r_new = cyr_teddy.is_present(&folded),
+            None => return Err("корпус содержит прочие письменности — фолд недоступен".into()),
+        }
+        new_times.push(ms(t));
+    }
+    if r_old || r_new {
+        return Err("кириллические miss-паттерны неожиданно найдены".into());
+    }
+
+    // Хит-случай: все три исполнителя обязаны согласиться.
+    let ascii_hit: Vec<String> = ["Runtime", "buffer", "ENGINE"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let cyr_hit: Vec<String> = ["Модуль", "резонанс"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let ac_hit = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&ascii_hit)
+        .map_err(|e| format!("AC hit: {e}"))?;
+    let hit_refs: Vec<&[u8]> = ascii_hit.iter().map(|s| s.as_bytes()).collect();
+    let teddy_hit = Teddy::build_ascii_ci(&hit_refs).map_err(|e| format!("Teddy hit: {e}"))?;
+    let cyr_hit_refs: Vec<&[u8]> = cyr_hit.iter().map(|s| s.as_bytes()).collect();
+    let cyr_teddy_hit = Teddy::build(&cyr_hit_refs).map_err(|e| format!("Teddy cyr hit: {e}"))?;
+    let lower = text.to_lowercase();
+    let agree = ac_hit.find_iter(&text).next().is_some()
+        && teddy_hit.is_present(hay)
+        && cyr_hit.iter().any(|q| lower.contains(q.as_str()))
+        && cyr_teddy_hit.is_present(lower.as_bytes());
+
+    let ac_ms = median(&mut ac_times);
+    let ted_ms = median(&mut ted_times);
+    let old_ms = median(&mut old_times);
+    let new_ms = median(&mut new_times);
+    Ok(PrefilterBench {
+        corpus_bytes: text.len(),
+        patterns: ascii_miss.len(),
+        ac_fullscan_ms: ac_ms,
+        teddy_fullscan_ms: ted_ms,
+        speedup_x: if ted_ms > 0.0 { ac_ms / ted_ms } else { 0.0 },
+        cyr_old_ms: old_ms,
+        cyr_teddy_ms: new_ms,
+        cyr_speedup_x: if new_ms > 0.0 { old_ms / new_ms } else { 0.0 },
+        agree,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -635,10 +825,12 @@ pub fn run_suite(opts: &BenchOpts) -> Result<BenchResults, String> {
     ));
     std::fs::create_dir_all(&root).map_err(|e| format!("tmp {root:?}: {e}"))?;
     let result = (|| {
+        let prefilter = bench_prefilter(opts)?;
         let exact = bench_exact(&root, opts)?;
         let lexical = bench_lexical(&root, opts)?;
         let passage = bench_passage(opts)?;
         Ok(BenchResults {
+            prefilter,
             exact,
             lexical,
             passage,
@@ -668,6 +860,16 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn prefilter_agreement_and_sanity() {
+        // Golden: контур 0 — согласие AC/Teddy/contains и разумные метрики.
+        let opts = BenchOpts { runs: 2, ..Default::default() };
+        let res = bench_prefilter(&opts).expect("prefilter bench");
+        assert!(res.agree, "хит-случай: исполнители разошлись");
+        assert!(res.speedup_x > 0.0);
+        assert!(res.corpus_bytes > 1_000_000);
     }
 
     #[test]
@@ -861,6 +1063,30 @@ pub fn report_text(res: &BenchResults) -> String {
     s.push_str("POLER Engine Benchmark Suite\n");
     s.push_str("══════════════════════════════════════════════════\n");
 
+    s.push_str("[0] Literal Prefilter — Teddy SIMD vs Aho-Corasick (v2.0)\n");
+    s.push_str(&format!(
+        "    корпус: {:.1} MB, {} паттернов, полный скан без хитов\n",
+        res.prefilter.corpus_bytes as f64 / 1048576.0,
+        res.prefilter.patterns
+    ));
+    s.push_str(&format!(
+        "    Aho-Corasick:  {:8.2} мс  ({:.2} GB/s)\n",
+        res.prefilter.ac_fullscan_ms,
+        res.prefilter.corpus_bytes as f64 / 1e9 / (res.prefilter.ac_fullscan_ms / 1000.0).max(1e-9)
+    ));
+    s.push_str(&format!(
+        "    Teddy SIMD:    {:8.2} мс  ({:.2} GB/s) — ускорение {:.2}×{}\n",
+        res.prefilter.teddy_fullscan_ms,
+        res.prefilter.corpus_bytes as f64 / 1e9 / (res.prefilter.teddy_fullscan_ms / 1000.0).max(1e-9),
+        res.prefilter.speedup_x,
+        if res.prefilter.agree { " ✓ согласие" } else { " ✗ РАСХОЖДЕНИЕ" }
+    ));
+    s.push_str(&format!(
+        "    Кириллица: было {:8.2} мс (to_lowercase+N×contains) → стало {:8.2} мс (фолд+Teddy) — {:.2}×\n",
+        res.prefilter.cyr_old_ms, res.prefilter.cyr_teddy_ms, res.prefilter.cyr_speedup_x
+    ));
+
+    s.push('\n');
     s.push_str("[1] Exact Retrieval — POLER Native Grep vs эталон\n");
     s.push_str(&format!(
         "    корпус: {} файлов × {} строк (шаблон {})\n",

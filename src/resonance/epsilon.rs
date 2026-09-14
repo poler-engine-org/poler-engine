@@ -15,15 +15,18 @@
 //!   которые наивный BM25/TF-IDF игнорирует, а векторный RAG усредняет;
 //! * `κ` — масштабный калибровочный коэффициент.
 //!
-//! Семантические маркеры ищутся в окне автоматом Ахо-Корасик
-//! (LeftmostLongest) — классическая задача мультитокен-поиска по
-//! предвычисленному словарю фраз.
+//! Семантические маркеры ищутся в окне SIMD-решётом Teddy
+//! (v2.0, задача 2.5; ранее — Aho-Corasick). Семантика LeftmostLongest
+//! сохранена ТОЧНО (в таблице есть префиксные пары «не может» ⊂
+//! «не может быть», «must» ⊂ «must not» — значения ε не меняются);
+//! эквивалентность доказана дифференциальными тестами Teddy против
+//! crates.io `aho-corasick` на случайных множествах и на маркер-плотных
+//! текстах (`marker_teddy_matches_ac_differential`).
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use crate::retrieval::teddy::Teddy;
+use crate::tokenizer::InvertedIndex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
-
-use crate::tokenizer::InvertedIndex;
 
 /// Таблица маркеров: (фраза, вес). Отрицания — максимальный вес:
 /// именно на них ломается косинусное сходство эмбеддингов.
@@ -101,26 +104,23 @@ const MARKER_TABLE: &[(&str, f64)] = &[
     ("deadline", 1.0),
 ];
 
-static MARKER_AC: LazyLock<(AhoCorasick, Vec<f64>)> = LazyLock::new(|| {
-    let pats: Vec<&str> = MARKER_TABLE.iter().map(|(p, _)| *p).collect();
-    let ac = AhoCorasick::builder()
-        .match_kind(MatchKind::LeftmostLongest)
-        .build(pats)
-        .expect("построение автомата маркеров не может провалиться");
+static MARKER_TEDDY: LazyLock<(Teddy, Vec<f64>)> = LazyLock::new(|| {
+    let pats: Vec<&[u8]> = MARKER_TABLE.iter().map(|(p, _)| p.as_bytes()).collect();
+    let teddy = Teddy::build(&pats).expect("построение Teddy-решёта маркеров не может провалиться");
     let weights = MARKER_TABLE.iter().map(|(_, w)| *w).collect();
-    (ac, weights)
+    (teddy, weights)
 });
 
-/// Считает Σ Bonus_semantic по окну текста (нижний регистр + Ахо-Корасик).
+/// Считает Σ Bonus_semantic по окну текста (нижний регистр + Teddy).
 pub fn semantic_bonus(window_text: &str) -> f64 {
     if window_text.is_empty() {
         return 0.0;
     }
     let hay = window_text.to_lowercase();
-    let (ac, weights) = &*MARKER_AC;
+    let (teddy, weights) = &*MARKER_TEDDY;
     let mut total = 0.0;
-    for m in ac.find_iter(&hay) {
-        total += weights[m.pattern().as_usize()];
+    for m in teddy.find_iter(hay.as_bytes()) {
+        total += weights[m.pattern];
     }
     total
 }
@@ -359,6 +359,44 @@ mod tests {
     fn semantic_bonus_empty() {
         assert_eq!(semantic_bonus(""), 0.0);
         assert_eq!(semantic_bonus("обычные слова без маркеров"), 0.0);
+    }
+
+    #[test]
+    fn marker_teddy_matches_ac_differential() {
+        // Дифференциал Teddy против Aho-Corasick LeftmostLongest на
+        // маркер-плотных текстах, включая префиксные пары таблицы
+        // («не может» ⊂ «не может быть», «must» ⊂ «must not»).
+        let ac = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(MARKER_TABLE.iter().map(|(p, _)| *p).collect::<Vec<&str>>())
+            .unwrap();
+        let texts = [
+            "КРИТИЧНО: unsafe unwrap() вызовет panic! Важно: TODO и FIXME, deprecated hack. Обязан исправить срочно!",
+            "важный модуль. критический сбой, угроза аварии. must be fixed: required mandatory. устаревший интерфейс, устарел.",
+            "это не может быть правдой: система не должна падать, никогда. risk: failure. shall not pass. дедлайн завтра, deadline близко. метрика metric.",
+            "обычное окно без маркеров совсем",
+            "",
+            "must not",
+            "не может",
+            "не может быть",
+            "todo: хак hack и fixme, mandatory deprecated urgent important",
+        ];
+        let (teddy, weights) = &*MARKER_TEDDY;
+        for t in texts {
+            let hay = t.to_lowercase();
+            let via_teddy: Vec<(usize, usize, usize)> = teddy
+                .find_iter(hay.as_bytes())
+                .map(|m| (m.pattern, m.start, m.end))
+                .collect();
+            let via_ac: Vec<(usize, usize, usize)> = ac
+                .find_iter(&hay)
+                .map(|m| (m.pattern().as_usize(), m.start(), m.end()))
+                .collect();
+            assert_eq!(via_teddy, via_ac, "текст: {t}");
+            let w_t: Vec<f64> = via_teddy.iter().map(|&(p, _, _)| weights[p]).collect();
+            let w_a: Vec<f64> = via_ac.iter().map(|&(p, _, _)| weights[p]).collect();
+            assert_eq!(w_t, w_a, "веса: {t}");
+        }
     }
 
     #[test]

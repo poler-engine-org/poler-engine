@@ -5,7 +5,7 @@
 //! индексы всех файлов репозитория одновременно. Вместо этого:
 //!
 //! * **Литеральный предфильтр** (техника GNU grep `kwset` / ripgrep
-//!   prefilter): SIMD-поиск aho-corasick (ASCII case-insensitive; для
+//!   prefilter): SIMD-решёто Teddy (ASCII case-insensitive; для
 //!   кириллицы — lowercase-contains) отбраковывает файлы **до** токенизации;
 //! * **Проход 1**: потоковая статистика — временный [`FileTokens`]
 //!   (заимствованные из mmap срезы, zero-copy) освобождается сразу после
@@ -20,7 +20,7 @@
 //! индекса. Межпроходный кэш текста (`TEXT_CACHE_LIMIT` из v0.2) удалён
 //! полностью — каждый проход читает файл заново через mmap.
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use crate::retrieval::teddy::Teddy;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -190,34 +190,53 @@ pub fn streaming_counts(text: &str) -> (HashMap<String, usize>, u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Литеральный предфильтр (GNU grep kwset / ripgrep prefilter)
+// Литеральный предфильтр (Teddy SIMD — v2.0 задача 2.5)
 // ---------------------------------------------------------------------------
 
-/// Автомат Ахо-Корасик по ASCII-токенам запроса (case-insensitive).
-/// Для не-ASCII запросов возвращает None (фолбэк на lowercase-contains).
-pub fn literal_ac(query_tokens: &[String]) -> Option<AhoCorasick> {
-    if query_tokens.is_empty() || !query_tokens.iter().all(|t| t.is_ascii()) {
+/// Литеральный предфильтр запроса: SIMD-решёто Teddy (v2.0 задача 2.5,
+/// замена автомата Ахо-Корасик на горячем пути прохода 1).
+///
+/// * все токены ASCII — регистронезависимое решёто по сырому тексту
+///   (семантика прежнего `ascii_case_insensitive` AC, ноль аллокаций);
+/// * не-ASCII токены — точное решёто по быстрому фолду ASCII+кириллицы
+///   (байт-в-байт ≈ to_lowercase; прочие письменности — полный фолд).
+///
+/// `None` (пустые/мусорные токены, сверх лимита паттернов) — вызывающий
+/// код падает на прежний lowercase-contains фолбэк.
+pub fn literal_prefilter(query_tokens: &[String]) -> Option<Teddy> {
+    if query_tokens.is_empty() || query_tokens.iter().any(|t| t.is_empty()) {
         return None;
     }
-    AhoCorasickBuilder::new()
-        .ascii_case_insensitive(true)
-        .build(query_tokens)
-        .ok()
+    let pats: Vec<&[u8]> = query_tokens.iter().map(|s| s.as_bytes()).collect();
+    if query_tokens.iter().all(|t| t.is_ascii()) {
+        return Teddy::build_ascii_ci(&pats).ok();
+    }
+    Teddy::build(&pats).ok()
 }
 
-/// Есть ли в сыром тексте необходимое условие совпадения (литерал первого
-/// токена запроса)? Вызывается ДО PII-маскирования и токенизации.
-pub fn literal_present(raw: &str, query_tokens: &[String], ac: &Option<AhoCorasick>) -> bool {
+/// Есть ли в сыром тексте необходимое условие совпадения (литерал
+/// какого-либо токена запроса)? Вызывается ДО PII-маскирования и
+/// токенизации — на каждом файле корпуса в проходе 1.
+pub fn literal_present(raw: &str, query_tokens: &[String], pre: &Option<Teddy>) -> bool {
     if query_tokens.is_empty() {
         return false;
     }
-    if let Some(ac) = ac {
-        return ac.find_iter(raw).next().is_some();
+    match pre {
+        // ASCII-запрос: SIMD-решёто по сырому тексту, ноль аллокаций.
+        Some(t) if t.is_ascii_ci() => t.is_present(raw.as_bytes()),
+        // Кириллица и прочий не-ASCII: регистр меняет UTF-8 байты —
+        // быстрый фолд ASCII+кириллицы (≈to_lowercase, ~1 ГБ/с) и один
+        // проход решётом; прочие письменности — прежний полный фолд.
+        Some(t) => match crate::retrieval::teddy::fold_ascii_cyrillic(raw.as_bytes()) {
+            Some(folded) => t.is_present(&folded),
+            None => t.is_present(raw.to_lowercase().as_bytes()),
+        },
+        // Фолбэк (пустые/избыточные токены): прежнее поведение.
+        None => {
+            let lower = raw.to_lowercase();
+            query_tokens.iter().any(|q| lower.contains(q.as_str()))
+        }
     }
-    // Кириллица и прочий не-ASCII: регистр меняет UTF-8 байты —
-    // проверяем вхождение токенов в lowercase-копии текста.
-    let lower = raw.to_lowercase();
-    query_tokens.iter().any(|q| lower.contains(q.as_str()))
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +255,7 @@ pub fn pass1_file(
     query_tokens: &[String],
     config: &EngineConfig,
     _cleaner: &PiiCleaner,
-    ac: &Option<AhoCorasick>,
+    pre: &Option<Teddy>,
 ) -> Option<Pass1File> {
     with_text(path, config.max_file_bytes, |raw| {
         // Предфильтр по сырому тексту: файлы без литерала не токенизируются,
@@ -246,7 +265,7 @@ pub fn pass1_file(
         // регексы по всему корпусу стоили ~65% времени. Маскирование
         // выполняется только на материализации выходных сцен (engine.rs),
         // где текст получает AI-потребитель.
-        if !literal_present(raw, query_tokens, ac) {
+        if !literal_present(raw, query_tokens, pre) {
             let (counts, total) = streaming_counts(raw);
             return Pass1File {
                 counts,
@@ -1151,16 +1170,33 @@ mod tests {
 
     #[test]
     fn literal_prefilter_ascii_and_cyrillic() {
-        let ac = literal_ac(&q(&["process"]));
-        assert!(ac.is_some());
-        assert!(literal_present("call PROCESS now", &q(&["process"]), &ac));
-        assert!(!literal_present("nothing here", &q(&["process"]), &ac));
+        // ASCII: CI-решёто Teddy по сырому тексту (как прежде AC-CI).
+        let pre = literal_prefilter(&q(&["process"]));
+        assert!(pre.is_some());
+        assert!(pre.as_ref().unwrap().is_ascii_ci());
+        assert!(literal_present("call PROCESS now", &q(&["process"]), &pre));
+        assert!(!literal_present("nothing here", &q(&["process"]), &pre));
 
-        let none: Option<AhoCorasick> = None;
+        // Кириллица: теперь тоже Teddy — точное решёто по lowercase-копии
+        // (раньше — N × contains на ту же копию).
         let cyr = q(&["нокс"]);
-        assert!(literal_ac(&cyr).is_none());
+        let pre = literal_prefilter(&cyr);
+        assert!(pre.is_some());
+        assert!(!pre.as_ref().unwrap().is_ascii_ci());
+        assert!(literal_present("Здесь Нокс действует", &cyr, &pre));
+        assert!(literal_present("НОКС и нокс", &cyr, &pre));
+        assert!(!literal_present("Здесь Соболь", &cyr, &pre));
+
+        // Фолбэк без решёта: прежний lowercase-contains.
+        let none: Option<Teddy> = None;
         assert!(literal_present("Здесь Нокс действует", &cyr, &none));
         assert!(!literal_present("Здесь Соболь", &cyr, &none));
+        // Много-токенный запрос: достаточно любого литерала.
+        let both = q(&["alpha", "omega"]);
+        let pre = literal_prefilter(&both);
+        assert!(literal_present("только ALPHA тут", &both, &pre));
+        assert!(literal_present("только omega тут", &both, &pre));
+        assert!(!literal_present("ни одного литерала", &both, &pre));
     }
 
     #[test]
