@@ -17,6 +17,9 @@
 //! * **Passage Retrieval** — POLER Chunker против naive-сплиттера
 //!   (жёсткое окно по символам): latency + «целостность предложений» —
 //!   доля чанков, не обрывающих предложение посередине.
+//! * **Vector Layer** (v2.0, Приоритет 4) — RaBitQ 1-битное квантование
+//!   + poler-native HNSW: плотность кодов, recall трёх путей (sym-скан /
+//!   ADC-скан / граф) и латентность.
 //! * **Resources** — VmHWM (пик) и VmRSS (текущая) из /proc/self/status.
 //!
 //! Регрессионная составляющая — golden-тесты в `#[cfg(test)]` этого
@@ -224,6 +227,7 @@ pub struct BenchResults {
     pub lexical: LexicalBench,
     pub passage: PassageBench,
     pub compression: CompressionBench,
+    pub vector: VectorBench,
     pub resources: Option<ResourceBench>,
 }
 
@@ -885,12 +889,14 @@ pub fn run_suite(opts: &BenchOpts) -> Result<BenchResults, String> {
         let lexical = bench_lexical(&root, opts)?;
         let passage = bench_passage(opts)?;
         let compression = bench_compression(opts);
+        let vector = bench_vector(opts);
         Ok(BenchResults {
             prefilter,
             exact,
             lexical,
             passage,
             compression,
+            vector,
             resources: read_proc_status(),
         })
     })();
@@ -1152,6 +1158,248 @@ pub fn bench_compression(opts: &BenchOpts) -> CompressionBench {
         docstore_zstd_bytes,
         docstore_ratio: docstore_zstd_bytes as f64 / docstore_raw_bytes.max(1) as f64,
         table_ser_bit_exact,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Контур 5 (v2.0, Приоритет 4): Vector Layer — RaBitQ + poler-native HNSW
+// ---------------------------------------------------------------------------
+
+/// Контур 5: плотность 1-битных кодов, качество оценок и графа.
+#[derive(Debug, Clone, Serialize)]
+pub struct VectorBench {
+    /// Векторов в синтетическом корпусе.
+    pub n: usize,
+    /// Исходная размерность (BGE-M3-класс).
+    pub dim: usize,
+    /// Размерность после паддинга до степени двойки.
+    pub d_pad: usize,
+    /// Байт заняло бы fp32-хранение.
+    pub fp32_bytes: usize,
+    /// Байт занимают 1-битные коды.
+    pub codes_bytes: usize,
+    /// Байт занимают скаляры (mu/delta/gamma) + id.
+    pub scalars_bytes: usize,
+    /// Плотность: fp32 / коды.
+    pub density_codes_x: f64,
+    /// Плотность: fp32 / (коды + скаляры).
+    pub density_total_x: f64,
+    /// Время сборки HNSW (мс).
+    pub build_ms: f64,
+    /// Число запросов.
+    pub queries: usize,
+    /// recall@10 полного sym-скана (popcount-оценка) против fp32 GT.
+    pub recall_sym: f64,
+    /// recall@10 полного ADC-скана — потолок оценщика.
+    pub recall_adc_brute: f64,
+    /// recall@10 HNSW + ADC-переранжирование против fp32 GT.
+    pub recall_hnsw: f64,
+    /// HNSW против потолка оценщика (качество графа).
+    pub hnsw_vs_ceiling: f64,
+    /// Медиана латентности запроса HNSW (мкс).
+    pub p50_us: f64,
+    /// p99 латентности запроса HNSW (мкс).
+    pub p99_us: f64,
+    /// Пропускная способность sym-скана кодов (ГБ/с).
+    pub scan_gbps: f64,
+}
+
+/// Гауссовский отсчёт из bench-ГПСЧ (Бокс—Мюллер).
+fn gauss_bench(rng: &mut Rng) -> f64 {
+    let u1 = ((rng.next() >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+    let u2 = (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+/// Синтетика векторного контура: смесь гауссиан (кластерность
+/// реальных эмбеддингов), L2-нормализация. Детерминизм: свой ГПСЧ
+/// на вектор — параллелизм не меняет данные.
+fn vector_corpus(n: usize, d: usize, centers: usize, seed: u64) -> Vec<Vec<f32>> {
+    use rayon::prelude::*;
+    // Гетерогенные кластеры (как в живых корпусах): разброс шума 0.25–0.70
+    // на кластер — плотные и рыхлые темы вперемешку.
+    let noise_of = |c: usize| 0.25 + ((c * 7) % 10) as f64 / 20.0;
+    let mut rng = Rng::new(seed);
+    let cs: Vec<Vec<f64>> = (0..centers)
+        .map(|_| (0..d).map(|_| gauss_bench(&mut rng)).collect())
+        .collect();
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut vr =
+                Rng::new((seed ^ ((i as u64) << 32) ^ (i as u64).wrapping_mul(0x9E37_79B9)) | 1);
+            let c = &cs[i % centers];
+            let noise = noise_of(i % centers);
+            let mut v: Vec<f32> = (0..d)
+                .map(|j| (c[j] + gauss_bench(&mut vr) * noise) as f32)
+                .collect();
+            let norm = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>()).sqrt();
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm as f32;
+                }
+            }
+            v
+        })
+        .collect()
+}
+
+/// Контур 5: RaBitQ-плотность + HNSW recall/латентность.
+pub fn bench_vector(opts: &BenchOpts) -> VectorBench {
+    use crate::vectors::rabitq::{adc_cos, sym_ip};
+    use crate::vectors::store::CodeSource;
+    use crate::vectors::{HnswConfig, HnswIndex, QuantizedStore};
+
+    let small = opts.runs <= 2;
+    let n = if small { 4_000 } else { 40_000 };
+    let dim = 768; // BGE-M3-класс
+    let queries = if small { 20 } else { 100 };
+    let k = 10;
+    let centers = (n / 25).max(4);
+
+    let data = vector_corpus(n, dim, centers, SEED ^ 0xBEC7_0000_0000_0004);
+
+    // Плотность
+    let fp32_bytes = n * dim * 4;
+    let codes_bytes = n * (1024 / 8); // d_pad 1024
+    let scalars_bytes = n * 16;
+
+    // Кодирование + сборка графа
+    let mut store = QuantizedStore::new(dim, 0x504F_4C45); // 'POLE'
+    let t0 = Instant::now();
+    for (i, x) in data.iter().enumerate() {
+        store.push(i as u32, x);
+    }
+    let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let cfg = HnswConfig {
+        m: 16,
+        m0: 32,
+        ef_construction: if small { 100 } else { 150 },
+        seed: 77,
+    };
+    let t1 = Instant::now();
+    let mut idx = HnswIndex::new(cfg.clone());
+    for i in 0..n as u32 {
+        idx.insert(&store, i);
+    }
+    let build_ms = encode_ms + t1.elapsed().as_secs_f64() * 1000.0;
+
+    // Запросы: возмущённые точки данных (реалистично)
+    let mut qrng = Rng::new(SEED ^ 0x0E5E_0000_0000_0005);
+    let qs: Vec<Vec<f32>> = (0..queries)
+        .map(|qi| {
+            let src = &data[(qi * 331 + 7) % n];
+            src.iter()
+                .map(|v| {
+                    let u = (qrng.next() >> 40) as f64 / (1u64 << 24) as f64 - 0.5;
+                    v + (u as f32) * 0.02
+                })
+                .collect()
+        })
+        .collect();
+
+    // Эталон: fp32 brute force (rayon)
+    use rayon::prelude::*;
+    let gt: Vec<Vec<usize>> = qs
+        .par_iter()
+        .map(|q| {
+            let mut ips: Vec<(f64, usize)> = data
+                .par_iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    (
+                        x.iter().zip(q).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>(),
+                        i,
+                    )
+                })
+                .collect();
+            ips.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            ips.truncate(k);
+            ips.into_iter().map(|p| p.1).collect()
+        })
+        .collect();
+
+    let ef = 96;
+    let mut r_sym = 0.0f64;
+    let mut r_adc = 0.0f64;
+    let mut r_hnsw = 0.0f64;
+    let mut ceiling_recall = 0.0f64;
+    let mut lat_us: Vec<f64> = Vec::with_capacity(queries);
+    for (q, want) in qs.iter().zip(&gt) {
+        let prep = store.prepare_query(q);
+        // полный sym-скан
+        let mut best_sym: Vec<(f64, u32)> = (0..n as u32)
+            .map(|i| (sym_ip(store.side(i), prep.sym(), store.d_pad()), i))
+            .collect();
+        best_sym.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let got_sym: Vec<usize> = best_sym.iter().take(k).map(|p| p.1 as usize).collect();
+        // полный ADC-скан (потолок оценщика)
+        let mut best_adc: Vec<(f64, u32)> = (0..n as u32)
+            .map(|i| (adc_cos(store.codes(i), store.scalars(i), &prep, store.d_pad()), i))
+            .collect();
+        best_adc.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let got_adc: Vec<usize> = best_adc.iter().take(k).map(|p| p.1 as usize).collect();
+        // HNSW
+        let t2 = Instant::now();
+        let got_h: Vec<usize> =
+            idx.search(&store, &prep, k, ef).iter().map(|p| p.1 as usize).collect();
+        lat_us.push(t2.elapsed().as_secs_f64() * 1e6);
+
+        r_sym += want.iter().filter(|w| got_sym.contains(w)).count() as f64 / k as f64;
+        r_adc += want.iter().filter(|w| got_adc.contains(w)).count() as f64 / k as f64;
+        r_hnsw += want.iter().filter(|w| got_h.contains(w)).count() as f64 / k as f64;
+        ceiling_recall += want.iter().filter(|w| got_adc.contains(w)).count() as f64 / k as f64;
+    }
+    r_sym /= queries as f64;
+    r_adc /= queries as f64;
+    r_hnsw /= queries as f64;
+    ceiling_recall /= queries as f64;
+    let hnsw_vs_ceiling = if ceiling_recall > 0.0 {
+        r_hnsw / ceiling_recall
+    } else {
+        0.0
+    };
+
+    lat_us.sort_by(|a, b| a.total_cmp(b));
+    let p50 = lat_us[lat_us.len() / 2];
+    let p99 = lat_us[(lat_us.len() * 99 / 100).min(lat_us.len() - 1)];
+
+    // Пропускная способность sym-скана (popcount-путь)
+    let q0 = &qs[0];
+    let prep0 = store.prepare_query(q0);
+    let sym0 = prep0.sym();
+    let dp = store.d_pad();
+    let reps = if small { 3 } else { 8 };
+    let t3 = Instant::now();
+    let mut sink = 0u64;
+    for _ in 0..reps {
+        for i in 0..n as u32 {
+            let v = sym_ip(store.side(i), sym0, dp);
+            sink ^= v.to_bits() as u64;
+        }
+    }
+    let scan_s = t3.elapsed().as_secs_f64();
+    let scan_gbps = (reps as f64 * codes_bytes as f64) / scan_s / 1e9;
+    std::hint::black_box(&sink);
+
+    VectorBench {
+        n,
+        dim,
+        d_pad: 1024,
+        fp32_bytes,
+        codes_bytes,
+        scalars_bytes,
+        density_codes_x: fp32_bytes as f64 / codes_bytes as f64,
+        density_total_x: fp32_bytes as f64 / (codes_bytes + scalars_bytes) as f64,
+        build_ms,
+        queries,
+        recall_sym: r_sym,
+        recall_adc_brute: r_adc,
+        recall_hnsw: r_hnsw,
+        hnsw_vs_ceiling,
+        p50_us: p50,
+        p99_us: p99,
+        scan_gbps,
     }
 }
 
@@ -1527,7 +1775,36 @@ pub fn report_text(res: &BenchResults) -> String {
     ));
 
     s.push('\n');
-    s.push_str("[5] Resources\n");
+    s.push_str("[5] Vector Layer — RaBitQ 1-bit + poler-native HNSW (v2.0, Приоритет 4)\n");
+    let v = &res.vector;
+    s.push_str(&format!(
+        "    корпус: {} векторов × {}-d ({} кластеров): fp32 {:.1} МБ → коды {:.1} МБ + скаляры {:.1} МБ — {:.1}× по кодам, {:.1}× всего\n",
+        v.n,
+        v.dim,
+        (v.n / 25).max(4),
+        v.fp32_bytes as f64 / 1048576.0,
+        v.codes_bytes as f64 / 1048576.0,
+        v.scalars_bytes as f64 / 1048576.0,
+        v.density_codes_x,
+        v.density_total_x
+    ));
+    s.push_str(&format!(
+        "    сборка HNSW (M=16, efC=150): {:.1} с; латентность p50 {:.0} мкс / p99 {:.0} мкс (ef=96)\n",
+        v.build_ms / 1000.0,
+        v.p50_us,
+        v.p99_us
+    ));
+    s.push_str(&format!(
+        "    recall@10 против fp32: sym-скан {:.3} · ADC-скан {:.3} (потолок) · HNSW+ADC {:.3} — граф держит {:.0}% потолка\n",
+        v.recall_sym, v.recall_adc_brute, v.recall_hnsw, v.hnsw_vs_ceiling * 100.0
+    ));
+    s.push_str(&format!(
+        "    скан кодов (XOR+POPCNT): {:.1} ГБ/с — 1B×768-d ≈ 96 ГБ кодов сканируются ядром по касанию страниц mmap\n",
+        v.scan_gbps
+    ));
+
+    s.push('\n');
+    s.push_str("[6] Resources\n");
     if let Some(r) = &res.resources {
         s.push_str(&format!(
             "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)\n",

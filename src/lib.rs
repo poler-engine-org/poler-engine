@@ -67,6 +67,7 @@ pub mod sources;
 pub mod streaming;
 pub mod tokenizer;
 pub mod vcs;
+pub mod vectors;
 pub mod web;
 
 use std::fs::File;

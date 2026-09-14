@@ -111,9 +111,16 @@ madvise/whatlang/Snowball/UAX#29 + **Teddy SIMD** (`retrieval/teddy.rs`: реш�
 Шаг 3 — **Compression** (`src/compression/`: чистый порт FSST с compress-probe
 лукапами + `VocabArena` (словарь корпуса 4.1× плотнее HashMap), пер-файловые
 словари ID-парами 8×, lz4-парковка постингов, zstd doc store 26×; трейт
-`TermFreqs` — ε побитово совпадает между представлениями).
+`TermFreqs` — ε побитово совпадает между представлениями);
+Шаг 4 (кирпич 1 из 3) — **Vector Substrate** (`src/vectors/`: чистый RaBitQ —
+рандомизированное вращение Адамара + 1-битные коды, оценки sym (arcsin-MLE,
+popcount) и ADC (центрированный, несмещённый); poler-native HNSW над кодами —
+граф держит 100% потолка оценщика; mmap-хранилище zero-copy; плотность 768-d
+**24× по кодам / 21.3× всего**; скан кодов 8.4 ГБ/с; Embedder-трейт — точка
+подключения BGE-M3).
 
-Дальше: Vector Layer (BGE-M3/usearch/RaBitQ — самая длинная фаза) → SPLADE →
-IIR-Resonance Fusion (уникальная инновация) → Code Intelligence
+Дальше: Vector Layer кирпич 2 — fastembed-rs BGE-M3 + CLI `--semantic dense`
+(VocabArena и квантованный субстрат готовы) → кирпич 3 (ColBERT/Matryoshka) →
+SPLADE → IIR-Resonance Fusion (уникальная инновация) → Code Intelligence
 (tree-sitter/Salsa) → KG (GLiNER/Leiden) → Streaming Archives → Agentic/MCP v2 →
 Differential Dataflow.
