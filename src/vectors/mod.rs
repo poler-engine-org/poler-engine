@@ -4,7 +4,7 @@
 //! данных с задержкой микросекунды», а не сменную модель.
 //!
 //! ```text
-//! Embedder (кирпич 2: fastembed BGE-M3 / nomic)
+//! Embedder (кирпич 2: нативный .pqw-энкодер через pqc — Part E)
 //!     │  Vec<f32> (d)
 //!     ▼
 //! rabitq::Encoder ── вращение Адамара + 1-битные коды
@@ -28,14 +28,18 @@
 //! генерирует текст и не интерпретирует смысл векторов — это дело
 //! эмбеддера (инференс готовой модели) и ИИ-потребителя.
 //!
-//! Кирпич 2 (следующая сессия): fastembed-rs + BGE-M3 (dense 1024-d),
-//! CLI `--semantic dense`; кирпич 3: ColBERT multi-vector, Matryoshka.
+//! Кирпич 2 из 3 — нативный инференс (Part E): PqwEmbedder открывает
+//! BGE-M3-класс из контейнера .pqw (mmap + Sha256, weight-only
+//! int8/int4, SIMD-кернелы pqc::tensor). fastembed/ort ОТМЕНЕНЫ —
+//! суверенный стек без ONNX Runtime и C++ FFI.
 
 pub mod hnsw;
+pub mod pqw_bridge;
 pub mod rabitq;
 pub mod store;
 
 pub use hnsw::{HnswConfig, HnswIndex};
+pub use pqw_bridge::PqwEmbedder;
 pub use rabitq::{adc_cos, adc_ip, sym_ip, Encoder, QueryPrep, VecScalars};
 pub use store::{CodeSource, QuantizedStore, QuantizedStoreView};
 

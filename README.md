@@ -88,7 +88,7 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
   zero-copy, выравнивание кодов 8 Б проверяется при открытии); формат
   «PRBQ v1»: 12 Б скаляров + 4 Б id + D/8 Б кода на вектор.
 * **`src/vectors/mod.rs`** — трейт `Embedder` (точка подключения
-  fastembed-rs BGE-M3 в кирпиче 2) и `HashEmbedder` — детерминированная
+  нативного .pqw-энкодера из кирпича 2) и `HashEmbedder` — детерминированная
   feature-hashing проекция для конвейерных тестов без модели (НЕ
   семантическая — общий словарь сближает, разный разводит).
 * Честная физика: recall@10 ADC-потолка на вырожденной гауссовой
@@ -100,6 +100,39 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 HashMap (250 нс против 90 нс на пробу) — на фоне mmap-сканов и
 материализации сцен незаметно. Цель «RAM индекса 5–10×» достигнута
 на парковке watcher-состояния (доминанта на корпусах 65K+ файлов).
+
+* **Шаг 4, кирпич 2 (Sovereign ML — Part E/F PLAN_POLER_V2)** —
+  архитектура изменена владельцем: fastembed/ort/ONNX **ОТМЕНЕНЫ**,
+  весь нейроинференс — нативный Rust через собственное ядро `pqc`
+  (вендор-вынос из POLER-Quantum-RS), формат весов **`.pqw` v2**
+  (см. `docs/PQW_FORMAT.md`):
+
+| Компонент | ONNX Runtime (отменено) | pqc-натив (реализовано) |
+|---|---|---|
+| Внешние зависимости | libonnxruntime.so ~100 МБ C++ | **0** — один статический бинарь |
+| Формат весов | .onnx 500 МБ | **.pqw: int8/int4, mmap, SHA-256, секции по страницам 4096** |
+| Энкодер (BGE-M3/GLiNER-класс) | ort-сессия | **BERT post-norm forward на AVX2 weight-only кернелах** |
+| Декодер (GLM-класс) | — | **RoPE + MQA/GQA + SwiGLU + KV-арена + MoE-роутер** |
+| Целостность весов | нет | **SHA-256 при открытии — подмена ловится до инференса** |
+
+  Модули: `src/pqc/` (tensor — SIMD-кернелы dot int8/int4/f32,
+  LayerNorm/RMSNorm, GELU-erf, SiLU, softmax, RoPE-таблицы; pqw —
+  контейнер + билдер; encoder — BERT/XLM-R-спина; sha256 — свой
+  FIPS 180-4; selftest), `src/llm/glm_engine.rs` (GLM-декодер:
+  инкрементальный forward_pos, KV-арена без аллокаций в шаге, greedy/
+  temperature/top-p сэмплирование, детокенизатор UAX#29-правил),
+  `src/ner/native_gliner.rs` (span-голова: [start ‖ end ‖ width_emb] →
+  классификатор → sigmoid), `src/vectors/pqw_bridge.rs`
+  (PqwEmbedder → трейт Embedder → RaBitQ-субстрат).
+  CLI: `--pqw-selftest` (полный автономный цикл инференса: 6/6),
+  `--semantic dense --model X.pqw`, `--llm local --model X.pqw`,
+  `--ner gliner --model X.pqw`.
+  Дифференциальные тесты: native int8-энкодер vs наивный fp32-эталон —
+  cos > 0.999 (int4 > 0.98, fp32 > 0.9999); инкрементальный GLM vs
+  fp32-эталон; KV-инвариант (перезапуск = побитово те же логиты);
+  SHA-256-тамперинг; 1044 теста зелёные (+56).
+  Следующий кирпич: конвертер реальных весов (BGE-M3 int8 → .pqw) +
+  настоящий XLM-R-токенизатор + e2e `--semantic dense` на Eteryya.
 
 ---
 

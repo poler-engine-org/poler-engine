@@ -117,10 +117,26 @@ madvise/whatlang/Snowball/UAX#29 + **Teddy SIMD** (`retrieval/teddy.rs`: реш�
 popcount) и ADC (центрированный, несмещённый); poler-native HNSW над кодами —
 граф держит 100% потолка оценщика; mmap-хранилище zero-copy; плотность 768-d
 **24× по кодам / 21.3× всего**; скан кодов 8.4 ГБ/с; Embedder-трейт — точка
-подключения BGE-M3).
+подключения BGE-M3);
+Шаг 4 (кирпич 2) — **Sovereign ML (Part E/F)** — архитектура изменена:
+fastembed/ort/ONNX ОТМЕНЕНЫ, нейроинференс нативный через собственное ядро
+`pqc` (`src/pqc/`: tensor — AVX2 weight-only int8/int4/f32 кернелы, LayerNorm/
+RMSNorm/GELU/SiLU/softmax/RoPE; pqw — формат весов `.pqw` v2: mmap zero-copy,
+SHA-256 верификация при открытии, секции по страницам 4096, см.
+`docs/PQW_FORMAT.md`; encoder — BERT/XLM-R-спина BGE-M3/GLiNER; sha256 — свой
+FIPS 180-4; selftest). Потребители: `src/llm/glm_engine.rs` (GLM-декодер:
+RoPE + MQA/GQA + SwiGLU + KV-арена + MoE-роутер топ-k + greedy/temperature/
+top-p сэмплирование + UAX#29-детокенизатор), `src/ner/native_gliner.rs`
+(span-голова GLiNER), `src/vectors/pqw_bridge.rs` (PqwEmbedder → Embedder →
+RaBitQ-субстрат). CLI: `--pqw-selftest` (автономный цикл 6/6), `--semantic
+dense --model X.pqw`, `--llm local --model X.pqw`, `--ner gliner --model
+X.pqw`. Дифференциальные тесты против наивных fp32-эталонов: int8 cos>0.999,
+int4 >0.98, fp32 >0.9999; KV-инвариант побитовый; SHA-тамперинг ловится.
+**1044 теста зелёные (+56), ноль новых зависимостей.**
 
-Дальше: Vector Layer кирпич 2 — fastembed-rs BGE-M3 + CLI `--semantic dense`
-(VocabArena и квантованный субстрат готовы) → кирпич 3 (ColBERT/Matryoshka) →
-SPLADE → IIR-Resonance Fusion (уникальная инновация) → Code Intelligence
-(tree-sitter/Salsa) → KG (GLiNER/Leiden) → Streaming Archives → Agentic/MCP v2 →
-Differential Dataflow.
+Дальше: кирпич 2.5 — конвертер реальных весов (safetensors/ONNX → .pqw,
+потоковая запись) + настоящий XLM-R-токенизатор + e2e `--semantic dense`
+на Eteryya → кирпич 3 (ColBERT/Matryoshka) → SPLADE → IIR-Resonance Fusion
+(уникальная инновация) → Code Intelligence (tree-sitter/Salsa) → KG
+(GLiNER-веса → .pqw, Leiden) → Streaming Archives → Agentic/MCP v2 →
+Differential Dataflow → .pqw/pqc bridge → **локальный GLM-3 6B/70B (Part F)**.

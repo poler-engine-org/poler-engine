@@ -302,6 +302,32 @@ struct Cli {
     #[arg(short, long)]
     query: Option<String>,
 
+    // ---------- v2.0 Part E/F: суверенный ML-инференс (.pqw через pqc) ----------
+
+    /// Путь к .pqw-модели (для --semantic dense / --llm local / --ner gliner).
+    #[arg(long = "model", value_name = "PQW")]
+    model: Option<PathBuf>,
+
+    /// Семантический режим: dense = нативный энкодер из .pqw (через pqc,
+    /// не ONNX). Требует --model и -q.
+    #[arg(long = "semantic", value_name = "MODE")]
+    semantic: Option<String>,
+
+    /// LLM-генерация (Part F): local = нативный GLM-декодер из .pqw.
+    /// remote/auto — мост к серверному GLM (Фаза 12.9, заглушка).
+    #[arg(long = "llm", value_name = "MODE")]
+    llm: Option<String>,
+
+    /// Извлечение сущностей: gliner = нативная span-голова из .pqw.
+    #[arg(long = "ner", value_name = "MODEL")]
+    ner: Option<String>,
+
+    /// Самопроверка суверенного стека: синтетические .pqw-модели →
+    /// полный цикл инференса (энкодер + GLiNER + GLM + MoE + Sha256)
+    /// без сети, без внешних библиотек.
+    #[arg(long = "pqw-selftest")]
+    pqw_selftest: bool,
+
     /// AIDDE impact-анализ символа (call graph + upstream/downstream паспорт).
     #[arg(long)]
     impact: Option<String>,
@@ -555,6 +581,22 @@ fn run(cli: Cli) -> ExitCode {
             eprintln!("poler-engine: не удалось настроить пул потоков: {e}");
             return ExitCode::from(2);
         }
+    }
+
+    // ---------- v2.0 Part E/F: суверенный ML-инференс через pqc ----------
+    // Никакого ONNX Runtime: энкодер/NER/LLM читают .pqw mmap'ом и
+    // считаются нативными SIMD-кернелами внутри этого бинарника.
+    if cli.pqw_selftest {
+        return ExitCode::from(poler_engine::pqc::selftest::run_selftest() as u8);
+    }
+    if let Some(mode) = cli.semantic.as_deref() {
+        return ExitCode::from(run_semantic_native(mode, &cli) as u8);
+    }
+    if let Some(mode) = cli.llm.as_deref() {
+        return ExitCode::from(run_llm(mode, &cli) as u8);
+    }
+    if let Some(what) = cli.ner.as_deref() {
+        return ExitCode::from(run_ner(what, &cli) as u8);
     }
 
     // ---------- MCP-сервер: stdio JSON-RPC для LLM-агентов ----------
@@ -1288,4 +1330,196 @@ fn watch_mode(cli: Cli, config: EngineConfig, query: String, scan_target: PathBu
     }
     eprintln!("poler-engine watch: остановлено");
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// v2.0 Part E/F: обработчики суверенного ML-инференса (pqc)
+// ---------------------------------------------------------------------------
+
+/// `--semantic dense --model X.pqw -q "…"`: нативный энкодер (BGE-M3-класс)
+/// через pqc — mmap + Sha256 + weight-only int8/int4, без ONNX.
+fn run_semantic_native(mode: &str, cli: &Cli) -> i32 {
+    if mode != "dense" {
+        eprintln!(
+            "poler-engine: неизвестный --semantic режим {mode:?} (доступен: dense)"
+        );
+        return 2;
+    }
+    let Some(model_path) = &cli.model else {
+        eprintln!(
+            "poler-engine: --semantic dense требует --model <path.pqw>\n  \
+             конвертер реальных весов (BGE-M3 → .pqw) — следующий кирпич;\n  \
+             проверить стек сейчас: poler-engine --pqw-selftest"
+        );
+        return 2;
+    };
+    let Some(query) = &cli.query else {
+        eprintln!("poler-engine: --semantic dense требует -q <текст>");
+        return 2;
+    };
+    use poler_engine::vectors::Embedder as _;
+    let mut embedder = match poler_engine::vectors::pqw_bridge::PqwEmbedder::open(model_path) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    let t0 = std::time::Instant::now();
+    match embedder.embed_batch(&[query.as_str()]) {
+        Ok(vs) => {
+            let v = &vs[0];
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let head: Vec<String> = v.iter().take(8).map(|x| format!("{x:.4}")).collect();
+            println!(
+                "pqw-native dense · dim={} · L2={norm:.4} · [{}] …",
+                v.len(),
+                head.join(" ")
+            );
+            println!(
+                "модель: {} · {:.1} мс · субстрат: RaBitQ 1-bit + HNSW готов принять векторы",
+                embedder.name(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            2
+        }
+    }
+}
+
+/// `--llm local --model X.pqw -q "…"`: нативный GLM-декодер (RoPE + MQA +
+/// SwiGLU + MoE) через pqc. remote/auto — мост Фазы 12.9 (заглушка).
+fn run_llm(mode: &str, cli: &Cli) -> i32 {
+    match mode {
+        "local" => {}
+        "remote" | "auto" => {
+            eprintln!(
+                "poler-engine: --llm {mode} — серверный GLM-мост это Фаза 12.9 (не встроен);\n  \
+                 сейчас доступен автономный режим: --llm local --model glm.pqw"
+            );
+            return 2;
+        }
+        _ => {
+            eprintln!(
+                "poler-engine: неизвестный --llm режим {mode:?} (доступны: local, remote, auto)"
+            );
+            return 2;
+        }
+    }
+    let Some(model_path) = &cli.model else {
+        eprintln!(
+            "poler-engine: --llm local требует --model <glm.pqw>\n  \
+             конвертер PyTorch GLM → .pqw (int4) — Фаза 12.7;\n  \
+             проверить декодер сейчас: poler-engine --pqw-selftest"
+        );
+        return 2;
+    };
+    let Some(prompt) = &cli.query else {
+        eprintln!("poler-engine: --llm local требует -q <промпт>");
+        return 2;
+    };
+    let model = match poler_engine::llm::glm_engine::GlmModel::open(model_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    let prompt_ids = poler_engine::pqc::hash_token_ids(prompt, model.vocab() as u32);
+    if prompt_ids.is_empty() {
+        eprintln!("poler-engine: промпт без UAX#29-слов — нечего генерировать");
+        return 2;
+    }
+    let max_new = 32usize;
+    let t0 = std::time::Instant::now();
+    let out = match model.generate(&prompt_ids, max_new, &poler_engine::llm::glm_engine::Sampling::Greedy, 0)
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    let dt = t0.elapsed().as_secs_f64();
+    let words: Vec<String> = out.iter().map(|&i| format!("t{i}")).collect();
+    let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    let text = poler_engine::llm::glm_engine::detokenize_join(&refs);
+    println!(
+        "glm-local · {} токенов за {dt:.3} с = {:.0} ток/с · greedy",
+        out.len(),
+        out.len() as f64 / dt.max(1e-9)
+    );
+    println!(
+        "ответ: «{text}»\n  \
+         (плейсхолдер-токенизатор: реальный BPE GLM — Фаза 12.5, конвертер весов — 12.7)"
+    );
+    0
+}
+
+/// `--ner gliner --model X.pqw -q "…"`: нативная span-голова GLiNER через pqc.
+fn run_ner(what: &str, cli: &Cli) -> i32 {
+    if what != "gliner" {
+        eprintln!("poler-engine: неизвестный --ner {what:?} (доступен: gliner)");
+        return 2;
+    }
+    let Some(model_path) = &cli.model else {
+        eprintln!(
+            "poler-engine: --ner gliner требует --model <gliner.pqw>\n  \
+             конвертер весов GLiNER → .pqw — Фаза 7.3;\n  \
+             проверить голову сейчас: poler-engine --pqw-selftest"
+        );
+        return 2;
+    };
+    let Some(text) = &cli.query else {
+        eprintln!("poler-engine: --ner gliner требует -q <текст>");
+        return 2;
+    };
+    let model = match poler_engine::ner::native_gliner::GlinerModel::open(model_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    use unicode_segmentation::UnicodeSegmentation;
+    let words: Vec<String> = text.unicode_words().map(|w| w.to_string()).collect();
+    if words.is_empty() {
+        eprintln!("poler-engine: текст без UAX#29-слов");
+        return 2;
+    }
+    let vocab = model.vocab() as u32;
+    let ids: Vec<u32> = words
+        .iter()
+        .map(|w| {
+            poler_engine::pqc::hash_token_ids(w, vocab)
+                .first()
+                .copied()
+                .unwrap_or(0)
+        })
+        .collect();
+    let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    let t0 = std::time::Instant::now();
+    let entities = match model.extract(&word_refs, &ids, 0.5) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    println!(
+        "gliner-native · {} сущностей · метки [{}] · {:.1} мс",
+        entities.len(),
+        model.labels().join(", "),
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    for e in entities.iter().take(20) {
+        println!("  {}:{} [{:.2}] {}..{}", e.label, e.text, e.score, e.start, e.end);
+    }
+    if entities.len() > 20 {
+        println!("  … и ещё {}", entities.len() - 20);
+    }
+    0
 }
