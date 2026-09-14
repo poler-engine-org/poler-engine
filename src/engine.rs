@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
+use crate::compression::{GlobalStats, PostingsStore, StatsRef, VocabArena};
 use crate::graph::EntityGraph;
 use crate::output::{ContextAnchor, SearchResult};
 use crate::parser::markdown_scenes::truncate_char_safe;
@@ -48,23 +49,41 @@ impl WatchEvent {
 /// v0.6 (bug: память на многофайловых корпусах с частым словом):
 /// `records` хранит только top_n лучших по резонансу якорей файла
 /// (Early Top-K Pruning), а полный список хитов — компактные
-/// `hit_keys` (байтовые позиции, 8 байт на хит) для diff-режима и
-/// честного total_hits. Сцены, на которые не ссылается ни один
-/// оставшийся якорь, удаляются.
+/// `hit_keys` для diff-режима и честного total_hits. Сцены, на которые
+/// не ссылается ни один оставшийся якорь, удаляются.
+///
+/// v2.0 (Приоритет 3 — Compression): parked-состояние уплотнено:
+/// * `counts` — пары `(term_id, count)` против FSST-арены словаря
+///   корпуса: 8 байт на запись вместо ~64–96 у HashMap<String, usize>;
+/// * `hits`/`hit_keys` — lz4-парковка постингов ([`PostingsStore`]),
+///   разжатие по требованию (diff/повторный pass 2 изменённых файлов
+///   получает свежие hits — сжатые копии не читаются вовсе).
 #[derive(Debug, Clone)]
 struct FileEntry {
     mtime: SystemTime,
     size: u64,
-    counts: HashMap<String, usize>,
+    /// Словарь файла парами (term_id, count) — ID из WatchState::vocab.
+    counts: Vec<(u32, u32)>,
     total: u64,
-    hits: Vec<u32>,
-    /// Все байтовые позиции хитов (компактно, для diff/статистики).
-    hit_keys: Vec<usize>,
+    /// Индексы токенов хитов файла (lz4-парковка).
+    hits: PostingsStore,
+    /// Все байтовые позиции хитов файла (lz4-парковка, для diff/статистики).
+    hit_keys: PostingsStore,
     /// Число хитов, прошедших temporal-фильтр (честный total_hits).
     hits_temporal: usize,
     /// Только top_n лучших якорей файла (по резонансу).
     records: Vec<HitRecord>,
     scenes: HashMap<(usize, usize), SceneInfo>,
+}
+
+/// Паркуемое watcher-состояние прогона: FSST-словарь корпуса (термы
+/// сжаты, ID appending-only — стабильны между ресканами) + состояния
+/// файлов. Именно эта структура определяет RAM индекса между прогонами:
+/// v2.0 держит её в ~14 Б/терм + 8 Б/(терм,файл) против ~64–96 Б/запись
+/// ранее (цель приоритета 3: 5–10×).
+struct WatchState {
+    vocab: VocabArena,
+    files: HashMap<PathBuf, FileEntry>,
 }
 
 /// Поисковый движок с опциональным инкрементальным состоянием.
@@ -77,9 +96,10 @@ pub struct Engine {
     config: EngineConfig,
     watching: bool,
     diff_mode: bool,
-    state: Option<HashMap<PathBuf, FileEntry>>,
-    /// Ключи (путь, байт) всех хитов предыдущего прогона — для diff.
-    last_hit_keys: HashSet<(PathBuf, usize)>,
+    state: Option<WatchState>,
+    /// Байтовые позиции хитов предыдущего прогона по файлам
+    /// (lz4-парковка) — для diff-режима.
+    last_hit_keys: HashMap<PathBuf, PostingsStore>,
 }
 
 fn round2(x: f64) -> f64 {
@@ -93,7 +113,7 @@ impl Engine {
             watching,
             diff_mode: false,
             state: None,
-            last_hit_keys: HashSet::new(),
+            last_hit_keys: HashMap::new(),
         }
     }
 
@@ -149,7 +169,15 @@ impl Engine {
         let pre = streaming::literal_prefilter(&query_tokens);
 
         // ---------- классификация файлов (incremental) ----------
-        let prev = std::mem::take(&mut self.state).unwrap_or_default();
+        // v2.0: словарь корпуса (FSST-арена) живёт в состоянии и переходит
+        // из прогона в прогон; ID термов appending-only — TermIdCounts
+        // сохранённых файлов остаются валидными без перекодирования.
+        let (vocab, kept_from_prev): (VocabArena, HashMap<PathBuf, FileEntry>) =
+            match std::mem::take(&mut self.state) {
+                Some(ws) => (ws.vocab, ws.files),
+                None => (VocabArena::new(), HashMap::new()),
+            };
+        let prev = kept_from_prev;
         let mut event = WatchEvent::default();
         let mut kept: HashMap<PathBuf, FileEntry> = HashMap::new();
         let mut to_process: Vec<PathBuf> = Vec::new();
@@ -184,8 +212,13 @@ impl Engine {
         }
 
         // ---------- Проход 1: потоковая статистика ----------
+        // v2.0 (Приоритет 3): глобальный словарь корпуса — FSST-арена
+        // (интернирование + compress-probe лукапы), частоты — Vec<u32>
+        // по ID. Строки не клонируются: pass 1 отдаёт Box<str>-словари,
+        // арена сжимает термы на лету (после ~32 КБ staging-фазы).
         struct PassSink {
-            global: HashMap<String, usize>,
+            vocab: VocabArena,
+            counts: Vec<u32>,
             n_total: u64,
             hit_files: HashMap<PathBuf, Vec<u32>>,
             entries: HashMap<PathBuf, FileEntry>,
@@ -199,27 +232,34 @@ impl Engine {
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let mut entry_counts: Option<HashMap<String, usize>> =
-                    if watching { Some(HashMap::new()) } else { None };
-                for (k, v) in r.counts {
-                    *self.global.entry(k.clone()).or_insert(0) += v;
-                    if let Some(ec) = &mut entry_counts {
-                        ec.insert(k, v);
+                let mut entry_counts: Vec<(u32, u32)> =
+                    if watching { Vec::with_capacity(r.counts.len()) } else { Vec::new() };
+                for (k, v) in &r.counts {
+                    let id = self.vocab.intern(k) as usize;
+                    if id >= self.counts.len() {
+                        self.counts.resize(id + 1, 0);
+                    }
+                    self.counts[id] += *v;
+                    if watching {
+                        entry_counts.push((id as u32, *v));
                     }
                 }
                 self.n_total += r.total;
                 // Entry создаётся ВСЕГДА: в него pass 2 кладёт records/scenes.
-                // Словарь counts удерживается только в watcher-режиме
+                // Словарь counts (пары ID) удерживается только в watcher-режиме
                 // (нужен для вычитания при инкрементальном rescan).
+                // hits паркуются lz4; сырой список — только для pass 2
+                // hit-файлов этого прогона.
+                let hits_store = PostingsStore::from_u32(&r.hits);
                 self.entries.insert(
                     path.to_path_buf(),
                     FileEntry {
                         mtime,
                         size,
-                        counts: entry_counts.unwrap_or_default(),
+                        counts: entry_counts,
                         total: r.total,
-                        hits: r.hits.clone(),
-                        hit_keys: Vec::new(),
+                        hits: hits_store,
+                        hit_keys: PostingsStore::default(),
                         hits_temporal: 0,
                         records: Vec::new(),
                         scenes: HashMap::new(),
@@ -231,15 +271,21 @@ impl Engine {
             }
 
             fn add_kept(&mut self, e: &FileEntry) {
-                for (k, v) in &e.counts {
-                    *self.global.entry(k.clone()).or_insert(0) += v;
+                // Слияние ID-пар без строк и хеширования.
+                for &(id, v) in &e.counts {
+                    let id = id as usize;
+                    if id >= self.counts.len() {
+                        self.counts.resize(id + 1, 0);
+                    }
+                    self.counts[id] += v;
                 }
                 self.n_total += e.total;
             }
         }
 
         let mut sink = PassSink {
-            global: HashMap::new(),
+            vocab,
+            counts: Vec::new(),
             n_total: 0,
             hit_files: HashMap::new(),
             entries: HashMap::new(),
@@ -262,8 +308,13 @@ impl Engine {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         }
-        let sink = sink_mu.into_inner().unwrap();
+        let mut sink = sink_mu.into_inner().unwrap();
         stats.total_tokens = sink.n_total;
+
+        // Между проходами: staging-фаза арены закрывается — таблица FSST
+        // обучается, термы сжимаются. Проход 2 ищет частоты compress-probe
+        // по сжатым байтам (декомпрессии нет на горячем пути).
+        sink.vocab.ensure_compact();
 
         // ---------- Проход 2: только hit-файлы ----------
         stats.files_with_hits = sink
@@ -271,14 +322,17 @@ impl Engine {
             .len()
             + kept.values().filter(|e| !e.hits.is_empty()).count();
         let n_total = sink.n_total as usize;
-        let global = &sink.global;
+        let gstats = StatsRef::Global(GlobalStats {
+            vocab: &sink.vocab,
+            counts: &sink.counts,
+        });
         let mut fresh_entries = sink.entries;
         let hit_paths: Vec<PathBuf> = sink.hit_files.keys().cloned().collect();
         let (hg, hn) = streaming::split_giants(&hit_paths);
 
         let pass2 = |p: &Path| -> Option<Pass2Result> {
             let hits = sink.hit_files.get(p)?;
-            streaming::pass2_file(p, &query_tokens, &config, &cleaner, global, n_total, hits)
+            streaming::pass2_file(p, &query_tokens, &config, &cleaner, &gstats, n_total, hits)
         };
 
         let results_mu: Mutex<Vec<(PathBuf, Pass2Result)>> = Mutex::new(Vec::new());
@@ -301,7 +355,7 @@ impl Engine {
                 &query_tokens,
                 &config,
                 &cleaner,
-                global,
+                &gstats,
                 n_total,
                 hits,
             ) {
@@ -326,8 +380,10 @@ impl Engine {
                     .count(),
                 None => hit_keys.len(),
             };
+            // v2.0: lz4-парковка постингов watcher-состояния.
+            let parked_hit_keys = PostingsStore::from_usize(&hit_keys);
             if let Some(e) = fresh_entries.get_mut(&p) {
-                e.hit_keys = hit_keys;
+                e.hit_keys = parked_hit_keys;
                 e.hits_temporal = hits_temporal;
                 e.records = records;
                 e.scenes = scenes;
@@ -387,8 +443,19 @@ impl Engine {
         stats.total_hits = full_hits;
 
         // ---------- diff-режим: только новые якоря ----------
+        // v2.0: ключи предыдущего прогона хранятся lz4-парковкой;
+        // разжатие — однократное и только в diff-прогоне.
         if incremental && self.diff_mode {
-            let prev = &self.last_hit_keys;
+            let prev: HashSet<(PathBuf, usize)> = self
+                .last_hit_keys
+                .iter()
+                .flat_map(|(p, pk)| {
+                    pk.to_usize()
+                        .into_iter()
+                        .map(move |b| (p.clone(), b))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
             records.retain(|r| !prev.contains(&(r.path.clone(), r.byte_pos)));
         }
 
@@ -428,28 +495,33 @@ impl Engine {
 
         stats.elapsed_ms = started.elapsed().as_millis();
 
+        // Парковка watcher-состояния: FSST-арена (словарь корпуса,
+        // компактная фаза) + файлы с ID-парами и lz4-постингами.
+        // Именно это удерживается между прогонами — целевая RAM
+        // приоритета 3 (5–10× меньше HashMap-представления).
         self.state = if watching {
             let mut m = kept;
             m.extend(fresh_entries);
-            Some(m)
+            Some(WatchState {
+                vocab: sink.vocab,
+                files: m,
+            })
         } else {
             None
         };
 
         // Полный набор ключей хитов текущего прогона (для diff): в
-        // watcher-режиме собирается из состояния всех файлов.
+        // watcher-режиме собирается из состояния всех файлов —
+        // lz4-парковкой, БЕЗ материализации (PathBuf, usize)-множества.
         if watching {
             self.last_hit_keys = self
                 .state
                 .as_ref()
-                .map(|m| {
-                    m.iter()
-                        .flat_map(|(p, e)| {
-                            e.hit_keys
-                                .iter()
-                                .map(|&b| (p.clone(), b))
-                                .collect::<Vec<_>>()
-                        })
+                .map(|ws| {
+                    ws.files
+                        .iter()
+                        .filter(|(_, e)| !e.hit_keys.is_empty())
+                        .map(|(p, e)| (p.clone(), e.hit_keys.clone()))
                         .collect()
                 })
                 .unwrap_or_default();

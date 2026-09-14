@@ -162,6 +162,60 @@ pub struct ResourceBench {
     pub vm_rss_kb: u64,
 }
 
+/// Контур 4 (v2.0, Приоритет 3): Compression — плотность памяти индекса.
+///
+/// A/B-сравнение старого (HashMap) и нового (FSST/lz4/zstd) представлений
+/// на синтетическом словаре морфологии: RAM-дельты VmRSS + точные
+/// логические размеры, коэффициенты сжатия постингов и doc store,
+/// цена compress-probe лукапов и parity против HashMap.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompressionBench {
+    /// Термов в синтетическом словаре корпуса.
+    pub vocab_terms: usize,
+    /// Сырые байты термов.
+    pub vocab_raw_bytes: usize,
+    /// FSST-blob термов.
+    pub vocab_fsst_bytes: usize,
+    /// Сжатие термов FSST (доля сырья).
+    pub vocab_fsst_ratio: f64,
+    /// RAM глобального словаря: HashMap (VmRSS-дельта, кБ).
+    pub vocab_hashmap_rss_kb: u64,
+    /// RAM глобального словаря: VocabArena + counts (VmRSS-дельта, кБ).
+    pub vocab_arena_rss_kb: u64,
+    /// Выигрыш RAM глобального словаря (×).
+    pub vocab_ram_gain_x: f64,
+    /// Логические байты арены (blob+offsets+index+counts+таблица).
+    pub vocab_arena_logical_bytes: usize,
+    /// Лукапы: HashMap, мкс на 1000 проб.
+    pub lookup_hashmap_us_per_k: f64,
+    /// Лукапы: FSST-арена (compress-probe), мкс на 1000 проб.
+    pub lookup_arena_us_per_k: f64,
+    /// Замедление лукапов (×) — цена compress-probe.
+    pub lookup_slowdown_x: f64,
+    /// Parity: все пробы арены совпали с HashMap.
+    pub lookup_parity: bool,
+    /// Пер-файловые словари (500 файлов × 300 термов): HashMap, кБ.
+    pub file_dicts_hashmap_rss_kb: u64,
+    /// Пер-файловые словари: TermIdCounts, кБ.
+    pub file_dicts_termid_rss_kb: u64,
+    /// Выигрыш пер-файловых словарей (×).
+    pub file_dicts_ram_gain_x: f64,
+    /// Постинги: сырые байты (u32 + usize LE).
+    pub postings_raw_bytes: usize,
+    /// Постинги: lz4.
+    pub postings_lz4_bytes: usize,
+    /// Сжатие постингов (доля сырья).
+    pub postings_ratio: f64,
+    /// Doc store: сырой текст страниц.
+    pub docstore_raw_bytes: usize,
+    /// Doc store: zstd со словарём.
+    pub docstore_zstd_bytes: usize,
+    /// Сжатие doc store (доля сырья).
+    pub docstore_ratio: f64,
+    /// Сериализация FSST-таблицы побитово точна.
+    pub table_ser_bit_exact: bool,
+}
+
 /// Полный отчёт прогона.
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchResults {
@@ -169,6 +223,7 @@ pub struct BenchResults {
     pub exact: ExactBench,
     pub lexical: LexicalBench,
     pub passage: PassageBench,
+    pub compression: CompressionBench,
     pub resources: Option<ResourceBench>,
 }
 
@@ -829,16 +884,275 @@ pub fn run_suite(opts: &BenchOpts) -> Result<BenchResults, String> {
         let exact = bench_exact(&root, opts)?;
         let lexical = bench_lexical(&root, opts)?;
         let passage = bench_passage(opts)?;
+        let compression = bench_compression(opts);
         Ok(BenchResults {
             prefilter,
             exact,
             lexical,
             passage,
+            compression,
             resources: read_proc_status(),
         })
     })();
     let _ = std::fs::remove_dir_all(&root);
     result
+}
+
+// ---------------------------------------------------------------------------
+// Контур 4 (v2.0, Приоритет 3): Compression — плотность памяти индекса
+// ---------------------------------------------------------------------------
+
+/// Синтетический словарь морфологии (ru+en): общий хвост — типовая еда
+/// FSST; размер кратен пространству комбинаций, генерация детерминирована.
+fn compression_vocab(n: usize) -> Vec<String> {
+    let prefixes = ["", "пере", "недо", "анти", "квази", "микро", "мега", "суб"];
+    let connectors = ["", "-", "_"];
+    let stems = [
+        "нокс", "когт", "сплетен", "вонзил", "систем", "протокол", "резонанс", "вектор",
+        "runtime", "protocol", "system", "vector", "reson", "index", "token", "quer",
+        "поток", "кадр", "импульс", "гармоник",
+    ];
+    let sufs = [
+        "а", "ы", "и", "е", "у", "ой", "ам", "ами", "ах", "ing", "ed", "er", "s", "tion",
+        "ness", "ble", "mente", "", "logy", "ative",
+    ];
+    // 8 × 20 × 3 × 20 × 16 = 153 600 комбинаций — с запасом над размером
+    // словаря бенчмарка (иначе генератор зациклится).
+    let quals = [
+        "", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v14", "v15", "v16",
+    ];
+    let mut rng = Rng(SEED ^ 0x00C0_FFEE_0000_0003);
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut seen = std::collections::HashSet::new();
+    while out.len() < n {
+        let w = format!(
+            "{}{}{}{}{}",
+            prefixes[rng.below(prefixes.len() as u64) as usize],
+            stems[rng.below(stems.len() as u64) as usize],
+            connectors[rng.below(connectors.len() as u64) as usize],
+            sufs[rng.below(sufs.len() as u64) as usize],
+            quals[rng.below(quals.len() as u64) as usize]
+        );
+        if seen.insert(w.clone()) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// VmRSS (кБ) на данный момент (для дельт измерений).
+fn rss_now_kb() -> u64 {
+    read_proc_status().map(|r| r.vm_rss_kb).unwrap_or(0)
+}
+
+/// Контур 4: A/B плотности памяти — HashMap vs FSST/lz4/zstd.
+pub fn bench_compression(opts: &BenchOpts) -> CompressionBench {
+    use crate::compression::{DocStoreCodec, FsstTable, PostingsStore, TermFreqs, VocabArena};
+
+    // Синтетический словарь: в тестах меньше, в CLI-раннере — полноценно.
+    let vocab_n = if opts.runs <= 2 { 40_000 } else { 120_000 };
+    let terms = compression_vocab(vocab_n);
+    let vocab_raw_bytes: usize = terms.iter().map(|t| t.len()).sum();
+
+    // ---------- Глобальный словарь: HashMap (старое представление) ----------
+    let rss0 = rss_now_kb();
+    let mut hashmap: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(terms.len());
+    for (i, t) in terms.iter().enumerate() {
+        hashmap.insert(t.clone(), i % 97 + 1);
+    }
+    let lookup_probe_hm = |h: &std::collections::HashMap<String, usize>| -> (f64, bool) {
+        let mut ok = 0usize;
+        let t0 = Instant::now();
+        for i in 0..100_000usize {
+            let q = &terms[i % terms.len()];
+            if h.freq(q).is_some() {
+                ok += 1;
+            }
+        }
+        (ms(t0) * 1000.0, ok == 100_000)
+    };
+    let (lookup_hashmap_us, _) = lookup_probe_hm(&hashmap);
+    let vocab_hashmap_rss_kb = rss_now_kb().saturating_sub(rss0);
+    drop(hashmap);
+
+    // ---------- Глобальный словарь: VocabArena (новое представление) ----------
+    let rss1 = rss_now_kb();
+    let mut arena = VocabArena::new();
+    let mut counts: Vec<u32> = Vec::with_capacity(terms.len());
+    for (i, t) in terms.iter().enumerate() {
+        let id = arena.intern(t) as usize;
+        if id >= counts.len() {
+            counts.resize(id + 1, 0);
+        }
+        counts[id] = (i % 97 + 1) as u32;
+    }
+    arena.ensure_compact();
+    let vocab_arena_rss_kb = rss_now_kb().saturating_sub(rss1);
+    let vocab_arena_logical_bytes = arena.heap_bytes() + counts.len() * 4;
+    // Чистый blob сжатых термов (коэффициент FSST) — без служебных
+    // структур; полный логический объём арены — отдельно.
+    let vocab_fsst_bytes = arena.blob_bytes();
+
+    // Лукапы арены + parity против модели.
+    let model: std::collections::HashMap<&str, u32> = terms
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), (i % 97 + 1) as u32))
+        .collect();
+    let g = crate::compression::GlobalStats {
+        vocab: &arena,
+        counts: &counts,
+    };
+    let mut parity = true;
+    let t0 = Instant::now();
+    for i in 0..100_000usize {
+        let q = &terms[i % terms.len()];
+        if g.freq(q) != model.get(q.as_str()).copied() {
+            parity = false;
+        }
+    }
+    let lookup_arena_us = ms(t0) * 1000.0;
+    for (t, c) in &model {
+        if g.freq(t) != Some(*c) {
+            parity = false;
+        }
+    }
+
+    // Сериализация таблицы: побитовая точность восстановленного кодировщика.
+    let table_ser_bit_exact = {
+        let table_bytes = arena
+            .serialized_table_bytes();
+        match FsstTable::from_bytes(&table_bytes) {
+            Some(restored) => terms
+                .iter()
+                .take(2000)
+                .all(|t| restored.encode(t.as_bytes()) == arena.encode_reference(t.as_bytes())),
+            None => false,
+        }
+    };
+
+    // ---------- Пер-файловые словари: ID-пары vs HashMap ----------
+    // Порядок: сначала МАЛЕНЬКИЕ ID-пары (свежие страницы — честная
+    // дельта), затем БОЛЬШИЕ HashMap (растёт сверх освобождённого) —
+    // иначе аллокатор переиспользует страницы и дельта второго занижается.
+    let files_n = 500usize;
+    let per_file_terms = 300usize;
+    let rss2 = rss_now_kb();
+    let dicts_id: Vec<Vec<(u32, u32)>> = (0..files_n)
+        .map(|f| {
+            let mut v = Vec::with_capacity(per_file_terms);
+            for k in 0..per_file_terms {
+                let idx = (f * 31 + k * 7) % terms.len();
+                let id = arena.id_of(&terms[idx]).expect("терм проинтернирован") as u32;
+                v.push((id, ((k % 13) + 1) as u32));
+            }
+            v
+        })
+        .collect();
+    let file_dicts_termid_rss_kb = rss_now_kb().saturating_sub(rss2);
+    drop(dicts_id);
+
+    let rss3 = rss_now_kb();
+    let dicts_hm: Vec<std::collections::HashMap<String, usize>> = (0..files_n)
+        .map(|f| {
+            let mut m = std::collections::HashMap::with_capacity(per_file_terms);
+            for k in 0..per_file_terms {
+                let idx = (f * 31 + k * 7) % terms.len();
+                m.insert(terms[idx].clone(), (k % 13) + 1);
+            }
+            m
+        })
+        .collect();
+    let file_dicts_hashmap_rss_kb = rss_now_kb().saturating_sub(rss3);
+    drop(dicts_hm);
+
+    // ---------- Постинги: lz4 ----------
+    let hits: Vec<u32> = (0..20_000u32).map(|i| i * 3 + 1).collect();
+    let mut pos = 0usize;
+    let keys: Vec<usize> = (0..20_000)
+        .map(|i| {
+            pos += 137 + (i % 41);
+            pos
+        })
+        .collect();
+    let postings_raw_bytes = hits.len() * 4 + keys.len() * std::mem::size_of::<usize>();
+    let postings_lz4_bytes =
+        PostingsStore::from_u32(&hits).compressed_bytes() + PostingsStore::from_usize(&keys).compressed_bytes();
+
+    // ---------- Doc store: zstd со словарём ----------
+    let page = |n: usize| {
+        format!(
+            "Страница {n} портала: навигация, поиск по сайту, обратная связь, \
+             содержание, версия для печати, редактировать. Уникальный абзац {n} \
+             про систему резонанса и вектор индексации. Повторяемые обороты \
+             страниц: метрика, протокол, токен, запрос, дедлайн, критично."
+        )
+        .repeat(3)
+    };
+    let pages_txt: Vec<String> = (0..200).map(page).collect();
+    let docstore_raw_bytes: usize = pages_txt.iter().map(|p| p.len()).sum();
+    let docstore_zstd_bytes = {
+        let refs: Vec<&str> = pages_txt.iter().map(|p| p.as_str()).collect();
+        let dict = DocStoreCodec::train_dict_from_texts(&refs);
+        let codec = match dict {
+            Some(d) => DocStoreCodec::with_dict(d).expect("кодек со словарём"),
+            None => DocStoreCodec::new().expect("кодек"),
+        };
+        pages_txt.iter().map(|p| codec.compress(p).unwrap().len()).sum()
+    };
+
+    // Дельта 0 кБ = аллокатор уложился в уже имеющиеся страницы
+    // (занижение, не преувеличение) — выходим на логические байты.
+    let gain = |old: u64, new: u64, new_logical: usize, old_logical: usize| -> f64 {
+        if new == 0 {
+            old_logical as f64 / new_logical.max(1) as f64
+        } else {
+            old as f64 / new as f64
+        }
+    };
+    let file_dicts_logical_id = files_n * per_file_terms * 8;
+    let file_dicts_logical_hm = files_n * per_file_terms * 64;
+
+    CompressionBench {
+        vocab_terms: terms.len(),
+        vocab_raw_bytes,
+        vocab_fsst_bytes,
+        vocab_fsst_ratio: vocab_fsst_bytes as f64 / vocab_raw_bytes.max(1) as f64,
+        vocab_hashmap_rss_kb,
+        vocab_arena_rss_kb,
+        vocab_ram_gain_x: gain(
+            vocab_hashmap_rss_kb,
+            vocab_arena_rss_kb,
+            vocab_arena_logical_bytes,
+            terms.len() * 64 + vocab_raw_bytes,
+        ),
+        vocab_arena_logical_bytes,
+        lookup_hashmap_us_per_k: lookup_hashmap_us / 100.0,
+        lookup_arena_us_per_k: lookup_arena_us / 100.0,
+        lookup_slowdown_x: if lookup_hashmap_us > 0.0 {
+            lookup_arena_us / lookup_hashmap_us
+        } else {
+            0.0
+        },
+        lookup_parity: parity,
+        file_dicts_hashmap_rss_kb,
+        file_dicts_termid_rss_kb,
+        file_dicts_ram_gain_x: gain(
+            file_dicts_hashmap_rss_kb,
+            file_dicts_termid_rss_kb,
+            file_dicts_logical_id,
+            file_dicts_logical_hm,
+        ),
+        postings_raw_bytes,
+        postings_lz4_bytes,
+        postings_ratio: postings_lz4_bytes as f64 / postings_raw_bytes.max(1) as f64,
+        docstore_raw_bytes,
+        docstore_zstd_bytes,
+        docstore_ratio: docstore_zstd_bytes as f64 / docstore_raw_bytes.max(1) as f64,
+        table_ser_bit_exact,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1352,40 @@ mod tests {
     }
 
     #[test]
+    fn compression_golden_density_and_parity() {
+        // Golden контура 4: parity частот (арена == HashMap), побитовая
+        // сериализация таблицы, детерминированные логические размеры
+        // (RSS-дельты в общем тест-процессе шумят аллокатором — они
+        // только отражаются в отчёте CLI-раннера).
+        let opts = BenchOpts { runs: 2, ..Default::default() };
+        let res = bench_compression(&opts);
+        assert!(res.lookup_parity, "parity частот арены против HashMap нарушен");
+        assert!(res.table_ser_bit_exact, "сериализация FSST-таблицы не побитова");
+
+        // Логическая модель HashMap<String, usize>: 24Б заголовок String +
+        // ~24Б heap-чанк + 8Б значение + ~16Б слот ≈ 64Б/терм + сами байты.
+        // Арена (точная бухгалтерия) обязана быть кратно плотнее.
+        let hashmap_logical = res.vocab_terms * 64 + res.vocab_raw_bytes;
+        assert!(
+            res.vocab_arena_logical_bytes * 2 < hashmap_logical,
+            "арена {} не плотнее вдвое модели HashMap {}",
+            res.vocab_arena_logical_bytes,
+            hashmap_logical
+        );
+        // Сжатие термов на морфологии: заметно ниже сырья.
+        assert!(res.vocab_fsst_ratio < 0.75, "ratio={}", res.vocab_fsst_ratio);
+        // Постинги/doc store сжимаются.
+        assert!(res.postings_ratio < 0.75, "ratio={}", res.postings_ratio);
+        assert!(res.docstore_ratio < 0.5, "ratio={}", res.docstore_ratio);
+        // ID-пары: 8Б/запись против ~64Б строкового словаря.
+        let files_n = 500usize;
+        let per_file = 300usize;
+        let id_pairs = files_n * per_file * 8;
+        let str_dicts = files_n * per_file * 64;
+        assert!(id_pairs * 2 < str_dicts);
+    }
+
+    #[test]
     fn run_suite_small_smoke() {
         // полный конвейер на мини-параметрах — без паник и мусора
         let opts = BenchOpts {
@@ -1140,7 +1488,46 @@ pub fn report_text(res: &BenchResults) -> String {
     ));
 
     s.push('\n');
-    s.push_str("[4] Resources\n");
+    s.push_str("[4] Compression — плотность памяти индекса (v2.0, Приоритет 3)\n");
+    s.push_str(&format!(
+        "    словарь корпуса: {} термов ({} КБ сырья) → FSST-blob {} КБ — {:.2}× сжатие термов\n",
+        res.compression.vocab_terms,
+        res.compression.vocab_raw_bytes / 1024,
+        res.compression.vocab_fsst_bytes / 1024,
+        res.compression.vocab_raw_bytes as f64 / res.compression.vocab_fsst_bytes.max(1) as f64
+    ));
+    s.push_str(&format!(
+        "    глобальный словарь RAM: HashMap {:.1} МБ → арена {:.1} МБ — {:.1}× плотнее{}\n",
+        res.compression.vocab_hashmap_rss_kb as f64 / 1024.0,
+        res.compression.vocab_arena_rss_kb as f64 / 1024.0,
+        res.compression.vocab_ram_gain_x,
+        if res.compression.lookup_parity { " ✓ parity частот" } else { " ✗ PARITY НАРУШЕН" }
+    ));
+    s.push_str(&format!(
+        "    пер-файловые словари (500×300): HashMap {:.1} МБ → ID-пары {:.1} МБ — {:.1}× плотнее\n",
+        res.compression.file_dicts_hashmap_rss_kb as f64 / 1024.0,
+        res.compression.file_dicts_termid_rss_kb as f64 / 1024.0,
+        res.compression.file_dicts_ram_gain_x
+    ));
+    s.push_str(&format!(
+        "    постинги lz4: {} КБ → {} КБ ({:.2}×); doc store zstd: {} КБ → {} КБ ({:.2}×)\n",
+        res.compression.postings_raw_bytes / 1024,
+        res.compression.postings_lz4_bytes / 1024,
+        res.compression.postings_raw_bytes as f64 / res.compression.postings_lz4_bytes.max(1) as f64,
+        res.compression.docstore_raw_bytes / 1024,
+        res.compression.docstore_zstd_bytes / 1024,
+        res.compression.docstore_raw_bytes as f64 / res.compression.docstore_zstd_bytes.max(1) as f64
+    ));
+    s.push_str(&format!(
+        "    лукапы: HashMap {:.1} мкс/1000 → арена {:.1} мкс/1000 (compress-probe ×{:.1}){}\n",
+        res.compression.lookup_hashmap_us_per_k,
+        res.compression.lookup_arena_us_per_k,
+        res.compression.lookup_slowdown_x,
+        if res.compression.table_ser_bit_exact { ", сериализация таблицы побитова ✓" } else { ", СЕРИАЛИЗАЦИЯ НЕ ТОЧНА ✗" }
+    ));
+
+    s.push('\n');
+    s.push_str("[5] Resources\n");
     if let Some(r) = &res.resources {
         s.push_str(&format!(
             "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)\n",

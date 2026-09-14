@@ -23,9 +23,10 @@
 //! crates.io `aho-corasick` на случайных множествах и на маркер-плотных
 //! текстах (`marker_teddy_matches_ac_differential`).
 
+use crate::compression::TermFreqs;
 use crate::retrieval::teddy::Teddy;
 use crate::tokenizer::InvertedIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Таблица маркеров: (фраза, вес). Отрицания — максимальный вес:
@@ -130,10 +131,14 @@ pub fn semantic_bonus(window_text: &str) -> f64 {
 /// * `query_tokens` — токены запроса (kw); их вхождения дают множитель
 ///   `1 + ln(1 + count)`, сами они исключаются из unique-суммы;
 /// * `bonus` — заранее посчитанный [`semantic_bonus`] по тексту окна.
-pub fn calculate_epsilon(
+///
+/// v2.0 (Приоритет 3): источник частот абстрагирован трейтом
+/// [`TermFreqs`] — глобальная статистика живёт в сжатом словаре
+/// (FSST-арена), локальная — в HashMap. Мономорфизация, без dyn.
+pub fn calculate_epsilon<F: TermFreqs>(
     window_tokens: &[&str],
     query_tokens: &[String],
-    global_counts: &HashMap<String, usize>,
+    global_counts: &F,
     total_tokens: usize,
     kappa: f64,
     bonus: f64,
@@ -145,7 +150,11 @@ pub fn calculate_epsilon(
     let query_set: HashSet<&str> = query_tokens.iter().map(|s| s.as_str()).collect();
 
     let mut kw_count = 0usize;
-    let mut unique: HashSet<&str> = HashSet::new();
+    // BTreeSet, а не HashSet: детерминированный порядок суммирования.
+    // Порядок итерации хеш-множества меняет порядок FP-сложения (последний
+    // ulp) — ранжирование становилось невоспроизводимым между прогонами;
+    // дифференциальный тест ε (HashMap vs FSST-арена) это вскрыл.
+    let mut unique: BTreeSet<&str> = BTreeSet::new();
     for t in window_tokens {
         if query_set.contains(*t) {
             kw_count += 1;
@@ -156,7 +165,7 @@ pub fn calculate_epsilon(
 
     let mut sum = 0.0;
     for t in unique {
-        let freq = *global_counts.get(t).unwrap_or(&1) as f64;
+        let freq = global_counts.freq(t).unwrap_or(1) as f64;
         let rarity = (log_n - freq.ln()).max(0.0);
         sum += rarity * rarity;
     }
@@ -190,10 +199,10 @@ pub struct SlidingEpsilon {
 
 impl SlidingEpsilon {
     /// Готовит калькулятор: предвычисляет rarity² для словаря документа.
-    pub fn new(
+    pub fn new<F: TermFreqs>(
         index: &InvertedIndex,
         query_tokens: &[String],
-        global_counts: &HashMap<String, usize>,
+        global_counts: &F,
         total_tokens: usize,
         kappa: f64,
         radius: usize,
@@ -201,7 +210,7 @@ impl SlidingEpsilon {
         let log_n = (total_tokens.max(1) as f64).ln();
         let mut rarity2 = HashMap::with_capacity(index.token_counts.len());
         for tok in index.token_counts.keys() {
-            let freq = *global_counts.get(tok).unwrap_or(&1) as f64;
+            let freq = global_counts.freq(tok).unwrap_or(1) as f64;
             let r = (log_n - freq.ln()).max(0.0);
             rarity2.insert(tok.clone(), r * r);
         }
@@ -296,7 +305,8 @@ mod tests {
 
     #[test]
     fn empty_window_is_zero() {
-        assert_eq!(calculate_epsilon(&[], &q(&["нокс"]), &HashMap::new(), 100, 1.0, 0.0), 0.0);
+        let empty: HashMap<String, usize> = HashMap::new();
+        assert_eq!(calculate_epsilon(&[], &q(&["нокс"]), &empty, 100, 1.0, 0.0), 0.0);
     }
 
     #[test]

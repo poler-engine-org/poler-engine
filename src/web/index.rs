@@ -21,6 +21,7 @@ use super::extract::{clean_text, snippet_for, title_from_text};
 use super::phrase::{decode_positions, encode_positions, parse_query, phrase_occurrences};
 use super::stem::tokenize_stem;
 use super::simhash::{near_duplicate, simhash};
+use crate::compression::DocStoreCodec;
 use crate::retrieval::semantic_bridge::{QueryExpansion, SemanticBridge};
 
 /// Веса POLER WebRank v1.
@@ -82,8 +83,30 @@ pub struct IndexStats {
     pub db_bytes: u64,
 }
 
+fn zstd_err(e: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
+/// Усечение строки по границе символа (для кольца обучения словаря).
+fn truncate_char_safe_str(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 pub struct WebIndex {
     conn: Connection,
+    /// v2.0 (Приоритет 3.2): кодек doc store — pages.text хранится
+    /// zstd-BLOB'ом (со словарём после обучения), старые строки читаются
+    /// как плоский текст (ленивая миграция).
+    docstore: DocStoreCodec,
+    /// Кольцо свежих текстов для обучения zstd-словаря (ограничено).
+    train_ring: Vec<String>,
 }
 
 impl WebIndex {
@@ -139,17 +162,13 @@ impl WebIndex {
              CREATE INDEX IF NOT EXISTS idx_terms_page ON terms(page_id);
              CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);",
         )?;
-        let ix = Self { conn };
-        ix.migrate_positions_v1()?;
-        Ok(ix)
+        Self::with_conn(conn)
     }
 
     /// In-memory база (тесты).
     pub fn open_memory() -> rusqlite::Result<Self> {
-        let ix = Self {
-            conn: Connection::open_in_memory()?,
-        };
-        ix.conn.execute_batch(
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pages(
                id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL,
                title TEXT NOT NULL DEFAULT '', lang TEXT NOT NULL DEFAULT '',
@@ -171,7 +190,113 @@ impl WebIndex {
              CREATE INDEX IF NOT EXISTS idx_terms_page ON terms(page_id);
              CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst);",
         )?;
+        Self::with_conn(conn)
+    }
+
+    /// Общий конструктор: кодек doc store + миграции (позиции v0.11.0,
+    /// затем zstd-колонка/словарь v2.0).
+    fn with_conn(conn: Connection) -> rusqlite::Result<Self> {
+        let codec = DocStoreCodec::new()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let mut ix = Self {
+            conn,
+            docstore: codec,
+            train_ring: Vec::new(),
+        };
+        // Порядок важен: docstore-миграция добавляет колонку text_c,
+        // которую читает позиционная миграция (старые строки — плоский
+        // текст, новые — zstd-BLOB).
+        ix.migrate_docstore_v1()?;
+        ix.migrate_positions_v1()?;
         Ok(ix)
+    }
+
+    // ------------------------------------------------------------------
+    // Миграция v2: doc store на zstd (v2.0, Приоритет 3.2)
+    // ------------------------------------------------------------------
+
+    /// Колонка `text_c` + словарь из meta (либо обучение по существующим
+    /// страницам старой БД). Ленивая миграция: строки до v2.0 остаются в
+    /// `text` и читаются как плоский текст.
+    fn migrate_docstore_v1(&mut self) -> rusqlite::Result<()> {
+        let has_text_c: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = 'text_c'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_text_c == 0 {
+            self.conn
+                .execute_batch("ALTER TABLE pages ADD COLUMN text_c BLOB")?;
+        }
+        let dict: Option<Vec<u8>> = match self.conn.query_row(
+            "SELECT v FROM meta WHERE k = 'zstd_dict'",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(d) => Some(d),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(d) = dict {
+            if !d.is_empty() {
+                self.docstore.install_dict(d).map_err(zstd_err)?;
+                return Ok(());
+            }
+        }
+        // Старая БД без словаря, страниц достаточно — обучаем при открытии.
+        let pages: i64 = self.conn.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))?;
+        if pages >= 64 {
+            self.train_docstore_dict()?;
+        }
+        Ok(())
+    }
+
+    /// Обучение zstd-словаря по свежим текстам (кольцо апсертов либо
+    /// существующие страницы). Словарь иммутабелен после создания и
+    /// хранится в `meta['zstd_dict']`.
+    fn train_docstore_dict(&mut self) -> rusqlite::Result<()> {
+        if self.docstore.has_dict() {
+            return Ok(());
+        }
+        let ring: Vec<String> = std::mem::take(&mut self.train_ring);
+        let texts: Vec<String> = if ring.len() >= crate::compression::zstd_dict::DICT_TRAIN_MIN_PAGES
+        {
+            ring
+        } else {
+            // Читаем свежие страницы (старые строки — плоский текст,
+            // новые — разжимаем; цикл обучения видит обе формы).
+            let mut out: Vec<String> = Vec::new();
+            let mut stmt = self
+                .conn
+                .prepare("SELECT text, text_c FROM pages ORDER BY id DESC LIMIT 256")?;
+            let rows = stmt.query_map([], |r| {
+                let text: String = r.get(0)?;
+                let text_c: Option<Vec<u8>> = r.get(1)?;
+                match text_c {
+                    Some(blob) if !blob.is_empty() => self
+                        .docstore
+                        .decompress(&blob)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
+                    _ => Ok(text),
+                }
+            })?;
+            for row in rows {
+                out.push(row?);
+                if out.len() >= 256 {
+                    break;
+                }
+            }
+            out
+        };
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        if let Some(dict) = DocStoreCodec::train_dict_from_texts(&refs) {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES('zstd_dict', ?1)",
+                params![dict],
+            )?;
+            self.docstore.install_dict(dict).map_err(zstd_err)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -198,13 +323,20 @@ impl WebIndex {
         self.conn
             .execute_batch("ALTER TABLE terms ADD COLUMN positions BLOB")?;
         let pages: Vec<(i64, String, String)> = {
-            let mut stmt = self.conn.prepare("SELECT id, text, title FROM pages")?;
+            let mut stmt = self.conn.prepare("SELECT id, text, text_c, title FROM pages")?;
             let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
+                // v2.0: свежие строки держат текст в text_c (zstd),
+                // старые — в text; миграция позиций видит обе формы.
+                let plain: String = r.get(1)?;
+                let blob: Option<Vec<u8>> = r.get(2)?;
+                let text = match blob {
+                    Some(b) if !b.is_empty() => self
+                        .docstore
+                        .decompress(&b)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    _ => plain,
+                };
+                Ok((r.get::<_, i64>(0)?, text, r.get::<_, String>(3)?))
             })?;
             rows.collect::<Result<Vec<_>, rusqlite::Error>>()?
         };
@@ -308,19 +440,23 @@ impl WebIndex {
             }
         }
 
+        // v2.0 (Приоритет 3.2): текст страницы хранится zstd-BLOB'ом;
+        // `text` остаётся пустым (старые строки — плоский текст, лениво).
+        let text_c = self.docstore.compress(&text).map_err(zstd_err)?;
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO pages(url, title, lang, meta_desc, text, content_hash, simhash, doclen, fetched_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO pages(url, title, lang, meta_desc, text, text_c, content_hash, simhash, doclen, fetched_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(url) DO UPDATE SET
-               title=?2, lang=?3, meta_desc=?4, text=?5, content_hash=?6,
-               simhash=?7, doclen=?8, fetched_at=?9, dup_of=''",
+               title=?2, lang=?3, meta_desc=?4, text=?5, text_c=?6, content_hash=?7,
+               simhash=?8, doclen=?9, fetched_at=?10, dup_of=''",
             params![
                 doc.url,
                 title,
                 doc.lang,
                 doc.meta_description,
-                text,
+                String::new(),
+                text_c,
                 doc.content_hash,
                 sim,
                 tokens.len() as i64,
@@ -365,6 +501,23 @@ impl WebIndex {
             }
         }
         tx.commit()?;
+
+        // Кольцо свежих текстов для обучения словаря (сжатая форма
+        // непригодна для сэмплов): до 256 страниц по 8 КБ.
+        if !self.docstore.has_dict() {
+            let mut sample: String = text;
+            truncate_char_safe_str(&mut sample, 8 * 1024);
+            self.train_ring.push(sample);
+            if self.train_ring.len() > 256 {
+                self.train_ring.remove(0);
+            }
+            let min_pages = crate::compression::zstd_dict::DICT_TRAIN_MIN_PAGES;
+            if self.train_ring.len() >= min_pages
+                && self.train_ring.len() % min_pages == 0
+            {
+                self.train_docstore_dict()?;
+            }
+        }
         Ok((id, true))
     }
 
@@ -742,19 +895,29 @@ impl WebIndex {
         }
         let mut candidates: Vec<Cand> = Vec::new();
         for (pid, e) in &acc {
+            // v2.0: text_c (zstd) у свежих строк, text — у старых.
             let row = self.conn.query_row(
-                "SELECT url, title, lang, text, rank, doclen, fetched_at, dup_of FROM pages WHERE id = ?1",
+                "SELECT url, title, lang, text, text_c, rank, doclen, fetched_at, dup_of FROM pages WHERE id = ?1",
                 params![pid],
                 |r| {
+                    let plain: String = r.get(3)?;
+                    let blob: Option<Vec<u8>> = r.get(4)?;
+                    let text = match blob {
+                        Some(b) if !b.is_empty() => self
+                            .docstore
+                            .decompress(&b)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                        _ => plain,
+                    };
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, f64>(4)?,
-                        r.get::<_, i64>(5)?,
+                        text,
+                        r.get::<_, f64>(5)?,
                         r.get::<_, i64>(6)?,
-                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, String>(8)?,
                     ))
                 },
             );

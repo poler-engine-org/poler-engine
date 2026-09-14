@@ -216,6 +216,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ad534f4357a5264cce5019c989cf66a4f0dc4e0d1b1d15f8aacec0ff7360273"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1963,6 +1965,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2039,6 +2051,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -2316,6 +2337,7 @@ dependencies = [
  "gix",
  "globset",
  "ignore",
+ "lz4_flex",
  "memchr",
  "memmap2",
  "petgraph",
@@ -2332,6 +2354,7 @@ dependencies = [
  "unicode-segmentation",
  "ureq",
  "whatlang",
+ "zstd",
 ]
 
 [[package]]
@@ -3132,6 +3155,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
+
+[[package]]
 name = "unicode-bom"
 version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3662,6 +3691,34 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.0+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "zune-core"

@@ -20,6 +20,7 @@
 //! индекса. Межпроходный кэш текста (`TEXT_CACHE_LIMIT` из v0.2) удалён
 //! полностью — каждый проход читает файл заново через mmap.
 
+use crate::compression::{StatsRef, TermFreqs};
 use crate::retrieval::teddy::Teddy;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -165,8 +166,12 @@ impl<'a> FileTokens<'a> {
 
 /// Потоковый подсчёт частот токенов без построения массива токенов
 /// (для файлов, отброшенных литеральным предфильтром).
-pub fn streaming_counts(text: &str) -> (HashMap<String, usize>, u64) {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+///
+/// v2.0 (Приоритет 3): ключи `Box<str>` — pass 1 больше не клонирует
+/// строки при передаче словаря файла в sink (интернирование в
+/// FSST-арену принимает `&str`).
+pub fn streaming_counts(text: &str) -> (HashMap<Box<str>, u32>, u64) {
+    let mut counts: HashMap<Box<str>, u32> = HashMap::new();
     let mut total = 0u64;
     let mut in_word = false;
     let mut start = 0usize;
@@ -179,12 +184,12 @@ pub fn streaming_counts(text: &str) -> (HashMap<String, usize>, u64) {
         } else if in_word {
             in_word = false;
             total += 1;
-            *counts.entry(text[start..i].to_string()).or_insert(0) += 1;
+            *counts.entry(text[start..i].to_string().into_boxed_str()).or_insert(0) += 1;
         }
     }
     if in_word {
         total += 1;
-        *counts.entry(text[start..].to_string()).or_insert(0) += 1;
+        *counts.entry(text[start..].to_string().into_boxed_str()).or_insert(0) += 1;
     }
     (counts, total)
 }
@@ -244,8 +249,11 @@ pub fn literal_present(raw: &str, query_tokens: &[String], pre: &Option<Teddy>) 
 // ---------------------------------------------------------------------------
 
 /// Результат прохода 1 по одному файлу.
+///
+/// `counts` — словарь файла с `Box<str>`-ключами, перемещаемый из
+/// [`FileTokens`] без клонов строк (v2.0, Приоритет 3).
 pub struct Pass1File {
-    pub counts: HashMap<String, usize>,
+    pub counts: HashMap<Box<str>, u32>,
     pub total: u64,
     pub hits: Vec<u32>,
 }
@@ -275,14 +283,12 @@ pub fn pass1_file(
         }
         let ft = FileTokens::build(raw);
         let hits = ft.find_phrase(query_tokens);
-        let counts: HashMap<String, usize> = ft
-            .counts
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v as usize))
-            .collect();
+        let total = ft.toks_len() as u64;
+        // v2.0: словарь файла перемещается целиком (ноль клонов строк);
+        // интернирование в FSST-арену происходит в sink под мьютексом.
         Pass1File {
-            counts,
-            total: ft.toks_len() as u64,
+            counts: ft.counts,
+            total,
             hits,
         }
     })
@@ -421,7 +427,7 @@ pub fn pass2_giant_parallel(
     query_tokens: &[String],
     config: &EngineConfig,
     _cleaner: &PiiCleaner,
-    global_counts: &HashMap<String, usize>,
+    global_counts: &StatsRef,
     n_total: usize,
     hits: &[u32],
 ) -> Option<Pass2Result> {
@@ -477,11 +483,6 @@ pub fn pass2_giant_parallel(
                 if sub_hits.is_empty() {
                     return None;
                 }
-                let local_counts: HashMap<String, usize> = sub_ft
-                    .counts
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), *v as usize))
-                    .collect();
 
                 let sub_eps_res: Vec<(f64, f64)> = match config.resonance_mode {
                     ResonanceMode::Psi => {
@@ -572,7 +573,7 @@ pub fn pass2_giant_parallel(
                         let qset: HashSet<&str> =
                             query_tokens.iter().map(|s| s.as_str()).collect();
                         let rarity2 = |tok: &str| -> f64 {
-                            let freq = *global_counts.get(tok).unwrap_or(&1) as f64;
+                            let freq = global_counts.freq(tok).unwrap_or(1) as f64;
                             let rr = (log_n - freq.ln()).max(0.0);
                             rr * rr
                         };
@@ -627,7 +628,6 @@ pub fn pass2_giant_parallel(
                         out
                     }
                 };
-                let _ = local_counts;
 
                 // ── Стриминговый Top-K в чанке (bug PYCCLE) ──
                 use std::cmp::Reverse;
@@ -759,7 +759,7 @@ fn field_eps_res(
     ft: &FileTokens,
     hits: &[u32],
     query: &[String],
-    gcounts: &HashMap<String, usize>,
+    gcounts: &StatsRef,
     gtotal: usize,
     kappa: f64,
     phi: f64,
@@ -773,7 +773,7 @@ fn field_eps_res(
     let qset: HashSet<&str> = query.iter().map(|s| s.as_str()).collect();
     let hit_idx: HashMap<u32, usize> = hits.iter().enumerate().map(|(i, &h)| (h, i)).collect();
     let rarity2 = |tok: &str| -> f64 {
-        let freq = *gcounts.get(tok).unwrap_or(&1) as f64;
+        let freq = gcounts.freq(tok).unwrap_or(1) as f64;
         let rr = (log_n - freq.ln()).max(0.0);
         rr * rr
     };
@@ -861,7 +861,7 @@ pub fn pass2_file(
     query_tokens: &[String],
     config: &EngineConfig,
     _cleaner: &PiiCleaner,
-    global_counts: &HashMap<String, usize>,
+    global_counts: &StatsRef,
     n_total: usize,
     hits: &[u32],
 ) -> Option<Pass2Result> {
@@ -877,15 +877,12 @@ pub fn pass2_file(
         // Кэш заголовков: один проход по файлу вместо O(файл) на каждый хит
         let locator = crate::parser::markdown_scenes::SceneLocator::new(text, path);
 
-        // Статистики для ε: глобальные по корпусу либо локальные по файлу.
-        let local_counts: HashMap<String, usize>;
-        let (gcounts, gtotal): (&HashMap<String, usize>, usize) = if config.local_stats {
-            local_counts = ft
-                .counts
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v as usize))
-                .collect();
-            (&local_counts, ft.toks_len())
+        // Статистики для ε: глобальные по корпусу либо локальные по файлу
+        // (v2.0: локальный словарь заимствуется у FileTokens — ноль клонов).
+        let local_stats: StatsRef;
+        let (gcounts, gtotal): (&StatsRef, usize) = if config.local_stats {
+            local_stats = StatsRef::Local(&ft.counts);
+            (&local_stats, ft.toks_len())
         } else {
             (global_counts, n_total)
         };
@@ -1118,7 +1115,7 @@ mod tests {
         assert_eq!(counts.get("beta"), Some(&2));
         assert_eq!(counts.get("gamma"), Some(&1));
         for (k, v) in &ft.counts {
-            assert_eq!(counts.get(k.as_ref()), Some(&(*v as usize)));
+            assert_eq!(counts.get(k.as_ref()), Some(&(*v as u32)));
         }
     }
 
@@ -1137,11 +1134,9 @@ mod tests {
                     kappa lambda alpha mu nu xi omicron pi alpha";
         let ft = FileTokens::build(text);
         let query = q(&["alpha"]);
-        let gcounts: HashMap<String, usize> = ft
-            .counts
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v as usize))
-            .collect();
+        // v2.0: field_eps_res принимает StatsRef; локальная статистика —
+        // заимствованный словарь FileTokens (как в реальном пути --local-stats).
+        let gcounts = crate::compression::StatsRef::Local(&ft.counts);
         let hits = ft.find_phrase(&query);
         let radius = 3;
         let n = ft.toks_len();

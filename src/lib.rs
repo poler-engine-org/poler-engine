@@ -27,6 +27,8 @@
 //!              │         (временные структуры освобождаются сразу)
 //!              ▼
 //!        merge global stats (N_total, freq) — только словарь корпуса
+//!              (v2.0 Compression: FSST-арена — термы сжаты, ID-стабильны;
+//!               пер-файловые словари — пары ID 8Б, постинги — lz4-парковка)
 //!              ▼
 //!        [Проход 2, rayon] только hit-файлы:
 //!              окна W_t → ε (+semantic bonus) → IIR R_t = ε_t + φ·R_{t-1}
@@ -46,6 +48,7 @@
 
 pub mod aidde;
 pub mod bench;
+pub mod compression;
 pub mod engine;
 pub mod gateway;
 pub mod graph;
@@ -88,6 +91,7 @@ pub use psi::{psi_resonances, PsiField, PsiParams};
 pub use resonance::{
     apply_iir_resonance, calculate_epsilon, semantic_bonus, IirFilter, SlidingEpsilon,
 };
+pub use compression::{GlobalStats, PostingsStore, TermFreqs, VocabArena};
 pub use streaming::{FileTokens, GIANT_FILE_BYTES};
 pub use tokenizer::{InvertedIndex, PiiCleaner, PiiMode};
 

@@ -857,3 +857,187 @@ fn sqlite_impact_reuse_skips_rebuild() {
     let (s3, _) = SymbolStore::open_existing(&db).unwrap();
     assert!(impact_analysis_sqlite(&s3, "core_fn", 2, 100).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// v2.0 Compression (Приоритет 3): дифференциальные тесты плотности памяти
+// ---------------------------------------------------------------------------
+
+#[test]
+fn epsilon_identical_through_compressed_vocab() {
+    // Дифференциал: ε, посчитанная через HashMap-частоты, обязана
+    // побитово совпадать с ε через FSST-арену (VocabArena + GlobalStats)
+    // — иначе замена представления словаря меняет ранжирование.
+    use poler_engine::compression::{GlobalStats, TermFreqs, VocabArena};
+    use poler_engine::resonance::calculate_epsilon;
+
+    let corpus = [
+        "нокс вонзила когти в сплетение теней и растворилась в сумерках",
+        "система не должна отключаться при отказе питания реактора",
+        "runtime panic unwrap deprecated hack todo fixme unsafe блок",
+        "вектор резонанса протокола системы индексируется токенами запроса",
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+    ];
+    let mut old: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut arena = VocabArena::new();
+    let mut counts: Vec<u32> = Vec::new();
+    let mut total = 0usize;
+    for doc in corpus {
+        for tok in doc.split_whitespace() {
+            let t = tok.to_lowercase();
+            *old.entry(t.clone()).or_insert(0) += 1;
+            let id = arena.intern(&t) as usize;
+            if id >= counts.len() {
+                counts.resize(id + 1, 0);
+            }
+            counts[id] += 1;
+            total += 1;
+        }
+    }
+    arena.ensure_compact();
+    assert!(arena.is_compact());
+    let g = GlobalStats {
+        vocab: &arena,
+        counts: &counts,
+    };
+
+    let queries: Vec<Vec<String>> = vec![
+        vec!["нокс".into()],
+        vec!["не".into(), "должна".into()],
+        vec!["runtime".into()],
+        vec!["вектор".into(), "резонанса".into()],
+        vec!["отсутствует".into()],
+    ];
+    for text in corpus {
+        let window: Vec<&str> = text.split_whitespace().collect();
+        let lowered: Vec<String> = window.iter().map(|w| w.to_lowercase()).collect();
+        for q in &queries {
+            let e_old = calculate_epsilon(&lowered.iter().map(|s| s.as_str()).collect::<Vec<_>>(), q, &old, total, 1.0, 0.0);
+            let e_new = calculate_epsilon(&lowered.iter().map(|s| s.as_str()).collect::<Vec<_>>(), q, &g, total, 1.0, 0.0);
+            assert_eq!(e_old, e_new, "ε разошлась на {text:?} q={q:?}");
+        }
+    }
+    // и частоты напрямую совпадают
+    for (term, freq) in &old {
+        assert_eq!(g.freq(term).unwrap() as usize, *freq, "терм {term:?}");
+    }
+    assert_eq!(g.freq("нет_такого_терма"), None);
+}
+
+#[test]
+fn watcher_state_survives_compaction_cycle() {
+    // Полный цикл watcher: scan → rescan (компактная арена + ID-пары) →
+    // результаты обязаны совпадать со свежим сканом тех же файлов.
+    let dir = TempDir::new().unwrap();
+    for i in 0..4 {
+        fs::write(
+            dir.path().join(format!("f{i}.md")),
+            format!("# Глава {i}\n\nНокс и система резонанса. Повторение: нокс, нокс.\n"),
+        )
+        .unwrap();
+    }
+    let mut engine = poler_engine::Engine::new(EngineConfig::default(), true);
+    let (res1, _) = engine.scan(dir.path(), "нокс");
+    assert!(res1.total_hits >= 12);
+
+    // «свежий» движок без watcher-состояния — эталон
+    let mut fresh = poler_engine::Engine::new(EngineConfig::default(), false);
+    let (res_fresh, _) = fresh.scan(dir.path(), "нокс");
+    assert_eq!(res1.total_hits, res_fresh.total_hits);
+
+    // rescan без изменений: статистика из сжатого состояния (ID-пары)
+    let (ev, res2, _) = engine.rescan(dir.path(), "нокс");
+    assert!(ev.is_empty(), "{ev:?}");
+    assert_eq!(res2.total_hits, res_fresh.total_hits);
+    // якоря идентичны свежему прогону (ε/R посчитаны по тем же частотам)
+    let a1: Vec<(String, f64, f64)> = res_fresh
+        .anchors
+        .iter()
+        .map(|a| (a.file.clone(), a.epsilon, a.resonance))
+        .collect();
+    let a2: Vec<(String, f64, f64)> = res2
+        .anchors
+        .iter()
+        .map(|a| (a.file.clone(), a.epsilon, a.resonance))
+        .collect();
+    assert_eq!(a1, a2, "якоря rescan должны совпадать со свежим сканом");
+
+    // изменение файла: вычитание старого словаря + новый pass 1/2
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    fs::write(dir.path().join("f0.md"), "# Глава 0\n\nПолностью новый текст без искомого слова.\n").unwrap();
+    let (ev3, res3, _) = engine.rescan(dir.path(), "нокс");
+    assert_eq!(ev3.changed.len(), 1, "{ev3:?}");
+    assert!(res3.total_hits < res_fresh.total_hits);
+    let mut fresh2 = poler_engine::Engine::new(EngineConfig::default(), false);
+    let (res_fresh2, _) = fresh2.scan(dir.path(), "нокс");
+    assert_eq!(res3.total_hits, res_fresh2.total_hits);
+}
+
+#[test]
+fn web_docstore_compression_roundtrip() {
+    // zstd doc store: 40 страниц → словарь обучается → поиск находит
+    // страницы и читает их сжатые тексты; старые строки читаются тоже.
+    use poler_engine::web::index::{WebIndex, WebDoc};
+
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("web.db");
+    let mut ix = WebIndex::open(&db).unwrap();
+    let page = |n: usize| WebDoc {
+        url: format!("https://site.io/{n}"),
+        title: format!("Страница {n}"),
+        text: format!(
+            "Общая шапка сайта: навигация, поиск, обратная связь. \
+             Уникальный контент номер {n} про нокс и систему резонанса. \
+             Служебные обороты: содержание, версия для печати, редактировать."
+        ),
+        lang: "ru".into(),
+        meta_description: String::new(),
+        content_hash: format!("hash{n}"),
+        links: vec![],
+    };
+    for n in 0..40 {
+        ix.upsert_page(&page(n)).unwrap();
+    }
+    // словарь обучен (>= 16 страниц), мета-запись существует
+    assert!(ix.conn()
+        .query_row("SELECT COUNT(*) FROM meta WHERE k = 'zstd_dict'", [],
+        |r| r.get::<_, i64>(0)).unwrap() > 0);
+    // сжатые тексты реально в text_c
+    let compressed: i64 = ix.conn()
+        .query_row("SELECT COUNT(*) FROM pages WHERE text_c IS NOT NULL AND length(text_c) > 0", [],
+        |r| r.get(0)).unwrap();
+    assert!(compressed >= 39, "почти все строки обязаны быть сжаты: {compressed}");
+    let db_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+
+    // поиск по сжатому doc store
+    let hits = ix.search("нокс резонанса", 10).unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits[0].snippet.contains("нокс") || hits[0].snippet.contains("контент"));
+
+    // переоткрытие: словарь из meta, поиск работает
+    drop(ix);
+    let mut ix2 = WebIndex::open(&db).unwrap();
+    let hits2 = ix2.search("уникальный контент", 10).unwrap();
+    assert!(!hits2.is_empty());
+
+    // старая строка (плоский текст + термы, как в БД до v2.0) читается
+    // наравне со сжатыми
+    ix2.conn()
+        .execute(
+            "INSERT INTO pages(url, title, lang, meta_desc, text, content_hash, simhash, doclen, fetched_at)
+             VALUES('https://old.io/1', 'Old', 'ru', '', 'legacy plain text про нокс', 'h1', 0, 6, 1)",
+            [],
+        )
+        .unwrap();
+    ix2.conn()
+        .execute(
+            "INSERT INTO terms(term, page_id, tf, title_tf, positions) VALUES
+             ('legacy', (SELECT id FROM pages WHERE url='https://old.io/1'), 1, 0, NULL),
+             ('plain', (SELECT id FROM pages WHERE url='https://old.io/1'), 1, 0, NULL)",
+            [],
+        )
+        .unwrap();
+    let hits3 = ix2.search("legacy plain", 10).unwrap();
+    assert_eq!(hits3.len(), 1);
+    assert!(db_bytes > 0);
+}
