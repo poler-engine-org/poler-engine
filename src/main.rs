@@ -336,6 +336,11 @@ struct Cli {
     #[arg(long = "ner", value_name = "MODEL")]
     ner: Option<String>,
 
+    /// Метки сущностей для --ner gliner (через запятую; zero-shot).
+    /// Для реальных чекпойнтов GLiNER обязательно: «--ner-labels людина,місто».
+    #[arg(long = "ner-labels", value_name = "LIST")]
+    ner_labels: Option<String>,
+
     /// Самопроверка суверенного стека: синтетические .pqw-модели →
     /// полный цикл инференса (энкодер + GLiNER + GLM + MoE + Sha256)
     /// без сети, без внешних библиотек.
@@ -1678,6 +1683,10 @@ fn run_llm(mode: &str, cli: &Cli) -> i32 {
 }
 
 /// `--ner gliner --model X.pqw -q "…"`: нативная span-голова GLiNER через pqc.
+///
+/// model_type=Gliner (реальные чекпойнты, mdeberta-спина): zero-shot метки
+/// через `--ner-labels`, пословленная токенизация из секции __tokenizer__.
+/// model_type=SpanNer (синтетика/selftest): метки фиксированы в __labels__.
 fn run_ner(what: &str, cli: &Cli) -> i32 {
     if what != "gliner" {
         eprintln!("poler-engine: неизвестный --ner {what:?} (доступен: gliner)");
@@ -1686,7 +1695,7 @@ fn run_ner(what: &str, cli: &Cli) -> i32 {
     let Some(model_path) = &cli.model else {
         eprintln!(
             "poler-engine: --ner gliner требует --model <gliner.pqw>\n  \
-             конвертер весов GLiNER → .pqw — Фаза 7.3;\n  \
+             конвертер реальных весов: scripts/convert_gliner_to_pqw.py;\n  \
              проверить голову сейчас: poler-engine --pqw-selftest"
         );
         return 2;
@@ -1695,6 +1704,54 @@ fn run_ner(what: &str, cli: &Cli) -> i32 {
         eprintln!("poler-engine: --ner gliner требует -q <текст>");
         return 2;
     };
+    // Маршрутизация по model_type из заголовка .pqw.
+    let real = match poler_engine::pqc::pqw::QuantizedWeightsView::open(model_path) {
+        Ok(v) => matches!(v.header().model_type, poler_engine::pqc::pqw::ModelType::Gliner),
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    if real {
+        let labels: Vec<&str> = match &cli.ner_labels {
+            Some(l) => l.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect(),
+            None => {
+                eprintln!(
+                    "poler-engine: --ner gliner (реальный чекпойнт) требует \n  \
+                     --ner-labels \"метка1,метка2,…\" (zero-shot список типов сущностей)"
+                );
+                return 2;
+            }
+        };
+        let model = match poler_engine::ner::RealGlinerModel::open(model_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let entities = match model.predict(text, &labels, 0.5) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        };
+        println!(
+            "gliner-native · {} сущностей · метки [{}] · {:.1} мс",
+            entities.len(),
+            labels.join(", "),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        for e in entities.iter().take(20) {
+            println!("  {}:{} [{:.2}] {}..{}", e.label, e.text, e.score, e.start, e.end);
+        }
+        if entities.len() > 20 {
+            println!("  … и ещё {}", entities.len() - 20);
+        }
+        return 0;
+    }
     let model = match poler_engine::ner::native_gliner::GlinerModel::open(model_path) {
         Ok(m) => m,
         Err(e) => {

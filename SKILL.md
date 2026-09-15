@@ -157,3 +157,37 @@ fp32-numpy-эталоном **cos ≥ 0.9999 на всех 24 слоях**, се
 (уникальная инновация) → Code Intelligence (tree-sitter/Salsa) → KG
 (GLiNER-веса → .pqw, Leiden) → Streaming Archives → Agentic/MCP v2 →
 Differential Dataflow → .pqw/pqc bridge → **локальный GLM-3 6B/70B (Part F)**.
+
+---
+
+## Шаг 4, кирпич 2.6 — GLiNER на реальных весах (mdeberta, закрыт)
+
+**Артефакты:** `src/pqc/deberta.rs` (DeBERTa-v2/v3-спина: disentangled
+attention c2p+p2c через ОДНУ log-бакет-таблицу `bucket(i−j)+256`,
+share_att_key, rel-LN, eps 1e-7, staged-forward для дифференциалов),
+`scripts/convert_gliner_to_pqw.py` (torch-zip + spm-прото-парсер stdlib →
+`.pqw` model_type=Gliner, int8, 297 МБ из 1.17 ГБ = 3.9×), секция
+`__tokenizer__` **v2** (профиль нормализации 1: NFC+strip_right —
+mdeberta; спец-токены `<<ENT>>`=250103/`<<SEP>>`=250104/[FLERT]=250102
+поверх base-250101; `▁` — spm-кусок id 260, дубликат в vocab НЕ
+добавлять — score 0.0 перехватывает Viterbi!), `src/ner/
+native_gliner.rs::RealGlinerModel` (BiLSTM-голова torch-конвенции
+гейтов [i,f,g,o] + SpanMarker-MLP + prompt-проекция + жадный
+не-оверлап), CLI `--ner gliner --model X.pqw --ner-labels "a,b"`.
+
+**Верификация (urchade/gliner_multi, 291.7M параметров, мультиязык):**
+numpy-эталон всей математики (спина+LSTM+голова) на реальных весах —
+7/7 сущностей («Джон Сміта»→людина 0.988, «Київ»→місто 0.991, «2023
+році»→дата 0.959, Eiffel Tower→будівля 0.994, Google→організація
+0.929). Rust-дифференциал (tests/gliner_real_model.rs, само-скип без
+модели): токенизация **побитово = HF** (68 ids), emb_ln 0.9997 /
+layer0 0.9998 / layer11 0.9992 (int8-аккумуляция 12 слоёв; e2e-гейт —
+сущности+скоры), predict 7/7, скоры в допуске 0.03. CLI: 1.8 с/текст
+(2 ядра). **Ключевой дефект, найденный эталоном:** p2c-индекс — тот же
+bucket(q−k)+256, что c2c (НЕ зеркальный) — код HF подтверждает
+«Q·PK[idx] и K·PQ[idx]». **1059 тестов зелёные (+6), ноль новых
+зависимостей.**
+
+Дальше: конвертер ChatGLM3-6B → .pqw int4 (Фаза 12.7; конвертация на
+ПК владельца через P³-мост — 150 ГБ диск) → кирпич 3 (ColBERT) → SPLADE
+→ IIR-Fusion → KG (GLiNER → AIDDE-якоря) → локальный GLM (Part F).

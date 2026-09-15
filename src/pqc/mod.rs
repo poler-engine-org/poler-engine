@@ -11,7 +11,9 @@
 //!       │              выравнивание секций на страницу 4096)
 //!       ├── tensor   — кернелы: dot fp32/int8/int4, LayerNorm/RMSNorm,
 //!       │              GELU/SiLU, softmax, RoPE-таблицы, квантование
-//!       ├── encoder  — BERT/XLM-R-энкодер (спина BGE-M3 и GLiNER)
+//!       ├── encoder  — BERT/XLM-R-энкодер (спина BGE-M3)
+//!       ├── deberta  — DeBERTa-v2/v3-энкодер (спина GLiNER: disentangled
+//!       │              attention, log-бакеты относительных позиций)
 //!       ├── sha256   — собственный FIPS 180-4 хэш
 //!       └── selftest — полный автономный цикл инференса (CLI --pqw-selftest)
 //!
@@ -29,6 +31,7 @@
 //! crates/pqc-inference — отдельный кирпич после открытия репозитория.
 
 pub mod encoder;
+pub mod deberta;
 pub mod nfc_tables;
 pub mod pqw;
 pub mod selftest;

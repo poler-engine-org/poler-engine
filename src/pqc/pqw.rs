@@ -77,6 +77,9 @@ pub enum ModelType {
     Decoder = 1,
     /// Энкодер + span-голова (GLiNER).
     SpanNer = 2,
+    /// GLiNER реальных чекпойнтов: mdeberta/deberta-спина + BiLSTM +
+    /// SpanMarker + prompt-проекция, пословленная токенизация (v2).
+    Gliner = 3,
 }
 
 impl ModelType {
@@ -85,6 +88,7 @@ impl ModelType {
             0 => Ok(Self::Encoder),
             1 => Ok(Self::Decoder),
             2 => Ok(Self::SpanNer),
+            3 => Ok(Self::Gliner),
             _ => Err(format!("неизвестный model_type={v}")),
         }
     }
@@ -170,6 +174,11 @@ impl PqwHeader {
     /// Флаг: FFN — MoE (экспертные тензоры в слоях).
     pub fn is_moe(&self) -> bool {
         self.flags & 4 != 0
+    }
+    /// Флаг: спина — DeBERTa-v2/v3 (disentangled attention, rel-buckets,
+    /// без абсолютных позиций, eps 1e-7). Для model_type Gliner.
+    pub fn is_deberta(&self) -> bool {
+        self.flags & 8 != 0
     }
 }
 

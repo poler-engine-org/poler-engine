@@ -165,6 +165,365 @@ impl GlinerModel {
 }
 
 // ---------------------------------------------------------------------------
+// Реальные чекпойнты GLiNER (model_type=Gliner): mdeberta-спина + BiLSTM +
+// SpanMarker + prompt-проекция. Конвертер: scripts/convert_gliner_to_pqw.py.
+// ---------------------------------------------------------------------------
+
+/// GLiNER поверх mmap-весов `.pqw` реального чекпойнта (класс Gliner).
+///
+/// Пайплайн (порт urchade/gliner_multi, верифицирован numpy-эталоном):
+///
+/// ```text
+/// слова: regex \w+(?:[-_]\w+)*|\S
+/// вход:  [CLS] <<ENT>> метка1 … <<ENT>> меткаN <<SEP>> куски слов [SEP]
+/// спина: DeBERTa-v2 (deberta.rs)
+/// промпты: скрытые состояния позиций <<ENT>> (контекстные!)
+/// слова:  первые субтокены → BiLSTM(384×2) → SpanMarker-MLP
+/// скор:  dot(span_rep, prompt_rep) → sigmoid → жадный не-оверлап
+/// ```
+pub struct RealGlinerModel {
+    encoder: crate::pqc::deberta::DebertaEncoder,
+    tokenizer: crate::pqc::tokenizer::UnigramTokenizer,
+    max_width: usize,
+    ent_id: u32,
+    sep_id: u32,
+}
+
+/// Слово-сплиттер GLiNER: `\w+(?:[-_]\w+)*|\S` (unicode).
+fn split_words(text: &str) -> Vec<&str> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\w+(?:[-_]\w+)*|\S").unwrap());
+    re.find_iter(text).map(|m| m.as_str()).collect()
+}
+
+impl RealGlinerModel {
+    /// Открывает модель (Sha256-верификация + секции __tokenizer__/__gliner__).
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let encoder = crate::pqc::deberta::DebertaEncoder::open(path)?;
+        let view = encoder.view();
+        let tokenizer = match view.tensor("__tokenizer__") {
+            Some(t) => crate::pqc::tokenizer::UnigramTokenizer::parse(t.raw_bytes()?)?,
+            None => return Err("GLiNER: секция __tokenizer__ не найдена".into()),
+        };
+        let meta = view
+            .require("__gliner__")?
+            .raw_str()?
+            .to_string();
+        let (max_width, ent_id, sep_id) = parse_gliner_meta(&meta)?;
+        // валидация: спец-токены секции __tokenizer__ согласованы с __gliner__
+        if tokenizer.id_of("<<ENT>>") != ent_id || tokenizer.id_of("<<SEP>>") != sep_id {
+            return Err(format!(
+                "GLiNER: спец-токены расползлись — ENT={:?} (мета {ent_id}), SEP={:?} (мета {sep_id})",
+                tokenizer.id_of("<<ENT>>"),
+                tokenizer.id_of("<<SEP>>")
+            ));
+        }
+        Ok(Self { encoder, tokenizer, max_width, ent_id, sep_id })
+    }
+
+    /// Максимум ширины сущности (в словах).
+    pub fn max_width(&self) -> usize {
+        self.max_width
+    }
+
+    /// Токенизатор модели (пословленное кодирование, дифференциальные тесты).
+    pub fn tokenizer(&self) -> &crate::pqc::tokenizer::UnigramTokenizer {
+        &self.tokenizer
+    }
+
+    /// Извлечение сущностей: текст + zero-shot метки + порог sigmoid.
+    pub fn predict(&self, text: &str, labels: &[&str], threshold: f32) -> Result<Vec<Entity>, String> {
+        if labels.is_empty() {
+            return Err("GLiNER: список меток пуст".into());
+        }
+        let words = split_words(text);
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // --- вход: промпт (<<ENT>> метка)×N + <<SEP>> + слова ---
+        let ent_word = "<<ENT>>";
+        let sep_word = "<<SEP>>";
+        let mut input_words: Vec<&str> = Vec::with_capacity(labels.len() * 2 + words.len() + 1);
+        for lab in labels {
+            input_words.push(ent_word);
+            input_words.push(lab);
+        }
+        input_words.push(sep_word);
+        let n_prompt = input_words.len();
+        input_words.extend_from_slice(&words);
+
+        let (bos, eos, _, _) = self.tokenizer.special_ids();
+        let enc = self.tokenizer.encode_words(&input_words);
+        let mut ids = Vec::with_capacity(enc.ids.len() + 2);
+        ids.push(bos);
+        ids.extend_from_slice(&enc.ids);
+        ids.push(eos);
+
+        // --- спина ---
+        let h = self.encoder.hidden();
+        let states = self.encoder.forward(&ids)?;
+
+        // --- промпты: контекстные состояния позиций <<ENT>> ---
+        let mut prompt_rows: Vec<usize> = Vec::with_capacity(labels.len());
+        for (pos, &id) in ids.iter().enumerate() {
+            if id == self.ent_id {
+                prompt_rows.push(pos);
+            }
+        }
+        if prompt_rows.len() != labels.len() {
+            return Err(format!(
+                "GLiNER: найдено {} маркеров <<ENT>> (ожидалось {})",
+                prompt_rows.len(),
+                labels.len()
+            ));
+        }
+
+        // --- слова: первые субтокены текстовых слов ---
+        let view = self.encoder.view();
+        let mut words_emb = vec![0f32; words.len() * h];
+        for w in 0..words.len() {
+            let w_global = n_prompt + w;
+            let Some(fp_global) = enc.first_piece.get(w_global).copied().flatten() else {
+                return Err(format!("GLiNER: слово {:?} без кусков", words[w]));
+            };
+            let pos = fp_global as usize + 1; // +1 за [CLS]
+            words_emb[w * h..(w + 1) * h].copy_from_slice(&states[pos * h..(pos + 1) * h]);
+        }
+
+        // --- BiLSTM поверх слов ---
+        let lstm = self.lstm_forward(&words_emb)?;
+
+        // --- SpanMarker: project_start/end → relu(concat) → out_project ---
+        let w_count = words.len();
+        let mut start_rep = vec![0f32; w_count * h];
+        let mut end_rep = vec![0f32; w_count * h];
+        self.span_mlp(&lstm, &mut start_rep, &mut end_rep)?;
+
+        // --- prompt-проекция ---
+        let mut prompts_emb = vec![0f32; labels.len() * h];
+        for (c, &pos) in prompt_rows.iter().enumerate() {
+            prompts_emb[c * h..(c + 1) * h].copy_from_slice(&states[pos * h..(pos + 1) * h]);
+        }
+        let prompt_rep = self.prompt_mlp(&prompts_emb, labels.len())?;
+
+        // --- скоры + декод ---
+        let out_w = view.require("span_out_w")?;
+        let out_b = view.tensor("span_out_b");
+        let mut span_vec = vec![0f32; 2 * h];
+        let mut rep = vec![0f32; h];
+        let mut found: Vec<(f32, usize, usize, usize)> = Vec::new(); // (score, i, j, label)
+        for i in 0..w_count {
+            for wd in 0..self.max_width {
+                let j = i + wd;
+                if j >= w_count {
+                    break;
+                }
+                span_vec[..h].copy_from_slice(&start_rep[i * h..(i + 1) * h]);
+                span_vec[h..].copy_from_slice(&end_rep[j * h..(j + 1) * h]);
+                relu_inplace(&mut span_vec);
+                out_w.matvec(&span_vec, &mut rep)?;
+                if let Some(b) = &out_b {
+                    add_bias_inplace(&mut rep, Some(b))?;
+                }
+                for (c, _) in labels.iter().enumerate() {
+                    let mut dot = 0f32;
+                    for (a, b) in rep.iter().zip(&prompt_rep[c * h..(c + 1) * h]) {
+                        dot += a * b;
+                    }
+                    let p = 1.0 / (1.0 + (-dot).exp());
+                    if p >= threshold {
+                        found.push((p, i, j, c));
+                    }
+                }
+            }
+        }
+        // жадный не-оверлап по убыванию скора (flat NER)
+        found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut taken: Vec<(usize, usize)> = Vec::new();
+        let mut entities = Vec::new();
+        for &(score, i, j, c) in &found {
+            let overlaps = taken.iter().any(|&(i2, j2)| i <= j2 && i2 <= j);
+            if !overlaps {
+                taken.push((i, j));
+                entities.push(Entity {
+                    text: words[i..=j].iter().copied().collect::<Vec<_>>().join(" "),
+                    label: labels[c].to_string(),
+                    score,
+                    start: i,
+                    end: j + 1,
+                });
+            }
+        }
+        entities.sort_by_key(|e| e.start);
+        Ok(entities)
+    }
+
+    /// BiLSTM над словами: [W × h] → [W × h] (fwd ‖ bwd по 384).
+    fn lstm_forward(&self, words_emb: &[f32]) -> Result<Vec<f32>, String> {
+        let view = self.encoder.view();
+        let h = self.encoder.hidden();
+        let w = words_emb.len() / h;
+        let h2 = h / 2;
+        let ih = view.require("lstm_ih_w")?;
+        let hh = view.require("lstm_hh_w")?;
+        let ih_b = view.require("lstm_ih_b")?.f32s()?.to_vec();
+        let hh_b = view.require("lstm_hh_b")?.f32s()?.to_vec();
+        let ih_r = view.require("lstm_ih_w_r")?;
+        let hh_r = view.require("lstm_hh_w_r")?;
+        let ih_b_r = view.require("lstm_ih_b_r")?.f32s()?.to_vec();
+        let hh_b_r = view.require("lstm_hh_b_r")?.f32s()?.to_vec();
+
+        let mut out = vec![0f32; w * h];
+        let mut gates = vec![0f32; 4 * h2];
+        let mut gates2 = vec![0f32; 4 * h2];
+        let mut hc = vec![0f32; 2 * h2]; // h ‖ c
+        let mut hc2 = vec![0f32; 2 * h2];
+
+        for t in 0..w {
+            // прямой
+            ih.matvec(&words_emb[t * h..(t + 1) * h], &mut gates)?;
+            hh.matvec(&hc[..h2], &mut gates2)?;
+            for g in 0..4 * h2 {
+                gates[g] += gates2[g];
+            }
+            for (g, &v) in gates.iter_mut().zip(&ih_b) { *g += v; }
+            for (g, &v) in gates.iter_mut().zip(&hh_b) { *g += v; }
+            lstm_step(&mut gates, &mut hc, h2);
+            out[t * h..t * h + h2].copy_from_slice(&hc[..h2]);
+            // обратный
+            let tb = w - 1 - t;
+            ih_r.matvec(&words_emb[tb * h..(tb + 1) * h], &mut gates)?;
+            hh_r.matvec(&hc2[..h2], &mut gates2)?;
+            for g in 0..4 * h2 {
+                gates[g] += gates2[g];
+            }
+            for (g, &v) in gates.iter_mut().zip(&ih_b_r) { *g += v; }
+            for (g, &v) in gates.iter_mut().zip(&hh_b_r) { *g += v; }
+            lstm_step(&mut gates, &mut hc2, h2);
+            out[tb * h + h2..(tb + 1) * h].copy_from_slice(&hc2[..h2]);
+        }
+        Ok(out)
+    }
+
+    /// SpanMarker-MLP: project_start/end (768→1536→768) для каждого слова.
+    fn span_mlp(&self, lstm_out: &[f32], start_rep: &mut [f32], end_rep: &mut [f32]) -> Result<(), String> {
+        let view = self.encoder.view();
+        let h = self.encoder.hidden();
+        let w = lstm_out.len() / h;
+        let s0 = view.require("span_start_0_w")?;
+        let s3 = view.require("span_start_3_w")?;
+        let e0 = view.require("span_end_0_w")?;
+        let e3 = view.require("span_end_3_w")?;
+        let s0b = view.require("span_start_0_b")?.f32s()?.to_vec();
+        let s3b = view.require("span_start_3_b")?.f32s()?.to_vec();
+        let e0b = view.require("span_end_0_b")?.f32s()?.to_vec();
+        let e3b = view.require("span_end_3_b")?.f32s()?.to_vec();
+        let wide = 2 * h;
+        let mut mid = vec![0f32; wide];
+        for t in 0..w {
+            let xt = &lstm_out[t * h..(t + 1) * h];
+            // start
+            s0.matvec(xt, &mut mid)?;
+            for (m, &v) in mid.iter_mut().zip(&s0b) { *m += v; }
+            relu_inplace(&mut mid);
+            s3.matvec(&mid, &mut start_rep[t * h..(t + 1) * h])?;
+            for (m, &v) in start_rep[t * h..(t + 1) * h].iter_mut().zip(&s3b) { *m += v; }
+            // end
+            e0.matvec(xt, &mut mid)?;
+            for (m, &v) in mid.iter_mut().zip(&e0b) { *m += v; }
+            relu_inplace(&mut mid);
+            e3.matvec(&mid, &mut end_rep[t * h..(t + 1) * h])?;
+            for (m, &v) in end_rep[t * h..(t + 1) * h].iter_mut().zip(&e3b) { *m += v; }
+        }
+        Ok(())
+    }
+
+    /// prompt-MLP: 768→3072→768 для каждой метки.
+    fn prompt_mlp(&self, prompts_emb: &[f32], n_labels: usize) -> Result<Vec<f32>, String> {
+        let view = self.encoder.view();
+        let h = self.encoder.hidden();
+        let wide = view.require("prompt_0_w")?.rows();
+        let p0 = view.require("prompt_0_w")?;
+        let p3 = view.require("prompt_3_w")?;
+        let p0b = view.require("prompt_0_b")?.f32s()?.to_vec();
+        let p3b = view.require("prompt_3_b")?.f32s()?.to_vec();
+        let mut mid = vec![0f32; wide];
+        let mut out = vec![0f32; n_labels * h];
+        for c in 0..n_labels {
+            p0.matvec(&prompts_emb[c * h..(c + 1) * h], &mut mid)?;
+            for (m, &v) in mid.iter_mut().zip(&p0b) { *m += v; }
+            relu_inplace(&mut mid);
+            p3.matvec(&mid, &mut out[c * h..(c + 1) * h])?;
+            for (m, &v) in out[c * h..(c + 1) * h].iter_mut().zip(&p3b) { *m += v; }
+        }
+        Ok(out)
+    }
+}
+
+/// Шаг LSTM: gates [i‖f‖g‖o] + состояние hc (h‖c) → новое hc.
+///
+/// Порядок гейтов — torch-конвенция [i, f, g, o].
+fn lstm_step(gates: &mut [f32], hc: &mut [f32], h2: usize) {
+    let (h_state, c_state) = hc.split_at_mut(h2);
+    for i in 0..h2 {
+        let gi = gates[i];
+        let gf = gates[h2 + i];
+        let gg = gates[2 * h2 + i];
+        let go = gates[3 * h2 + i];
+        let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let c = sig(gf) * c_state[i] + sig(gi) * gg.tanh();
+        c_state[i] = c;
+        h_state[i] = sig(go) * c.tanh();
+    }
+}
+
+fn relu_inplace(v: &mut [f32]) {
+    for x in v.iter_mut() {
+        if *x < 0.0 {
+            *x = 0.0;
+        }
+    }
+}
+
+fn add_bias_inplace(v: &mut [f32], bias: Option<&crate::pqc::pqw::TensorView>) -> Result<(), String> {
+    if let Some(b) = bias {
+        let bs = b.f32s()?;
+        if bs.len() != v.len() {
+            return Err(format!("bias {} != вектор {}", bs.len(), v.len()));
+        }
+        for (o, &x) in v.iter_mut().zip(bs) {
+            *o += x;
+        }
+    }
+    Ok(())
+}
+
+/// Разбор секции __gliner__ (json: max_width, ent_id, sep_id, flert_id).
+fn parse_gliner_meta(meta: &str) -> Result<(usize, u32, u32), String> {
+    let mut max_width = 0usize;
+    let mut ent_id = u32::MAX;
+    let mut sep_id = u32::MAX;
+    // минимальный json-парсер плоских полей (формат конвертера стабилен)
+    for kv in meta.trim_matches(|c| c == '{' || c == '}').split(',') {
+        let mut it = kv.splitn(2, ':');
+        let key = it.next().unwrap_or("").trim().trim_matches('"');
+        let val = it.next().unwrap_or("").trim();
+        match key {
+            "max_width" => max_width = val.parse().map_err(|_| "max_width не число")?,
+            "ent_id" => ent_id = val.parse().map_err(|_| "ent_id не число")?,
+            "sep_id" => sep_id = val.parse().map_err(|_| "sep_id не число")?,
+            _ => {}
+        }
+    }
+    if max_width == 0 || ent_id == u32::MAX || sep_id == u32::MAX {
+        return Err(format!("__gliner__: неполные метаданные ({meta})"));
+    }
+    Ok((max_width, ent_id, sep_id))
+}
+
+// ---------------------------------------------------------------------------
 // Синтетическая модель (тесты + --pqw-selftest)
 // ---------------------------------------------------------------------------
 

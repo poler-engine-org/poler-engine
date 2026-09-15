@@ -2,4 +2,4 @@
 
 pub mod native_gliner;
 
-pub use native_gliner::{synth_gliner, Entity, GlinerModel};
+pub use native_gliner::{synth_gliner, Entity, GlinerModel, RealGlinerModel};

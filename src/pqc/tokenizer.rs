@@ -19,15 +19,22 @@
 //! Данные живут в RAW-секции `__tokenizer__` контейнера `.pqw` (бинарный
 //! формат ниже) — модель самодостаточна, никаких sidecar-файлов.
 //!
-//! ## Формат секции `__tokenizer__` (v1)
+//! ## Формат секции `__tokenizer__` (v1 / v2)
 //!
 //! ```text
-//! "TOKR" u16 version=1 u8 algo(0=unigram) u8 flags(bit0=add_prefix_space)
+//! "TOKR" u16 version={1,2} u8 algo(0=unigram) u8 flags(bit0=add_prefix_space)
 //! u32 unk_id bos_id eos_id pad_id mask_id (0xFFFFFFFF = нет)
 //! u32 vocab_size;  ×N { u16 len, bytes, f32 score }
 //! u32 specials_count; ×N { u16 len, bytes, u32 id }
-//! u32 norm_count;   ×N { u32 codepoint, u16 len, bytes }
+//! [v2] u8 norm_profile: 0 = per-cp таблица (ниже), 1 = NFC + strip_right
+//!                        (mdeberta: Replace(\s{2,}|[\n\r\t]→' ')+NFC+Strip —
+//!                         для пословленного кодирования редуктируется к NFC)
+//! [profile 0 / v1] u32 norm_count; ×N { u32 codepoint, u16 len, bytes }
 //! ```
+//!
+//! v2/profile 1 нужен mdeberta-v3 (спина GLiNER): у него нет charsmap-
+//! таблицы XLM-R — нормализация это только NFC (+ правый trim), а 
+//! коллапса пробелов и lower-case нет вовсе.
 
 use std::collections::HashMap;
 
@@ -99,8 +106,10 @@ pub struct UnigramTokenizer {
     scores: Vec<f64>,
     /// кусок → id (первое вхождение; дубликаты словаря игнорируются).
     map: HashMap<Box<[u8]>, u32>,
-    /// codepoint → замена (нормализация).
+    /// codepoint → замена (нормализация; только profile 0).
     norm: HashMap<u32, Box<[u8]>>,
+    /// Профиль нормализации: 0 = таблица+NFC+коллапс, 1 = NFC+strip_right.
+    norm_profile: u8,
     /// Спец-токены для raw-split: (bytes, id), длинные первыми.
     specials: Vec<(Box<[u8]>, u32)>,
     unk_id: u32,
@@ -120,7 +129,7 @@ impl UnigramTokenizer {
             return Err("токенизатор: магия TOKR не найдена".into());
         }
         let version = c.u16()?;
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(format!("токенизатор: версия {version} не поддерживается"));
         }
         let algo = c.u8()?;
@@ -169,7 +178,12 @@ impl UnigramTokenizer {
         // длинные первыми (raw-скан матчит жадно слева)
         specials.sort_by(|a: &(Box<[u8]>, u32), b: &(Box<[u8]>, u32)| b.0.len().cmp(&a.0.len()));
 
-        let n_norm = c.u32()? as usize;
+        let norm_profile = if version >= 2 { c.u8()? } else { 0 };
+        if norm_profile > 1 {
+            return Err(format!("токенизатор: norm_profile {norm_profile} не поддерживается"));
+        }
+
+        let n_norm = if norm_profile == 0 { c.u32()? as usize } else { 0 };
         let mut norm = HashMap::with_capacity(n_norm);
         for _ in 0..n_norm {
             let cp = c.u32()?;
@@ -190,6 +204,7 @@ impl UnigramTokenizer {
             scores,
             map,
             norm,
+            norm_profile,
             specials,
             unk_id,
             bos_id,
@@ -237,9 +252,44 @@ impl UnigramTokenizer {
         ids
     }
 
-    /// id куска по строке (для тестов и CLI-отладки).
+    /// Пословленное кодирование (семантика HF `is_split_into_words`):
+    /// каждое слово — независимый сегмент, БЕЗ обёртки bos/eos.
+    ///
+    /// `first_piece[w]` — индекс в `ids` первого куска слова `w`
+    /// (None — спец-токен без кусков или пустое слово). GLiNER берёт
+    /// скрытое состояние именно первого субтокена (subtoken_pooling=first).
+    pub fn encode_words(&self, words: &[&str]) -> EncodedWords {
+        let mut ids = Vec::new();
+        let mut first_piece = Vec::with_capacity(words.len());
+        for &w in words {
+            let before = ids.len();
+            for seg in self.split_specials(w) {
+                match seg {
+                    Segment::Special(id) => ids.push(id),
+                    Segment::Text(t) => {
+                        let norm = self.normalize(t);
+                        if norm.is_empty() {
+                            continue;
+                        }
+                        let ms = self.metaspace(&norm);
+                        ids.extend(self.viterbi(ms.as_bytes()));
+                    }
+                }
+            }
+            first_piece.push(if ids.len() > before { Some(before as u32) } else { None });
+        }
+        EncodedWords { ids, first_piece }
+    }
+
+    /// id куска по строке (спец-токены + словарь; unk если нет).
     pub fn id_of(&self, piece: &str) -> u32 {
-        self.map.get(piece.as_bytes()).copied().unwrap_or(self.unk_id)
+        let b = piece.as_bytes();
+        for (sp, id) in &self.specials {
+            if sp.as_ref() == b {
+                return *id;
+            }
+        }
+        self.map.get(b).copied().unwrap_or(self.unk_id)
     }
 
     /// Кодирование одного обычного сегмента: норм → метаспейс → Viterbi.
@@ -287,10 +337,24 @@ impl UnigramTokenizer {
         out
     }
 
-    /// Нормализация: таблица → NFC → коллапс пробелов.
+    /// Нормализация.
+    ///
+    /// profile 0 (XLM-R): per-cp таблица → NFC → коллапс пробелов.
+    /// profile 1 (mdeberta): NFC → правый trim (Replace-регекс — no-op
+    /// для отдельных слов: внутри слова нет `\s{2,}|\n\r\t`).
     fn normalize(&self, s: &str) -> String {
         if s.is_empty() {
             return String::new();
+        }
+        if self.norm_profile == 1 {
+            let chars: Vec<char> = s.chars().collect();
+            let ordered = canonical_order(&chars);
+            let composed = compose(&ordered);
+            let mut out = String::with_capacity(composed.len());
+            for ch in composed {
+                out.push(ch);
+            }
+            return out.trim_end().to_string();
         }
         // 1. per-codepoint таблица (полная NFKC-замена одиночных символов)
         let mut chars: Vec<char> = Vec::with_capacity(s.len());
@@ -424,6 +488,15 @@ enum Segment<'t> {
     Special(u32),
 }
 
+/// Результат пословленного кодирования (`UnigramTokenizer::encode_words`).
+pub struct EncodedWords {
+    /// Все куски подряд (без обёртки bos/eos).
+    pub ids: Vec<u32>,
+    /// Индекс первого куска каждого слова в `ids` (None — спец-слово
+    /// без кусков или пустое нормализованное слово).
+    pub first_piece: Vec<Option<u32>>,
+}
+
 // ---------------------------------------------------------------------------
 // NFC: канонический порядок + композиция (UAX#15, Hangul алгоритмически)
 // ---------------------------------------------------------------------------
@@ -532,13 +605,15 @@ fn compose(chars: &[char]) -> Vec<char> {
 // Сборка секции (для тестов и билдера синтетики)
 // ---------------------------------------------------------------------------
 
-/// Собирает бинарную секцию `__tokenizer__` (unigram v1).
+/// Собирает бинарную секцию `__tokenizer__` (unigram v1/v2).
 pub struct TokenizerSectionBuilder {
     vocab: Vec<(Box<[u8]>, f32)>,
     specials: Vec<(Box<[u8]>, u32)>,
     norm: Vec<(u32, Box<[u8]>)>,
     ids: [u32; 5],
     add_prefix_space: bool,
+    /// 0 = таблица+NFC+коллапс (XLM-R), 1 = NFC+strip_right (mdeberta).
+    norm_profile: u8,
 }
 
 impl Default for TokenizerSectionBuilder {
@@ -555,6 +630,7 @@ impl TokenizerSectionBuilder {
             norm: Vec::new(),
             ids: [3, 0, 2, 1, NO_ID], // unk bos eos pad mask
             add_prefix_space: true,
+            norm_profile: 0,
         }
     }
 
@@ -583,10 +659,17 @@ impl TokenizerSectionBuilder {
         self
     }
 
+    /// Профиль нормализации v2: 1 = NFC+strip_right (mdeberta), без таблицы.
+    pub fn norm_profile(mut self, profile: u8) -> Self {
+        self.norm_profile = profile;
+        self
+    }
+
     pub fn build(self) -> Vec<u8> {
+        let v2 = self.norm_profile > 0;
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&if v2 { 2u16 } else { 1u16 }.to_le_bytes());
         out.push(0); // unigram
         out.push(u8::from(self.add_prefix_space));
         for id in self.ids {
@@ -603,6 +686,9 @@ impl TokenizerSectionBuilder {
             out.extend_from_slice(&(p.len() as u16).to_le_bytes());
             out.extend_from_slice(p);
             out.extend_from_slice(&id.to_le_bytes());
+        }
+        if v2 {
+            out.push(self.norm_profile);
         }
         out.extend_from_slice(&(self.norm.len() as u32).to_le_bytes());
         for (cp, rep) in &self.norm {
