@@ -215,7 +215,7 @@ def synth_gliner(seed, layers, hidden, heads, intermediate, vocab, max_pos, labe
 
 os.makedirs(OUT, exist_ok=True)
 synth_encoder(42, 2, 64, 4, 128, 96, 64).write(os.path.join(OUT, "demo_encoder.pqw"))
-synth_glm(9, 2, 64, 4, 1, 96, 128, 64).write(os.path.join(OUT, "demo_glm.pqw"))
+synth_glm(9, 2, 64, 4, 1, 96, 128, 512).write(os.path.join(OUT, "demo_glm.pqw"))
 synth_gliner(7, 1, 32, 4, 64, 64, 64, ["PERSON", "LOCATION", "OBJECT"]).write(
     os.path.join(OUT, "demo_gliner.pqw"))
 print("OK")
