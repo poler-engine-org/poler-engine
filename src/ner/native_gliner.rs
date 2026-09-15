@@ -681,7 +681,7 @@ mod tests {
         );
         builder.write_to(&path).unwrap();
         let model = GlinerModel::open(&path).unwrap();
-        let words = ["альфа", "бета", "гамма"];
+        let _words = ["альфа", "бета", "гамма"];
         let ids: Vec<u32> = vec![10, 20, 30];
         let out = model.encoder.forward(&ids).unwrap();
         let native = model.span_scores(&out, 0, 2).unwrap();
