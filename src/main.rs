@@ -314,6 +314,11 @@ struct Cli {
     #[arg(long = "semantic", value_name = "MODE")]
     semantic: Option<String>,
 
+    /// Корпус для --semantic dense или --llm quantum (каталог или файл): чанкируются
+    /// или насыщают русла квантовой циркуляции J.
+    #[arg(long = "corpus", value_name = "PATH")]
+    corpus: Option<PathBuf>,
+
     /// Корпус для --semantic dense (каталог или файл): чанкируются,
     /// эмбеддятся нативным энкодером и ранжируются косинусом.
     #[arg(long = "semantic-corpus", value_name = "PATH", requires = "semantic")]
@@ -1622,16 +1627,9 @@ fn run_quantum_llm(cli: &Cli) -> i32 {
     };
     let mut mind = if let Some(path) = &cli.model {
         match poler_engine::quantum::QuantumMind::open(path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("poler-engine: {e}");
-                return 2;
-            }
-        }
-    } else {
-        match poler_engine::quantum::QuantumMind::new(1024, 42) {
             Ok(mut m) => {
-                if let Some(corpus_path) = &cli.semantic_corpus {
+                let corpus_opt = cli.corpus.as_ref().or(cli.semantic_corpus.as_ref());
+                if let Some(corpus_path) = corpus_opt {
                     let mut files = Vec::new();
                     if collect_text_files(corpus_path, &mut files, 256) {
                         for f in files {
@@ -1640,9 +1638,30 @@ fn run_quantum_llm(cli: &Cli) -> i32 {
                             }
                         }
                     }
-                } else {
-                    let _ = m.ingest(prompt, 0);
                 }
+                let _ = m.ingest(prompt, 0);
+                m
+            }
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        }
+    } else {
+        match poler_engine::quantum::QuantumMind::new(1024, 42) {
+            Ok(mut m) => {
+                let corpus_opt = cli.corpus.as_ref().or(cli.semantic_corpus.as_ref());
+                if let Some(corpus_path) = corpus_opt {
+                    let mut files = Vec::new();
+                    if collect_text_files(corpus_path, &mut files, 256) {
+                        for f in files {
+                            if let Ok(text) = std::fs::read_to_string(f) {
+                                let _ = m.ingest(&text, 0);
+                            }
+                        }
+                    }
+                }
+                let _ = m.ingest(prompt, 0);
                 m
             }
             Err(e) => {

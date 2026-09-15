@@ -71,7 +71,30 @@ impl QuantumMind {
             });
         }
 
-        // 2. Иначе разбираем как нейровесовой .pqw контейнер (PQW2NN / POLERQW)
+        // 2. Проверяем, является ли файл стандартным .safetensors
+        if path.extension().and_then(|s| s.to_str()) == Some("safetensors") || (bytes.len() >= 8 && u64::from_le_bytes(bytes[0..8].try_into().unwrap()) < 1_000_000 && bytes.get(8) == Some(&b'{')) {
+            let header = crystallizer::SafetensorsHeader::parse(&bytes)?;
+            let d_pol = 4096u32;
+            let mut mind = Self::new(d_pol, 42)?;
+            for (name, _) in &header.tensors {
+                let clean_name = name.replace('.', " ").replace('_', " ");
+                for word in clean_name.split_whitespace() {
+                    if word.len() > 1 && word.len() <= 32 {
+                        mind.curriculum.observe_lexicon(word);
+                    }
+                }
+                let salt = 0x517cc1b727220a95u64;
+                let h1 = (pqw_core::checksum::fnv1a64(name.as_bytes()) ^ salt) % (d_pol as u64);
+                let h2 = (pqw_core::checksum::fnv1a64(name.as_bytes()).rotate_left(17)) % (d_pol as u64);
+                if h1 != h2 {
+                    mind.curriculum.observe_event(h1 as u32, 1);
+                    mind.curriculum.observe_event(h2 as u32, -1);
+                }
+            }
+            return Ok(mind);
+        }
+
+        // 3. Иначе разбираем как нейровесовой .pqw контейнер (PQW2NN / POLERQW)
         let view = crate::pqc::pqw::QuantizedWeightsView::open(path)?;
         let d_pol = 4096u32;
         let mut mind = Self::new(d_pol, 42)?;
