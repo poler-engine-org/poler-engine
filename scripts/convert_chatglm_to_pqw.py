@@ -20,7 +20,7 @@ MAGIC = b"POLERQW\x00"
 VERSION = 2
 HEADER_SIZE = 128
 
-MODEL_TYPE_DECODER = 2
+MODEL_TYPE_DECODER = 1
 QUANT_INT4 = 2
 
 def parse_spm_tokenizer(path):
