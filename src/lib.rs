@@ -63,6 +63,7 @@ pub mod parser;
 pub mod poler;
 pub mod psi;
 pub mod pqc;
+pub mod quantum;
 pub mod reader;
 pub mod resonance;
 pub mod retrieval;

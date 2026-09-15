@@ -1613,21 +1613,89 @@ fn collect_text_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>,
     true
 }
 
+/// `--llm quantum [--model X.poler] -q "…"`: квантово-фазовый L5-разум
+/// (русла циркуляции J, сфера Блоха, Born-лотерея по аттракторам).
+fn run_quantum_llm(cli: &Cli) -> i32 {
+    let Some(prompt) = &cli.query else {
+        eprintln!("poler-engine: --llm quantum требует -q <промпт>");
+        return 2;
+    };
+    let mut mind = if let Some(path) = &cli.model {
+        match poler_engine::quantum::QuantumMind::open(path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        }
+    } else {
+        match poler_engine::quantum::QuantumMind::new(1024, 42) {
+            Ok(mut m) => {
+                if let Some(corpus_path) = &cli.semantic_corpus {
+                    let mut files = Vec::new();
+                    if collect_text_files(corpus_path, &mut files, 256) {
+                        for f in files {
+                            if let Ok(text) = std::fs::read_to_string(f) {
+                                let _ = m.ingest(&text, 0);
+                            }
+                        }
+                    }
+                } else {
+                    let _ = m.ingest(prompt, 0);
+                }
+                m
+            }
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        }
+    };
+
+    use std::io::Write;
+    print!("квантовый ответ: ");
+    let _ = std::io::stdout().flush();
+    let t0 = std::time::Instant::now();
+    let res = mind.generate_stream(prompt, 64, |token| {
+        print!("{token} ");
+        let _ = std::io::stdout().flush();
+        true
+    });
+    println!();
+    match res {
+        Ok(rep) => {
+            let dt = t0.elapsed().as_secs_f64();
+            println!(
+                "\nquantum-L5 · {} шагов за {dt:.3} с = {:.1} шаг/с · Born-лотерея по руслам J (релевантность: {:.1}%)",
+                rep.steps.len(),
+                rep.steps.len() as f64 / dt.max(1e-9),
+                rep.relevance * 100.0
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-engine quantum: {e}");
+            2
+        }
+    }
+}
+
 /// `--llm local --model X.pqw -q "…"`: нативный GLM-декодер (RoPE + MQA +
 /// SwiGLU + MoE) через pqc. remote/auto — мост Фазы 12.9 (заглушка).
 fn run_llm(mode: &str, cli: &Cli) -> i32 {
     match mode {
+        "quantum" => return run_quantum_llm(cli),
         "local" => {}
         "remote" | "auto" => {
             eprintln!(
                 "poler-engine: --llm {mode} — серверный GLM-мост это Фаза 12.9 (не встроен);\n  \
-                 сейчас доступен автономный режим: --llm local --model glm.pqw"
+                 сейчас доступны автономные режимы: --llm quantum, --llm local --model glm.pqw"
             );
             return 2;
         }
         _ => {
             eprintln!(
-                "poler-engine: неизвестный --llm режим {mode:?} (доступны: local, remote, auto)"
+                "poler-engine: неизвестный --llm режим {mode:?} (доступны: quantum, local, remote, auto)"
             );
             return 2;
         }
