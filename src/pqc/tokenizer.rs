@@ -108,7 +108,7 @@ pub struct UnigramTokenizer {
     map: HashMap<Box<[u8]>, u32>,
     /// codepoint → замена (нормализация; только profile 0).
     norm: HashMap<u32, Box<[u8]>>,
-    /// Профиль нормализации: 0 = таблица+NFC+коллапс, 1 = NFC+strip_right.
+    /// Профиль нормализации: 0 = таблица+NFC+коллапс, 1 = NFC+strip_right, 2 = Identity (ChatGLM3).
     norm_profile: u8,
     /// Спец-токены для raw-split: (bytes, id), длинные первыми.
     specials: Vec<(Box<[u8]>, u32)>,
@@ -119,6 +119,9 @@ pub struct UnigramTokenizer {
     unk_score: f64,
     add_prefix_space: bool,
     max_piece_len: usize,
+    /// Таблица 256 байтовых токенов <0x00>..<0xFF> для byte-fallback (ChatGLM3).
+    byte_tokens: [Option<u32>; 256],
+    has_byte_fallback: bool,
 }
 
 impl UnigramTokenizer {
@@ -147,6 +150,8 @@ impl UnigramTokenizer {
         let mut pieces = Vec::with_capacity(n_vocab);
         let mut scores = Vec::with_capacity(n_vocab);
         let mut map = HashMap::with_capacity(n_vocab);
+        let mut byte_tokens = [None; 256];
+        let mut has_byte_fallback = false;
         let mut min_score = f64::INFINITY;
         let mut max_piece_len = 0usize;
         for i in 0..n_vocab {
@@ -156,6 +161,14 @@ impl UnigramTokenizer {
             let boxed: Box<[u8]> = piece.into();
             if map.insert(boxed.clone(), i as u32).is_none() {
                 max_piece_len = max_piece_len.max(len);
+            }
+            if piece.len() == 6 && piece.starts_with(b"<0x") && piece.ends_with(b">") {
+                if let Ok(hstr) = std::str::from_utf8(&piece[3..5]) {
+                    if let Ok(bval) = u8::from_str_radix(hstr, 16) {
+                        byte_tokens[bval as usize] = Some(i as u32);
+                        has_byte_fallback = true;
+                    }
+                }
             }
             if score < min_score {
                 min_score = score;
@@ -179,7 +192,7 @@ impl UnigramTokenizer {
         specials.sort_by(|a: &(Box<[u8]>, u32), b: &(Box<[u8]>, u32)| b.0.len().cmp(&a.0.len()));
 
         let norm_profile = if version >= 2 { c.u8()? } else { 0 };
-        if norm_profile > 1 {
+        if norm_profile > 2 {
             return Err(format!("токенизатор: norm_profile {norm_profile} не поддерживается"));
         }
 
@@ -213,6 +226,8 @@ impl UnigramTokenizer {
             unk_score: min_score - 10.0,
             add_prefix_space: flags & 1 != 0,
             max_piece_len: max_piece_len.min(64),
+            byte_tokens,
+            has_byte_fallback,
         })
     }
 
@@ -250,6 +265,32 @@ impl UnigramTokenizer {
         }
         ids.push(self.eos_id);
         ids
+    }
+
+    /// Детокенизация: последовательность ids → исходный текст.
+    /// Обрабатывает метаспейсы (\u{2581} → пробел) и байтовые fallback-токены (<0xXX> → сырой байт).
+    pub fn detokenize(&self, ids: &[u32]) -> String {
+        let mut raw_bytes = Vec::new();
+        for &id in ids {
+            if let Some(piece) = self.piece(id) {
+                if piece.len() == 6 && piece.starts_with(b"<0x") && piece.ends_with(b">") {
+                    if let Ok(hstr) = std::str::from_utf8(&piece[3..5]) {
+                        if let Ok(bval) = u8::from_str_radix(hstr, 16) {
+                            raw_bytes.push(bval);
+                            continue;
+                        }
+                    }
+                }
+                raw_bytes.extend_from_slice(piece);
+            }
+        }
+        let s = String::from_utf8_lossy(&raw_bytes);
+        let s = s.replace('\u{2581}', " ");
+        if self.add_prefix_space && s.starts_with(' ') {
+            s[1..].to_string()
+        } else {
+            s
+        }
     }
 
     /// Пословленное кодирование (семантика HF `is_split_into_words`):
@@ -340,11 +381,14 @@ impl UnigramTokenizer {
     /// Нормализация.
     ///
     /// profile 0 (XLM-R): per-cp таблица → NFC → коллапс пробелов.
-    /// profile 1 (mdeberta): NFC → правый trim (Replace-регекс — no-op
-    /// для отдельных слов: внутри слова нет `\s{2,}|\n\r\t`).
+    /// profile 1 (mdeberta): NFC → правый trim.
+    /// profile 2 (ChatGLM3/raw SPM): Identity (без изменений).
     fn normalize(&self, s: &str) -> String {
         if s.is_empty() {
             return String::new();
+        }
+        if self.norm_profile == 2 {
+            return s.to_string();
         }
         if self.norm_profile == 1 {
             let chars: Vec<char> = s.chars().collect();
@@ -390,13 +434,64 @@ impl UnigramTokenizer {
         t
     }
 
-    /// Unigram-Viterbi: DP по байтам, старты на границах чаров.
+    /// Unigram-Viterbi: DP по байтам.
     fn viterbi(&self, bytes: &[u8]) -> Vec<u32> {
         let size = bytes.len();
         if size == 0 {
             return Vec::new();
         }
         let neg = f64::NEG_INFINITY;
+
+        if self.has_byte_fallback {
+            let mut dp_score = vec![neg; size + 1];
+            let mut dp_start = vec![usize::MAX; size + 1];
+            let mut dp_tok = vec![0u32; size + 1];
+            dp_score[0] = 0.0;
+            dp_start[0] = 0;
+
+            let max_l = self.max_piece_len.min(64);
+            for i in 0..size {
+                if dp_start[i] == usize::MAX && i != 0 {
+                    continue;
+                }
+                let base = dp_score[i];
+                let limit = (size - i).min(max_l);
+                for l in 1..=limit {
+                    let sub = &bytes[i..i + l];
+                    if let Some(&tid) = self.map.get(sub) {
+                        let cand = base + self.scores[tid as usize];
+                        if cand > dp_score[i + l] {
+                            dp_score[i + l] = cand;
+                            dp_start[i + l] = i;
+                            dp_tok[i + l] = tid;
+                        }
+                    }
+                }
+                let b = bytes[i];
+                if let Some(btid) = self.byte_tokens[b as usize] {
+                    let cand = base + self.scores[btid as usize];
+                    if cand > dp_score[i + 1] {
+                        dp_score[i + 1] = cand;
+                        dp_start[i + 1] = i;
+                        dp_tok[i + 1] = btid;
+                    }
+                }
+            }
+
+            let mut ids = Vec::new();
+            let mut curr = size;
+            while curr > 0 {
+                let prev = dp_start[curr];
+                if prev == usize::MAX || prev == curr {
+                    break;
+                }
+                ids.push(dp_tok[curr]);
+                curr = prev;
+            }
+            ids.reverse();
+            return ids;
+        }
+
         let mut score = vec![neg; size + 1];
         let mut start = vec![usize::MAX; size + 1];
         let mut tid = vec![0u32; size + 1];
@@ -690,11 +785,13 @@ impl TokenizerSectionBuilder {
         if v2 {
             out.push(self.norm_profile);
         }
-        out.extend_from_slice(&(self.norm.len() as u32).to_le_bytes());
-        for (cp, rep) in &self.norm {
-            out.extend_from_slice(&cp.to_le_bytes());
-            out.extend_from_slice(&(rep.len() as u16).to_le_bytes());
-            out.extend_from_slice(rep);
+        if self.norm_profile == 0 {
+            out.extend_from_slice(&(self.norm.len() as u32).to_le_bytes());
+            for (cp, rep) in &self.norm {
+                out.extend_from_slice(&cp.to_le_bytes());
+                out.extend_from_slice(&(rep.len() as u16).to_le_bytes());
+                out.extend_from_slice(rep);
+            }
         }
         out
     }
@@ -821,4 +918,37 @@ mod tests {
             assert_eq!(once, twice, "NFC обязан быть идемпотентным для {s:?}");
         }
     }
+
+    #[test]
+    fn byte_fallback_and_detokenize_roundtrip() {
+        let mut b = TokenizerSectionBuilder::new()
+            .ids(0, 1, 2, 3, 4)
+            .piece("<unk>", 0.0) // 0
+            .piece("<s>", 0.0)   // 1
+            .piece("</s>", 0.0)  // 2
+            .piece("<pad>", 0.0) // 3
+            .piece("<mask>", 0.0); // 4
+
+        // Add 256 byte tokens <0x00>..<0xFF>
+        for i in 0..256 {
+            b = b.piece(&format!("<0x{i:02X}>"), -10.0);
+        }
+        // Add vocabulary words
+        b = b.piece("\u{2581}", -1.0)
+            .piece("\u{2581}hello", -0.5)
+            .piece("\u{2581}world", -0.5)
+            .norm_profile(2);
+
+        let sec = b.build();
+        let tok = UnigramTokenizer::parse(&sec).expect("parse byte-fallback tokenizer");
+        assert!(tok.has_byte_fallback);
+
+        let input = "hello world!";
+        let ids = tok.encode(input);
+        // Exclude bos and eos
+        let text_ids = &ids[1..ids.len() - 1];
+        let decoded = tok.detokenize(text_ids);
+        assert_eq!(decoded, input);
+    }
 }
+

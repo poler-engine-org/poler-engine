@@ -568,6 +568,10 @@ pub fn synth_gliner(
             let (q, s) = tensor::quant_i4_per_row(&w, max_width, hidden);
             b.add_i4("span_width_emb", vec![max_width, hidden], &q, &s);
         }
+        Quant::Trit5 => {
+            let (q, s) = tensor::quant_trit5_per_row(&w, max_width, hidden);
+            b.add_trit5("span_width_emb", vec![max_width, hidden], &q, &s);
+        }
         Quant::F32 => {
             b.add_f32("span_width_emb", vec![max_width, hidden], &w);
         }
@@ -583,6 +587,10 @@ pub fn synth_gliner(
         Quant::Int4 => {
             let (q, s) = tensor::quant_i4_per_row(&proj, n_labels, 3 * hidden);
             b.add_i4("span_proj_w", vec![n_labels, 3 * hidden], &q, &s);
+        }
+        Quant::Trit5 => {
+            let (q, s) = tensor::quant_trit5_per_row(&proj, n_labels, 3 * hidden);
+            b.add_trit5("span_proj_w", vec![n_labels, 3 * hidden], &q, &s);
         }
         Quant::F32 => {
             b.add_f32("span_proj_w", vec![n_labels, 3 * hidden], &proj);

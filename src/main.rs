@@ -1651,33 +1651,56 @@ fn run_llm(mode: &str, cli: &Cli) -> i32 {
             return 2;
         }
     };
-    let prompt_ids = poler_engine::pqc::hash_token_ids(prompt, model.vocab() as u32);
+    let (prompt_ids, has_real_tok) = if let Some(tok) = model.tokenizer() {
+        let formatted = if prompt.contains("[gMASK]") || prompt.contains("<|user|>") {
+            prompt.clone()
+        } else {
+            format!("[gMASK]sop<|user|>\n{prompt}<|assistant|>")
+        };
+        let mut ids = tok.encode(&formatted);
+        // If encode added bos (id=0 or 1) and eos (id=2), remove them if [gMASK]/sop are present
+        if ids.first() == Some(&0) || ids.first() == Some(&1) {
+            ids.remove(0);
+        }
+        if ids.last() == Some(&2) {
+            ids.pop();
+        }
+        (ids, true)
+    } else {
+        (poler_engine::pqc::hash_token_ids(prompt, model.vocab() as u32), false)
+    };
     if prompt_ids.is_empty() {
-        eprintln!("poler-engine: промпт без UAX#29-слов — нечего генерировать");
+        eprintln!("poler-engine: пустой промпт — нечего генерировать");
         return 2;
     }
-    let max_new = 32usize;
+    let max_new = 128usize;
     let t0 = std::time::Instant::now();
-    let out = match model.generate(&prompt_ids, max_new, &poler_engine::llm::glm_engine::Sampling::Greedy, 0)
-    {
+    use std::io::Write;
+    print!("ответ: ");
+    let _ = std::io::stdout().flush();
+    let out = match model.generate_stream(
+        &prompt_ids,
+        max_new,
+        &poler_engine::llm::glm_engine::Sampling::Greedy,
+        0,
+        |_tok, piece| {
+            print!("{piece}");
+            let _ = std::io::stdout().flush();
+            true
+        },
+    ) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("poler-engine: {e}");
+            eprintln!("\npoler-engine: {e}");
             return 2;
         }
     };
+    println!();
     let dt = t0.elapsed().as_secs_f64();
-    let words: Vec<String> = out.iter().map(|&i| format!("t{i}")).collect();
-    let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
-    let text = poler_engine::llm::glm_engine::detokenize_join(&refs);
     println!(
-        "glm-local · {} токенов за {dt:.3} с = {:.0} ток/с · greedy",
+        "\nglm-local · {} токенов за {dt:.3} с = {:.1} ток/с · greedy",
         out.len(),
         out.len() as f64 / dt.max(1e-9)
-    );
-    println!(
-        "ответ: «{text}»\n  \
-         (плейсхолдер-токенизатор: реальный BPE GLM — Фаза 12.5, конвертер весов — 12.7)"
     );
     0
 }

@@ -380,6 +380,10 @@ pub fn synth_encoder(
                 let (q, s) = tensor::quant_i4_per_row(&w, rows, cols);
                 b.add_i4(name, vec![rows, cols], &q, &s);
             }
+            Quant::Trit5 => {
+                let (q, s) = tensor::quant_trit5_per_row(&w, rows, cols);
+                b.add_trit5(name, vec![rows, cols], &q, &s);
+            }
             Quant::F32 => {
                 b.add_f32(name, vec![rows, cols], &w);
             }

@@ -27,8 +27,20 @@
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
-// Детект CPU
-// ---------------------------------------------------------------------------
+/// Доступен ли AVX (AVX1, 256-бит float) на этой машине.
+pub fn avx() -> bool {
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
 
 /// Доступен ли AVX2+FMA на этой машине (кэш на процесс).
 pub fn avx2() -> bool {
@@ -49,13 +61,16 @@ pub fn avx2() -> bool {
 // Скалярные произведения
 // ---------------------------------------------------------------------------
 
-/// Скалярное произведение fp32 (AVX2+FMA при наличии, иначе скаляр).
+/// Скалярное произведение fp32 (AVX2/AVX1 при наличии, иначе скаляр).
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot_f32: длины не совпадают");
     #[cfg(target_arch = "x86_64")]
     {
         if avx2() {
             return unsafe { dot_f32_avx2(a, b) };
+        }
+        if avx() {
+            return unsafe { dot_f32_avx(a, b) };
         }
     }
     dot_f32_scalar(a, b)
@@ -72,17 +87,30 @@ pub fn dot_i8_f32(q: &[i8], x: &[f32]) -> f32 {
         if avx2() {
             return unsafe { dot_i8_f32_avx2(q, x) };
         }
+        if avx() {
+            return unsafe { dot_i8_f32_avx(q, x) };
+        }
     }
     dot_i8_f32_scalar(q, x)
 }
 
 /// Скалярное произведение int4-строки (упакованные nibble) с fp32-вектором.
 ///
-/// Распаковка в горячем цикле: `v = nibble − 8 ∈ [-8, 7]`. Портативный
-/// путь (AVX2-ниббл-трюк — оптимизация следующих кирпичей: int4 нужен
-/// GLM-декодеру, энкодер ездит на int8).
+/// Распаковка в горячем цикле: `v = nibble − 8 ∈ [-8, 7]`.
+/// При наличии AVX1/AVX2 выполняется векторная распаковка и параллельное FMA/MUL+ADD.
 pub fn dot_i4_f32(packed: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert_eq!(packed.len(), (n + 1) / 2, "dot_i4_f32: размер упаковки");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx() {
+            return unsafe { dot_i4_f32_avx(packed, x, n) };
+        }
+    }
+    dot_i4_f32_scalar(packed, x, n)
+}
+
+#[inline]
+fn dot_i4_f32_scalar(packed: &[u8], x: &[f32], n: usize) -> f32 {
     let mut s = 0f32;
     for (i, &b) in packed.iter().enumerate() {
         let lo = (b & 0xF) as i32 - 8;
@@ -90,6 +118,112 @@ pub fn dot_i4_f32(packed: &[u8], x: &[f32], n: usize) -> f32 {
         let x0 = if i * 2 < n { x[i * 2] } else { 0.0 };
         let x1 = if i * 2 + 1 < n { x[i * 2 + 1] } else { 0.0 };
         s += lo as f32 * x0 + hi as f32 * x1;
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Trit5 Codec (3^5 = 243 <= 256) & SIMD No-Mul Dot Product
+// ---------------------------------------------------------------------------
+
+/// Статическая таблица декодирования Trit5 -> f32 [243 x 8]
+/// 5 значений — это декодированные триты t_i in {-1.0, 0.0, +1.0},
+/// последние 3 элемента выровнены нулями для 256-битного AVX2 загрузчика.
+pub static TRIT5_LUT_F32: [[f32; 8]; 243] = generate_trit5_lut();
+
+/// Константный генератор таблицы декодирования во время компиляции
+const fn generate_trit5_lut() -> [[f32; 8]; 243] {
+    let mut lut = [[0.0f32; 8]; 243];
+    let mut b = 0;
+    while b < 243 {
+        let mut curr = b;
+        let mut i = 0;
+        while i < 5 {
+            let u = curr % 3;
+            let t = (u as i8) - 1; // 0 -> -1.0, 1 -> 0.0, 2 -> +1.0
+            lut[b][i] = t as f32;
+            curr /= 3;
+            i += 1;
+        }
+        b += 1;
+    }
+    lut
+}
+
+/// Кодек Trit5: упаковка и распаковка 5 тритов в 1 байт
+pub struct Trit5Codec;
+
+impl Trit5Codec {
+    /// Упаковывает 5 тритов t_i in {-1, 0, +1} в 1 байт.
+    /// Возвращает None, если хотя бы один трит выходит за пределы {-1, 0, +1}.
+    #[inline(always)]
+    pub fn pack_5(trits: &[i8; 5]) -> Option<u8> {
+        let mut byte_val: u16 = 0;
+        let mut mul: u16 = 1;
+
+        for &t in trits.iter() {
+            if t < -1 || t > 1 {
+                return None;
+            }
+            let u = (t + 1) as u16; // Map {-1, 0, +1} -> {0, 1, 2}
+            byte_val += u * mul;
+            mul *= 3;
+        }
+
+        Some(byte_val as u8)
+    }
+
+    /// Распаковывает байт B in [0, 242] в 5 тритов t_i in {-1, 0, +1}.
+    #[inline(always)]
+    pub fn unpack_5(byte: u8) -> [i8; 5] {
+        if byte >= 243 {
+            return [0; 5];
+        }
+        let entry = &TRIT5_LUT_F32[byte as usize];
+        [
+            entry[0] as i8,
+            entry[1] as i8,
+            entry[2] as i8,
+            entry[3] as i8,
+            entry[4] as i8,
+        ]
+    }
+}
+
+/// Скалярное произведение Trit5-строки весов с fp32-вектором активаций.
+///
+/// No-Mul исполнение: веса в {-1, 0, +1}, умножение заменяется на условное
+/// знаковое сложение / вычитание через маски знаков AVX2 или скалярную ветку.
+pub fn dot_trit5_f32(packed: &[u8], x: &[f32], n: usize) -> f32 {
+    debug_assert_eq!(packed.len(), (n + 4) / 5, "dot_trit5_f32: размер упаковки");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx() {
+            return unsafe { dot_trit5_f32_avx(packed, x, n) };
+        }
+    }
+    dot_trit5_f32_scalar(packed, x, n)
+}
+
+#[inline]
+fn dot_trit5_f32_scalar(packed: &[u8], x: &[f32], n: usize) -> f32 {
+    let mut s = 0f32;
+    let mut x_idx = 0;
+    for &b in packed {
+        let entry = if b < 243 { &TRIT5_LUT_F32[b as usize] } else { &[0.0; 8] };
+        for i in 0..5 {
+            if x_idx >= n {
+                break;
+            }
+            let t = entry[i];
+            let xi = x[x_idx];
+            if t == 1.0 {
+                s += xi;
+            } else if t == -1.0 {
+                s -= xi;
+            }
+            x_idx += 1;
+        }
     }
     s
 }
@@ -157,9 +291,233 @@ unsafe fn dot_i8_f32_avx2(q: &[i8], x: &[f32]) -> f32 {
     sum
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn dot_f32_avx(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 32 <= n {
+        let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(va0, vb0));
+
+        let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+        let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(va1, vb1));
+
+        let va2 = _mm256_loadu_ps(a.as_ptr().add(i + 16));
+        let vb2 = _mm256_loadu_ps(b.as_ptr().add(i + 16));
+        acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(va2, vb2));
+
+        let va3 = _mm256_loadu_ps(a.as_ptr().add(i + 24));
+        let vb3 = _mm256_loadu_ps(b.as_ptr().add(i + 24));
+        acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(va3, vb3));
+
+        i += 32;
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut sum = hsum256(acc);
+    while i < n {
+        sum += *a.get_unchecked(i) * *b.get_unchecked(i);
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx", enable = "sse4.1")]
+unsafe fn dot_i8_f32_avx(q: &[i8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = q.len();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let w8_0 = _mm_loadl_epi64(q.as_ptr().add(i) as *const __m128i);
+        let w8_0_lo = _mm_cvtepi8_epi32(w8_0);
+        let w8_0_hi = _mm_cvtepi8_epi32(_mm_srli_si128(w8_0, 4));
+        let wf0 = _mm256_set_m128(_mm_cvtepi32_ps(w8_0_hi), _mm_cvtepi32_ps(w8_0_lo));
+        let xf0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(wf0, xf0));
+
+        let w8_1 = _mm_loadl_epi64(q.as_ptr().add(i + 8) as *const __m128i);
+        let w8_1_lo = _mm_cvtepi8_epi32(w8_1);
+        let w8_1_hi = _mm_cvtepi8_epi32(_mm_srli_si128(w8_1, 4));
+        let wf1 = _mm256_set_m128(_mm_cvtepi32_ps(w8_1_hi), _mm_cvtepi32_ps(w8_1_lo));
+        let xf1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(wf1, xf1));
+
+        i += 16;
+    }
+    let mut sum = hsum256(_mm256_add_ps(acc0, acc1));
+    while i < n {
+        sum += *q.get_unchecked(i) as f32 * *x.get_unchecked(i);
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx", enable = "sse4.1")]
+unsafe fn dot_i4_f32_avx(packed: &[u8], x: &[f32], n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mask = _mm_set1_epi8(0x0F);
+    let offset = _mm_set1_epi8(8);
+
+    let mut byte_idx = 0;
+    let mut x_idx = 0;
+    let total_bytes = packed.len();
+
+    // 8 packed bytes = 16 int4 weights = 16 floats (two 256-bit AVX vectors)
+    while byte_idx + 8 <= total_bytes && x_idx + 16 <= n {
+        let raw = _mm_loadl_epi64(packed.as_ptr().add(byte_idx) as *const __m128i);
+        let lo = _mm_sub_epi8(_mm_and_si128(raw, mask), offset);
+        let hi = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw, 4), mask), offset);
+        let unpacked = _mm_unpacklo_epi8(lo, hi); // 16 signed i8s: lo0, hi0, lo1, hi1, ...
+
+        let w_lo = _mm_cvtepi8_epi32(unpacked);
+        let w_hi = _mm_cvtepi8_epi32(_mm_srli_si128(unpacked, 4));
+        let wf0 = _mm256_set_m128(_mm_cvtepi32_ps(w_hi), _mm_cvtepi32_ps(w_lo));
+        let xf0 = _mm256_loadu_ps(x.as_ptr().add(x_idx));
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(wf0, xf0));
+
+        let w_lo2 = _mm_cvtepi8_epi32(_mm_srli_si128(unpacked, 8));
+        let w_hi2 = _mm_cvtepi8_epi32(_mm_srli_si128(unpacked, 12));
+        let wf1 = _mm256_set_m128(_mm_cvtepi32_ps(w_hi2), _mm_cvtepi32_ps(w_lo2));
+        let xf1 = _mm256_loadu_ps(x.as_ptr().add(x_idx + 8));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(wf1, xf1));
+
+        byte_idx += 8;
+        x_idx += 16;
+    }
+
+    let mut sum = hsum256(_mm256_add_ps(acc0, acc1));
+    while byte_idx < total_bytes && x_idx < n {
+        let b = *packed.get_unchecked(byte_idx);
+        let lo = (b & 0xF) as i32 - 8;
+        let hi = (b >> 4) as i32 - 8;
+        sum += lo as f32 * *x.get_unchecked(x_idx);
+        if x_idx + 1 < n {
+            sum += hi as f32 * *x.get_unchecked(x_idx + 1);
+        }
+        byte_idx += 1;
+        x_idx += 2;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn dot_trit5_f32_avx(packed: &[u8], x: &[f32], n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let one_v = _mm256_set1_ps(1.0);
+    let neg_one_v = _mm256_set1_ps(-1.0);
+
+    let mut byte_idx = 0;
+    let total_bytes = packed.len();
+    let mut x_idx = 0;
+
+    // 4x unrolled No-Mul цикл (20 тритов за такт) — идеально ложится в 16 YMM регистров
+    while byte_idx + 4 <= total_bytes && x_idx + 23 <= n {
+        let b0 = *packed.get_unchecked(byte_idx);
+        let b1 = *packed.get_unchecked(byte_idx + 1);
+        let b2 = *packed.get_unchecked(byte_idx + 2);
+        let b3 = *packed.get_unchecked(byte_idx + 3);
+
+        if b0 < 243 && b1 < 243 && b2 < 243 && b3 < 243 {
+            let t0 = _mm256_loadu_ps(TRIT5_LUT_F32.get_unchecked(b0 as usize).as_ptr());
+            let xv0 = _mm256_loadu_ps(x.as_ptr().add(x_idx));
+            let p0 = _mm256_and_ps(xv0, _mm256_cmp_ps::<_CMP_EQ_OQ>(t0, one_v));
+            let n0 = _mm256_and_ps(xv0, _mm256_cmp_ps::<_CMP_EQ_OQ>(t0, neg_one_v));
+            acc0 = _mm256_add_ps(acc0, _mm256_sub_ps(p0, n0));
+
+            let t1 = _mm256_loadu_ps(TRIT5_LUT_F32.get_unchecked(b1 as usize).as_ptr());
+            let xv1 = _mm256_loadu_ps(x.as_ptr().add(x_idx + 5));
+            let p1 = _mm256_and_ps(xv1, _mm256_cmp_ps::<_CMP_EQ_OQ>(t1, one_v));
+            let n1 = _mm256_and_ps(xv1, _mm256_cmp_ps::<_CMP_EQ_OQ>(t1, neg_one_v));
+            acc1 = _mm256_add_ps(acc1, _mm256_sub_ps(p1, n1));
+
+            let t2 = _mm256_loadu_ps(TRIT5_LUT_F32.get_unchecked(b2 as usize).as_ptr());
+            let xv2 = _mm256_loadu_ps(x.as_ptr().add(x_idx + 10));
+            let p2 = _mm256_and_ps(xv2, _mm256_cmp_ps::<_CMP_EQ_OQ>(t2, one_v));
+            let n2 = _mm256_and_ps(xv2, _mm256_cmp_ps::<_CMP_EQ_OQ>(t2, neg_one_v));
+            acc2 = _mm256_add_ps(acc2, _mm256_sub_ps(p2, n2));
+
+            let t3 = _mm256_loadu_ps(TRIT5_LUT_F32.get_unchecked(b3 as usize).as_ptr());
+            let xv3 = _mm256_loadu_ps(x.as_ptr().add(x_idx + 15));
+            let p3 = _mm256_and_ps(xv3, _mm256_cmp_ps::<_CMP_EQ_OQ>(t3, one_v));
+            let n3 = _mm256_and_ps(xv3, _mm256_cmp_ps::<_CMP_EQ_OQ>(t3, neg_one_v));
+            acc3 = _mm256_add_ps(acc3, _mm256_sub_ps(p3, n3));
+        }
+
+        byte_idx += 4;
+        x_idx += 20;
+    }
+
+    // 1x vector loop
+    while byte_idx < total_bytes && x_idx + 8 <= n {
+        let b = *packed.get_unchecked(byte_idx);
+        if b < 243 {
+            let trits_ptr = TRIT5_LUT_F32.get_unchecked(b as usize).as_ptr();
+            let trits_v = _mm256_loadu_ps(trits_ptr);
+            let x_v = _mm256_loadu_ps(x.as_ptr().add(x_idx));
+
+            let pos_mask = _mm256_cmp_ps::<_CMP_EQ_OQ>(trits_v, one_v);
+            let neg_mask = _mm256_cmp_ps::<_CMP_EQ_OQ>(trits_v, neg_one_v);
+
+            let pos_vals = _mm256_and_ps(x_v, pos_mask);
+            let neg_vals = _mm256_and_ps(x_v, neg_mask);
+
+            let diff = _mm256_sub_ps(pos_vals, neg_vals);
+            acc0 = _mm256_add_ps(acc0, diff);
+        }
+        x_idx += 5;
+        byte_idx += 1;
+    }
+
+    let combined = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut sum = hsum256(combined);
+
+    // Хвост (безопасный скалярный No-Mul)
+    while byte_idx < total_bytes {
+        let b = *packed.get_unchecked(byte_idx);
+        if b < 243 {
+            let entry = TRIT5_LUT_F32.get_unchecked(b as usize);
+            for i in 0..5 {
+                if x_idx >= n {
+                    break;
+                }
+                let t = entry[i];
+                let xi = *x.get_unchecked(x_idx);
+                if t == 1.0 {
+                    sum += xi;
+                } else if t == -1.0 {
+                    sum -= xi;
+                }
+                x_idx += 1;
+            }
+        }
+        byte_idx += 1;
+    }
+
+    sum
+}
+
 /// Горизонтальная сумма `__m256` с фиксированным порядком (детерминизм).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx")]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     let lo = _mm256_castps256_ps128(v);
@@ -430,6 +788,47 @@ pub fn quant_i4_per_row(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<f3
     (q, scales)
 }
 
+/// Троичное квантование по строкам (Trit5): `(упакованные байты, масштабы)`.
+///
+/// Код ∈ {-1, 0, +1}, упаковывается по 5 тритов в байт через `Trit5Codec`.
+pub fn quant_trit5_per_row(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
+    debug_assert_eq!(w.len(), rows * cols);
+    let packed_cols = (cols + 4) / 5;
+    let mut packed = vec![0u8; rows * packed_cols];
+    let mut scales = vec![1f32; rows];
+    for r in 0..rows {
+        let row = &w[r * cols..(r + 1) * cols];
+        let m = row.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let sc = if m > 0.0 { m } else { 1.0 };
+        scales[r] = sc;
+        let mut trits_buf = [0i8; 5];
+        let mut buf_idx = 0;
+        let mut byte_idx = 0;
+        for &v in row {
+            let normalized = v / sc;
+            let trit = if normalized > 0.33 {
+                1i8
+            } else if normalized < -0.33 {
+                -1i8
+            } else {
+                0i8
+            };
+            trits_buf[buf_idx] = trit;
+            buf_idx += 1;
+            if buf_idx == 5 {
+                packed[r * packed_cols + byte_idx] = Trit5Codec::pack_5(&trits_buf).unwrap_or(0);
+                trits_buf = [0i8; 5];
+                buf_idx = 0;
+                byte_idx += 1;
+            }
+        }
+        if buf_idx > 0 {
+            packed[r * packed_cols + byte_idx] = Trit5Codec::pack_5(&trits_buf).unwrap_or(0);
+        }
+    }
+    (packed, scales)
+}
+
 // ---------------------------------------------------------------------------
 // Тесты
 // ---------------------------------------------------------------------------
@@ -627,5 +1026,58 @@ mod tests {
         assert!((silu(1.0) - 0.731_058_6).abs() < 1e-5);
         assert!((silu(-1.0) + 0.268_941_4).abs() < 1e-5);
         assert!(silu(10.0) > 9.999);
+    }
+
+    #[test]
+    fn trit5_bijection_all_243_states() {
+        for b in 0..243u8 {
+            let trits = Trit5Codec::unpack_5(b);
+            let packed = Trit5Codec::pack_5(&trits).expect("Ошибка упаковки Trit5");
+            assert_eq!(
+                packed, b,
+                "Сбой биекции на байте {}: trits = {:?}",
+                b, trits
+            );
+        }
+    }
+
+    #[test]
+    fn trit5_out_of_bounds() {
+        let invalid_trits = [1, 0, 2, -1, 0]; // 2 — невалидный трит (допустимы только -1, 0, 1)
+        assert!(Trit5Codec::pack_5(&invalid_trits).is_none());
+    }
+
+    #[test]
+    fn trit5_no_mul_dot_product_parity() {
+        let t1: [i8; 5] = [1, -1, 0, 1, -1];
+        let t2: [i8; 5] = [-1, -1, 1, 0, 1];
+
+        let b1 = Trit5Codec::pack_5(&t1).unwrap();
+        let b2 = Trit5Codec::pack_5(&t2).unwrap();
+
+        let packed_weights = vec![b1, b2];
+        let x = vec![0.5f32, 1.2, 3.4, -2.0, 0.8, 1.0, -1.5, 2.0, 4.0, -0.5];
+
+        // Ручной расчет:
+        // t1: +0.5 - 1.2 + 0.0 - 2.0 - 0.8 = -3.5
+        // t2: -1.0 + 1.5 + 2.0 + 0.0 - 0.5 = +2.0
+        // Сумма: -3.5 + 2.0 = -1.5
+        let expected = -1.5f32;
+
+        let scalar_result = dot_trit5_f32_scalar(&packed_weights, &x, 10);
+        assert!(
+            (scalar_result - expected).abs() < 1e-6,
+            "Scalar: {} != {}",
+            scalar_result,
+            expected
+        );
+
+        let final_result = dot_trit5_f32(&packed_weights, &x, 10);
+        assert!(
+            (final_result - expected).abs() < 1e-6,
+            "SIMD: {} != {}",
+            final_result,
+            expected
+        );
     }
 }

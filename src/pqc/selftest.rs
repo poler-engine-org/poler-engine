@@ -88,9 +88,10 @@ fn check_encoder(dir: &Path, quant: Quant) -> Result<String, String> {
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     let norm: f32 = out.cls.iter().map(|v| v * v).sum::<f32>().sqrt();
     let _ = std::fs::remove_file(&path);
-    // int4 — физика 4-бит (14 уровней): на синтетике честный порог ниже.
+    // int4/trit5 — физика сверхнизкого битрейта: на синтетике честный порог ниже.
     let (threshold, note) = match quant {
         Quant::Int4 => (0.98, "физика int4"),
+        Quant::Trit5 => (0.95, "физика троичного резонанса trit5"),
         Quant::Int8 => (0.999, "weight-only int8"),
         Quant::F32 => (0.9999, "fp32-контроль"),
     };

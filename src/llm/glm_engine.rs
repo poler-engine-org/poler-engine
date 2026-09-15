@@ -243,6 +243,7 @@ pub fn detokenize_join(words: &[&str]) -> String {
 /// GLM-декодер поверх mmap-весов `.pqw`.
 pub struct GlmModel {
     view: QuantizedWeightsView,
+    tokenizer: Option<crate::pqc::tokenizer::UnigramTokenizer>,
     hidden: usize,
     heads: usize,
     head_dim: usize,
@@ -277,6 +278,10 @@ impl GlmModel {
         if h.kv_heads == 0 || h.kv_heads > h.heads {
             return Err(format!("kv_heads={} невалидно", h.kv_heads));
         }
+        let tokenizer = match view.tensor("__tokenizer__") {
+            Some(t) => Some(crate::pqc::tokenizer::UnigramTokenizer::parse(t.raw_bytes()?)?),
+            None => None,
+        };
         let rope = tensor::RopeTable::new(head_dim, h.max_pos);
         Ok(Self {
             hidden: h.hidden,
@@ -290,8 +295,19 @@ impl GlmModel {
             experts: h.experts,
             top_k: h.top_k.max(1),
             rope,
+            tokenizer,
             view,
         })
+    }
+
+    /// Доступ к mmap-представлению квантованных весов.
+    pub fn view(&self) -> &QuantizedWeightsView {
+        &self.view
+    }
+
+    /// Токенизатор модели (если секция __tokenizer__ встроена в .pqw).
+    pub fn tokenizer(&self) -> Option<&crate::pqc::tokenizer::UnigramTokenizer> {
+        self.tokenizer.as_ref()
     }
 
     /// Размер словаря.
@@ -348,9 +364,19 @@ impl GlmModel {
             let attn_norm = self.view.require(&p("attn_norm_gamma"))?;
             tensor::rms_norm(&x, attn_norm.f32s()?, 1e-6, &mut hn);
 
-            self.view.require(&p("attn_q_w"))?.matvec(&hn, &mut q)?;
-            self.view.require(&p("attn_k_w"))?.matvec(&hn, &mut k)?;
-            self.view.require(&p("attn_v_w"))?.matvec(&hn, &mut v)?;
+            let q_w = self.view.tensor(&p("attn_q_w"))
+                .or_else(|| self.view.tensor(&p("q_proj_w")))
+                .ok_or_else(|| format!("тензор «{}» отсутствует в .pqw", p("attn_q_w")))?;
+            let k_w = self.view.tensor(&p("attn_k_w"))
+                .or_else(|| self.view.tensor(&p("k_proj_w")))
+                .ok_or_else(|| format!("тензор «{}» отсутствует в .pqw", p("attn_k_w")))?;
+            let v_w = self.view.tensor(&p("attn_v_w"))
+                .or_else(|| self.view.tensor(&p("v_proj_w")))
+                .ok_or_else(|| format!("тензор «{}» отсутствует в .pqw", p("attn_v_w")))?;
+
+            q_w.matvec(&hn, &mut q)?;
+            k_w.matvec(&hn, &mut k)?;
+            v_w.matvec(&hn, &mut v)?;
 
             // RoPE: каждую q-голову и kv-голову по позиции pos.
             for head in 0..self.heads {
@@ -378,7 +404,10 @@ impl GlmModel {
                     }
                 }
             }
-            self.view.require(&p("attn_o_w"))?.matvec(&ctx, &mut attn_out)?;
+            let o_w = self.view.tensor(&p("attn_o_w"))
+                .or_else(|| self.view.tensor(&p("out_proj_w")))
+                .ok_or_else(|| format!("тензор «{}» отсутствует в .pqw", p("attn_o_w")))?;
+            o_w.matvec(&ctx, &mut attn_out)?;
             for i in 0..h {
                 x[i] += attn_out[i];
             }
@@ -455,14 +484,20 @@ impl GlmModel {
         Ok(out)
     }
 
-    /// Авторегрессионная генерация: прогон промпта → `max_new` токенов.
-    pub fn generate(
+    /// Авторегрессионная генерация с потоковым колбэком (streaming).
+    /// Колбэк вызывается на каждый сгенерированный токен: `on_token(token_id, token_text) -> bool`
+    /// (возврат `false` останавливает генерацию досрочно).
+    pub fn generate_stream<F>(
         &self,
         prompt: &[u32],
         max_new: usize,
         sampling: &Sampling,
         seed: u64,
-    ) -> Result<Vec<u32>, String> {
+        mut on_token: F,
+    ) -> Result<Vec<u32>, String>
+    where
+        F: FnMut(u32, &str) -> bool,
+    {
         if prompt.is_empty() {
             return Err("LLM: пустой промпт".into());
         }
@@ -480,6 +515,7 @@ impl GlmModel {
             self.forward_pos(tok, kv.len(), &mut kv, &mut logits)?;
         }
         let mut generated = Vec::with_capacity(max_new);
+        let eos_id = self.tokenizer.as_ref().map(|t| t.special_ids().1).unwrap_or(2);
         for _ in 0..max_new {
             let s = match sampling {
                 Sampling::Greedy => Sampling::Greedy,
@@ -498,13 +534,38 @@ impl GlmModel {
                 },
             };
             let tok = sample_token(&logits, &s);
+            if tok == eos_id || tok == 2 || tok == 64795 || tok == 64797 {
+                break;
+            }
             generated.push(tok);
             step += 1;
+
+            let piece_str = if let Some(tok_engine) = &self.tokenizer {
+                tok_engine.detokenize(&[tok])
+            } else {
+                format!(" t{tok}")
+            };
+            let should_continue = on_token(tok, &piece_str);
+            if !should_continue {
+                break;
+            }
+
             if generated.len() < max_new {
                 self.forward_pos(tok, kv.len(), &mut kv, &mut logits)?;
             }
         }
         Ok(generated)
+    }
+
+    /// Авторегрессионная генерация: прогон промпта → `max_new` токенов.
+    pub fn generate(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        sampling: &Sampling,
+        seed: u64,
+    ) -> Result<Vec<u32>, String> {
+        self.generate_stream(prompt, max_new, sampling, seed, |_, _| true)
     }
 }
 
@@ -593,6 +654,10 @@ pub fn synth_glm(
             Quant::Int4 => {
                 let (q, s) = tensor::quant_i4_per_row(&w, rows, cols);
                 b.add_i4(name, vec![rows, cols], &q, &s);
+            }
+            Quant::Trit5 => {
+                let (q, s) = tensor::quant_trit5_per_row(&w, rows, cols);
+                b.add_trit5(name, vec![rows, cols], &q, &s);
             }
             Quant::F32 => {
                 b.add_f32(name, vec![rows, cols], &w);

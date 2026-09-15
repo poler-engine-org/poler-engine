@@ -57,6 +57,8 @@ use super::sha256::{hex, sha256};
 /// Магия формата (v2 — нейровеса; v1 «POLER_QW» занята фазовыми
 /// состояниями в крейте pqw репозитория POLER-Quantum-RS).
 pub const MAGIC: [u8; 8] = *b"PQW2NN\0\0";
+/// Альтернативная магия POLER Quantum Weights v2.
+pub const MAGIC_ALT: [u8; 8] = *b"POLERQW\0";
 /// Версия формата нейровесов.
 pub const VERSION: u32 = 2;
 /// Размер заголовка.
@@ -100,6 +102,7 @@ pub enum Quant {
     F32 = 0,
     Int8 = 1,
     Int4 = 2,
+    Trit5 = 3,
 }
 
 impl Quant {
@@ -108,6 +111,7 @@ impl Quant {
             0 => Ok(Self::F32),
             1 => Ok(Self::Int8),
             2 => Ok(Self::Int4),
+            3 => Ok(Self::Trit5),
             _ => Err(format!("неизвестный quant={v}")),
         }
     }
@@ -121,6 +125,8 @@ pub enum Dtype {
     I4 = 2,
     /// Сырые байты (метаданные: имена меток, конфиг).
     Raw = 3,
+    /// Упакованные 5 тритов на байт (3^5 = 243 <= 256).
+    Trit5 = 4,
 }
 
 impl Dtype {
@@ -130,6 +136,7 @@ impl Dtype {
             1 => Ok(Self::I8),
             2 => Ok(Self::I4),
             3 => Ok(Self::Raw),
+            4 => Ok(Self::Trit5),
             _ => Err(format!("неизвестный dtype={v}")),
         }
     }
@@ -296,6 +303,20 @@ impl PqwBuilder {
         });
     }
 
+    /// Добавляет троичный тензор Trit5 (5 тритов на байт, 3^5 = 243 <= 256).
+    pub fn add_trit5(&mut self, name: &str, dims: Vec<usize>, packed: &[u8], scales: &[f32]) {
+        let cols = if dims.len() > 1 { dims[1] } else { dims[0] };
+        let rows = if dims.len() > 1 { dims[0] } else { 1 };
+        debug_assert_eq!(packed.len(), rows * ((cols + 4) / 5));
+        self.tensors.push(BuilderTensor {
+            name: name.into(),
+            dtype: Dtype::Trit5,
+            dims,
+            scales: scales.to_vec(),
+            data: packed.to_vec(),
+        });
+    }
+
     /// Добавляет сырые байты (метаданные).
     pub fn add_raw(&mut self, name: &str, data: &[u8]) {
         self.tensors.push(BuilderTensor {
@@ -423,7 +444,7 @@ impl QuantizedWeightsView {
         if mmap.len() < HEADER {
             return Err(format!("файл обрезан: {} Б < заголовка", mmap.len()));
         }
-        if mmap[0..8] != MAGIC {
+        if mmap[0..8] != MAGIC && mmap[0..8] != MAGIC_ALT {
             return Err("чужая магия: не .pqw v2 (нейровеса)".into());
         }
         let u32_at = |off: usize| u32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
@@ -513,6 +534,10 @@ impl QuantizedWeightsView {
                     dims.first().copied().unwrap_or(0)
                         * ((dims.get(1).copied().unwrap_or(1) + 1) / 2)
                 }
+                Dtype::Trit5 => {
+                    dims.first().copied().unwrap_or(0)
+                        * ((dims.get(1).copied().unwrap_or(1) + 4) / 5)
+                }
                 Dtype::Raw => elems,
             };
             if dtype != Dtype::Raw && data_len != expect_len {
@@ -530,6 +555,7 @@ impl QuantizedWeightsView {
             });
         }
 
+        let flags = u16::from_le_bytes(mmap[18..20].try_into().unwrap());
         // Sha256 payload+таблицы — до разбора весов.
         let digest = sha256(&mmap[PAGE..table_offset + table_len]);
         if digest != sha_expect {
@@ -543,7 +569,7 @@ impl QuantizedWeightsView {
         let header = PqwHeader {
             model_type,
             quant,
-            flags: u16::from_le_bytes(mmap[18..20].try_into().unwrap()),
+            flags,
             layers: u32_at(20) as usize,
             hidden: u32_at(24) as usize,
             intermediate: u32_at(28) as usize,
@@ -663,6 +689,17 @@ impl TensorView<'_> {
         Ok(&self.data[s..s + packed])
     }
 
+    /// Trit5-строка (только Dtype::Trit5).
+    pub fn trit5_row(&self, r: usize) -> Result<&[u8], String> {
+        if self.dtype != Dtype::Trit5 {
+            return Err(format!("тензор {} не trit5", self.name));
+        }
+        let cols = self.cols();
+        let packed = (cols + 4) / 5;
+        let s = r * packed;
+        Ok(&self.data[s..s + packed])
+    }
+
     /// fp32-срез целиком (только Dtype::F32; выравнивание 4 проверено).
     pub fn f32s(&self) -> Result<&[f32], String> {
         if self.dtype != Dtype::F32 {
@@ -730,6 +767,21 @@ impl TensorView<'_> {
                     out[i] = sc * (nib as i32 - 8) as f32;
                 }
             }
+            Dtype::Trit5 => {
+                let sc = self.scale(r);
+                let packed = self.trit5_row(r)?;
+                let mut col = 0;
+                for &b in packed {
+                    let trits = super::tensor::Trit5Codec::unpack_5(b);
+                    for i in 0..5 {
+                        if col >= cols {
+                            break;
+                        }
+                        out[col] = sc * trits[i] as f32;
+                        col += 1;
+                    }
+                }
+            }
             Dtype::F32 => {
                 let row = self.f32_row(r)?;
                 out.copy_from_slice(row);
@@ -760,19 +812,61 @@ impl TensorView<'_> {
         }
         match self.dtype {
             Dtype::I8 => {
-                for r in 0..rows {
-                    out[r] = self.scale(r) * super::tensor::dot_i8_f32(self.i8_row(r)?, x);
+                if rows >= 32 {
+                    use rayon::prelude::*;
+                    out.par_iter_mut().enumerate().for_each(|(r, out_val)| {
+                        if let Ok(row) = self.i8_row(r) {
+                            *out_val = self.scale(r) * super::tensor::dot_i8_f32(row, x);
+                        }
+                    });
+                } else {
+                    for r in 0..rows {
+                        out[r] = self.scale(r) * super::tensor::dot_i8_f32(self.i8_row(r)?, x);
+                    }
                 }
             }
             Dtype::I4 => {
-                for r in 0..rows {
-                    let packed = self.i4_row(r)?;
-                    out[r] = self.scale(r) * super::tensor::dot_i4_f32(packed, x, cols);
+                if rows >= 32 {
+                    use rayon::prelude::*;
+                    out.par_iter_mut().enumerate().for_each(|(r, out_val)| {
+                        if let Ok(packed) = self.i4_row(r) {
+                            *out_val = self.scale(r) * super::tensor::dot_i4_f32(packed, x, cols);
+                        }
+                    });
+                } else {
+                    for r in 0..rows {
+                        let packed = self.i4_row(r)?;
+                        out[r] = self.scale(r) * super::tensor::dot_i4_f32(packed, x, cols);
+                    }
+                }
+            }
+            Dtype::Trit5 => {
+                if rows >= 32 {
+                    use rayon::prelude::*;
+                    out.par_iter_mut().enumerate().for_each(|(r, out_val)| {
+                        if let Ok(packed) = self.trit5_row(r) {
+                            *out_val = self.scale(r) * super::tensor::dot_trit5_f32(packed, x, cols);
+                        }
+                    });
+                } else {
+                    for r in 0..rows {
+                        let packed = self.trit5_row(r)?;
+                        out[r] = self.scale(r) * super::tensor::dot_trit5_f32(packed, x, cols);
+                    }
                 }
             }
             Dtype::F32 => {
-                for r in 0..rows {
-                    out[r] = super::tensor::dot_f32(self.f32_row(r)?, x);
+                if rows >= 32 {
+                    use rayon::prelude::*;
+                    out.par_iter_mut().enumerate().for_each(|(r, out_val)| {
+                        if let Ok(row) = self.f32_row(r) {
+                            *out_val = super::tensor::dot_f32(row, x);
+                        }
+                    });
+                } else {
+                    for r in 0..rows {
+                        out[r] = super::tensor::dot_f32(self.f32_row(r)?, x);
+                    }
                 }
             }
             Dtype::Raw => return Err(format!("тензор {}: raw не матвекторится", self.name)),
@@ -973,6 +1067,52 @@ mod tests {
                 w[i]
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trit5_tensor_roundtrip_and_matvec() {
+        use crate::pqc::tensor::Trit5Codec;
+        let path = tmp("trit5");
+        // Создаем матрицу 2x5 из тритов:
+        // row 0: [+1, -1,  0, +1, -1] -> packed byte b1
+        // row 1: [-1, -1, +1,  0, +1] -> packed byte b2
+        let t1: [i8; 5] = [1, -1, 0, 1, -1];
+        let t2: [i8; 5] = [-1, -1, 1, 0, 1];
+        let b1 = Trit5Codec::pack_5(&t1).unwrap();
+        let b2 = Trit5Codec::pack_5(&t2).unwrap();
+        let packed = vec![b1, b2];
+        let scales = vec![1.0f32, 2.0f32];
+
+        let mut b = PqwBuilder::new(ModelType::Decoder, Quant::Trit5, 1, 5, 1, 5, 8, 16);
+        b.add_trit5("archetype_proj", vec![2, 5], &packed, &scales);
+        b.write_to(&path).unwrap();
+
+        let view = QuantizedWeightsView::open(&path).unwrap();
+        let tv = view.require("archetype_proj").unwrap();
+        assert_eq!(tv.dtype, Dtype::Trit5);
+        assert_eq!(tv.rows(), 2);
+        assert_eq!(tv.cols(), 5);
+
+        // Gather test
+        let mut row0 = [0f32; 5];
+        tv.gather_row(0, &mut row0).unwrap();
+        assert_eq!(row0, [1.0, -1.0, 0.0, 1.0, -1.0]);
+
+        let mut row1 = [0f32; 5];
+        tv.gather_row(1, &mut row1).unwrap();
+        assert_eq!(row1, [-2.0, -2.0, 2.0, 0.0, 2.0]);
+
+        // Matvec test: out = W * x
+        let x = vec![0.5f32, 1.2, 3.4, -2.0, 0.8];
+        let mut out = [0f32; 2];
+        tv.matvec(&x, &mut out).unwrap();
+
+        // row 0: 1.0 * (+0.5 - 1.2 + 0.0 - 2.0 - 0.8) = -3.5
+        // row 1: 2.0 * (-0.5 - 1.2 + 3.4 + 0.0 + 0.8) = 2.0 * (2.5) = 5.0
+        assert!((out[0] - (-3.5f32)).abs() < 1e-5, "out[0]={}", out[0]);
+        assert!((out[1] - (5.0f32)).abs() < 1e-5, "out[1]={}", out[1]);
+
         let _ = std::fs::remove_file(&path);
     }
 }
