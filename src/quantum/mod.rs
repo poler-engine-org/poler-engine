@@ -146,10 +146,13 @@ impl QuantumMind {
     where
         F: FnMut(&str) -> bool,
     {
-        // 1. Динамическая термодинамическая адаптация порогов (U4)
+        // 1. Динамическая термодинамическая адаптация порогов (U4):
+        // Кинетика Ленгмюра / Михаэлиса-Ментен: τ_ign(Σ) = τ_0 · Σ(t) / (Σ_0 + Σ(t))
         let d_pol = self.curriculum.d_pol() as f64;
         let sigma = (self.curriculum.channel_count() as f64) / d_pol.max(1.0);
-        let tau_ign = (0.5 * (-0.1 * sigma).exp()).clamp(0.05, 0.5);
+        let sigma_0 = 0.25;
+        let tau_0 = 0.5;
+        let tau_ign = (tau_0 * (sigma / (sigma_0 + sigma))).clamp(0.02, 0.5);
         let _ = self.curriculum.set_momentum_thresholds(tau_ign, 1.0);
 
         // 2. Генерация потока мысли
