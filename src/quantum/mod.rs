@@ -6,6 +6,8 @@
 pub use pqc_core as core;
 pub use pqw_core as weights;
 
+pub mod crystallizer;
+
 use pqc_core::generate::{GeneratorConfig, L5Generator, GenerationReport};
 use pqc_core::gyro_lattice::QuantizedGyroCurriculum;
 use std::path::Path;
