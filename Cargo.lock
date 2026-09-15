@@ -2337,6 +2337,7 @@ dependencies = [
  "gix",
  "globset",
  "ignore",
+ "libc",
  "lz4_flex",
  "memchr",
  "memmap2",
