@@ -123,7 +123,7 @@ fastembed/ort/ONNX ОТМЕНЕНЫ, нейроинференс нативный
 `pqc` (`src/pqc/`: tensor — AVX2 weight-only int8/int4/f32 кернелы, LayerNorm/
 RMSNorm/GELU/SiLU/softmax/RoPE; pqw — формат весов `.pqw` v2: mmap zero-copy,
 SHA-256 верификация при открытии, секции по страницам 4096, см.
-`docs/PQW_FORMAT.md`; encoder — BERT/XLM-R-спина BGE-M3/GLiNER; sha256 — свой
+`docs/formats/PQW_FORMAT.md`; encoder — BERT/XLM-R-спина BGE-M3/GLiNER; sha256 — свой
 FIPS 180-4; selftest). Потребители: `src/llm/glm_engine.rs` (GLM-декодер:
 RoPE + MQA/GQA + SwiGLU + KV-арена + MoE-роутер топ-k + greedy/temperature/
 top-p сэмплирование + UAX#29-детокенизатор), `src/ner/native_gliner.rs`

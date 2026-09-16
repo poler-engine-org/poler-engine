@@ -1,98 +1,164 @@
-# poler-engine v0.17.4 — Transcript / Response View (лента чата в TUI)
+# Установка и сборка POLER Engine v2.0
 
-## Что нового
+> Если что-то не собирается — раздел 8 «Частые проблемы» внизу.
+> Карта документации: [docs/INDEX.md](docs/INDEX.md).
 
-### v0.17.4 (Transcript / Response View)
-- F3 в TUI — лента чата nlm ask (пары вопрос→ответ, персистентны в
-  poler_chat); Enter — полный ответ, y — копировать, d — удалить, r —
-  обновить; клик мышью открывает ответ.
+## 1. Требования
 
-### v0.17.3 (Companion Bridge M2+M3+M4)
+| Компонент | Минимум | Примечание |
+|---|---|---|
+| ОС | Linux x86_64 | AVX2 желателен ( fallback — скалярный путь в pqc/meta_compiler) |
+| Rust | 1.98+ (`rustup update stable`) | edition 2021, rust-version 1.80 в манифесте — но собирайте свежим |
+| RAM | 8 ГБ свободной для сборки | при < 8 ГБ — обязательно `-j1` (LTO fat + codegen-units=1 прожорливы) |
+| Диск | ~4 ГБ | репо + POLER-Quantum-RS + target/ |
+| Python 3 | только для конвертеров моделей | stdlib (+ torch уже не нужен — конвертеры читают zip/safetensors напрямую) |
 
-- **M2 ✓** `GcpEnterpriseProvider` — реал-имплементация 9 операций оф. Pre-GA NotebookLM Enterprise API через `ureq` (rustls) с Bearer из `oauth::ensure_gcp_fresh` (cloud-platform scope, `gcp_tokens.json`):
-  - `list_notebooks`, `get_notebook`, `batch_create_sources`, `upload_file` (`X-Goog-Upload-Protocol: raw`), `get_source`, `batch_delete_sources`, `create_audio_overview`, `delete_audio_overview`.
-  - lazy-init `Agent` (60s timeout), `bearer_json`/`bearer_upload`/`bearer_get` хедеры, `ureq_err` → `BridgeError`.
+## 2. КРИТИЧНО: два репозитория рядом
 
-- **M3 ✓** `HybridProvider` routing + fallback:
-  - `HybridProvider::route<F,G,R>(op, f_gcp, f_cdp)` generic-helper.
-  - Routing policy: `GcpOnly`/`CdpOnly` — primary only, fallback off; `Auto` (default) — primary=GCP если `gcp.supports(op)`, иначе CDP; fallback on (только если secondary `supports(op)`).
-  - Fallback триггерится только на `NotSupported`/`NotConfigured`; `Http`/`Transport`/`Parse` propagates без fallback.
-  - `primary_for(op)` и `fallback_enabled()` — pure-fns для тестов.
+`poler-engine` подключает крейты квантового ядра **path-зависимостями**:
 
-- **M4 ✓** TUI Enter-handler на источнике (Sources panel):
-  - Источник из `poler_sources` маппится в `companion::SourceKind` (file → FileUpload, url → Web, repo → Web{github.com}).
-  - `enter_action()` → `EnterAction`: `EditLocal` (spawn `$EDITOR`), `OpenUrl` (`xdg-open`), `EditTemp` (write `/tmp/...` + `$EDITOR`), `FallbackFetch` (message для будущей CdpBatchexecuteProvider имплементации).
+```toml
+# Cargo.toml
+pqc = { path = "../POLER-Quantum-RS_repo/crates/pqc" }
+pqw = { path = "../POLER-Quantum-RS_repo/crates/pqw" }
+```
 
-- **Дизайн-нот на будущее** — `docs/future-streaming-archives.md` (Zero-Storage Streaming Archives):
-  - Дословная фиксация идеи из research-сессии + **доработанная архитектура** под существующие модули poler-engine (`streaming.rs`, `resonance/`, `web/simhash.rs`, `tokenizer/pii.rs`, `aidde/`, `psi.rs`).
-  - 4 целевые аудитории: обучение локальных LLM, RAG-context injection для готовых LLM, помощь человеку (TUI discovery), параллельный поиск по конкретным и смежным темам (rayon `par_iter`).
-  - Полная математика: топологическая адресация (zip: O(δ) ≈ 64 КБ), ε(W_k), IIR R[n], SimHash F(d), энтропия Шеннона H(W_k), POLER[Ψ] ψ-поле с importance sampling.
-  - Roadmap SA1–SA7 (после v0.18.0).
-
-### Совместимость
-
-- 521 unit-test зелёных (+8 M3 routing tests +3 M2 helper tests; v0.17.1 было 510).
-- Бинарь 12 МБ (стабилен с v0.17.1).
-- База данных `web-index.db` — без изменений схемы (M2-M4 не трогают хранилище).
-- Исторические маркеры `// v0.17.0:` сохранены как источник правды о том, какая фича в каком релизе добавлена.
-
-## Установка
+Поэтому клонируем оба репозитория **в соседние каталоги**:
 
 ```bash
-# Распаковать
-tar -xzf poler-engine-v0.17.4-linux-x86_64.tar.gz
-
-# Установить в ~/.local/bin
-install -m 0755 poler-engine ~/.local/bin/
-
-# Проверить
-poler-engine --version
-# poler-engine 0.17.4
+mkdir -p ~/poler && cd ~/poler
+git clone git@github.com:poler-engine-org/poler-engine.git
+git clone git@github.com:poler-engine-org/POLER-Quantum-RS.git POLER-Quantum-RS_repo
 ```
 
-## Companion Bridge: первый запуск
+Имя каталога `POLER-Quantum-RS_repo` важно — оно захардкожено в
+Cargo.toml. (Эта боль ликвидируется монорепозиторием — план:
+`docs/MERGE_PLAN.md`.)
+
+## 3. Сборка
 
 ```bash
-# 1. OAuth consent screen в Google Cloud Console (тип: External).
-#    Scopes: gmail.readonly + drive.readonly + cloud-platform.
-#    Добавить пользователя в "Test users" (Pre-GA).
-
-# 2. Скачать OAuth client_secret JSON и положить:
-mkdir -p ~/.config/poler-engine
-chmod 600 client_secret.json
-mv client_secret.json ~/.config/poler-engine/
-
-# 3. Авторизоваться (со scope cloud-platform — для оф. NotebookLM API):
-poler-engine --gcp-auth
-
-# 4. Установить POLER_GCP_PROJECT_NUMBER (число из GCP Console):
-export POLER_GCP_PROJECT_NUMBER=123456789012
-
-# 5. Тесты Companion Bridge:
-poler-engine --google-gmail "Ollama"   # Gmail (v0.16.0 фича)
-poler-engine --google-drive            # Drive  (v0.16.0 фича)
-# M2: GcpEnterpriseProvider.list_notebooks — оф. Pre-GA API
-#     (после релиза M5 CLI subcommands: poler-engine nlm list-enterprise)
+cd poler-engine
+cargo build --release -j1        # -j1 при RAM < 8 ГБ; иначе можно без флага
+./target/release/poler-engine --version
 ```
 
-## Архитектура Companion Bridge
+Первый warning-free билд — часть культуры проекта (CONTRIBUTING.md §2).
+Бинарник статически несёт всё, кроме glibc; ~12–15 МБ.
 
-```text
-shell/TUI/CLI  →  HybridProvider  →  GcpEnterpriseProvider (оф. Pre-GA)
-                                  ↘  CdpBatchexecuteProvider (существ. nlm.rs)
+### 3.1. Сборка без AVX2
 
-Routing policy:
-  GcpOnly   → primary=GCP, fallback OFF
-  CdpOnly   → primary=CDP, fallback OFF
-  Auto      → primary=GCP если gcp.supports(op), иначе CDP
-              fallback ON: NotSupported/NotConfigured → secondary (если supports(op))
-              Http/Transport/Parse → propagate без fallback
+Бинарник детектит AVX2 в рантайме (`is_x86_feature_detected!` в pqc и
+meta_compiler) и падает на скалярный fallback — отдельной сборки не нужно.
+
+### 3.2. Docker
+
+Docker-контекст не видит каталоги выше текущего, а path-депы нужны сборке —
+поэтому перед сборкой ядро копируется внутрь контекста:
+
+```bash
+cp -r ../POLER-Quantum-RS_repo .
+docker build -t poler-engine .
+rm -rf POLER-Quantum-RS_repo        # прибрать за собой
+docker run --rm -v "$PWD:/data" poler-engine /data -q "запрос" --format ai-json
 ```
 
-## Источник
+(CI делает то же самое автоматически при наличии секрета
+`POLER_QUANTUM_TOKEN` — см. .github/workflows/ci.yml.)
 
-Полные записи работы — в `worklog.md`:
-- v0.18.0-m2-gcp-real-calls
-- v0.18.0-m3-hybrid-routing
-- v0.18.0-m4-tui-enter-handler
-- v0.17.3-release-pack
+Dockerfile в корне репозитория.
+
+## 4. Проверка установки
+
+```bash
+# 1. Автономный самотест формата весов (без моделей)
+./target/release/poler-engine --pqw-selftest          # ожидание: 6/6
+
+# 2. Полный тест-сьют (~1 059 тестов, минуты)
+cargo test
+
+# 3. Живой поиск на тестовом корпусе
+git clone --depth 1 https://github.com/Kotokvit/Eteryya.git ~/eteryya
+./target/release/poler-engine ~/eteryya -q "Алексей" --format ai-json | head -50
+```
+
+Тесты на реальных моделях (tests/pqw_real_model.rs, tests/gliner_real_model.rs,
+tests/safetensors_crystallize_bench.rs) само-скипаются без файлов моделей —
+это норма (TESTING.md §1.3).
+
+## 5. Модели (.pqw) — как получить
+
+Формат описан в `docs/formats/PQW_FORMAT.md`. Готовые чекпойнты проекта
+кладутся в `models/`:
+
+```bash
+mkdir -p models
+```
+
+### 5.1. BGE-M3 (эмбеддер, int8, ~573 МБ)
+
+```bash
+# скачать исходные веса HuggingFace (pytorch_model.bin) в cache/hf/…
+python3 scripts/convert_hf_to_pqw.py --src <путь к pytorch_model.bin> \
+    --dst models/bge-m3.pqw --quant int8
+```
+
+Конвертер потоковый: RAM не растёт с моделью (тот же паттерн — для 70B).
+
+### 5.2. GLiNER (NER, int8, 297 МБ из 1.17 ГБ)
+
+```bash
+python3 scripts/convert_gliner_to_pqw.py --src <urchade_gliner_multi…> \
+    --dst models/gliner.pqw
+```
+
+### 5.3. ChatGLM3-6B (декодер, int4, ~3.2 ГБ)
+
+```bash
+python3 scripts/convert_chatglm_to_pqw.py --src <chatglm3-6b/> \
+    --dst models/chatglm3-6b.pqw --quant int4
+```
+
+Требует ~12–15 ГБ RAM на чтение fp16 и ~10 ГБ диска под поток; запускать
+на машине с запасом (в 4-ГБ песочнице — OOM). Известный открытый вопрос:
+int4-декодер воспроизводит 0 токенов (диагностируется, HISTORY.md).
+
+### 5.4. Использование
+
+```bash
+./target/release/poler-engine ~/corpus --semantic dense --model models/bge-m3.pqw -q "запрос"
+./target/release/poler-engine ~/corpus --ner gliner --model models/gliner.pqw --ner-labels "человек,место"
+./target/release/poler-engine --llm local --model models/chatglm3-6b.pqw
+```
+
+## 6. Тестовый корпус
+
+Роман «Eteryya» (65K+ файлов, 153 МБ): https://github.com/Kotokvit/Eteryya —
+эталон полноты («Алексей» = 10 696 хитов, «Нокс» = 547) и одновременно
+литературный канон проекта (docs/HISTORY.md, этап 0).
+
+## 7. Интерфейсы после установки
+
+```bash
+poler-engine --shell      # REPL с Tab-completion
+poler-engine --tui        # TUI: chat | notes | sources
+poler-engine --gateway    # Terminal Gateway (sandbox-контур; см. docs/terminal-gateway-architecture.md)
+poler-engine --mcp        # MCP-сервер stdio (для LLM-агентов)
+```
+
+## 8. Частые проблемы
+
+| Симптом | Причина | Лечение |
+|---|---|---|
+| `error: failed to load manifest for pqc` | нет соседнего POLER-Quantum-RS_repo | §2 — клонировать рядом с точным именем |
+| Сборка убита OOM-killer | LTO + параллельный codegen | `cargo build --release -j1` |
+| `чужая магия: не PRBQ-хранилище` | файл не того формата | docs/formats/PRBQ_FORMAT.md |
+| Тесты `pqw_real_model` skip | нет models/*.pqw | §5 (skip — норма) |
+| rustc ругается на `#[inline(always)]` + `#[target_feature]` | rustc ≥ 1.87 запрещает комбинацию | не использовать их вместе (кодоген уже испускает `#[inline]`) |
+
+## 9. Что удалено в v2.0 (чтобы не искать)
+
+Google OAuth / NotebookLM / Gmail / Drive-импорт, `dev-stand/`, флаги
+`--google-*`, `--nlm-*`, `--auth-ui`, `--license-import`. Суверенный стек:
+всё локально. Старый мост — `docs/companion-bridge-design.md` (исторический
+документ). EULA-статус: `--license`.

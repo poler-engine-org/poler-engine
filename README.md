@@ -12,6 +12,15 @@ RAG из архитектуры LLM-агентов.
 poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relations'
 ```
 
+> **Документация (v2.0):** полная карта — [`docs/INDEX.md`](docs/INDEX.md).
+> Архитектура — `docs/ARCHITECTURE.md` · теория (ε, R(t), RaBitQ, R1CS) —
+> `docs/THEORY.md` · история проекта — `docs/HISTORY.md` · справочник
+> модулей — `docs/MODULES.md` · CLI — `docs/CLI.md` · форматы —
+> `docs/formats/` · глоссарий — `GLOSSARY.md` · контрибуция —
+> `CONTRIBUTING.md` · план монорепозитория — `docs/MERGE_PLAN.md`.
+> Этот README — прежде всего чейнджлог; нижние секции частично описывают
+> старые версии (v0.3.x), актуальная структура — в `docs/MODULES.md`.
+
 ---
 
 ## v2.0 (в разработке): Sovereign Stack — ступени плотности
@@ -105,7 +114,7 @@ HashMap (250 нс против 90 нс на пробу) — на фоне mmap-�
   архитектура изменена владельцем: fastembed/ort/ONNX **ОТМЕНЕНЫ**,
   весь нейроинференс — нативный Rust через собственное ядро `pqc`
   (вендор-вынос из POLER-Quantum-RS), формат весов **`.pqw` v2**
-  (см. `docs/PQW_FORMAT.md`):
+  (см. `docs/formats/PQW_FORMAT.md`):
 
 | Компонент | ONNX Runtime (отменено) | pqc-натив (реализовано) |
 |---|---|---|

@@ -7,6 +7,11 @@
 FROM rust:1.98-slim-bookworm AS builder
 WORKDIR /build
 
+# Квантовое ядро: path-депы pqc/pqw (../POLER-Quantum-RS_repo,
+# см. INSTALL.md §2). Каталог кладётся в контекст сборки:
+#   cp -r ../POLER-Quantum-RS_repo . && docker build .
+COPY POLER-Quantum-RS_repo /POLER-Quantum-RS_repo
+
 # Слой зависимостей кэшируется отдельно от исходников
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo "pub fn _placeholder() {}" > src/lib.rs && \
