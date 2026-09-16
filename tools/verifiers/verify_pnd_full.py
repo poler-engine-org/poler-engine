@@ -10,8 +10,11 @@ Zig 0.14.0). Прежние PENDING-заявки Тома V снимаются �
 Слои (--sections, по умолчанию все быстрые):
   golden  — побитовая сверка Python-транслитерации с golden-векторами,
             снятыми НАПРЯМУЮ с Zig-ядра (54 626 векторов, вкл. 272 полных
-            шифрования; кеш: golden/pnd_v8_golden_54626.txt, регенерация
-            --regen при наличии zig + poler-os)
+            шифрования; кеш: golden/pnd_v8_golden_54626.txt, регенерация —
+            zig run --dep poler_core -Mroot=tools/verifiers/zig_probe/
+            golden_dump.zig -Mpoler_core=os/core/poler_core.zig из корня
+            монорепо). Ядро — PND v8.2 (P0-фиксы аудита Шнайера: F1 полное
+            256-битное расписание ключей, F3 PolerDrbg вместо PolerPrng)
   v1      — Теорема V.1 НА РЕАЛЬНОЙ Φ (6 шагов: add/rotl13/xorshift16/
             mul/rotl7/add): пошаговые леммы биективности (Z3 + явный
             обратный), round-trip
@@ -51,7 +54,7 @@ RCON = [0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000,
         0x2F000000, 0x5E000000, 0xBC000000, 0x63000000, 0xC6000000]
 LHCA_F = 0xACACACAC           # polerFeistelF L957
 LHCA_KS = 0xACACACAC          # keySchedule L992
-LHCA_PRNG = 0xAAAAAAAA        # PolerPrng L1035
+LHCA_PRNG = 0xAAAAAAAA        # историч. (PolerPrng удалён в v8.2, P0-F3)
 # ±D-лемма: D = rotl((C2 << 12) mod 2^32, 7)
 D_LEMMA = 0xE0000060
 
@@ -184,9 +187,11 @@ def key_schedule(key, epsilon):
             temp[j] = ct_sbox(temp[j])
         sub_rot = int.from_bytes(bytes(temp), 'little')
         rcon_word = RCON[min(i - 1, len(RCON) - 1)]
-        rk[i][0] = pnd_mix(rk[i - 1][0], sub_rot ^ rcon_word, epsilon)
+        # P0-F1 (аудит Шнайера): key[4..7] вмешиваются в КАЖДЫЙ раунд —
+        # полный 256-битный ключ (раньше игнорировались, эффективных 128 бит)
+        rk[i][0] = pnd_mix(rk[i - 1][0] ^ key[4], sub_rot ^ rcon_word, epsilon)
         for j in range(1, 4):
-            rk[i][j] = pnd_mix(rk[i - 1][j], rk[i][j - 1], epsilon)
+            rk[i][j] = pnd_mix(rk[i - 1][j] ^ key[4 + j], rk[i][j - 1], epsilon)
         # lhcaDiffuseBlock: 2 раунда lhca + каскадный XOR
         for j in range(4):
             rk[i][j] = lhca_step(lhca_step(rk[i][j], LHCA_KS), LHCA_KS)
@@ -201,6 +206,39 @@ def derive_round_epsilon(rk, idx):
     eps = phi(rk[idx][0] ^ rk[idx][1]) ^ rk[idx][2] ^ rk[idx][3]
     eps = (eps + ((idx + 1) * PHI_C1)) & M32
     return 1 if eps == 0 else eps
+
+DRBG_REKEY_BLOCKS = 65536
+
+def drbg_init(seed):
+    """poler_core.zig PolerDrbg.init — свёртка сида через φ-цепь."""
+    k = [0] * 8
+    acc = 0x9E3779B9
+    for i, w in enumerate(seed):
+        acc = phi((acc ^ w ^ ((i * 0x85EBCA6B) & M32)) & M32)
+        k[i] = acc
+    eps = phi(k[0] ^ k[7])
+    eps = 1 if eps == 0 else eps
+    return {'key': k, 'counter': 0, 'epsilon': eps,
+            'buf': [0, 0, 0, 0], 'pos': 4, 'since': 0}
+
+def drbg_next(st):
+    """poler_core.zig PolerDrbg.refill/next — POLER-CTR с rekey."""
+    if st['pos'] >= 4:
+        block = [st['counter'] & M32, (st['counter'] >> 32) & M32,
+                 0xD48B51B7, 0x9E3779B9]  # доменные константы DRBG
+        out = cipher_encrypt(st['key'], st['epsilon'], block)
+        st['buf'] = out
+        st['pos'] = 0
+        st['counter'] = (st['counter'] + 1) & 0xFFFFFFFFFFFFFFFF
+        st['since'] += 1
+        if st['since'] >= DRBG_REKEY_BLOCKS:
+            st['key'] = [phi(st['key'][i] ^ out[i & 3]) for i in range(8)]
+            eps = phi(st['key'][0] ^ st['key'][7])
+            st['epsilon'] = 1 if eps == 0 else eps
+            st['since'] = 0
+    v = st['buf'][st['pos']]
+    st['pos'] += 1
+    return v
 
 def cipher_encrypt(key, epsilon, pt):
     """poler_core.zig L739-771 — 20 раундов Фейстеля + whitening."""
@@ -301,9 +339,9 @@ def run_golden(path):
                 ok = mine == ct
                 back = cipher_decrypt(k, e, ct)
                 ok = ok and (back == pt) and (rt == 1)
-            elif tag == 'prng':
-                # prng seed out — проверяется последовательно ниже
-                stats.setdefault('prng', [0, 0])
+            elif tag == 'drbg':
+                # drbg seed-signature out — проверяется последовательно ниже
+                stats.setdefault('drbg', [0, 0])
                 continue
             elif tag == 'modinv':
                 a, y = int(p[1], 16), int(p[2], 16)
@@ -323,33 +361,33 @@ def run_golden(path):
                 stats[tag][1] += 1
                 if len(fails) < 5:
                     fails.append(line.strip())
-    # prng — последовательная проверка (состояние)
-    prng_states = {}
-    prng_ok, prng_n = True, 0
+    # drbg — последовательная проверка (состояние; P0-F3: PolerDrbg)
+    drbg_states = {}
+    drbg_ok, drbg_n = True, 0
     with open(path) as f:
         for line in f:
             p = line.split()
-            if not p or p[0] != 'prng':
+            if not p or p[0] != 'drbg':
                 continue
-            seed, out = int(p[1], 16), int(p[2], 16)
-            st = prng_states.get(seed)
+            seed_hex, out = p[1], int(p[2], 16)
+            st = drbg_states.get(seed_hex)
             if st is None:
-                st = seed if seed != 0 else 0xDEADBEEF     # PolerPrng.init
-            # next(): state = lhca(phi(pndMix(state, key, eps)), 0xAAAAAAAA)
-            mixed = pnd_mix(st, 0xCAFEBABE, 1)
-            st = lhca_step(phi(mixed), LHCA_PRNG)
-            prng_states[seed] = st
-            prng_n += 1
-            if st != out:
-                prng_ok = False
+                # hex-подпись сида = 8 слов по 8 hex-символов
+                seed = [int(seed_hex[i * 8:(i + 1) * 8], 16) for i in range(8)]
+                st = drbg_init(seed)
+            v = drbg_next(st)
+            drbg_states[seed_hex] = st
+            drbg_n += 1
+            if v != out:
+                drbg_ok = False
                 if len(fails) < 5:
-                    fails.append('prng %s -> %s (mine %s)' % (p[1], p[2], hex(st)))
+                    fails.append('drbg -> %s (mine %s)' % (p[2], hex(v)))
                 break
-    total = sum(v[0] for v in stats.values()) + prng_n
-    bad = sum(v[1] for v in stats.values()) + (0 if prng_ok else 1)
+    total = sum(v[0] for v in stats.values()) + drbg_n
+    bad = sum(v[1] for v in stats.values()) + (0 if drbg_ok else 1)
     return {'golden_file': str(path), 'total_vectors': total,
             'per_tag': {k: {'n': v[0], 'mismatch': v[1]} for k, v in stats.items()},
-            'prng_chain': {'n': prng_n, 'ok': prng_ok},
+            'drbg_chain': {'n': drbg_n, 'ok': drbg_ok},
             'mismatches': bad, 'fail_examples': fails,
             'verdict': ('BIT-FOR-BIT OK — транслитерация ≡ Zig-ядро'
                         if bad == 0 else 'REFUTED — расхождение с Zig!'),

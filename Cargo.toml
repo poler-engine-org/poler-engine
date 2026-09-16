@@ -49,6 +49,15 @@ path = "src/lib.rs"
 name = "poler-engine"
 path = "src/main.rs"
 
+[features]
+# M4 (docs/UNIFIED_ARCHITECTURE.md): C-ABI мост к Zig-криптоядру PND v8.2
+# (os/core/poler_core.zig). Фича включает build.rs, который собирает
+# os/core через Zig 0.14.0 в libpoler_core.a и линкует статически.
+# Требования к окружению: `zig` в PATH, либо POLER_ZIG=/путь/к/zig,
+# либо готовая библиотека POLER_CORE_LIB=.../os/core/zig-out/lib.
+# Без фичи сборка не требует Zig-тулчейна (CI по умолчанию — без неё).
+pnd-ffi = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"

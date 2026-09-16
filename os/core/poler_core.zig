@@ -35,6 +35,15 @@
 //   - RDTSC бенчмарки
 // ============================================================================
 
+// v8.2 (P0-фиксы аудита Шнайера A2Z — os/docs/SCHNEIER_AUDIT_A2Z.md, гл. 11):
+//   F1: расписание ключей разворачивает ПОЛНЫЙ 256-битный ключ
+//       (двухветвевая схема: key[4..7] вмешиваются в каждый раунд);
+//       ранее key[4..7] игнорировались — эффективных бит было 128.
+//   F3: PolerPrng (32-битное состояние, периоды 309–86 686) заменён
+//       счётчиковым PolerDrbg: 256-битное состояние поверх POLER-CTR.
+//   F2: добавлен PolerCbc — каскад с IV и сцеплением блоков (kernel-
+//       версия cascadeEncrypt работала в ECB и удалена с BIOS-модулями).
+//
 // ============================================================================
 // КОНСТАНТЫ И ТИПЫ
 // ============================================================================
@@ -356,7 +365,7 @@ pub const INV_SBOX: [SBOX_SIZE]u8 = computeInverseSBox();
 /// x^8 + x^4 + x^3 + x + 1 (0x11B, the AES polynomial).
 /// Uses mask-based conditionals — NO data-dependent branches.
 /// All 8 iterations always execute the same operations regardless of input.
-fn ctGf256Mul(a: u8, b: u8) u8 {
+pub fn ctGf256Mul(a: u8, b: u8) u8 {
     var p: u8 = 0;
     var aa: u8 = a;
 
@@ -720,8 +729,11 @@ pub const PolerCipher = struct {
             round_epsilons[i] = deriveRoundEpsilon(&round_keys, i);
         }
 
+        // P0-F1: свёртка всех восьми слов ключа (раньше — только key[0..3]).
+        // Примечание аудита D-1: поле lhca_config не читается путями
+        // шифрования — оставлено для совместимости, свёртка всё равно полная.
         const lhca_config = LHCAConfig{
-            .rule_mask = key[0] ^ key[1] ^ key[2] ^ key[3],
+            .rule_mask = key[0] ^ key[1] ^ key[2] ^ key[3] ^ key[4] ^ key[5] ^ key[6] ^ key[7],
         };
 
         return PolerCipher{
@@ -902,7 +914,7 @@ fn invShiftRows(state: *[BLOCK_WORDS]u32) void {
 /// Это MDS-матрица: ветвление = 5 (максимально для 4×4 над GF(2^8)).
 /// Любое изменение 1 байта входа изменяет ВСЕ 4 байта выхода.
 /// Использует ctGf256Mul — constant-time, устойчива к cache-timing атакам.
-fn mixColumnsPnd(word: u32) u32 {
+pub fn mixColumnsPnd(word: u32) u32 {
     const a: [4]u8 = @bitCast(word);
     const r0 = ctGf256Mul(0x02, a[0]) ^ ctGf256Mul(0x03, a[1]) ^ a[2] ^ a[3];
     const r1 = a[0] ^ ctGf256Mul(0x02, a[1]) ^ ctGf256Mul(0x03, a[2]) ^ a[3];
@@ -913,7 +925,7 @@ fn mixColumnsPnd(word: u32) u32 {
 }
 
 /// Обратная MDS MixColumns (для совместимости, не используется в Фейстеле)
-fn invMixColumnsPnd(word: u32) u32 {
+pub fn invMixColumnsPnd(word: u32) u32 {
     const a: [4]u8 = @bitCast(word);
     const r0 = ctGf256Mul(0x0E, a[0]) ^ ctGf256Mul(0x0B, a[1]) ^ ctGf256Mul(0x0D, a[2]) ^ ctGf256Mul(0x09, a[3]);
     const r1 = ctGf256Mul(0x09, a[0]) ^ ctGf256Mul(0x0E, a[1]) ^ ctGf256Mul(0x0B, a[2]) ^ ctGf256Mul(0x0D, a[3]);
@@ -943,7 +955,7 @@ fn invMixColumnsPnd(word: u32) u32 {
 ///   lhcaStep — линейная гибридная CA (дополнительное рассеивание)
 ///
 /// Не обязана быть обратимой — обратимость гарантируется структурой Фейстеля.
-fn polerFeistelF(r_word: u32, round_key: u32, epsilon: u32) u32 {
+pub fn polerFeistelF(r_word: u32, round_key: u32, epsilon: u32) u32 {
     // v8: S-box ДО PND — нелинеаризуем входы до умножения
     var bytes: [4]u8 = @bitCast(r_word);
     bytes[0] = constantTimeSbox(bytes[0]);
@@ -964,7 +976,7 @@ fn polerFeistelF(r_word: u32, round_key: u32, epsilon: u32) u32 {
 ///
 /// Решение v7: PND-подобная inter-word диффузия через phi-сцепление.
 /// phi(a^b) — нелинейная биекция, создаёт сильную зависимость между словами.
-fn polerFeistelFHalf(r: [2]u32, round_keys: [2]u32, epsilon: u32) [2]u32 {
+pub fn polerFeistelFHalf(r: [2]u32, round_keys: [2]u32, epsilon: u32) [2]u32 {
     var out: [2]u32 = undefined;
     out[0] = polerFeistelF(r[0], round_keys[0], epsilon);
     out[1] = polerFeistelF(r[1], round_keys[1], epsilon);
@@ -988,15 +1000,29 @@ const RCON: [20]u32 = [_]u32{
     0x2F000000, 0x5E000000, 0xBC000000, 0x63000000, 0xC6000000,
 };
 
+// P0-F1 (аудит Шнайера A2Z, глава 11): ранее расписание разворачивало
+// ТОЛЬКО key[0..3] — слова key[4..7] игнорировались, эффективная длина
+// ключа была 128 бит из заявленных 256 (идентичные round-keys и CT для
+// ключей, различающихся словами 4–7). Исправление по аудиту —
+// «правильное»: двухветвевое расписание, где вторая половина ключа
+// вмешивается в КАЖДЫЙ раунд расширения:
+//   ветка A (whitening):    rk[0] = key[0..3]
+//   ветка B (каждый раунд): первый операнд pndMix XOR-ится с key[4..7]
+// Изменение любого бита key[4..7] проходит через нелинейную pndMix-цепь
+// и биективную LHCA-диффузию во всё расписание и все round-ε.
+// Критерии приёмки (аудит): ключи, различающиеся только словами 4–7,
+// дают разные шифротексты; изменение любого из 256 бит ключа меняет CT.
 fn keySchedule(key: *const [KEY_WORDS]u32, epsilon: u32, round_keys: *[22][BLOCK_WORDS]u32) void {
     const lhca_config = LHCAConfig{ .rule_mask = 0xACACACAC };
 
+    // Ветка A: начальный whitening из первых 128 бит
     round_keys[0][0] = key[0];
     round_keys[0][1] = key[1];
     round_keys[0][2] = key[2];
     round_keys[0][3] = key[3];
 
-    // Генерируем подключи 1..21 (21 = rounds+1 для финального whitening)
+    // Подключи 1..21 (21 = rounds+1 для финального whitening);
+    // ветка B: key[4..7] участвует в каждом раунде — полный 256-битный ключ
     for (1..22) |i| {
         var temp: [4]u8 = @bitCast(round_keys[i - 1][3]);
         const t0 = temp[0];
@@ -1007,38 +1033,165 @@ fn keySchedule(key: *const [KEY_WORDS]u32, epsilon: u32, round_keys: *[22][BLOCK
 
         const rcon_idx = if (i - 1 < RCON.len) i - 1 else RCON.len - 1;
         const rcon_word = RCON[rcon_idx];
-        round_keys[i][0] = pndMix(round_keys[i - 1][0], sub_rot ^ rcon_word, epsilon);
+        round_keys[i][0] = pndMix(round_keys[i - 1][0] ^ key[4], sub_rot ^ rcon_word, epsilon);
         for (1..BLOCK_WORDS) |j| {
-            round_keys[i][j] = pndMix(round_keys[i - 1][j], round_keys[i][j - 1], epsilon);
+            round_keys[i][j] = pndMix(round_keys[i - 1][j] ^ key[4 + j], round_keys[i][j - 1], epsilon);
         }
         lhcaDiffuseBlock(&round_keys[i], lhca_config, 2);
     }
 }
 
 // ============================================================================
-// POLER PRNG
+// POLER DRBG — счётчиковый генератор (P0-F3, аудит Шнайера)
 // ============================================================================
+//
+// Замена удалённого PolerPrng (32-битное состояние, периоды 309–86 686,
+// медиана 14 960 — катастрофически мало; находка F3 аудита A2Z).
+//
+// Конструкция — CTR-DRBG над собственным примитивом (POLER-CTR,
+// как предписывает глава 11 аудита):
+//
+//   output_block = PolerCipher.encrypt(counter_block, internal_key)
+//   counter: u64 — строго возрастает, цикл невозможен до 2^64 блоков
+//   rekey каждые 2^16 блоков: key ← φ(key ⊕ последний блок) — прямая
+//   секретность (раскрытие состояния не восстанавливает старые блоки).
+//
+// Состояние: 256 бит ключа + 64 бита счётчика. Период ≥ 2^66 выходных
+// слов до полного оборота счётчика; цепочка rekey не циклируется
+// раньше ~2^255 состояний ключа.
 
-pub const PolerPrng = struct {
-    state: u32,
+pub const DRBG_REKEY_BLOCKS: u32 = 65536;
+
+pub const PolerDrbg = struct {
+    key: [KEY_WORDS]u32, // 256-битное внутреннее состояние
+    counter: u64,
     epsilon: u32,
-    key: u32,
+    cipher: PolerCipher, // кэш расписания — пересборка только при rekey
+    buf: [BLOCK_WORDS]u32,
+    buf_pos: usize,
+    blocks_since_rekey: u32,
 
-    pub fn init(seed: u32, epsilon: u32, key: u32) PolerPrng {
-        const s = if (seed == 0) @as(u32, 0xDEADBEEF) else seed;
-        return PolerPrng{ .state = s, .epsilon = epsilon, .key = key };
+    /// Инициализация из 256-битного сида. Свёртка через φ-цепь
+    /// устраняет структурированные сиды (все-нулевые, счётчики) —
+    /// любой сид даёт полностью перемешанное состояние.
+    pub fn init(seed: *const [KEY_WORDS]u32) PolerDrbg {
+        var k: [KEY_WORDS]u32 = undefined;
+        var acc: u32 = 0x9E3779B9;
+        for (seed, 0..) |w, i| {
+            acc = phi(acc ^ w ^ (@as(u32, @intCast(i)) *% 0x85EBCA6B));
+            k[i] = acc;
+        }
+        var eps = phi(k[0] ^ k[7]);
+        if (eps == 0) eps = 1; // No Excuses
+        return PolerDrbg{
+            .key = k,
+            .counter = 0,
+            .epsilon = eps,
+            .cipher = PolerCipher.init(&k, eps),
+            .buf = .{ 0, 0, 0, 0 },
+            .buf_pos = BLOCK_WORDS, // форсирует refill при первом next()
+            .blocks_since_rekey = 0,
+        };
     }
 
-    pub fn next(self: *PolerPrng) u32 {
-        const pnd_result = pndMix(self.state, self.key, self.epsilon);
-        const permuted = phi(pnd_result);
-        const diffused = lhcaStep(permuted, LHCAConfig{ .rule_mask = 0xAAAAAAAA });
-        self.state = diffused;
-        return self.state;
+    fn refill(self: *PolerDrbg) void {
+        // Доменное разделение: блоки DRBG никогда не совпадают с
+        // пользовательскими шифрованиями (константные слова 2–3).
+        var block: [BLOCK_WORDS]u32 = .{
+            @truncate(self.counter),
+            @truncate(self.counter >> 32),
+            0xD48B51B7, // доменный тег DRBG
+            0x9E3779B9,
+        };
+        self.cipher.encryptBlock(&block, &self.buf);
+        self.buf_pos = 0;
+        self.counter +%= 1;
+        self.blocks_since_rekey += 1;
+
+        if (self.blocks_since_rekey >= DRBG_REKEY_BLOCKS) {
+            for (&self.key, 0..) |*w, i| w.* = phi(w.* ^ self.buf[i & 3]);
+            var eps = phi(self.key[0] ^ self.key[7]);
+            if (eps == 0) eps = 1;
+            self.epsilon = eps;
+            self.cipher = PolerCipher.init(&self.key, eps);
+            self.blocks_since_rekey = 0;
+        }
     }
 
-    pub fn nextRange(self: *PolerPrng, max: u32) u32 {
-        return self.next() % max;
+    /// Следующее 32-битное слово потока.
+    pub fn next(self: *PolerDrbg) u32 {
+        if (self.buf_pos >= BLOCK_WORDS) self.refill();
+        const v = self.buf[self.buf_pos];
+        self.buf_pos += 1;
+        return v;
+    }
+
+    /// Равномерное слово в [0, max). Безсмещённый rejection sampling
+    /// (вместо `% max` у удалённого PolerPrng).
+    pub fn nextRange(self: *PolerDrbg, max: u32) u32 {
+        if (max == 0) return 0;
+        // Зона отбрасывания: выравниваем 2^32 к кратности max
+        const zone: u64 = (@as(u64, 1) << 32) - ((@as(u64, 1) << 32) % @as(u64, max));
+        while (true) {
+            const v = self.next();
+            if (@as(u64, v) < zone) return @intCast(v % max);
+        }
+    }
+};
+
+// ============================================================================
+// POLER-CBC — каскад с IV и сцеплением (P0-F2, аудит Шнайера)
+// ============================================================================
+//
+// Аудит A2Z, находка F2: kernel-версия cascadeEncrypt работала в режиме
+// ECB (без IV, без сцепления) — два одинаковых блока давали одинаковые
+// шифротексты, утекая структуру сообщения. Тот код удалён вместе с
+// BIOS-модулями (доступен в истории); библиотека предоставляет
+// ПРАВИЛЬНУЮ замену с первой попытки:
+//   ct[i] = Encrypt(pt[i] XOR ct[i-1]),   ct[-1] = IV
+// IV — 4 слова энтропии (источник: PolerDrbg либо PUF-хаб).
+
+pub const PolerCbc = struct {
+    cipher: PolerCipher,
+
+    pub fn init(key: *const [KEY_WORDS]u32, epsilon: u32) PolerCbc {
+        return PolerCbc{ .cipher = PolerCipher.init(key, epsilon) };
+    }
+
+    /// Зашифровать поток слов (длина кратна BLOCK_WORDS). ct.len ≥ pt.len.
+    pub fn encrypt(self: *const PolerCbc, iv: *const [BLOCK_WORDS]u32, pt: []const u32, ct: []u32) void {
+        std.debug.assert(pt.len % BLOCK_WORDS == 0 and ct.len >= pt.len);
+        var prev = iv.*;
+        var i: usize = 0;
+        while (i < pt.len) : (i += BLOCK_WORDS) {
+            var block: [BLOCK_WORDS]u32 = .{
+                pt[i] ^ prev[0],
+                pt[i + 1] ^ prev[1],
+                pt[i + 2] ^ prev[2],
+                pt[i + 3] ^ prev[3],
+            };
+            var out: [BLOCK_WORDS]u32 = undefined;
+            self.cipher.encryptBlock(&block, &out);
+            @memcpy(ct[i .. i + BLOCK_WORDS], &out);
+            prev = out;
+        }
+    }
+
+    /// Расшифровать поток слов (длина кратна BLOCK_WORDS).
+    pub fn decrypt(self: *const PolerCbc, iv: *const [BLOCK_WORDS]u32, ct: []const u32, pt: []u32) void {
+        std.debug.assert(ct.len % BLOCK_WORDS == 0 and pt.len >= ct.len);
+        var prev = iv.*;
+        var i: usize = 0;
+        while (i < ct.len) : (i += BLOCK_WORDS) {
+            var block: [BLOCK_WORDS]u32 = .{ ct[i], ct[i + 1], ct[i + 2], ct[i + 3] };
+            var out: [BLOCK_WORDS]u32 = undefined;
+            self.cipher.decryptBlock(&block, &out);
+            pt[i] = out[0] ^ prev[0];
+            pt[i + 1] = out[1] ^ prev[1];
+            pt[i + 2] = out[2] ^ prev[2];
+            pt[i + 3] = out[3] ^ prev[3];
+            prev = block;
+        }
     }
 };
 
@@ -1877,5 +2030,157 @@ test "Q32 fixed-point PND φ-wrapper properties" {
     const half_deform_val = pndMixQ32(a, b, 0x80000000);
     try std.testing.expect(eps_zero != half_deform_val);
     try std.testing.expect(half_deform_val != full_deform_val);
+}
+
+// ============================================================================
+// P0-ТЕСТЫ АУДИТА ШНАЙЕРА A2Z — v8.2 (глава 11: критерии приёмки фиксов)
+// ============================================================================
+
+test "P0-F1: ключи с разными словами 4-7 дают разные шифротексты" {
+    // Аудит A2Z, критерий приёмки F1: «два ключа, различающиеся только
+    // словами 4–7, дают разные шифротексты». До фикса v8.2 — проваливался
+    // (расписание игнорировало key[4..7], round-keys были идентичны).
+    var drbg = PolerDrbg.init(&[_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    var trials: usize = 0;
+    while (trials < 32) : (trials += 1) {
+        var key: [KEY_WORDS]u32 = undefined;
+        for (&key) |*w| w.* = drbg.next();
+        const eps = drbg.next();
+        var pt: [BLOCK_WORDS]u32 = undefined;
+        for (&pt) |*w| w.* = drbg.next();
+
+        const c0 = PolerCipher.init(&key, eps);
+        var ct0: [BLOCK_WORDS]u32 = undefined;
+        c0.encryptBlock(&pt, &ct0);
+
+        var w: usize = 4;
+        while (w < KEY_WORDS) : (w += 1) {
+            var key2 = key;
+            key2[w] ^= 0xFFFFFFFF; // полностью другое слово из второй половины
+            const c1 = PolerCipher.init(&key2, eps);
+            var ct1: [BLOCK_WORDS]u32 = undefined;
+            c1.encryptBlock(&pt, &ct1);
+            try std.testing.expect(ct0[0] != ct1[0] or ct0[1] != ct1[1] or
+                ct0[2] != ct1[2] or ct0[3] != ct1[3]);
+        }
+    }
+}
+
+test "P0-F1: изменение любого из 256 бит ключа меняет шифротекст (Ось IV)" {
+    // Аудит A2Z, Ось IV: тест-вектор полной битовой чувствительности
+    // ключа — основа для пересчёта постквантовой заявки от 128 к 256 бит.
+    var drbg = PolerDrbg.init(&[_]u32{ 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x10, 0x11 });
+    var trials: usize = 0;
+    while (trials < 16) : (trials += 1) {
+        var key: [KEY_WORDS]u32 = undefined;
+        for (&key) |*w| w.* = drbg.next();
+        const eps = drbg.next();
+        var pt: [BLOCK_WORDS]u32 = undefined;
+        for (&pt) |*w| w.* = drbg.next();
+
+        const c0 = PolerCipher.init(&key, eps);
+        var ct0: [BLOCK_WORDS]u32 = undefined;
+        c0.encryptBlock(&pt, &ct0);
+
+        var bit: usize = 0;
+        while (bit < 256) : (bit += 1) {
+            var key2 = key;
+            key2[bit / 32] ^= @as(u32, 1) << @intCast(bit % 32);
+            const c1 = PolerCipher.init(&key2, eps);
+            var ct1: [BLOCK_WORDS]u32 = undefined;
+            c1.encryptBlock(&pt, &ct1);
+            try std.testing.expect(ct0[0] != ct1[0] or ct0[1] != ct1[1] or
+                ct0[2] != ct1[2] or ct0[3] != ct1[3]);
+        }
+    }
+}
+
+test "P0-F3: PolerDrbg — первые 100 000 выходов уникальны" {
+    // Регрессия против удалённого PolerPrng: периоды 309–86 686,
+    // медиана 14 960 (аудит F3). DRBG обязан пройти на порядок дальше.
+    var drbg = PolerDrbg.init(&[_]u32{ 42, 43, 44, 45, 46, 47, 48, 49 });
+    var seen = std.AutoHashMap(u32, void).init(std.testing.allocator);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        const v = drbg.next();
+        try std.testing.expect(!seen.contains(v));
+        try seen.put(v, {});
+    }
+}
+
+test "P0-F3: PolerDrbg детерминизм и чувствительность сида" {
+    const seed = [KEY_WORDS]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var a = PolerDrbg.init(&seed);
+    var b = PolerDrbg.init(&seed);
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        try std.testing.expectEqual(a.next(), b.next());
+    }
+
+    var seed2 = seed;
+    seed2[7] ^= 1; // ровно один бит сида
+    var c = PolerDrbg.init(&seed2);
+    var d = PolerDrbg.init(&seed);
+    var diffs: usize = 0;
+    i = 0;
+    while (i < 256) : (i += 1) {
+        if (d.next() != c.next()) diffs += 1;
+    }
+    try std.testing.expect(diffs > 200); // потоки практически не пересекаются
+}
+
+test "P0-F3: PolerDrbg бит-баланс (200k выходов, все 32 бита ~50%)" {
+    var drbg = PolerDrbg.init(&[_]u32{ 0xDEAD, 0xBEEF, 0xCAFE, 0xBABE, 1, 2, 3, 4 });
+    var counts = [_]u32{0} ** 32;
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) {
+        const v = drbg.next();
+        var b: u5 = 0;
+        while (true) : (b += 1) {
+            if ((v >> b) & 1 == 1) counts[b] += 1;
+            if (b == 31) break;
+        }
+    }
+    for (counts) |cnt| {
+        const p = @as(f64, @floatFromInt(cnt)) / 200_000.0;
+        // σ ≈ 0.0011 → допуск 0.006 ≈ 5.4σ, тест детерминирован фиксированным сидом
+        try std.testing.expect(@abs(p - 0.5) < 0.006);
+    }
+}
+
+test "P0-F3: PolerDrbg nextRange — границы и безсмещённость" {
+    var drbg = PolerDrbg.init(&[_]u32{ 9, 9, 9, 9, 9, 9, 9, 9 });
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const v = drbg.nextRange(7);
+        try std.testing.expect(v < 7);
+    }
+    try std.testing.expectEqual(@as(u32, 0), drbg.nextRange(1));
+}
+
+test "P0-F2: PolerCbc — одинаковые блоки дают разные шифротексты" {
+    // Аудит A2Z, критерий приёмки F2: «два одинаковых блока в сообщении
+    // дают разные блоки шифротекста» — исключение ECB-утечки структуры.
+    const key = [KEY_WORDS]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const cbc = PolerCbc.init(&key, 0xDEAD);
+    const iv = [BLOCK_WORDS]u32{ 0x11111111, 0x22222222, 0x33333333, 0x44444444 };
+    const pt = [_]u32{ 0xA, 0xB, 0xC, 0xD, 0xA, 0xB, 0xC, 0xD }; // два одинаковых блока
+    var ct: [8]u32 = undefined;
+    cbc.encrypt(&iv, &pt, &ct);
+    try std.testing.expect(ct[0] != ct[4] or ct[1] != ct[5] or
+        ct[2] != ct[6] or ct[3] != ct[7]);
+
+    // Раундтрип
+    var back: [8]u32 = undefined;
+    cbc.decrypt(&iv, &ct, &back);
+    try std.testing.expectEqualSlices(u32, &pt, &back);
+
+    // Разный IV → разный шифротекст (одно и то же сообщение)
+    const iv2 = [BLOCK_WORDS]u32{ 0, 0, 0, 0 };
+    var ct2: [8]u32 = undefined;
+    cbc.encrypt(&iv2, &pt, &ct2);
+    try std.testing.expect(ct[0] != ct2[0] or ct[1] != ct2[1] or
+        ct[2] != ct2[2] or ct[3] != ct2[3]);
 }
 

@@ -164,6 +164,10 @@ Sentinel → v0.28.0 Root Broker Password Mode + Builtin Hunter. Репозит�
 | (f3ba7c8) | **Reverse Meta-Compiler** — честная 8-полосная AVX2 | бит-в-бит фаззинг 88 схем; 31 490 проходов/с; см. quantum-eri.md |
 | (e342465) | Архив 299 источников в docs/ | теоретическая база |
 | (667711a) | Транскрипт сессии (sanitized) | первоисточник этой хроники |
+| (4679ce0) | **Суверенный Гиппокамп v0.29**: библиотека POLER (332 файла, 3.65 млн токенов) в нативном индексе — MVR-провенанс, MCP query_poler_knowledge | 23 468 чанков; RaBitQ+HNSW 4.6 МБ; RSS 17.3 МБ; 1028/1028 тестов |
+| (f5e53dc, 33c3b48) | **M2**: всасывание POLER-Quantum-RS в crates/{pqc,pqw} (filter-repo + subtree) | 25 коммитов истории RQ1–RQ23 сохранены; CI без соседних клонов |
+| (513af6a, 1ce6583) | **M3 — монорепозиторий**: poler-os влит в os/ (147/147 коммитов), BIOS/Ring-0 модули в историю, крипто-ядро извлечено в os/core/ | 298 коммитов единой истории; репо 290→45 МБ; 23/23 zig + 1028/1028 rust |
+| (M4, этот коммит) | **Крипто-мост и P0-фиксы аудита Шнайера**: ядро PND v8.2 — двухветвевое 256-битное расписание (F1), PolerDrbg счётчиковый (F3), PolerCbc с IV (F2); C-ABI abi.zig → libpoler_core.a → Rust src/crypto/pnd.rs (фича pnd-ffi) | 30/30 zig (23+7 P0); golden 54 626 регенерирован, Python BIT-FOR-BIT OK; 1035/1035 rust (pnd-ffi); CI-джоба zig-core |
 
 Параллельно POLER-OS прошёл CDD №10 (v0.19.0 графика) → №12 (p1–p15:
 Gamescope-марафон, XMM0-clobber, demand-zero) → №15 (fork/execve,

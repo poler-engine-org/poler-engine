@@ -49,6 +49,36 @@ jobs:
       - name: Микробенчмарк
         run: cargo run --release --example bench
 
+  # M4 (docs/UNIFIED_ARCHITECTURE.md): крипто-ядро Zig (os/core, PND v8.2
+  # с P0-фиксами аудита Шнайера) + C-ABI мост в Rust. Двойная зелёность
+  # обязательна: zig build test (ядро + parity) и cargo --features pnd-ffi.
+  zig-core:
+    name: Крипто-ядро Zig (os/core) + Rust FFI мост
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить Zig 0.14.0
+        run: |
+          curl -sL https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz | tar -xJ -C "$HOME"
+          echo "$HOME/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: "Тесты крипто-ядра PND v8.2 (30: ядро + P0 аудита + C-ABI parity)"
+        run: |
+          cd os/core
+          zig build test
+
+      - name: "Rust FFI (фича pnd-ffi): golden-связка Zig-Rust"
+        run: cargo test --lib --features pnd-ffi
+
+      - name: "MVR-верификатор: побитовая сверка Python против Zig (54 626 golden-векторов)"
+        run: |
+          python3 -m pip install --user numpy z3-solver
+          python3 tools/verifiers/verify_pnd_full.py --sections golden
+
   docker:
     name: Docker-образ
     runs-on: ubuntu-latest

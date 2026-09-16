@@ -49,6 +49,7 @@
 pub mod aidde;
 pub mod bench;
 pub mod compression;
+pub mod crypto;
 pub mod engine;
 pub mod gateway;
 pub mod graph;

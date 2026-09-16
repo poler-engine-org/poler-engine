@@ -1,8 +1,10 @@
-// MVR-v3, фаза побитовой сверки: дамп golden vectors из РЕАЛЬНОГО ядра
-// poler-os (probe-копия с pub-алиасами, diff = 12 строк).
+// MVR-v3, фаза побитовой сверки: дамп golden vectors из РЕАЛЬНОГО ядра.
+// M4: ядро живёт в монорепо (os/core/poler_core.zig, PND v8.2 с P0-фиксами
+// аудита Шнайера) и экспортирует нужные функции как pub — probe-копия
+// больше не нужна, дампер импортирует ядро напрямую.
 // Выход: текстовые строки "tag hex..." для последующей сверки с Python.
 const std = @import("std");
-const core = @import("poler_core_probe.zig");
+const core = @import("poler_core");
 
 var out_buf: std.ArrayList(u8) = undefined;
 var out_arena: std.heap.ArenaAllocator = undefined;
@@ -54,13 +56,13 @@ pub fn main() !void {
     // ── 4. mixColumnsPnd / inv: базисы, краевые, LCG ──────────────────────
     const basis: [5]u32 = .{ 0x00000000, 0x00000001, 0x00000100, 0x00010000, 0x01000000 };
     for (basis) |w| {
-        emit("mds {x:0>8} {x:0>8}\n", .{ w, core.probe_mixColumnsPnd(w) });
-        emit("invmds {x:0>8} {x:0>8}\n", .{ w, core.probe_invMixColumnsPnd(w) });
+        emit("mds {x:0>8} {x:0>8}\n", .{ w, core.mixColumnsPnd(w) });
+        emit("invmds {x:0>8} {x:0>8}\n", .{ w, core.invMixColumnsPnd(w) });
     }
-    emit("mds {x:0>8} {x:0>8}\n", .{ @as(u32, 0xFFFFFFFF), core.probe_mixColumnsPnd(0xFFFFFFFF) });
+    emit("mds {x:0>8} {x:0>8}\n", .{ @as(u32, 0xFFFFFFFF), core.mixColumnsPnd(0xFFFFFFFF) });
     for (0..4096) |_| {
         const w = lcg();
-        emit("mds {x:0>8} {x:0>8}\n", .{ w, core.probe_mixColumnsPnd(w) });
+        emit("mds {x:0>8} {x:0>8}\n", .{ w, core.mixColumnsPnd(w) });
     }
 
     // ── 5. lhcaStep: маски Фейстеля/PRNG/краевые на LCG-состояниях ────────
@@ -76,11 +78,11 @@ pub fn main() !void {
     // ── 6. F-функции раунда ────────────────────────────────────────────────
     for (0..4096) |_| {
         const r = lcg(); const rk = lcg(); const e = lcg();
-        emit("fround {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n", .{ r, rk, e, core.probe_polerFeistelF(r, rk, e) });
+        emit("fround {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n", .{ r, rk, e, core.polerFeistelF(r, rk, e) });
     }
     for (0..4096) |_| {
         const r0 = lcg(); const r1 = lcg(); const k0 = lcg(); const k1 = lcg(); const e = lcg();
-        const res = core.probe_polerFeistelFHalf(.{ r0, r1 }, .{ k0, k1 }, e);
+        const res = core.polerFeistelFHalf(.{ r0, r1 }, .{ k0, k1 }, e);
         emit("fhalf {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n",
             .{ r0, r1, k0, k1, e, res[0], res[1] });
     }
@@ -128,10 +130,17 @@ pub fn main() !void {
                ct[0], ct[1], ct[2], ct[3], @intFromBool(rt_ok) });
     }
 
-    // ── 8. PRNG и утилиты ──────────────────────────────────────────────────
-    for ([3]u32{ 0, 1, 0xDEADBEEF }) |seed| {
-        var prng = core.PolerPrng.init(seed, 1, 0xCAFEBABE);
-        for (0..1000) |_| emit("prng {x:0>8} {x:0>8}\n", .{ seed, prng.next() });
+    // ── 8. DRBG (P0-F3: PolerPrng удалён) и утилиты ──────────────────────
+    const drbg_seeds: [3][8]u32 = .{
+        .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .{ 0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9E3779B9, 0x517CC1B7, 0xFFFFFFFF, 0x00000001, 0x80000000 },
+    };
+    for (drbg_seeds) |s| {
+        var drbg = core.PolerDrbg.init(&s);
+        // hex-подпись сида (8 слов) — ключ потока в верификаторе
+        for (0..1000) |_| emit("drbg {x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8} {x:0>8}\n",
+            .{ s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], drbg.next() });
     }
     for (0..4096) |_| {
         const a = lcg() | 1;
@@ -141,7 +150,7 @@ pub fn main() !void {
     for (0..4096) |_| {
         const x: u8 = @truncate(lcg());
         const y: u8 = @truncate(lcg());
-        emit("gfmul {x:0>2} {x:0>2} {x:0>2}\n", .{ x, y, core.probe_ctGf256Mul(x, y) });
+        emit("gfmul {x:0>2} {x:0>2} {x:0>2}\n", .{ x, y, core.ctGf256Mul(x, y) });
     }
 
     try std.io.getStdOut().writeAll(out_buf.items);

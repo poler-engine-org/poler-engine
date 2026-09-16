@@ -14,8 +14,9 @@
 
 | Путь | Что это | Роль в едином инструменте |
 |---|---|---|
-| `core/poler_core.zig` | Криптографическое и диффузионное ядро PND v8 (1881 строка, единственный импорт — `std`) | Статическая библиотека `libpoler_core.a` (C-ABI) для Rust-движка: `pndMix`, биекция `Φ`, LHCA, Feistel ×20, ctSbox, MDS |
-| `core/build.zig` | Сборка ядра как userspace-библиотеки (Zig 0.14.0) | `zig build` → `libpoler_core.a`; `zig build test` → **23/23 crypto-теста зелёные** (проверено standalone на Linux) |
+| `core/poler_core.zig` | Криптографическое и диффузионное ядро PND **v8.2** (2086 строк, единственный импорт — `std`): pndMix, биекция Φ, LHCA, Feistel ×20, ctSbox, MDS; P0-фиксы аудита Шнайера — F1 (двухветвевое 256-битное расписание), F3 (PolerDrbg — счётчиковый DRBG), F2 (PolerCbc — каскад с IV) | Ядро шифра и диффузии |
+| `core/abi.zig` | C-ABI обвязка (M4): 16 экспортов `poler_*` — скаляры, шифр и DRBG через opaque-handle, POLER-CBC | Связка с Rust-движком: `src/crypto/pnd.rs`, фича `pnd-ffi` |
+| `core/build.zig` | Сборка userspace-библиотеки (Zig 0.14.0): PIC + bundle_compiler_rt для линковки в PIE-бинарники Rust | `zig build` → `libpoler_core.a`; `zig build test` → **30/30 тестов** (23 ядра + 7 P0 аудита) + C-ABI parity |
 | `docs/` | Вся база знаний OS-ветки: аудит Шнайера A2Z (`SCHNEIER_AUDIT_A2Z.md`), math-sources, архитектурные doc'и, исторический README, `docs/kernel/` — спецификации ядра (SMP, legal-аудит) | Эпистемический субстрат: первоисточники для MVR-провенанса Гиппокампа |
 | `AGENT.md`, `AGENT_STATE.md`, `LICENSE` | Исторические протоколы и лицензия репозитория-донора | Археология; читаются агентами как контекст решений |
 
@@ -54,17 +55,37 @@
 
 ```bash
 cd os/core
-zig build test          # 23 встроенных crypto-теста (Feistel, phi, SAC, LHCA)
-zig build               # zig-out/lib/libpoler_core.a
+zig build test          # 30 тестов: 23 исходных + 7 P0 аудита Шнайера + C-ABI parity
+zig build               # zig-out/lib/libpoler_core.a (PIC + compiler-rt)
 zig build -Doptimize=ReleaseFast
 ```
 
 Тулчейн: Zig 0.14.0 (как в исходном poler-os).
 
+Rust-сторона (фича `pnd-ffi`): `cargo test --lib --features pnd-ffi`
+из корня монорепо — build.rs сам собирает `os/core` и линкует
+статическую библиотеку (нужен `zig` в PATH или `POLER_ZIG=...`).
+
+## P0-фиксы аудита Шнайера (v8.2, 2026-09-17)
+
+По главе 11 `os/docs/SCHNEIER_AUDIT_A2Z.md`, критерии приёмки исполнены:
+
+- **F1** — расписание ключей разворачивает полный 256-битный ключ
+  (двухветвевая схема: key[4..7] вмешиваются в каждый раунд);
+  тест: ключи, различающиеся только словами 4–7, дают разные CT;
+  тест Оси IV: изменение любого из 256 бит ключа меняет CT.
+- **F3** — PolerPrng (периоды 309–86 686) удалён; счётчиковый
+  PolerDrbg: 256-бит состояние поверх POLER-CTR, rekey каждые 2^16
+  блоков; тест: первые 100 000 выходов уникальны, бит-баланс ~50%.
+- **F2** — добавлен PolerCbc (IV + сцепление); тест: два одинаковых
+  pt-блока дают разные ct-блоки (ECB-утечка исключена).
+- Golden-векторы регенерированы (54 626), Python-транслитерация —
+  BIT-FOR-BIT OK (`tools/verifiers/verify_pnd_full.py`).
+
 ## Дальнейший путь
 
-Следующие шаги для этого каталога — в `docs/UNIFIED_ARCHITECTURE.md`
-(корень монорепозитория): M4 — C-ABI export-обвязка + FFI-мост в Rust +
-P0-фиксы аудита Шнайера (расписание ключей `key[4..7]` → полный 256-бит,
-замена PolerPrng на DRBG, IV/nonce для каскада) с верификацией на
-golden-векторах `tools/verifiers/golden/`.
+Следующие шаги — в `docs/UNIFIED_ARCHITECTURE.md` (корень
+монорепозитория): M5 (XLM-R → .pqw, переинжест Гиппокампа), M6
+(резидентный MCP <5 мс), M7 (микро-рантайм как замена Docker).
+Оставшиеся P1-пункты аудита (RSA-blinding, KDF доменного разделения
+ключей каскада) — отдельной вехой поверх DRBG.

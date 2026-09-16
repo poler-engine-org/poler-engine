@@ -11,6 +11,7 @@
 | C | `verify_rabitq_arcsin.py` | III.1 (arcsin-MLE), III.2 (стиснення) | III | NumPy 2.1.3 (MC/FWHT/CRB) | 2026-09-16, commit 38a862a | AXIOM CONFIRMED (GW; MLE≈CRB; ADC; 144 Б) |
 | A | `verify_pnd_gf.py` | V.2′ (S-box x^254: δ_S=4, NL=112) | V | NumPy 2.1.3 (GF(2⁸), DDT/LAT) | 2026-09-16, commit 36df975 | CONFIRMED (примітиви; ARX-часть виведена з обігу — див. A-фінал) |
 | A-фінал | `verify_pnd_full.py` | V.1 (реальна Φ), V.2 (δ≤8 — REFUTED), V.3 (MDS ℬ=5), V.4 (LHCA), V.5 (пари раундів), V.6 (SAC) | V (вид. 2) | NumPy 2.1.3, Z3 5.1.0, Zig 0.14.0 (golden), повний перебір 2³² | 2026-09-16 | Див. таблицю вердиктів Тому V; ключове: V.2 REFUTED точно (δ≈2²⁸·²), MDS ℬ=5 AXIOM, Δφ — 8 значень на 2³² |
+| A-P0 (M4) | `verify_pnd_full.py` (golden, оновлено під v8.2) + zig-тести ядра 30/30 + Rust FFI 7 тестів | P0-критерії аудиту Шнайера: F1 (повний 256-бітний ключ), F3 (DRBG), F2 (CBC-анти-ECB) | V (постскриптум аудиту) | Zig 0.14.0, Python 3.12, Rust 1.98 (фича pnd-ffi) | 2026-09-17, M4 | F1/F2/F3 ✅: BIT-FOR-BIT OK на 54 626 векторах; чутливість до всіх 256 біт підтверджена Zig+Rust; 100k виходів DRBG унікальні |
 | E | `verify_iir_z.py` | IV.1 (IIR ⟺ слід Вольтерри) | IV | SymPy 1.14.0 (rsolve/полюси), NumPy 2.1.3 | 2026-09-16, commit 38a862a | AXIOM CONFIRMED |
 
 ## Rust-тести, народжені верифікацією

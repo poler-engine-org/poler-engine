@@ -10,36 +10,53 @@ const std = @import("std");
 // статическая библиотека для Linux/macOS/Windows — без голого железа,
 // без QEMU, без загрузочных секторов.
 //
-//   zig build              # → zig-out/lib/libpoler_core.a
-//   zig build test         # 23 встроенных crypto-теста (Feistel, phi, SAC, LHCA)
+//   zig build              # → zig-out/lib/libpoler_core.a (root = abi.zig)
+//   zig build test         # тесты poler_core.zig (30) + parity-тесты abi.zig
 //   zig build -Doptimize=ReleaseFast
 //
-// Плановый следующий шаг (M4, docs/UNIFIED_ARCHITECTURE.md): export-обвязка
-// C-ABI (poler_pnd_mix, poler_feistel_encrypt, ...) и FFI-мост из Rust
-// (poler-engine) через extern "C" — нулевой оверхед, нуль внешних
-// зависимостей.
+// M4 (docs/UNIFIED_ARCHITECTURE.md): Rust-сторона poler-engine линкует
+// эту библиотеку через фичу `pnd-ffi` (см. build.rs в корне монорепо и
+// src/crypto/pnd.rs). Ядро PND v8.2 включает P0-фиксы аудита Шнайера
+// (F1: полный 256-битный ключ; F3: PolerDrbg; F2: PolerCbc).
 // ============================================================================
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Статическая библиотека: libpoler_core.a / poler_core.lib
+    // Статическая библиотека с C-ABI экспортами: libpoler_core.a / .lib
     const lib = b.addStaticLibrary(.{
         .name = "poler_core",
-        .root_source_file = b.path("poler_core.zig"),
+        .root_source_file = b.path("abi.zig"),
         .target = target,
         .optimize = optimize,
     });
+    // PIC: потребители линкуют библиотеку в PIE-бинарники (Rust-тесты,
+    // CI) — без этого ld падает на R_X86_64_32S против локальных символов.
+    // (Zig 0.14: флаг живёт на root_module, а не на Compile-степе.)
+    lib.root_module.pic = true;
+    // Встраиваем compiler-rt: иначе линкер потребителя не найдёт
+    // __zig_probe_stack и прочие встроенные процедуры.
+    lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 
-    // Встроенные crypto-тесты ядра (зеленые: 23/23, Zig 0.14.0)
-    const unit_tests = b.addTest(.{
+    // Тесты крипто-ядра (30: 23 исходных + 7 P0 аудита Шнайера)
+    const core_tests = b.addTest(.{
         .root_source_file = b.path("poler_core.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run poler_core crypto self-tests");
-    test_step.dependOn(&run_unit_tests.step);
+    const run_core_tests = b.addRunArtifact(core_tests);
+
+    // Parity-тесты C-ABI слоя (экспортные функции ≡ прямые вызовы ядра)
+    const abi_tests = b.addTest(.{
+        .root_source_file = b.path("abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_abi_tests = b.addRunArtifact(abi_tests);
+
+    const test_step = b.step("test", "Run poler_core crypto self-tests + C-ABI parity tests");
+    test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&run_abi_tests.step);
 }
