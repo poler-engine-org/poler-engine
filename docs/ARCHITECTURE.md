@@ -195,17 +195,19 @@ pub trait Embedder: Send + Sync {
 
 ## 5.1. Зависимости и сборка
 
-22 зависимости, ноль ML-фреймворков. Критично: `pqc`/`pqw` подключены
-**path-зависимостями** на соседний клон POLER-Quantum-RS
-(`../POLER-Quantum-RS_repo/crates/*`) — сборка требует обоих репозиториев
-рядом (см. [INSTALL.md](../INSTALL.md) и [MERGE_PLAN.md](MERGE_PLAN.md) —
-эта боль ликвидируется монорепозиторием). Release-профиль: LTO fat,
-codegen-units=1, panic=abort, strip — поэтому при RAM < 8 ГБ собирать с
-`-j1`.
+22 внешние зависимости, ноль ML-фреймворков. С фазы **M2** (merge `f5e53dc`
++ workspace `33c3b48`, 2026-09-16) квантовые крейты `pqc`/`pqw` живут
+**в самом репозитории** (`crates/`, единый Cargo Workspace, история
+RQ1–RQ23 сохранена) — свежий `git clone` + `cargo build` работает без
+соседних клонов и секретов (провенанс — `crates/README.md`; план —
+[MERGE_PLAN.md](MERGE_PLAN.md)). Release-профиль общий на весь workspace:
+LTO fat, codegen-units=1, panic=abort, strip — поэтому при RAM < 8 ГБ
+собирать с `-j1`.
 
-CI (`.github/workflows/ci.yml`) гоняет тесты на push; известный дефект
-`branches: ain` (опечатка вместо `[main`) исправлен вместе с этим
-документом.
+CI (`.github/workflows/ci.yml`) с фазы M2 гоняет `cargo test --workspace`
+(clippy-гейт + весь сьют трёх пакетов) на голом checkout без токенов;
+до M2 опечатка `branches: ain` маскировала неразрешимость path-депов
+(CI физически не собирал репозиторий на чистом checkout).
 
 ## 6. Режимы исполнения и границы доверия
 

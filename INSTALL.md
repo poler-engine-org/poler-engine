@@ -10,30 +10,26 @@
 | ОС | Linux x86_64 | AVX2 желателен ( fallback — скалярный путь в pqc/meta_compiler) |
 | Rust | 1.98+ (`rustup update stable`) | edition 2021, rust-version 1.80 в манифесте — но собирайте свежим |
 | RAM | 8 ГБ свободной для сборки | при < 8 ГБ — обязательно `-j1` (LTO fat + codegen-units=1 прожорливы) |
-| Диск | ~4 ГБ | репо + POLER-Quantum-RS + target/ |
+| Диск | ~4 ГБ | репо (с квантовыми крейтами внутри) + target/ |
 | Python 3 | только для конвертеров моделей | stdlib (+ torch уже не нужен — конвертеры читают zip/safetensors напрямую) |
 
-## 2. КРИТИЧНО: два репозитория рядом
+## 2. Сборка из одного репозитория (M2)
 
-`poler-engine` подключает крейты квантового ядра **path-зависимостями**:
-
-```toml
-# Cargo.toml
-pqc = { path = "../POLER-Quantum-RS_repo/crates/pqc" }
-pqw = { path = "../POLER-Quantum-RS_repo/crates/pqw" }
-```
-
-Поэтому клонируем оба репозитория **в соседние каталоги**:
+С фазы M2 (2026-09-16, docs/MERGE_PLAN.md) квантовые крейты `pqc`/`pqw`
+живут прямо в репозитории (`crates/`, единый Cargo Workspace с сохраненной
+историей RQ1–RQ23) — **никаких соседних клонов больше не нужно**:
 
 ```bash
-mkdir -p ~/poler && cd ~/poler
-git clone git@github.com:poler-engine-org/poler-engine.git
-git clone git@github.com:poler-engine-org/POLER-Quantum-RS.git POLER-Quantum-RS_repo
+git clone https://github.com/poler-engine-org/poler-engine.git
+cd poler-engine
+cargo build --release -j1        # -j1 при RAM < 8 ГБ; иначе можно без флага
+./target/release/poler-engine --version
 ```
 
-Имя каталога `POLER-Quantum-RS_repo` важно — оно захардкожено в
-Cargo.toml. (Эта боль ликвидируется монорепозиторием — план:
-`docs/MERGE_PLAN.md`.)
+Внешних зависимостей у pqc/pqw — ноль, дерево движка не изменилось.
+Старый репозиторий poler-engine-org/POLER-Quantum-RS больше не требуется
+для сборки (история крейтов доступна через `git log <merge>^2`, провенанс —
+`crates/README.md`).
 
 ## 3. Сборка
 
@@ -53,20 +49,16 @@ meta_compiler) и падает на скалярный fallback — отдель
 
 ### 3.2. Docker
 
-Docker-контекст не видит каталоги выше текущего, а path-депы нужны сборке —
-поэтому перед сборкой ядро копируется внутрь контекста:
+С фазы M2 Docker-контекст самодостаточен (крейты внутри репо) —
+трюк с копированием соседнего репозитория больше не нужен:
 
 ```bash
-cp -r ../POLER-Quantum-RS_repo .
 docker build -t poler-engine .
-rm -rf POLER-Quantum-RS_repo        # прибрать за собой
 docker run --rm -v "$PWD:/data" poler-engine /data -q "запрос" --format ai-json
 ```
 
-(CI делает то же самое автоматически при наличии секрета
-`POLER_QUANTUM_TOKEN` — см. .github/workflows/ci.yml.)
-
-Dockerfile в корне репозитория.
+Dockerfile в корне репозитория. CI собирает образ на голом checkout
+без секретов (см. .github/workflows/ci.yml).
 
 ## 4. Проверка установки
 
@@ -74,8 +66,8 @@ Dockerfile в корне репозитория.
 # 1. Автономный самотест формата весов (без моделей)
 ./target/release/poler-engine --pqw-selftest          # ожидание: 6/6
 
-# 2. Полный тест-сьют (~1 059 тестов, минуты)
-cargo test
+# 2. Полный тест-сьют (~1 845 тестов: движок + pqc + pqw, минуты)
+cargo test --workspace
 
 # 3. Живой поиск на тестовом корпусе
 git clone --depth 1 https://github.com/Kotokvit/Eteryya.git ~/eteryya
@@ -150,10 +142,11 @@ poler-engine --mcp        # MCP-сервер stdio (для LLM-агентов)
 
 | Симптом | Причина | Лечение |
 |---|---|---|
-| `error: failed to load manifest for pqc` | нет соседнего POLER-Quantum-RS_repo | §2 — клонировать рядом с точным именем |
+| `error: failed to load manifest for pqc` | устаревший клон до M2 (path-депы на ../POLER-Quantum-RS_repo) | обновиться: `git pull` — с M2 крейты внутри репо |
 | Сборка убита OOM-killer | LTO + параллельный codegen | `cargo build --release -j1` |
 | `чужая магия: не PRBQ-хранилище` | файл не того формата | docs/formats/PRBQ_FORMAT.md |
 | Тесты `pqw_real_model` skip | нет models/*.pqw | §5 (skip — норма) |
+| Тест `glm_int4…` не запускается | помечен `#[ignore = KNOWN-BUG]` (int4-декодер, TESTING.md §4) | `cargo test -p poler-engine --lib glm_int4 -- --ignored` |
 | rustc ругается на `#[inline(always)]` + `#[target_feature]` | rustc ≥ 1.87 запрещает комбинацию | не использовать их вместе (кодоген уже испускает `#[inline]`) |
 
 ## 9. Что удалено в v2.0 (чтобы не искать)

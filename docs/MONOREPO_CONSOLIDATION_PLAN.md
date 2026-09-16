@@ -3,6 +3,15 @@
 > **Target Goal:** Unify `poler-engine`, `POLER-Quantum-RS`, and `poler-os` into a single, sovereign root monorepo.  
 > **Eliminating:** Path-dependency fragility (`../POLER-Quantum-RS_repo`), external C++ / ONNX runtimes, duplicate code.  
 > **Architecture:** Pure Rust / Zig Workspace with zero external dynamic library dependencies.
+>
+> **STATUS UPDATE (2026-09-16, M2 executed):** Phase 1, step 1 is DONE —
+> `crates/pqc` and `crates/pqw` now live in this repository (merge `f5e53dc`
+> + workspace wiring `33c3b48`), full RQ1–RQ23 commit history preserved
+> (`git log f5e53dc^2`), CI builds the workspace on a bare checkout with
+> **no tokens/secrets**. Note: the workspace is currently a root-package
+> hybrid (`poler-engine` stays at repo root, per docs/MERGE_PLAN.md M2);
+> the virtual-manifest layout below (with `crates/poler-engine`) is the M3
+> target. Steps 2 (`crates/crystallizer` extraction) and Phase 2–3 remain open.
 
 ---
 
