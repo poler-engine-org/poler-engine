@@ -1,0 +1,2470 @@
+// ============================================================================
+// POLER-OS drm_kms.zig — DRM/KMS + fbdev ядро (v0.19.0, CDD №10, шаг 1)
+// ============================================================================
+//
+// МОДЕЛЬ (Starnix-прецедент linux_syscalls.zig): семантическое ядро DRM —
+// ЧИСТОЕ (нативные тесты через DrmOps-инъекцию), платформенный доступ
+// (валидация user-VA, копирование, PMM-страницы dumb-буферов) — за ops.
+//
+// ФИЛОСОФИЯ «Всё есть файл» (UNIX): экран = /dev/fb0 и /dev/dri/card0.
+// Вывод = mmap видеопамяти + запись пикселей; режим = sys_ioctl; события
+// ввода = /dev/input/event0/1 (evdev.zig, шаг 2). Mesa/Gamescope/Wayland —
+// ГОТОВЫЙ юзерспейс CachyOS, поднимающийся поверх этих файлов.
+//
+// UAPI-СОВМЕСТИМОСТЬ: все структуры = дословные раскладки include/uapi/drm/*
+// и include/uapi/linux/fb.h (x86_64). ioctl-номера кодируются _IO/_IOR/_IOW/
+// _IOWR с базой 'd' (0x64) — тесты сверяют с реальными значениями Linux
+// (libdrm/strace), чтобы libdrm из CachyOS говорила с ядром без пересборки.
+//
+// WC (Write-Combining): линейный фреймбуфер мапится PWT-битом PTE (0x08)
+// ПОСЛЕ перепрограммирования IA32_PAT (MSR 0x277) в Linux-раскладку
+// 0x0007010600070106, где PAT[1]/PAT[5] = WC — максимальный FPS записи
+// пикселей без cacheline-writeback-трафика на VRAM.
+//
+// Инвариант CDD №10: НИКАКОЙ враждебный ввод (мусорные VA/cmd/handle/размеры)
+// не должен приводить к kernel-panic — только к -errno.
+// ============================================================================
+
+const std = @import("std");
+const testing = std.testing;
+const linux = @import("linux_syscalls.zig");
+
+// ─── IOC-кодирование ioctl (asm-generic/ioctl.h) ──────────────────────────
+
+pub const IOC_NONE: u32 = 0;
+pub const IOC_WRITE: u32 = 1; // user → kernel
+pub const IOC_READ: u32 = 2; // kernel → user
+
+/// _IOC(dir, type, nr, size): dir<<30 | size<<16 | type<<8 | nr
+pub inline fn ioc(dir: u32, typ: u32, nr: u32, size: u32) u32 {
+    return (dir << 30) | (size << 16) | (typ << 8) | nr;
+}
+
+pub inline fn io(typ: u32, nr: u32) u32 {
+    return ioc(IOC_NONE, typ, nr, 0);
+}
+
+pub inline fn ior(comptime T: type, typ: u32, nr: u32) u32 {
+    return ioc(IOC_READ, typ, nr, @sizeOf(T));
+}
+
+pub inline fn iow(comptime T: type, typ: u32, nr: u32) u32 {
+    return ioc(IOC_WRITE, typ, nr, @sizeOf(T));
+}
+
+pub inline fn iowr(comptime T: type, typ: u32, nr: u32) u32 {
+    return ioc(IOC_READ | IOC_WRITE, typ, nr, @sizeOf(T));
+}
+
+// ─── UAPI-структуры DRM (include/uapi/drm/drm.h + drm_mode.h, x86_64) ──────
+
+/// struct drm_version (64Б): name/date/desc — ПРИЁМНИКИ в user, длины in/out.
+pub const DrmVersion = extern struct {
+    major: i32 = 0,
+    minor: i32 = 0,
+    patch: i32 = 0,
+    // неявное выравнивание 4Б до u64 (компилятор — как в C)
+    name_len: u64 = 0,
+    name_ptr: u64 = 0,
+    date_len: u64 = 0,
+    date_ptr: u64 = 0,
+    desc_len: u64 = 0,
+    desc_ptr: u64 = 0,
+};
+
+/// struct drm_get_cap (16Б)
+pub const DrmGetCap = extern struct {
+    capability: u64 = 0,
+    value: u64 = 0,
+};
+
+/// struct drm_set_client_cap (16Б)
+pub const DrmSetClientCap = extern struct {
+    capability: u64 = 0,
+    value: u64 = 0,
+};
+
+/// struct drm_mode_modeinfo (68Б)
+pub const Modeinfo = extern struct {
+    clock: u32 = 0,
+    hdisplay: u16 = 0,
+    hsync_start: u16 = 0,
+    hsync_end: u16 = 0,
+    htotal: u16 = 0,
+    hskew: u16 = 0,
+    vdisplay: u16 = 0,
+    vsync_start: u16 = 0,
+    vsync_end: u16 = 0,
+    vtotal: u16 = 0,
+    vscan: u16 = 0,
+    vrefresh: u32 = 0,
+    flags: u32 = 0,
+    mtype: u32 = 0, // DRM_MODE_TYPE_*
+    name: [32]u8 = .{0} ** 32,
+};
+
+/// struct drm_mode_card_res (64Б)
+pub const CardRes = extern struct {
+    fb_id_ptr: u64 = 0,
+    crtc_id_ptr: u64 = 0,
+    connector_id_ptr: u64 = 0,
+    encoder_id_ptr: u64 = 0,
+    count_fbs: u32 = 0,
+    count_crtcs: u32 = 0,
+    count_connectors: u32 = 0,
+    count_encoders: u32 = 0,
+    max_width: u32 = 0,
+    max_height: u32 = 0,
+    min_width: u32 = 0,
+    min_height: u32 = 0,
+};
+
+/// struct drm_mode_crtc (104Б): fb_id — только для SETCRTC (GETCRTC игнорирует)
+pub const ModeCrtc = extern struct {
+    set_connectors_ptr: u64 = 0,
+    count_connectors: u32 = 0,
+    crtc_id: u32 = 0,
+    fb_id: u32 = 0,
+    x: u32 = 0,
+    y: u32 = 0,
+    gamma_size: u32 = 0,
+    mode_valid: u32 = 0,
+    mode: Modeinfo = .{},
+};
+
+/// struct drm_mode_get_encoder (20Б)
+pub const GetEncoder = extern struct {
+    encoder_id: u32 = 0,
+    encoder_type: u32 = 0,
+    crtc_id: u32 = 0,
+    possible_crtcs: u32 = 0,
+    possible_clones: u32 = 0,
+};
+
+/// struct drm_mode_get_connector (80Б)
+pub const GetConnector = extern struct {
+    encoders_ptr: u64 = 0,
+    modes_ptr: u64 = 0,
+    props_ptr: u64 = 0,
+    prop_values_ptr: u64 = 0,
+    count_modes: u32 = 0,
+    count_props: u32 = 0,
+    count_encoders: u32 = 0,
+    encoder_id: u32 = 0,
+    connector_id: u32 = 0,
+    connector_type: u32 = 0,
+    connector_type_id: u32 = 0,
+    connection: u32 = 0,
+    mm_width: u32 = 0,
+    mm_height: u32 = 0,
+    subpixel: u32 = 0,
+    pad: u32 = 0,
+};
+
+/// struct drm_mode_fb_cmd (28Б) — ADDFB/GETFB (legacy, без модификаторов)
+pub const FbCmd = extern struct {
+    fb_id: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pitch: u32 = 0,
+    bpp: u32 = 0,
+    depth: u32 = 0,
+    handle: u32 = 0,
+};
+
+/// struct drm_mode_create_dumb (32Б)
+pub const CreateDumb = extern struct {
+    height: u32 = 0,
+    width: u32 = 0,
+    bpp: u32 = 0,
+    flags: u32 = 0,
+    handle: u32 = 0,
+    pitch: u32 = 0,
+    size: u64 = 0,
+};
+
+/// struct drm_mode_map_dumb (16Б)
+pub const MapDumb = extern struct {
+    handle: u32 = 0,
+    pad: u32 = 0,
+    offset: u64 = 0,
+};
+
+/// struct drm_mode_destroy_dumb (4Б)
+pub const DestroyDumb = extern struct {
+    handle: u32 = 0,
+};
+
+/// struct drm_mode_crtc_page_flip (24Б)
+pub const PageFlip = extern struct {
+    crtc_id: u32 = 0,
+    fb_id: u32 = 0,
+    flags: u32 = 0,
+    sequence: u32 = 0,
+    user_data: u64 = 0,
+};
+
+// ─── UAPI-структуры fbdev (include/uapi/linux/fb.h, x86_64) ────────────────
+
+/// struct fb_bitfield (12Б)
+pub const FbBitfield = extern struct {
+    offset: u32 = 0,
+    length: u32 = 0,
+    msb_right: u32 = 0,
+};
+
+/// struct fb_var_screeninfo (160Б) — VSCREENINFO
+pub const FbVarScreenInfo = extern struct {
+    xres: u32 = 0,
+    yres: u32 = 0,
+    xres_virtual: u32 = 0,
+    yres_virtual: u32 = 0,
+    xoffset: u32 = 0,
+    yoffset: u32 = 0,
+    bits_per_pixel: u32 = 0,
+    grayscale: u32 = 0,
+    red: FbBitfield = .{},
+    green: FbBitfield = .{},
+    blue: FbBitfield = .{},
+    transp: FbBitfield = .{},
+    nonstd: u32 = 0,
+    activate: u32 = 0,
+    height: u32 = 0, // мм (ЭЛТ-эпоха) — 0 = неизвестно
+    width: u32 = 0,
+    accel_flags: u32 = 0,
+    pixclock: u32 = 0, // пикосекунды на пиксель
+    left_margin: u32 = 0,
+    right_margin: u32 = 0,
+    upper_margin: u32 = 0,
+    lower_margin: u32 = 0,
+    hsync_len: u32 = 0,
+    vsync_len: u32 = 0,
+    sync: u32 = 0,
+    vmode: u32 = 0,
+    rotate: u32 = 0,
+    colorspace: u32 = 0,
+    reserved: [4]u32 = .{0} ** 4,
+};
+
+/// struct fb_fix_screeninfo (80Б) — FSCREENINFO
+pub const FbFixScreenInfo = extern struct {
+    id: [16]u8 = .{0} ** 16,
+    smem_start: u64 = 0, // физ. адрес VRAM (информативно для юзерспейса)
+    smem_len: u32 = 0,
+    ftype: u32 = 0, // FB_TYPE_*
+    type_aux: u32 = 0,
+    visual: u32 = 0, // FB_VISUAL_*
+    xpanstep: u16 = 0,
+    ypanstep: u16 = 0,
+    ywrapstep: u16 = 0,
+    line_length: u32 = 0, // pitch
+    // неявное выравнивание 4Б до u64 (компилятор — как в C)
+    mmio_start: u64 = 0,
+    mmio_len: u32 = 0,
+    accel: u32 = 0, // FB_ACCEL_NONE
+    capabilities: u16 = 0,
+    reserved: u16 = 0,
+};
+
+// ─── DRM ioctl-номера (nr из include/uapi/drm/drm.h) ───────────────────────
+
+pub const DRM_IOCTL_BASE: u32 = 0x64; // 'd'
+
+pub const DRM_IOCTL_VERSION: u32 = ior(DrmVersion, DRM_IOCTL_BASE, 0x00);
+pub const DRM_IOCTL_GET_MAGIC: u32 = ioc(IOC_READ, DRM_IOCTL_BASE, 0x02, 4);
+pub const DRM_IOCTL_GET_CAP: u32 = iowr(DrmGetCap, DRM_IOCTL_BASE, 0x0C);
+pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = iow(DrmSetClientCap, DRM_IOCTL_BASE, 0x0D);
+pub const DRM_IOCTL_SET_MASTER: u32 = io(DRM_IOCTL_BASE, 0x1E);
+pub const DRM_IOCTL_DROP_MASTER: u32 = io(DRM_IOCTL_BASE, 0x1F);
+
+pub const DRM_IOCTL_MODE_GETRESOURCES: u32 = iowr(CardRes, DRM_IOCTL_BASE, 0xA0);
+pub const DRM_IOCTL_MODE_GETCRTC: u32 = iowr(ModeCrtc, DRM_IOCTL_BASE, 0xA1);
+pub const DRM_IOCTL_MODE_SETCRTC: u32 = iowr(ModeCrtc, DRM_IOCTL_BASE, 0xA2);
+pub const DRM_IOCTL_MODE_GETENCODER: u32 = iowr(GetEncoder, DRM_IOCTL_BASE, 0xA6);
+pub const DRM_IOCTL_MODE_GETCONNECTOR: u32 = iowr(GetConnector, DRM_IOCTL_BASE, 0xA7);
+pub const DRM_IOCTL_MODE_ADDFB: u32 = iow(FbCmd, DRM_IOCTL_BASE, 0xAE);
+/// CDD №12 p3: ADDFB2 (0xC06864B8 — IOWR, 104Б) — modern libdrm
+/// (drmModeAddFB2/WithModifiers; gamescope 3.16 legacy-путь)
+pub const DRM_IOCTL_MODE_ADDFB2: u32 = iowr(FbCmd2, DRM_IOCTL_BASE, 0xB8);
+/// RMFB (0xC00464AF — IOWR, 4Б): fb_id
+pub const DRM_IOCTL_MODE_RMFB: u32 = iowr(DrmU32, DRM_IOCTL_BASE, 0xAF);
+/// SET_VERSION (0xC0106407 — IOWR, 16Б): libdrm drmGetBusid/drmSetVersion
+pub const DRM_IOCTL_SET_VERSION: u32 = iowr(DrmSetVersion, DRM_IOCTL_BASE, 0x07);
+/// OBJ_GETPROPERTIES (0xC02064B9 — IOWR, 32Б): gamescope шуршит свойствами/// GETPLANE_RES (0xC01064B5 — IOWR, 16Б)
+pub const PlaneRes = extern struct {
+    plane_id_ptr: u64 = 0,
+    count_planes: u32 = 0,
+    _pad: u32 = 0,
+};
+/// GETPLANE (0xC02064B6 — IOWR, 32Б)
+pub const GetPlane = extern struct {
+    plane_id: u32 = 0,
+    crtc_id: u32 = 0,
+    fb_id: u32 = 0,
+    possible_crtcs: u32 = 0,
+    gamma_size: u32 = 0,
+    count_format_types: u32 = 0,
+    format_type_ptr: u64 = 0, // @24 — 8-выравнено, пада НЕТ (sizeof 32!)
+};
+/// GETPROPERTY (0xC04064AA — IOWR, 64Б): метаданные пропа (имя! либлifтофф
+/// резолвит пропы ПО ИМЕНИ)
+pub const GetProperty = extern struct {
+    values_ptr: u64 = 0,
+    enum_blob_ptr: u64 = 0,
+    prop_id: u32 = 0,
+    flags: u32 = 0,
+    name: [32]u8 = [_]u8{0} ** 32,
+    count_values: u32 = 0,
+    count_enum_blobs: u32 = 0,
+};
+/// ATOMIC (0xC03864BC — IOWR, 56Б)
+pub const ModeAtomic = extern struct {
+    flags: u32 = 0,
+    count_objs: u32 = 0,
+    objs_ptr: u64 = 0,
+    count_props_ptr: u64 = 0,
+    props_ptr: u64 = 0,
+    prop_values_ptr: u64 = 0,
+    reserved: u64 = 0,
+    user_data: u64 = 0,
+};
+/// CREATEPROPBLOB (0x401064BD — IOW, 16Б)
+pub const CreatePropBlob = extern struct {
+    data: u64 = 0,
+    length: u32 = 0,
+    blob_id: u32 = 0,
+};
+/// DESTROYPROPBLOB (0x400464BE — IOW, 8Б)
+pub const DestroyPropBlob = extern struct {
+    blob_id: u32 = 0, // sizeof 4 (без пада!)
+};
+/// drm_mode_property_enum (40Б): {u64 value; char name[32]}
+pub const PropertyEnum = extern struct {
+    value: u64 = 0,
+    name: [32]u8 = [_]u8{0} ** 32,
+};
+
+/// OBJ_GETPROPERTIES (0xC02064B9 — IOWR, 32Б): gamescope шуршит свойствами
+/// коннектора (DPMS/vrr) — отдаём ПУСТОЙ список (count=0)
+pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = iowr(ObjGetProps, DRM_IOCTL_BASE, 0xB9);
+/// GETPROPBLOB (0xC01064AC — IOWR, 16Б): blob по id — ENOENT (свойств нет)/// GETPROPBLOB (0xC01064AC — IOWR, 16Б): blob по id — ENOENT (свойств нет)
+/// CDD №12 p13: атомарная волна (libliftoff/gamescope atomic-only)
+pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = iowr(PlaneRes, DRM_IOCTL_BASE, 0xB5);
+pub const DRM_IOCTL_MODE_GETPLANE: u32 = iowr(GetPlane, DRM_IOCTL_BASE, 0xB6);
+pub const DRM_IOCTL_MODE_GETPROPERTY: u32 = iowr(GetProperty, DRM_IOCTL_BASE, 0xAA);
+pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iow(CreatePropBlob, DRM_IOCTL_BASE, 0xBD);
+pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = iow(DestroyPropBlob, DRM_IOCTL_BASE, 0xBE);
+pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr(ModeAtomic, DRM_IOCTL_BASE, 0xBC);
+/// CDD №12 p13: GEM_CLOSE (IOW 0x09, 4Б) + PRIME (IOWR 0x2D/0x2E, 12Б)
+pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4008_6409; // p14: drm_gem_close{handle,pad} = 8Б (4Б-вариант не совпадал с libdrm!)
+pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
+pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C_642D;
+pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = iowr(GetPropBlob, DRM_IOCTL_BASE, 0xAC);
+
+// ─── CDD №12 p3: DRM-события (vblank/flip-complete через read(card0)) ─────
+
+/// struct drm_event { __u32 type; __u32 length; }
+pub const DRM_EVENT_VBLANK: u32 = 0x06;
+pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x08;
+/// DRM_MODE_PAGE_FLIP_EVENT (u32-флаг page_flip-запроса)
+pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x1;
+
+/// struct drm_event_vblank (32Б): read(card0) возвращает ЗАПИСИ этого вида;
+/// libdrm drmHandleEvent диспатчит по type/length (page_flip_handler).
+pub const DrmEventVblank = extern struct {
+    typ: u32 = DRM_EVENT_FLIP_COMPLETE,
+    length: u32 = 32,
+    user_data: u64 = 0,
+    tv_sec: u32 = 0,
+    tv_usec: u32 = 0,
+    sequence: u32 = 0,
+    reserved: u32 = 0,
+};
+
+/// struct drm_mode_fb_cmd2 (104Б) — ADDFB2 (плоскостной формат).
+/// Single-plane XR24/AR24: handles[0]/pitches[0]/offsets[0]; modifier[4]
+/// выровнен на 8 (extern struct — как C).
+pub const FbCmd2 = extern struct {
+    fb_id: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pixel_format: u32 = 0, // fourcc: 'XR24'=0x34325258 / 'AR24'=0x34325241
+    flags: u32 = 0, // DRM_MODE_FB_MODIFIERS — игнорируем (нет модификаторов)
+    handles: [4]u32 = .{0} ** 4,
+    pitches: [4]u32 = .{0} ** 4,
+    offsets: [4]u32 = .{0} ** 4,
+    modifier: [4]u64 = .{0} ** 4,
+};
+
+/// struct drm_set_version (16Б): версии DRM/driver (libdrm-хендшейк)
+pub const DrmSetVersion = extern struct {
+    drm_di_major: i32 = 0,
+    drm_di_minor: i32 = 0,
+    drm_dd_major: i32 = 0,
+    drm_dd_minor: i32 = 0,
+};
+
+/// struct drm_mode_obj_get_properties (32Б): obj_id/obj_type + массивы
+/// prop_id/prop_values (счётчики in/out). Пустой список = count=0.
+pub const ObjGetProps = extern struct {
+    props_ptr: u64 = 0,
+    prop_values_ptr: u64 = 0,
+    count_props: u32 = 0,
+    obj_id: u32 = 0,
+    obj_type: u32 = 0,
+    pad: u32 = 0,
+};
+
+/// struct drm_mode_get_blob (16Б): {blob_id, length, data(u64)}
+pub const GetPropBlob = extern struct {
+    blob_id: u32 = 0,
+    length: u32 = 0,
+    data: u64 = 0,
+};
+
+/// IOWR(u32) обёртка для RMFB (4Б — без отдельной структуры).
+pub const DrmU32 = extern struct { val: u32 = 0 };
+
+/// DRM_CLIENT_CAP_UNIVERSAL_PLANES (id 3) — отклоняем: плоскостей нет,
+/// gamescope останется на legacy CRTC/connector-пути
+pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 3;
+/// DRM_CLIENT_CAP_ATOMIC (id 5) — отклоняем: атомарного режима нет
+pub const DRM_CLIENT_CAP_ATOMIC: u64 = 5;
+
+pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = iow(PageFlip, DRM_IOCTL_BASE, 0xB0);
+pub const DRM_IOCTL_MODE_CREATE_DUMB: u32 = iowr(CreateDumb, DRM_IOCTL_BASE, 0xB2);
+pub const DRM_IOCTL_MODE_MAP_DUMB: u32 = iowr(MapDumb, DRM_IOCTL_BASE, 0xB3);
+pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = iowr(DestroyDumb, DRM_IOCTL_BASE, 0xB4);
+
+// ─── fbdev ioctl-номера (legacy-плоские, include/uapi/linux/fb.h) ──────────
+
+pub const FBIOGET_VSCREENINFO: u32 = 0x4600;
+pub const FBIOPUT_VSCREENINFO: u32 = 0x4601;
+pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
+pub const FBIOPUT_FSCREENINFO: u32 = 0x4603;
+
+// ─── DRM-константы-значения ────────────────────────────────────────────────
+
+pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
+pub const DRM_CAP_DUMB_PREFERRED_DEPTH: u64 = 0x3;
+pub const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+pub const DRM_CAP_CURSOR_WIDTH: u64 = 0x9;
+pub const DRM_CAP_CURSOR_HEIGHT: u64 = 0xA;
+
+pub const DRM_MODE_ENCODER_VIRTUAL: u32 = 5;
+pub const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
+pub const DRM_MODE_SUBPIXEL_NONE: u32 = 1;
+/// connector_status: connected = 1 (enum drm_connector_status)
+pub const DRM_MODE_CONNECTED: u32 = 1;
+pub const DRM_MODE_TYPE_DRIVER: u32 = 3; // DRIVER|PREFERRED
+pub const DRM_MODE_FLAG_NHSYNC: u32 = 0x2;
+pub const DRM_MODE_FLAG_NVSYNC: u32 = 0x4;
+
+pub const FB_TYPE_PACKED_PIXELS: u32 = 0;
+pub const FB_VISUAL_TRUECOLOR: u32 = 2;
+pub const FB_VMODE_NONINTERLACED: u32 = 0;
+pub const FB_ACCEL_NONE: u32 = 0;
+
+/// Максимальный dumb-буфер: 8192×8192×4 = 256МБ виртуально допустимо,
+/// но бюджет PMM ограничивает разумным 16МБ на буфер (16×1МБ-страниц …).
+pub const MAX_DUMB_BYTES: u64 = 16 * 1024 * 1024;
+/// Лимит измерений dumb (дрм-санити): XRGB8888 → 8192×8192.
+pub const MAX_DUMB_DIM: u32 = 8192;
+
+// ─── PAT/WC (write-combing видеопамяти) ────────────────────────────────────
+
+/// PTE-бит PWT (0x08) ПОСЛЕ PAT-репрограммирования выбирает PAT[1]=WC.
+/// Маппинг фреймбуфера: PRESENT|WRITABLE|USER|PWT (+NX) — быстрые burst-записи.
+pub const PTE_WC: u64 = 0x08;
+
+/// Linux-раскладка IA32_PAT (MSR 0x277): PA0/PA4=WB, PA1/PA5=WC,
+/// PA2/PA6=UC-, PA3/PA7=UC. Запись ядра на буте → PWT-бит = WC.
+pub const PAT_LINUX_WC: u64 = 0x0007_0106_0007_0106;
+
+// ─── Файловый фасад UNIX: пути устройств ───────────────────────────────────
+
+pub const DevKind = enum {
+    fb0,
+    dri_card0,
+    dri_render,
+};
+
+/// Резолв путей devfs: «Всё есть файл» — экран это файл.
+pub fn resolveDevPath(path: []const u8) ?DevKind {
+    if (std.mem.eql(u8, path, "/dev/fb0")) return .fb0;
+    if (std.mem.eql(u8, path, "/dev/dri/card0")) return .dri_card0;
+    if (std.mem.eql(u8, path, "/dev/dri/renderD128")) return .dri_render;
+    return null;
+}
+
+// ─── Операции окружения (инъекция: ядро ↔ нативные тесты) ──────────────────
+
+pub const DrmOps = struct {
+    /// Проверить user-диапазон [va, va+len) (want_write) — контракт
+    /// linuxValidate (постраничный walk PML4, canonical-потолок).
+    validate: *const fn (va: u64, len: u64, want_write: bool) bool,
+    /// User → ядро: копия байтов (ioctl-аргументы in). false = EFAULT.
+    copy_in: *const fn (dst: []u8, src_va: u64) bool,
+    /// Ядро → user: копия байтов (ioctl-аргументы out). false = EFAULT.
+    copy_out: *const fn (dst_va: u64, src: []const u8) bool,
+    /// Выделить N физ. страниц (нулевых) — backing dumb-буфера. null = ENOMEM.
+    alloc_pages: *const fn (pages: u64) ?u64,
+    /// Освободить N физ. страниц (DESTROY_DUMB).
+    free_pages: *const fn (phys: u64, pages: u64) void,
+    /// CDD №12 p4: СКАН-АУТ КАДРА на дисплей (VirtIO-GPU vring 2D) —
+    /// вызывается из PAGE_FLIP/SETCRTC при mode==.virtio_gpu: физ-backing
+    /// dumb-буфера фреймбуфера → RESOURCE_CREATE_2D+ATTACH_BACKING+
+    /// TRANSFER_TO_HOST_2D+SET_SCANOUT+RESOURCE_FLUSH. false = vring
+    /// недоступен (флип всё равно валиден — кадр не дошёл до дисплея).
+    scanout_frame: *const fn (phys: u64, len: u64, w: u32, h: u32, pitch: u32) bool,
+};
+
+// ─── Состояние DRM (dumb-KMS: 1 CRTC + 1 энкодер + 1 коннектор) ────────────
+
+pub const FbGeom = struct {
+    phys: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pitch: u32 = 0,
+    bpp: u8 = 0,
+};
+
+pub const DumbMode = enum {
+    inactive,
+    linear_fb, // скан-аут = линейный фреймбуфер бут-лоадера (VBE/PVH)
+    virtio_gpu, // скан-аут через VirtIO-GPU 2D (probe шага 1)
+};
+
+pub const DumbBuf = struct {
+    used: bool = false,
+    handle: u32 = 0,
+    phys: u64 = 0, // физ. база backing-страниц
+    /// CDD №12 p13: PRIME-импорт (lvp memfd): phys/size от файла, метрики
+    /// заполняются на ADDFB2 (запросу доверяем — источник: сам композитор)
+    prime_file: u32 = 0,
+    size: u64 = 0,
+    pages: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pitch: u32 = 0,
+    bpp: u32 = 0,
+};
+
+pub const FbReg = struct {
+    used: bool = false,
+    fb_id: u32 = 0,
+    handle: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pitch: u32 = 0,
+    bpp: u32 = 0,
+    depth: u32 = 0,
+};
+
+pub const MAX_DUMB: usize = 8;
+pub const MAX_FBS: usize = 8;
+/// CDD №12 p3: ёмкость кольца событий (переполнение — свежие
+/// затирают старые; 16 флипов в очереди — более чем достаточно)
+pub const MAX_DRM_EVENTS: usize = 16;
+
+/// Служебные object-id (libdrm ожидает ненулевые уникальные).
+const CRTC_ID: u32 = 33;
+/// CDD №12 p13: PRIMARY-плоскость (atomic-only gamescope 3.16/libliftoff)
+const PLANE_ID: u32 = 36;
+/// DRM_FORMAT_XRGB8888 ('XR24') — формат dumb/плоскости
+const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+/// CDD №12 p14: DRM_FORMAT_ARGB8888 ('AR24') — формат gamescope-композита
+/// (vulkan BGRA8888 ↔ DRM ARGB8888): должен быть в форматах плоскости,
+/// иначе wlr_drm_format_set_has(AR24, MOD_INVALID) = false → import-FB отказ.
+const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
+/// DRM_PLANE_TYPE_PRIMARY
+const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+/// Проп-флаги (drm_mode.h): RANGE/IMMUTABLE/ENUM/BLOB/OBJECT/SIGNED/ATOMIC
+const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
+const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
+const DRM_MODE_PROP_ATOMIC: u32 = 0x80000000;
+/// Флаги атомарного коммита
+const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
+const DRM_MODE_PAGE_FLIP_ASYNC_KNOWN: u32 = 0x02;
+
+/// Фиксированный реестр prop-id (полу-ABI poler-drm; 0x1000+ — вне
+/// пространства объектных id 1..99):
+const PROP_CRTC_ACTIVE: u32 = 0x1001;
+const PROP_CRTC_MODE_ID: u32 = 0x1002;
+const PROP_PLANE_TYPE: u32 = 0x1010;
+const PROP_PLANE_FB_ID: u32 = 0x1011;
+const PROP_PLANE_CRTC_ID: u32 = 0x1012;
+const PROP_PLANE_SRC_X: u32 = 0x1013;
+const PROP_PLANE_SRC_Y: u32 = 0x1014;
+const PROP_PLANE_SRC_W: u32 = 0x1015;
+const PROP_PLANE_SRC_H: u32 = 0x1016;
+const PROP_PLANE_CRTC_X: u32 = 0x1017;
+const PROP_PLANE_CRTC_Y: u32 = 0x1018;
+const PROP_PLANE_CRTC_W: u32 = 0x1019;
+const PROP_PLANE_CRTC_H: u32 = 0x101A;
+const PROP_PLANE_IN_FENCE_FD: u32 = 0x101B;
+const PROP_CONN_CRTC_ID: u32 = 0x1031;
+const PROP_CONN_DPMS: u32 = 0x1032;
+
+const ENCODER_ID: u32 = 34;
+const CONNECTOR_ID: u32 = 35;
+
+/// Фейковая GPU-апертура для MAP_DUMB-offset'ов: mmap(fd=card0, offset=X)
+/// ядра (шаг 3) резолвит X → dumb-буфер → физ. страницы. Слот на буфер —
+/// 256МБ (дешёвый div-lookup, достаточно для 8 буферов).
+pub const DUMB_APERTURE_BASE: u64 = 0x1000_0000_0000;
+pub const DUMB_SLOT_SIZE: u64 = 0x1000_0000;
+
+pub const DrmState = struct {
+    mode: DumbMode = .inactive,
+    geom: FbGeom = .{},
+    dumb: [MAX_DUMB]DumbBuf = [_]DumbBuf{.{}} ** MAX_DUMB,
+    fbs: [MAX_FBS]FbReg = [_]FbReg{.{}} ** MAX_FBS,
+    next_handle: u32 = 1, // 0 = невалидный handle (GEM-конвенция)
+    next_fb_id: u32 = 1,
+    crtc_fb_id: u32 = 0, // fb на скан-ауте (PAGE_FLIP/SETCRTC)
+    flips: u32 = 0, // счётчик page-flip'ов (E2E-наблюдаемо)
+    /// CDD №12 p4: успешные скан-ауты фреймбуфера через vring (первый кадр
+    /// gamescope = scanouts >= 1; e2e-маркер [DRM] scanout=N).
+    scanouts: u32 = 0,
+    width_mm: u32 = 300,
+    height_mm: u32 = 200,
+    // CDD №12 p3: кольцо DRM-событий (flip-complete после каждого
+    // PAGE_FLIP|EVENT; read(card0) выдаёт записи drm_event_vblank)
+    events: [MAX_DRM_EVENTS]DrmEventVblank = [_]DrmEventVblank{.{}} ** MAX_DRM_EVENTS,
+    ev_head: u32 = 0, // индекс чтения
+    ev_tail: u32 = 0, // индекс записи (head==tail → пусто)
+    // CDD №12 p13: blob-реестр (MODE_ID атомарных коммитов; mod-blob ≤ 128Б)
+    blobs: [8]PropBlob = [_]PropBlob{.{}} ** 8,
+    next_blob_id: u32 = 0x2001,
+};
+
+/// Blob атомарных пропов (MODE_ID): копия данных user (обычно Modeinfo)
+pub const PropBlob = struct {
+    used: bool = false,
+    id: u32 = 0,
+    len: u32 = 0,
+    data: [128]u8 = [_]u8{0} ** 128,
+};
+
+fn findBlob(st: *DrmState, blob_id: u32) ?*PropBlob {
+    if (blob_id == 0) return null;
+    for (&st.blobs) |*b| {
+        if (b.used and b.id == blob_id) return b;
+    }
+    return null;
+}
+
+/// Активировать DRM в режиме линейного фреймбуфера (скан-аут задан
+/// бут-лоадером: VBE через GRUB-multiboot2 или консольный linear fb).
+pub fn initLinearFb(st: *DrmState, geom: FbGeom) void {
+    st.mode = .linear_fb;
+    st.geom = geom;
+}
+
+/// Активировать DRM в режиме VirtIO-GPU (probe успешно, скан-аут через
+/// 2D-команды — виртуальный дисплей QEMU).
+pub fn initVirtioGpu(st: *DrmState, geom: FbGeom) void {
+    st.mode = .virtio_gpu;
+    st.geom = geom;
+}
+
+/// Идентификаторы объектов KMS (для логов/тестов): CRTC/энкодер/коннектор.
+pub fn kmsIds() [3]u32 {
+    return .{ CRTC_ID, ENCODER_ID, CONNECTOR_ID };
+}
+
+// ─── Внутренние хелперы ────────────────────────────────────────────────────
+
+fn findDumb(st: *DrmState, handle: u32) ?*DumbBuf {
+    if (handle == 0) return null;
+    for (&st.dumb) |*b| {
+        if (b.used and b.handle == handle) return b;
+    }
+    return null;
+}
+
+fn findFb(st: *DrmState, fb_id: u32) ?*FbReg {
+    if (fb_id == 0) return null;
+    for (&st.fbs) |*f| {
+        if (f.used and f.fb_id == fb_id) return f;
+    }
+    return null;
+}
+
+fn activeFbCount(st: *DrmState) u32 {
+    var n: u32 = 0;
+    for (&st.fbs) |*f| {
+        if (f.used) n += 1;
+    }
+    return n;
+}
+
+/// Modeinfo из геометрии скан-аута: 60Гц, vrefresh, имя-разрешение.
+/// Часовая частота: приближение CVT (tot ≈ 1.25× visible) — семантика,
+/// не VESA-точность: libdrm сопоставляет режим по hdisplay/vdisplay.
+pub fn geomModeinfo(geom: FbGeom) Modeinfo {
+    var m = Modeinfo{};
+    m.hdisplay = @intCast(@min(geom.width, 65535));
+    m.vdisplay = @intCast(@min(geom.height, 65535));
+    m.hsync_start = m.hdisplay + 40;
+    m.hsync_end = m.hsync_start + 40;
+    m.htotal = m.hdisplay + 160;
+    m.vsync_start = m.vdisplay + 10;
+    m.vsync_end = m.vsync_start + 10;
+    m.vtotal = m.vdisplay + 40;
+    m.vrefresh = 60;
+    m.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC;
+    m.mtype = DRM_MODE_TYPE_DRIVER;
+    const label = std.fmt.bufPrint(&m.name, "{d}x{d}", .{ m.hdisplay, m.vdisplay }) catch "poler";
+    _ = label;
+    // pixclock-аналог (кГц-масштаб): 60Гц × тотал-пиксели
+    const total: u64 = @as(u64, m.htotal) * @as(u64, m.vtotal);
+    m.clock = @intCast(@min(total * 60 / 1000, std.math.maxInt(u32)));
+    return m;
+}
+
+// ─── DRM ioctl: диспетчер /dev/dri/card0 ───────────────────────────────────
+
+/// Главная точка ioctl-слоя DRM. Возвращает 0 или -errno (Linux-ABI).
+pub fn drmIoctl(st: *DrmState, ops: DrmOps, cmd: u32, arg: u64) i64 {
+    switch (cmd) {
+        DRM_IOCTL_VERSION => return ioVersion(ops, arg),
+        DRM_IOCTL_GET_MAGIC => {
+            // struct drm_auth { magic: u32 } — ядро-мастер: любой валиден
+            if (!ops.validate(arg, 4, true)) return -linux.EFAULT;
+            var magic: u32 = 42;
+            if (!ops.copy_out(arg, std.mem.asBytes(&magic))) return -linux.EFAULT;
+            return 0;
+        },
+        DRM_IOCTL_GET_CAP => return ioGetCap(ops, arg),
+        DRM_IOCTL_SET_CLIENT_CAP => return ioSetClientCap(ops, arg),
+        DRM_IOCTL_SET_VERSION => return ioSetVersion(ops, arg),
+        DRM_IOCTL_SET_MASTER, DRM_IOCTL_DROP_MASTER => return 0,
+        DRM_IOCTL_MODE_GETRESOURCES => return ioGetResources(st, ops, arg),
+        DRM_IOCTL_MODE_GETCRTC => return ioGetCrtc(st, ops, arg),
+        DRM_IOCTL_MODE_SETCRTC => return ioSetCrtc(st, ops, arg),
+        DRM_IOCTL_MODE_GETENCODER => return ioGetEncoder(st, ops, arg),
+        DRM_IOCTL_MODE_GETCONNECTOR => return ioGetConnector(st, ops, arg),
+        DRM_IOCTL_MODE_OBJ_GETPROPERTIES => return ioObjGetProps(st, ops, arg),
+        DRM_IOCTL_MODE_GETPROPBLOB => return ioGetPropBlob(st, ops, arg),
+        DRM_IOCTL_MODE_ADDFB => return ioAddFb(st, ops, arg),
+        DRM_IOCTL_MODE_ADDFB2 => return ioAddFb2(st, ops, arg),
+        DRM_IOCTL_MODE_RMFB => return ioRmFb(st, ops, arg),
+        DRM_IOCTL_MODE_PAGE_FLIP => return ioPageFlip(st, ops, arg),
+        // CDD №12 p13: атомарная волна
+        DRM_IOCTL_MODE_GETPLANERESOURCES => return ioGetPlaneRes(st, ops, arg),
+        DRM_IOCTL_MODE_GETPLANE => return ioGetPlane(st, ops, arg),
+        DRM_IOCTL_MODE_GETPROPERTY => return ioGetProperty(ops, arg),
+        DRM_IOCTL_MODE_CREATEPROPBLOB => return ioCreatePropBlob(st, ops, arg),
+        DRM_IOCTL_MODE_DESTROYPROPBLOB => return ioDestroyPropBlob(st, ops, arg),
+        DRM_IOCTL_MODE_ATOMIC => return ioModeAtomic(st, ops, arg),
+        // CDD №12 p13: GEM_CLOSE — освободить слот буфера (PRIME/dumb)
+        DRM_IOCTL_GEM_CLOSE => return ioGemClose(st, ops, arg),
+        DRM_IOCTL_MODE_CREATE_DUMB => return ioCreateDumb(st, ops, arg),
+        DRM_IOCTL_MODE_MAP_DUMB => return ioMapDumb(st, ops, arg),
+        DRM_IOCTL_MODE_DESTROY_DUMB => return ioDestroyDumb(st, ops, arg),
+        else => return -linux.EINVAL, // DRM-ядро: unknown ioctl → EINVAL
+    }
+}
+
+/// DRM_IOCTL_VERSION: libdrm зовёт ДВАЖДЫ (null-указатели → длины; буферы →
+/// строки). Драйвер: «poler-drm» 1.19.0.
+fn ioVersion(ops: DrmOps, arg: u64) i64 {
+    var v: DrmVersion = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&v), arg)) return -linux.EFAULT;
+
+    const name = "poler-drm";
+    const date = "2026";
+    const desc = "POLER-OS dumb-KMS (CDD #10)";
+
+    // строки — только если user дал буфер, вмещающий строку
+    if (v.name_ptr != 0 and v.name_len >= name.len) {
+        if (!ops.copy_out(v.name_ptr, name)) return -linux.EFAULT;
+    }
+    if (v.date_ptr != 0 and v.date_len >= date.len) {
+        if (!ops.copy_out(v.date_ptr, date)) return -linux.EFAULT;
+    }
+    if (v.desc_ptr != 0 and v.desc_len >= desc.len) {
+        if (!ops.copy_out(v.desc_ptr, desc)) return -linux.EFAULT;
+    }
+
+    v.major = 1;
+    v.minor = 19;
+    v.patch = 0;
+    v.name_len = name.len;
+    v.date_len = date.len;
+    v.desc_len = desc.len;
+    if (!ops.copy_out(arg, std.mem.asBytes(&v))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioGetCap(ops: DrmOps, arg: u64) i64 {
+    var c: DrmGetCap = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
+    const val: u64 = switch (c.capability) {
+        DRM_CAP_DUMB_BUFFER => 1,
+        DRM_CAP_DUMB_PREFERRED_DEPTH => 32, // XRGB8888
+        DRM_CAP_TIMESTAMP_MONOTONIC => 1,
+        DRM_CAP_CURSOR_WIDTH => 64,
+        DRM_CAP_CURSOR_HEIGHT => 64,
+        else => return -linux.EINVAL, // Linux: unknown capability → EINVAL
+    };
+    c.value = val;
+    if (!ops.copy_out(arg, std.mem.asBytes(&c))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioSetClientCap(ops: DrmOps, arg: u64) i64 {
+    var c: DrmSetClientCap = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
+    // CDD №12 p13: ATOMIC (5) и UNIVERSAL_PLANES (3) — ПРИНИМАЕМ:
+    // gamescope 3.16 atomic-only (drmSetClientCap(ATOMIC) != 0 → фатал);
+    // атомарный UAPI транслируется в legacy-скан-аут (MODE_ATOMIC ниже).
+    // Остальные капсы (стерео-3D и пр.) — «принято, не активно».
+    return 0;
+}
+
+fn ioGetResources(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    // Headless (inactive) = render-node-семантика: KMS-объекты существуют
+    // (виртуальная топология 1+1+1), список режимов пуст (GETCONNECTOR).
+    // Dumb-буферы НЕ требуют скан-аута — lifecycle верифицируем headless.
+    var r: CardRes = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&r), arg)) return -linux.EFAULT;
+
+    const n_fbs = activeFbCount(st);
+    // Семантика Linux drm_mode_getresources: ядро ЗАПИСЫВАЕТ фактические
+    // счётчики; если пользовательский буфер вмещает — пишет и id-массивы.
+    if (r.crtc_id_ptr != 0 and r.count_crtcs >= 1) {
+        if (!writeU32(ops, r.crtc_id_ptr, CRTC_ID)) return -linux.EFAULT;
+    }
+    if (r.encoder_id_ptr != 0 and r.count_encoders >= 1) {
+        if (!writeU32(ops, r.encoder_id_ptr, ENCODER_ID)) return -linux.EFAULT;
+    }
+    if (r.connector_id_ptr != 0 and r.count_connectors >= 1) {
+        if (!writeU32(ops, r.connector_id_ptr, CONNECTOR_ID)) return -linux.EFAULT;
+    }
+    if (r.fb_id_ptr != 0 and r.count_fbs >= n_fbs and n_fbs > 0) {
+        var off: u64 = 0;
+        for (&st.fbs) |*f| {
+            if (!f.used) continue;
+            if (!writeU32(ops, r.fb_id_ptr + off, f.fb_id)) return -linux.EFAULT;
+            off += 4;
+        }
+    }
+
+    r.count_fbs = n_fbs;
+    r.count_crtcs = 1;
+    r.count_encoders = 1;
+    r.count_connectors = 1;
+    r.max_width = MAX_DUMB_DIM;
+    r.max_height = MAX_DUMB_DIM;
+    r.min_width = 1;
+    r.min_height = 1;
+    if (!ops.copy_out(arg, std.mem.asBytes(&r))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioGetCrtc(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var c: ModeCrtc = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
+    if (c.crtc_id != 0 and c.crtc_id != CRTC_ID) return -linux.EINVAL;
+    c.crtc_id = CRTC_ID;
+    c.gamma_size = 256;
+    if (st.mode != .inactive and st.geom.width > 0) {
+        c.mode_valid = 1;
+        c.mode = geomModeinfo(st.geom);
+    } else {
+        c.mode_valid = 0;
+    }
+    if (!ops.copy_out(arg, std.mem.asBytes(&c))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioSetCrtc(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var c: ModeCrtc = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
+    if (c.crtc_id != CRTC_ID) return -linux.EINVAL;
+    // fb_id=0 → disable CRTC (dpms off) — принимаем
+    if (c.fb_id != 0) {
+        if (findFb(st, c.fb_id) == null) return -linux.ENOENT;
+        st.crtc_fb_id = c.fb_id;
+        // CDD №12 p4: SETCRTC = режим уст-в фреймбуфер — СРАЗУ скан-аут
+        // (gamescope-легаси-путь задаёт CRTC до первого PAGE_FLIP).
+        _ = scanoutCrtcFb(st, ops);
+    } else {
+        st.crtc_fb_id = 0;
+    }
+    return 0;
+}
+
+fn ioGetEncoder(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    _ = st; // энкодер не зависит от геометрии скан-аута
+    var e: GetEncoder = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&e), arg)) return -linux.EFAULT;
+    if (e.encoder_id != 0 and e.encoder_id != ENCODER_ID) return -linux.EINVAL;
+    e.encoder_id = ENCODER_ID;
+    e.encoder_type = DRM_MODE_ENCODER_VIRTUAL;
+    e.crtc_id = CRTC_ID;
+    e.possible_crtcs = 1; // битмаска: только CRTC-0
+    e.possible_clones = 0;
+    if (!ops.copy_out(arg, std.mem.asBytes(&e))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioGetConnector(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var c: GetConnector = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&c), arg)) return -linux.EFAULT;
+    if (c.connector_id != 0 and c.connector_id != CONNECTOR_ID) return -linux.EINVAL;
+
+    const has_mode = st.mode != .inactive and st.geom.width > 0;
+    const n_modes: u32 = if (has_mode) 1 else 0;
+
+    // список режимов — в user-массив modeinfo (если вмещает)
+    if (c.modes_ptr != 0 and c.count_modes >= n_modes and n_modes > 0) {
+        const mode = geomModeinfo(st.geom);
+        if (!ops.copy_out(c.modes_ptr, std.mem.asBytes(&mode))) return -linux.EFAULT;
+    }
+    // список энкодеров — id-массив u32
+    if (c.encoders_ptr != 0 and c.count_encoders >= 1) {
+        if (!writeU32(ops, c.encoders_ptr, ENCODER_ID)) return -linux.EFAULT;
+    }
+
+    c.connector_id = CONNECTOR_ID;
+    c.encoder_id = if (has_mode) ENCODER_ID else 0;
+    // CDD №12 p13: connection=CONNECTED — libdrm/gamescope проверяют статус
+    c.connection = 1; // DRM_MODE_CONNECTED
+    c.connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
+    c.connector_type_id = 1;
+    c.mm_width = st.width_mm;
+    c.mm_height = st.height_mm;
+    c.subpixel = DRM_MODE_SUBPIXEL_NONE;
+    c.count_encoders = 1;
+    c.count_modes = n_modes;
+    c.count_props = 0;
+    if (!ops.copy_out(arg, std.mem.asBytes(&c))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioAddFb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var f: FbCmd = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&f), arg)) return -linux.EFAULT;
+    const b = findDumb(st, f.handle) orelse return -linux.EINVAL; // GEM-handle нет
+    if (f.width != b.width or f.height != b.height or f.pitch != b.pitch or f.bpp != b.bpp)
+        return -linux.EINVAL; // рассинхрон метрик с буфером
+
+    // переиспользование слота? ADDFB с существующим fb_id=0 → новый id
+    var slot: ?*FbReg = null;
+    for (&st.fbs) |*r| {
+        if (!r.used) {
+            slot = r;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+
+    slot.?.used = true;
+    slot.?.fb_id = st.next_fb_id;
+    st.next_fb_id +%= 1;
+    slot.?.handle = b.handle;
+    slot.?.width = b.width;
+    slot.?.height = b.height;
+    slot.?.pitch = b.pitch;
+    slot.?.bpp = b.bpp;
+    slot.?.depth = 24; // XRGB8888 → 24bpp полезных
+
+    f.fb_id = slot.?.fb_id;
+    f.depth = 24;
+    if (!ops.copy_out(arg, std.mem.asBytes(&f))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioPageFlip(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var p: PageFlip = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
+    // Linux drm_mode_page_flip: crtc-lookup неудача → -ENOENT
+    if (p.crtc_id != CRTC_ID) return -linux.ENOENT;
+    if (findFb(st, p.fb_id) == null) return -linux.ENOENT;
+    // CDD №12 p3: известные флаги — только EVENT; ASYNC и мусор → EINVAL
+    // (Linux тоже EINVAL на неизвестных флагах)
+    if (p.flags & ~DRM_MODE_PAGE_FLIP_EVENT != 0) return -linux.EINVAL;
+    // Асинхронные флипы (DRM_MODE_PAGE_FLIP_ASYNC) и vblank-event'ы
+    // (DRM_EVENT_PAGE_FLIP в drmHandleEvent) — v0.20.0: флип применяется
+    // немедленно, при флаге EVENT — квантуем flip-complete в кольцо событий.
+    st.crtc_fb_id = p.fb_id;
+    st.flips += 1;
+    // CDD №12 p4: ПЕРВЫЙ КАДР — флип выталкивает backing dumb-буфера
+    // фреймбуфера в дисплей через vring (VirtIO-GPU 2D-конвейер).
+    _ = scanoutCrtcFb(st, ops);
+    if (p.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
+        pushEvent(st, p.user_data, st.flips);
+    return 0;
+}
+
+/// CDD №12 p4: скан-аут текущего CRTC-фреймбуфера на дисплей.
+/// mode==.virtio_gpu + fb с dumb-бэкингом → ops.scanout_frame (vring);
+/// линейный fb (VBE) — кадр уже на дисплее (загрузчик). Счётчик scanouts
+/// — e2e-маркер «первого кадра gamescope».
+fn scanoutCrtcFb(st: *DrmState, ops: DrmOps) bool {
+    if (st.mode != .virtio_gpu) return false;
+    const fb_id = st.crtc_fb_id;
+    if (fb_id == 0) return false;
+    const fb = findFb(st, fb_id) orelse return false;
+    const dumb = findDumbByHandle(st, fb.handle) orelse return false;
+    const ok = ops.scanout_frame(dumb.phys, dumb.size, fb.width, fb.height, fb.pitch);
+    if (ok) {
+        st.scanouts += 1;
+        // e2e-маркер: сериализуется через ops-окружение (ядро печатает
+        // [DRM] scanout=N в своём скан-аут-хуке — здесь только счёт).
+    }
+    return ok;
+}
+
+/// Найти dumb-буфер по GEM-handle (fb.handle = dumb.handle при ADDFB2).
+fn findDumbByHandle(st: *DrmState, handle: u32) ?*DumbBuf {
+    for (&st.dumb) |*d| {
+        if (d.used and d.handle == handle) return d;
+    }
+    return null;
+}
+
+// ─── CDD №12 p3: DRM-события (flip-complete через read(card0)) ─────────────
+
+/// Записать событие в кольцо (переполнение — затираем старейшее).
+/// Виртуальные vblank-таймстемпы: sequence * 16667 мкс ≈ 60 Гц —
+// реалистичный каркас для drmHandleEvent/gamescope-пейсинга.
+pub fn pushEvent(st: *DrmState, user_data: u64, sequence: u32) void {
+    st.events[st.ev_tail % MAX_DRM_EVENTS] = .{
+        .typ = DRM_EVENT_FLIP_COMPLETE,
+        .length = @sizeOf(DrmEventVblank),
+        .user_data = user_data,
+        .tv_sec = (sequence * 16667) / 1_000_000,
+        .tv_usec = (sequence * 16667) % 1_000_000,
+        .sequence = sequence,
+    };
+    st.ev_tail +%= 1;
+    if (st.ev_tail - st.ev_head > @as(u32, MAX_DRM_EVENTS))
+        st.ev_head = st.ev_tail - @as(u32, MAX_DRM_EVENTS);
+}
+
+/// Есть ли события (poll/epoll-готовность card0: EPOLLIN).
+pub fn eventsPending(st: *DrmState) u32 {
+    return if (st.ev_tail != st.ev_head) 1 else 0;
+}
+
+/// read(card0): выдаём ЦЕЛЫЕ записи drm_event_vblank (по одной на вызов —
+// буфер libdrm drmHandleEvent ровно 1024Б; возвращает байты или -EAGAIN).
+// Буфер — user-VA (запись валидирована слоем syscall).
+pub fn readEvents(st: *DrmState, buf: []u8) i64 {
+    if (buf.len < @sizeOf(DrmEventVblank)) return -linux.EINVAL; // drm_event не влезает
+    if (st.ev_tail == st.ev_head) return -linux.EAGAIN; // очередь пуста
+    const ev = st.events[st.ev_head % MAX_DRM_EVENTS];
+    st.ev_head +%= 1;
+    @memcpy(buf[0..@sizeOf(DrmEventVblank)], std.mem.asBytes(&ev));
+    return @sizeOf(DrmEventVblank);
+}
+
+// ─── CDD №12 p3: ADDFB2 + RMFB + SET_VERSION + OBJ_GETPROPERTIES ──────────
+
+/// DRM_IOCTL_MODE_ADDFB2: плоскостная регистрация fb. Поддерживаем
+/// single-plane XRGB8888 ('XR24')/ARGB8888 ('AR24') — dumb-буфер с
+/// совпадающими метриками. Multi-plane/YUV — EINVAL (бэклог).
+fn ioAddFb2(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var f: FbCmd2 = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&f), arg)) return -linux.EFAULT;
+    // fourcc: little-endian u32 из 4 символов: 'X','R','2','4' → 0x34325258
+    const fourcc_xr24: u32 = 0x3432_5258;
+    const fourcc_ar24: u32 = 0x3432_5241;
+    if (f.pixel_format != fourcc_xr24 and f.pixel_format != fourcc_ar24)
+        return -linux.EINVAL; // YUV/мультиплоскостные форматы — бэклог
+    if (f.handles[0] == 0) return -linux.EINVAL;
+    for (f.handles[1..]) |h| {
+        if (h != 0) return -linux.EINVAL; // multi-plane — бэклог
+    }
+    if (f.offsets[0] != 0) return -linux.EINVAL; // смещённые плоскости — бэклог
+    const b = findDumb(st, f.handles[0]) orelse return -linux.EINVAL; // GEM-handle нет
+    if (b.prime_file != 0) {
+        // p13: PRIME-буфер — метрики ИЗ ЗАПРОСА (композитор), phys уже стоит
+        b.width = f.width;
+        b.height = f.height;
+        b.pitch = f.pitches[0];
+        b.bpp = 32;
+        const need: u64 = @as(u64, b.pitch) * @as(u64, b.height);
+        if (need > b.size) return -linux.EINVAL; // буфер мал — отказ
+    } else if (f.width != b.width or f.height != b.height or f.pitches[0] != b.pitch)
+        return -linux.EINVAL; // рассинхрон метрик с буфером
+
+    var slot: ?*FbReg = null;
+    for (&st.fbs) |*r| {
+        if (!r.used) {
+            slot = r;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+
+    slot.?.used = true;
+    slot.?.fb_id = st.next_fb_id;
+    st.next_fb_id +%= 1;
+    slot.?.handle = b.handle;
+    slot.?.width = b.width;
+    slot.?.height = b.height;
+    slot.?.pitch = b.pitch;
+    slot.?.bpp = b.bpp;
+    slot.?.depth = if (f.pixel_format == fourcc_ar24) 32 else 24; // XR24: 24 полезных
+
+    f.fb_id = slot.?.fb_id;
+    if (!ops.copy_out(arg, std.mem.asBytes(&f))) return -linux.EFAULT;
+    return 0;
+}
+
+/// RMFB: снятие fb (gamescope пересоздаёт буферы при ресайзе). Чужой id →
+/// ENOENT (Linux-семантика).
+fn ioRmFb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var f: DrmU32 = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&f), arg)) return -linux.EFAULT;
+    const r = findFb(st, f.val) orelse return -linux.ENOENT;
+    r.used = false;
+    if (st.crtc_fb_id == f.val) st.crtc_fb_id = 0; // скан-аут потерял fb
+    return 0;
+}
+
+/// SET_VERSION: libdrm-хендшейк (drmGetBusid/drmSetInterfaceVersion).
+/// Отдаём нашу версию интерфейса, драйвер — как передал клиент.
+fn ioSetVersion(ops: DrmOps, arg: u64) i64 {
+    var v: DrmSetVersion = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&v), arg)) return -linux.EFAULT;
+    // DRM интерфейс: 1.19 (drm-di), драйвер: как просили — 1.19
+    v.drm_di_major = 1;
+    v.drm_di_minor = 19;
+    v.drm_dd_major = 1;
+    v.drm_dd_minor = 19;
+    if (!ops.copy_out(arg, std.mem.asBytes(&v))) return -linux.EFAULT;
+    return 0;
+}
+
+/// Одна запись текущего значения пропа (для ioObjGetProps/atomic)
+const PropVal = struct { id: u32, value: u64 };
+
+fn crtcActive(st: *DrmState) u64 {
+    return if (st.mode != .inactive and st.geom.width > 0) 1 else 0;
+}
+
+fn planeProps(st: *DrmState) [12]PropVal {
+    const active = crtcActive(st);
+    const w: u64 = @intCast(@min(st.geom.width, 16383));
+    const h: u64 = @intCast(@min(st.geom.height, 16383));
+    return .{
+        .{ .id = PROP_PLANE_TYPE, .value = DRM_PLANE_TYPE_PRIMARY },
+        .{ .id = PROP_PLANE_FB_ID, .value = st.crtc_fb_id },
+        .{ .id = PROP_PLANE_CRTC_ID, .value = if (active != 0) CRTC_ID else 0 },
+        .{ .id = PROP_PLANE_SRC_X, .value = 0 },
+        .{ .id = PROP_PLANE_SRC_Y, .value = 0 },
+        .{ .id = PROP_PLANE_SRC_W, .value = w << 16 },
+        .{ .id = PROP_PLANE_SRC_H, .value = h << 16 },
+        .{ .id = PROP_PLANE_CRTC_X, .value = 0 },
+        .{ .id = PROP_PLANE_CRTC_Y, .value = 0 },
+        .{ .id = PROP_PLANE_CRTC_W, .value = w },
+        .{ .id = PROP_PLANE_CRTC_H, .value = h },
+        .{ .id = PROP_PLANE_IN_FENCE_FD, .value = 0xFFFFFFFFFFFFFF01 }, // -1
+    };
+}
+
+fn crtcProps(st: *DrmState) [2]PropVal {
+    return .{
+        .{ .id = PROP_CRTC_ACTIVE, .value = crtcActive(st) },
+        .{ .id = PROP_CRTC_MODE_ID, .value = 0 },
+    };
+}
+
+fn connProps(st: *DrmState) [2]PropVal {
+    return .{
+        .{ .id = PROP_CONN_CRTC_ID, .value = if (crtcActive(st) != 0) CRTC_ID else 0 },
+        .{ .id = PROP_CONN_DPMS, .value = 0 },
+    };
+}
+
+fn ioObjGetProps(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var p: ObjGetProps = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
+    // CDD №12 p13: атомарные пропы с ТЕКУЩИМИ значениями (либлифтофф
+    // резолвит по именам через GETPROPERTY; gamescope читает значения)
+    var vals: []const PropVal = &[_]PropVal{};
+    if (p.obj_id == CRTC_ID) {
+        vals = &crtcProps(st);
+    } else if (p.obj_id == PLANE_ID) {
+        vals = &planeProps(st);
+    } else if (p.obj_id == CONNECTOR_ID) {
+        vals = &connProps(st);
+    } else {
+        return -linux.ENOENT; // энкодер/неизвестный — libdrm передаст errno
+    }
+    // Linux-семантика: счётчик — фактический; массивы — если вмещает
+    if (p.props_ptr != 0 and p.prop_values_ptr != 0 and p.count_props >= vals.len) {
+        var idbuf: [12]u32 = undefined;
+        for (vals, 0..) |v, i| idbuf[i] = v.id;
+        if (!ops.copy_out(p.props_ptr, std.mem.sliceAsBytes(idbuf[0..vals.len])))
+            return -linux.EFAULT;
+        var valbuf: [12]u64 = undefined;
+        for (vals, 0..) |v, i| valbuf[i] = v.value;
+        if (!ops.copy_out(p.prop_values_ptr, std.mem.sliceAsBytes(valbuf[0..vals.len])))
+            return -linux.EFAULT;
+    }
+    p.count_props = @intCast(vals.len);
+    if (!ops.copy_out(arg, std.mem.asBytes(&p))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPLANERESOURCES: одна PRIMARY-плоскость.
+fn ioGetPlaneRes(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    _ = st;
+    var r: PlaneRes = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&r), arg)) return -linux.EFAULT;
+    if (r.plane_id_ptr != 0 and r.count_planes >= 1) {
+        if (!writeU32(ops, r.plane_id_ptr, PLANE_ID)) return -linux.EFAULT;
+    }
+    r.count_planes = 1;
+    if (!ops.copy_out(arg, std.mem.asBytes(&r))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPLANE: PRIMARY, форматы [ARGB8888, XRGB8888] (p14: AR24 — композит
+/// gamescope!). libdrm зовёт дважды: (ptr=0) счёт → (ptr,count) массив.
+fn ioGetPlane(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var p: GetPlane = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&p), arg)) return -linux.EFAULT;
+    if (p.plane_id != 0 and p.plane_id != PLANE_ID) return -linux.ENOENT;
+    // p14: пишем до count форматов (AR24 первым — приоритет композита).
+    const plane_fmts = [2]u32{ DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
+    if (p.format_type_ptr != 0 and p.count_format_types >= 1) {
+        const nfmt: u32 = @min(p.count_format_types, plane_fmts.len);
+        var fi: u32 = 0;
+        while (fi < nfmt) : (fi += 1) {
+            if (!writeU32(ops, p.format_type_ptr + fi * 4, plane_fmts[fi]))
+                return -linux.EFAULT;
+        }
+    }
+    p.plane_id = PLANE_ID;
+    p.crtc_id = if (crtcActive(st) != 0) CRTC_ID else 0;
+    p.fb_id = st.crtc_fb_id;
+    p.possible_crtcs = 1; // бит 0 = CRTC-0
+    p.gamma_size = 0;
+    p.count_format_types = 2; // AR24 + XR24
+    if (!ops.copy_out(arg, std.mem.asBytes(&p))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPROPERTY: метаданные пропа по id — ИМЯ (либлифтофф резолвит по имени).
+fn ioGetProperty(ops: DrmOps, arg: u64) i64 {
+    var g: GetProperty = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&g), arg)) return -linux.EFAULT;
+    const name: []const u8 = switch (g.prop_id) {
+        PROP_CRTC_ACTIVE => "ACTIVE",
+        PROP_CRTC_MODE_ID => "MODE_ID",
+        PROP_PLANE_TYPE => "type",
+        PROP_PLANE_FB_ID => "FB_ID",
+        PROP_PLANE_CRTC_ID => "CRTC_ID",
+        PROP_PLANE_SRC_X => "SRC_X",
+        PROP_PLANE_SRC_Y => "SRC_Y",
+        PROP_PLANE_SRC_W => "SRC_W",
+        PROP_PLANE_SRC_H => "SRC_H",
+        PROP_PLANE_CRTC_X => "CRTC_X",
+        PROP_PLANE_CRTC_Y => "CRTC_Y",
+        PROP_PLANE_CRTC_W => "CRTC_W",
+        PROP_PLANE_CRTC_H => "CRTC_H",
+        PROP_PLANE_IN_FENCE_FD => "IN_FENCE_FD",
+        PROP_CONN_CRTC_ID => "CRTC_ID",
+        PROP_CONN_DPMS => "DPMS",
+        else => return -linux.ENOENT,
+    };
+    const prop_obj: bool = (g.prop_id == PROP_PLANE_FB_ID or
+        g.prop_id == PROP_PLANE_CRTC_ID or g.prop_id == PROP_CONN_CRTC_ID);
+    var flags: u32 = 0;
+    var nvals: u32 = 0;
+    var enum3 = false;
+    if (g.prop_id == PROP_CRTC_MODE_ID) {
+        flags = DRM_MODE_PROP_BLOB; // blob (MODE_ID) — не ATOMIC-флаг (legacy BLOB)
+    } else if (g.prop_id == PROP_PLANE_TYPE) {
+        flags = DRM_MODE_PROP_IMMUTABLE | DRM_MODE_PROP_ENUM;
+        enum3 = true;
+    } else if (g.prop_id == PROP_CONN_DPMS) {
+        flags = DRM_MODE_PROP_ENUM;
+        enum3 = true;
+    } else if (g.prop_id == PROP_PLANE_IN_FENCE_FD) {
+        flags = DRM_MODE_PROP_SIGNED_RANGE;
+        nvals = 2;
+    } else if (prop_obj) {
+        flags = DRM_MODE_PROP_OBJECT; // FB_ID/CRTC_ID — указатели на объекты
+    } else {
+        flags = DRM_MODE_PROP_RANGE;
+        nvals = 2;
+    }
+    flags |= DRM_MODE_PROP_ATOMIC; // все наши пропы — атомарные
+    @memcpy(g.name[0..name.len], name);
+    if (nvals == 2 and g.values_ptr != 0 and g.count_values >= 2) {
+        var vals = [2]u64{ 0, 0xFFFFFFFFFFFFFFFF };
+        if (g.prop_id == PROP_PLANE_IN_FENCE_FD) vals = .{ 0xFFFFFFFFFFFFFF01, 0x7FFFFFFFFFFFFFFF };
+        if (!ops.copy_out(g.values_ptr, std.mem.sliceAsBytes(&vals))) return -linux.EFAULT;
+    }
+    if (enum3 and g.enum_blob_ptr != 0 and g.count_enum_blobs >= 3) {
+        // DRM_PLANE_TYPE / DPMS-энумы (имена ≤31Б)
+        var enums: [3]PropertyEnum = [_]PropertyEnum{.{}} ** 3;
+        setEnumName(&enums[0], "Overlay");
+        setEnumName(&enums[1], "Primary");
+        setEnumName(&enums[2], "Cursor");
+        if (g.prop_id == PROP_CONN_DPMS) {
+            setEnumName(&enums[0], "On");
+            setEnumName(&enums[1], "Standby");
+            setEnumName(&enums[2], "Off");
+        }
+        enums[0].value = 0;
+        enums[1].value = 1;
+        enums[2].value = 2;
+        if (!ops.copy_out(g.enum_blob_ptr, std.mem.sliceAsBytes(&enums))) return -linux.EFAULT;
+    }
+    g.flags = flags;
+    g.count_values = nvals;
+    g.count_enum_blobs = if (enum3) 3 else 0;
+    if (!ops.copy_out(arg, std.mem.asBytes(&g))) return -linux.EFAULT;
+    return 0;
+}
+
+fn setEnumName(e: *PropertyEnum, name: []const u8) void {
+    @memcpy(e.name[0..name.len], name);
+}
+
+/// CREATEPROPBLOB: копия ≤128Б (gamescope: blob мод-инфо для MODE_ID).
+fn ioCreatePropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var b: CreatePropBlob = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&b), arg)) return -linux.EFAULT;
+    if (b.length == 0 or b.length > 128) return -linux.EINVAL;
+    var slot: ?*PropBlob = null;
+    for (&st.blobs) |*x| {
+        if (!x.used) {
+            slot = x;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+    if (!ops.validate(b.data, b.length, false)) return -linux.EFAULT;
+    slot.?.used = true;
+    slot.?.len = b.length;
+    slot.?.id = st.next_blob_id;
+    st.next_blob_id +%= 1;
+    // копия данных блоба (через 2 шага: копи-ин-максимум — в temp нельзя:
+    // данные уже в user — читаем порциями в поле слота)
+    if (!ops.copy_in(slot.?.data[0..b.length], b.data)) return -linux.EFAULT;
+    b.blob_id = slot.?.id;
+    if (!ops.copy_out(arg, std.mem.asBytes(&b))) return -linux.EFAULT;
+    return 0;
+}
+
+/// GETPROPBLOB: blob по id (modeinfo для MODE_ID-коммитов).
+fn ioGetPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var b: GetPropBlob = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&b), arg)) return -linux.EFAULT;
+    const blob = findBlob(st, b.blob_id) orelse return -linux.ENOENT;
+    // Linux-семантика: length — фактический; данные — если вмещает
+    if (b.data != 0 and b.length >= blob.len) {
+        if (!ops.copy_out(b.data, blob.data[0..blob.len])) return -linux.EFAULT;
+    }
+    b.length = blob.len;
+    if (!ops.copy_out(arg, std.mem.asBytes(&b))) return -linux.EFAULT;
+    return 0;
+}
+
+/// DESTROYPROPBLOB: освободить слот.
+fn ioDestroyPropBlob(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var b: DestroyPropBlob = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&b), arg)) return -linux.EFAULT;
+    const blob = findBlob(st, b.blob_id) orelse return -linux.ENOENT;
+    blob.* = .{};
+    return 0;
+}
+
+/// GEM_CLOSE (0x40046409, 4Б): слот dumb/prime-буфера освобождается.
+fn ioGemClose(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var g: [8]u8 = undefined; // p14: {handle, pad} — 8Б ABI
+    if (!ops.copy_in(&g, arg)) return -linux.EFAULT;
+    const handle: u32 = std.mem.readInt(u32, g[0..4], .little);
+    if (findDumb(st, handle) == null) return -linux.EINVAL;
+    // p14: FB ещё держит этот буфер (GEM_CLOSE = drop-ref, НЕ destroy!)
+    for (&st.fbs) |*f| {
+        if (f.used and f.handle == handle) return 0; // живой FB — слот жив
+    }
+    for (&st.dumb) |*b| {
+        if (b.used and b.handle == handle) b.* = .{};
+    }
+    return 0;
+}
+
+/// CDD №12 p13: PRIME FD_TO_HANDLE — слот создаётся main64 (fd→memfd→phys);
+/// здесь только регистрация. Возвращает GEM-handle или -errno.
+pub fn primeImportSlot(st: *DrmState, file_id: u32, phys: u64, size: u64) i64 {
+    var slot: ?*DumbBuf = null;
+    for (&st.dumb) |*b| {
+        if (!b.used) {
+            slot = b;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+    slot.?.used = true;
+    slot.?.handle = st.next_handle;
+    st.next_handle +%= 1;
+    slot.?.prime_file = file_id;
+    slot.?.phys = phys; // memfd PMM-блок: user-VA маппинг делит страницы!
+    slot.?.size = size;
+    slot.?.pages = (size + 4095) / 4096;
+    return @intCast(slot.?.handle);
+}
+
+/// MODE_ATOMIC (CDD №12 p13): ТРАНСЛЯТОР атомарного коммита в наш
+/// SETCRTC/PAGE_FLIP-механизм. Объекты: PRIMARY-плоскость {FB_ID, CRTC_ID,
+/// SRC_*, CRTC_*}, CRTC {ACTIVE, MODE_ID}, коннектор {CRTC_ID}. Применение:
+/// плоскость с CRTC_ID=нашему + FB_ID → crtc_fb_id + СКАН-АУТ (vring).
+fn ioModeAtomic(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var a: ModeAtomic = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&a), arg)) return -linux.EFAULT;
+    if (a.count_objs == 0 or a.count_objs > 4) return -linux.EINVAL;
+    if ((a.flags & ~(DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC_KNOWN |
+        DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_NONBLOCK |
+        DRM_MODE_ATOMIC_ALLOW_MODESET)) != 0) return -linux.EINVAL;
+    // копим массивы запроса (объекты ≤4, пропов на объект ≤12 → ≤48 пар)
+    var objs: [4]u32 = undefined;
+    var counts: [4]u32 = undefined;
+    var props: [48]u32 = undefined;
+    var values: [48]u64 = undefined;
+    if (!ops.copy_in(std.mem.sliceAsBytes(objs[0..a.count_objs]), a.objs_ptr))
+        return -linux.EFAULT;
+    if (!ops.copy_in(std.mem.sliceAsBytes(counts[0..a.count_objs]), a.count_props_ptr))
+        return -linux.EFAULT;
+    var total: usize = 0;
+    for (counts[0..a.count_objs]) |c| total += c;
+    if (total == 0 or total > 48) return -linux.EINVAL;
+    if (!ops.copy_in(std.mem.sliceAsBytes(props[0..total]), a.props_ptr))
+        return -linux.EFAULT;
+    if (!ops.copy_in(std.mem.sliceAsBytes(values[0..total]), a.prop_values_ptr))
+        return -linux.EFAULT;
+
+    // разбор коммита
+    var fb_id: u32 = 0;
+    var plane_crtc: u32 = 0;
+    var have_plane = false;
+    var mode_blob: u32 = 0;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        switch (props[i]) {
+            PROP_PLANE_FB_ID => {
+                fb_id = @truncate(values[i]);
+                have_plane = true;
+            },
+            PROP_PLANE_CRTC_ID => plane_crtc = @truncate(values[i]),
+            PROP_CRTC_MODE_ID => mode_blob = @truncate(values[i]),
+            // ACTIVE/SRC_*/CRTC_*/IN_FENCE/коннектор — принимаем (геометрия
+            // фиксирована топологией; фенс-объектов нет)
+            else => {},
+        }
+    }
+    // TEST_ONLY: валидация без применения
+    if (a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0) {
+        if (have_plane and plane_crtc == CRTC_ID and fb_id != 0) {
+            if (findFb(st, fb_id) == null) return -linux.ENOENT;
+            if (mode_blob != 0 and findBlob(st, mode_blob) == null) return -linux.ENOENT;
+        }
+        return 0;
+    }
+    // применение: плоскость → наш CRTC
+    if (!have_plane or plane_crtc != CRTC_ID) return 0; // чужое/пустое — принято
+    if (fb_id == 0) {
+        st.crtc_fb_id = 0; // disable — как SETCRTC(fb=0)
+        return 0;
+    }
+    if (findFb(st, fb_id) == null) return -linux.ENOENT;
+    if (mode_blob != 0 and findBlob(st, mode_blob) == null) return -linux.ENOENT;
+    st.crtc_fb_id = fb_id;
+    st.flips += 1;
+    // СКАН-АУТ: общий путь с SETCRTC/PAGE_FLIP (vring 2D → первый кадр)
+    _ = scanoutCrtcFb(st, ops);
+    if (a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
+        pushEvent(st, a.user_data, st.flips);
+    return 0;
+}
+
+fn ioCreateDumb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var d: CreateDumb = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&d), arg)) return -linux.EFAULT;
+
+    // Санити: только XRGB8888, разумные размеры (враждебный ввод → EINVAL)
+    if (d.bpp != 32) return -linux.EINVAL;
+    if (d.width == 0 or d.height == 0) return -linux.EINVAL;
+    if (d.width > MAX_DUMB_DIM or d.height > MAX_DUMB_DIM) return -linux.EINVAL;
+
+    const pm = @mulWithOverflow(d.width, @as(u32, 4)); // pitch = w*4, XRGB8888
+    if (pm[1] != 0) return -linux.EINVAL;
+    const pitch: u32 = pm[0];
+    const size: u64 = @as(u64, pitch) * @as(u64, d.height);
+    if (size == 0 or size > MAX_DUMB_BYTES) return -linux.ENOMEM;
+    const pages = (size + 4095) / 4096;
+
+    var slot: ?*DumbBuf = null;
+    for (&st.dumb) |*b| {
+        if (!b.used) {
+            slot = b;
+            break;
+        }
+    }
+    if (slot == null) return -linux.ENOMEM;
+
+    const phys = ops.alloc_pages(pages) orelse return -linux.ENOMEM;
+
+    slot.?.used = true;
+    slot.?.handle = st.next_handle;
+    st.next_handle +%= 1;
+    slot.?.phys = phys;
+    slot.?.size = size;
+    slot.?.pages = pages;
+    slot.?.width = d.width;
+    slot.?.height = d.height;
+    slot.?.pitch = pitch;
+    slot.?.bpp = 32;
+
+    d.handle = slot.?.handle;
+    d.pitch = pitch;
+    d.size = size;
+    if (!ops.copy_out(arg, std.mem.asBytes(&d))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioMapDumb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var m: MapDumb = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&m), arg)) return -linux.EFAULT;
+    const b = findDumb(st, m.handle) orelse return -linux.ENOENT;
+    // offset в фейковой апертуре — mmap-слой (шаг 3) резолвит её в страницы
+    m.offset = apertureOffset(b.handle);
+    if (!ops.copy_out(arg, std.mem.asBytes(&m))) return -linux.EFAULT;
+    return 0;
+}
+
+fn ioDestroyDumb(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    var d: DestroyDumb = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&d), arg)) return -linux.EFAULT;
+    const b = findDumb(st, d.handle) orelse return -linux.EINVAL;
+    ops.free_pages(b.phys, b.pages);
+    b.* = .{};
+    return 0;
+}
+
+// ─── fbdev ioctl: диспетчер /dev/fb0 ───────────────────────────────────────
+
+/// ioctl на /dev/fb0 (legacy-номера, без IOC-кодирования). /dev/fb0 открывают
+/// прямые фреймбуфер-клиенты ДО поднятия DRM (initrd-лог, Plymouth-подобные).
+pub fn fbIoctl(st: *DrmState, ops: DrmOps, cmd: u32, arg: u64) i64 {
+    switch (cmd) {
+        FBIOGET_VSCREENINFO => return fbGetVar(st, ops, arg),
+        FBIOPUT_VSCREENINFO => return fbPutVar(st, ops, arg),
+        FBIOGET_FSCREENINFO => return fbGetFix(st, ops, arg),
+        FBIOPUT_FSCREENINFO => return -linux.EPERM, // fix-поля RO для user
+        else => return -linux.EINVAL,
+    }
+}
+
+fn fbGetVar(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    if (st.mode == .inactive) return -linux.ENODEV;
+    var v: FbVarScreenInfo = .{};
+    v.xres = st.geom.width;
+    v.yres = st.geom.height;
+    v.xres_virtual = st.geom.width;
+    v.yres_virtual = st.geom.height;
+    v.bits_per_pixel = st.geom.bpp;
+    v.grayscale = 0;
+    // XRGB8888 little-endian: blue 0:8, green 8:8, red 16:8, transp 24:0
+    v.blue = .{ .offset = 0, .length = 8, .msb_right = 0 };
+    v.green = .{ .offset = 8, .length = 8, .msb_right = 0 };
+    v.red = .{ .offset = 16, .length = 8, .msb_right = 0 };
+    v.transp = .{ .offset = 24, .length = 0, .msb_right = 0 };
+    v.activate = 0; // FB_ACTIVATE_NOW
+    v.pixclock = 1000000000 / 60; // ~60Гц (пикосекунды/пиксель — приближение)
+    v.vmode = FB_VMODE_NONINTERLACED;
+    if (!ops.copy_out(arg, std.mem.asBytes(&v))) return -linux.EFAULT;
+    return 0;
+}
+
+fn fbPutVar(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    if (st.mode == .inactive) return -linux.ENODEV;
+    var v: FbVarScreenInfo = undefined;
+    if (!ops.copy_in(std.mem.asBytes(&v), arg)) return -linux.EFAULT;
+    // Линейный fb бут-лоадера не переключается fbdev-ом (нет собственного
+    // CRTC): принимаем ТОЛЬКО идентичную геометрию — иначе EINVAL (честный
+    // отказ вместо молчаливой лжи).
+    if (v.xres != st.geom.width or v.yres != st.geom.height or
+        v.bits_per_pixel != st.geom.bpp) return -linux.EINVAL;
+    return 0;
+}
+
+fn fbGetFix(st: *DrmState, ops: DrmOps, arg: u64) i64 {
+    if (st.mode == .inactive) return -linux.ENODEV;
+    var f: FbFixScreenInfo = .{};
+    const id = "poler-fb0"; // ≤15 символов + нуль
+    @memcpy(f.id[0..id.len], id);
+    f.smem_start = st.geom.phys;
+    f.smem_len = @intCast(@as(u64, st.geom.pitch) * @as(u64, st.geom.height));
+    f.ftype = FB_TYPE_PACKED_PIXELS;
+    f.visual = FB_VISUAL_TRUECOLOR;
+    f.line_length = st.geom.pitch;
+    f.accel = FB_ACCEL_NONE;
+    if (!ops.copy_out(arg, std.mem.asBytes(&f))) return -linux.EFAULT;
+    return 0;
+}
+
+// ─── Апертура dumb-буферов (мост mmap fd=card0 → страницы) ─────────────────
+
+/// Offset-слот буфера в фейковой GPU-апертуре (MAP_DUMB возвращает её).
+pub fn apertureOffset(handle: u32) u64 {
+    return DUMB_APERTURE_BASE + @as(u64, handle) * DUMB_SLOT_SIZE;
+}
+
+/// Резолв mmap-offset → dumb-буфер (mmap-слой шага 3). Ошибка = null.
+pub fn lookupAperture(st: *DrmState, off: u64) ?*DumbBuf {
+    if (off < DUMB_APERTURE_BASE) return null;
+    const rel = off - DUMB_APERTURE_BASE;
+    if (rel % DUMB_SLOT_SIZE != 0) return null;
+    const handle: u32 = std.math.cast(u32, rel / DUMB_SLOT_SIZE) orelse return null;
+    return findDumb(st, handle);
+}
+
+// ─── Хелперы копирования u32-массивов ──────────────────────────────────────
+
+fn writeU32(ops: DrmOps, va: u64, value: u32) bool {
+    return ops.copy_out(va, std.mem.asBytes(&value));
+}
+
+// ============================================================================
+//  Нативные тесты (linux x86_64 gnu — Zig test runner)
+// ============================================================================
+
+/// Фейковое user-пространство (прецедент linux_syscalls.FakeEnv):
+/// буфер 32КБ по VA 0x20000_0000, fake-аллокатор физических страниц.
+const FakeEnv = struct {
+    const USER_BASE: u64 = 0x20000_0000;
+    const USER_LEN: u64 = 32 * 1024;
+
+    mem: []u8,
+    mmap_cursor: u64 = USER_BASE + USER_LEN,
+    allocs: usize = 0, // счётчик alloc_pages
+    frees: usize = 0, // счётчик free_pages
+    last_free_pages: u64 = 0,
+
+    fn init() !FakeEnv {
+        return .{ .mem = try testing.allocator.alloc(u8, @intCast(USER_LEN)) };
+    }
+    fn deinit(self: *FakeEnv) void {
+        testing.allocator.free(self.mem);
+    }
+    fn vaOk(va: u64, len: u64) bool {
+        if (len == 0) return true;
+        const sum = @addWithOverflow(va, len);
+        if (sum[1] != 0) return false;
+        if (sum[0] > linux.USER_VA_CEILING) return false;
+        return va >= USER_BASE and sum[0] <= USER_BASE + USER_LEN;
+    }
+    fn vaPtr(self: *FakeEnv, va: u64) ?[*]u8 {
+        if (va < USER_BASE or va >= USER_BASE + USER_LEN) return null;
+        return self.mem.ptr + @as(usize, @intCast(va - USER_BASE));
+    }
+};
+
+var g_env: ?*FakeEnv = null;
+
+fn fakeValidate(va: u64, len: u64, want_write: bool) bool {
+    _ = want_write;
+    return FakeEnv.vaOk(va, len);
+}
+fn fakeCopyIn(dst: []u8, src_va: u64) bool {
+    const e = g_env.?;
+    if (!FakeEnv.vaOk(src_va, dst.len)) return false;
+    const p = e.vaPtr(src_va) orelse return false;
+    @memcpy(dst, p[0..dst.len]);
+    return true;
+}
+fn fakeCopyOut(dst_va: u64, src: []const u8) bool {
+    const e = g_env.?;
+    if (!FakeEnv.vaOk(dst_va, src.len)) return false;
+    const p = e.vaPtr(dst_va) orelse return false;
+    @memcpy(p[0..src.len], src);
+    return true;
+}
+fn fakeAllocPages(pages: u64) ?u64 {
+    g_env.?.allocs += 1;
+    const pa: u64 = 0x5000_0000 + g_env.?.mmap_cursor; // «физика» fake
+    _ = pages;
+    return pa;
+}
+fn fakeFreePages(phys: u64, pages: u64) void {
+    _ = phys;
+    const e = g_env.?;
+    e.frees += 1;
+    e.last_free_pages = pages;
+}
+
+/// CDD №12 p4: фейк-скан-аут — фиксирует последний вызов (phys/w/h/pitch).
+var fake_scan_calls: u32 = 0;
+var fake_scan_phys: u64 = 0;
+var fake_scan_w: u32 = 0;
+var fake_scan_h: u32 = 0;
+var fake_scan_pitch: u32 = 0;
+var fake_scan_ret: bool = true;
+
+fn fakeScanoutFrame(phys: u64, len: u64, w: u32, h: u32, pitch: u32) bool {
+    _ = len;
+    if (!fake_scan_ret) return false;
+    fake_scan_calls += 1;
+    fake_scan_phys = phys;
+    fake_scan_w = w;
+    fake_scan_h = h;
+    fake_scan_pitch = pitch;
+    return true;
+}
+
+fn fakeOps() DrmOps {
+    return .{
+        .validate = fakeValidate,
+        .copy_in = fakeCopyIn,
+        .copy_out = fakeCopyOut,
+        .alloc_pages = fakeAllocPages,
+        .free_pages = fakeFreePages,
+        .scanout_frame = fakeScanoutFrame,
+    };
+}
+
+fn envSetup() !*FakeEnv {
+    const e = try testing.allocator.create(FakeEnv);
+    e.* = try FakeEnv.init();
+    @memset(e.mem, 0);
+    g_env = e;
+    return e;
+}
+fn envTeardown(e: *FakeEnv) void {
+    g_env = null;
+    e.deinit();
+    testing.allocator.destroy(e);
+}
+
+fn geom640() FbGeom {
+    return .{ .phys = 0xFD00_0000, .width = 640, .height = 480, .pitch = 2560, .bpp = 32 };
+}
+
+// ─── Тесты: UAPI-совместимость номеров/раскладок (якоря libdrm/strace) ─────
+
+test "drm: IOC-кодирование — формула _IOC(dir,type,nr,size)" {
+    // _IO('d', 0x1E) = 0x0000641E (SET_MASTER)
+    try testing.expectEqual(@as(u32, 0x0000_641E), DRM_IOCTL_SET_MASTER);
+    // _IOR('d', 0x00, drm_version 64Б) = 0x80406400 (VERSION — якорь strace:
+    // размер 0x40 сидит в битах 29..16, НЕ «0804» как у 4Б-структур!)
+    try testing.expectEqual(@as(u32, 0x8040_6400), DRM_IOCTL_VERSION);
+    // _IOWR('d', 0x0C, drm_get_cap 16Б) = 0xC010640C (GET_CAP)
+    try testing.expectEqual(@as(u32, 0xC010_640C), DRM_IOCTL_GET_CAP);
+    // _IOW('d', 0x0D, drm_set_client_cap 16Б) = 0x4010640D
+    try testing.expectEqual(@as(u32, 0x4010_640D), DRM_IOCTL_SET_CLIENT_CAP);
+}
+
+test "drm: DRM_MODE-* ioctl-номера = реальные значения Linux uapi" {
+    try testing.expectEqual(@as(u32, 0xC040_64A0), DRM_IOCTL_MODE_GETRESOURCES);
+    try testing.expectEqual(@as(u32, 0xC068_64A1), DRM_IOCTL_MODE_GETCRTC);
+    try testing.expectEqual(@as(u32, 0xC068_64A2), DRM_IOCTL_MODE_SETCRTC);
+    try testing.expectEqual(@as(u32, 0xC014_64A6), DRM_IOCTL_MODE_GETENCODER);
+    try testing.expectEqual(@as(u32, 0xC050_64A7), DRM_IOCTL_MODE_GETCONNECTOR);
+    try testing.expectEqual(@as(u32, 0x401C_64AE), DRM_IOCTL_MODE_ADDFB);
+    try testing.expectEqual(@as(u32, 0x4018_64B0), DRM_IOCTL_MODE_PAGE_FLIP);
+    try testing.expectEqual(@as(u32, 0xC020_64B2), DRM_IOCTL_MODE_CREATE_DUMB);
+    try testing.expectEqual(@as(u32, 0xC010_64B3), DRM_IOCTL_MODE_MAP_DUMB);
+    try testing.expectEqual(@as(u32, 0xC004_64B4), DRM_IOCTL_MODE_DESTROY_DUMB);
+}
+
+test "drm: UAPI-раскладки структур (x86_64 sizeof-якоря)" {
+    try testing.expectEqual(@as(usize, 64), @sizeOf(DrmVersion));
+    try testing.expectEqual(@as(usize, 16), @sizeOf(DrmGetCap));
+    try testing.expectEqual(@as(usize, 68), @sizeOf(Modeinfo));
+    try testing.expectEqual(@as(usize, 64), @sizeOf(CardRes));
+    try testing.expectEqual(@as(usize, 104), @sizeOf(ModeCrtc));
+    try testing.expectEqual(@as(usize, 20), @sizeOf(GetEncoder));
+    try testing.expectEqual(@as(usize, 80), @sizeOf(GetConnector));
+    try testing.expectEqual(@as(usize, 28), @sizeOf(FbCmd));
+    try testing.expectEqual(@as(usize, 32), @sizeOf(CreateDumb));
+    try testing.expectEqual(@as(usize, 16), @sizeOf(MapDumb));
+    try testing.expectEqual(@as(usize, 4), @sizeOf(DestroyDumb));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(PageFlip));
+    // выравнивание u64 после трёх i32 в drm_version: name_len @16
+    try testing.expectEqual(@as(usize, 16), @offsetOf(DrmVersion, "name_len"));
+}
+
+test "drm: fbdev-структуры — sizeof 160/80 (glibc fb.h)" {
+    try testing.expectEqual(@as(usize, 160), @sizeOf(FbVarScreenInfo));
+    try testing.expectEqual(@as(usize, 80), @sizeOf(FbFixScreenInfo));
+    // неявные паддинги: mmio_start @56 (после line_length @48 + pad)
+    try testing.expectEqual(@as(usize, 56), @offsetOf(FbFixScreenInfo, "mmio_start"));
+}
+
+// ─── Тесты: VERSION / CAP ──────────────────────────────────────────────────
+
+test "drm: VERSION — двухфазный протокол libdrm (длины → строки)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+
+    // Фаза 1: null-указатели → ядро возвращает только длины
+    var v: DrmVersion = .{};
+    const va = FakeEnv.USER_BASE;
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_VERSION, va));
+    const p = e.vaPtr(va).?;
+    const got: *const DrmVersion = @ptrCast(@alignCast(p));
+    try testing.expectEqual(@as(i32, 1), got.major);
+    try testing.expectEqual(@as(i64, 9), @as(i64, @intCast(got.name_len))); // "poler-drm"
+    try testing.expectEqual(@as(i64, 4), @as(i64, @intCast(got.date_len))); // "2026"
+
+    // Фаза 2: буферы → строки записаны в user
+    v.name_len = 64;
+    v.name_ptr = va + 0x100;
+    v.date_len = 64;
+    v.date_ptr = va + 0x140;
+    v.desc_len = 128;
+    v.desc_ptr = va + 0x180;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmVersion)], std.mem.asBytes(&v));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_VERSION, va));
+    const name = e.vaPtr(va + 0x100).?[0..9];
+    try testing.expectEqualStrings("poler-drm", name);
+    const date = e.vaPtr(va + 0x140).?[0..4];
+    try testing.expectEqualStrings("2026", date);
+}
+
+test "drm: GET_CAP — поддержанные капсы; неизвестная → -EINVAL" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const va = FakeEnv.USER_BASE;
+
+    var c: DrmGetCap = .{ .capability = DRM_CAP_DUMB_BUFFER };
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&c));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_GET_CAP, va));
+    const got: *const DrmGetCap = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u64, 1), got.value);
+
+    c.capability = DRM_CAP_DUMB_PREFERRED_DEPTH;
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&c));
+    _ = drmIoctl(&st, fakeOps(), DRM_IOCTL_GET_CAP, va);
+    try testing.expectEqual(@as(u64, 32), got.value);
+
+    c.capability = 0x999;
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&c));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, fakeOps(), DRM_IOCTL_GET_CAP, va));
+
+    // SET_MASTER — безаргументный успех
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_SET_MASTER, 0));
+    // неизвестный ioctl → -EINVAL (ядро DRM Linux)
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, fakeOps(), 0xC0DE_6499, va));
+}
+
+// ─── Тесты: GETRESOURCES / GETCRTC / GETENCODER / GETCONNECTOR ─────────────
+
+test "drm: GETRESOURCES — 1 CRTC/энкодер/коннектор, id-массивы в user" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const va = FakeEnv.USER_BASE;
+    const ids_va = FakeEnv.USER_BASE + 0x200;
+
+    var r: CardRes = .{};
+    // входные counts = ёмкость буферов юзера (Linux-семантика: ядро пишет
+    // id-массивы ТОЛЬКО если ёмкость вмещает; счётчики обновляет всегда)
+    r.count_crtcs = 1;
+    r.count_encoders = 1;
+    r.count_connectors = 1;
+    r.crtc_id_ptr = ids_va;
+    r.encoder_id_ptr = ids_va + 4;
+    r.connector_id_ptr = ids_va + 8;
+    @memcpy(e.vaPtr(va).?[0..64], std.mem.asBytes(&r));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_MODE_GETRESOURCES, va));
+
+    const got: *const CardRes = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 1), got.count_crtcs);
+    try testing.expectEqual(@as(u32, 1), got.count_encoders);
+    try testing.expectEqual(@as(u32, 1), got.count_connectors);
+    try testing.expectEqual(@as(u32, 0), got.count_fbs); // ADDFB ещё не было
+    const ids = e.vaPtr(ids_va).?;
+    try testing.expectEqual(kmsIds()[0], std.mem.readInt(u32, ids[0..4], .little));
+    try testing.expectEqual(kmsIds()[1], std.mem.readInt(u32, ids[4..8], .little));
+    try testing.expectEqual(kmsIds()[2], std.mem.readInt(u32, ids[8..12], .little));
+
+    // карта неактивна (headless) → render-node: объекты есть, ошибок нет
+    var st2 = DrmState{};
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, fakeOps(), DRM_IOCTL_MODE_GETRESOURCES, va));
+    const r2: *const CardRes = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 1), r2.count_crtcs);
+}
+
+test "drm: GETCRTC — mode_valid + modeinfo из геометрии" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const va = FakeEnv.USER_BASE;
+
+    var c: ModeCrtc = .{};
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&c));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_MODE_GETCRTC, va));
+    const got: *const ModeCrtc = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 1), got.mode_valid);
+    try testing.expectEqual(@as(u32, 640), got.mode.hdisplay);
+    try testing.expectEqual(@as(u32, 480), got.mode.vdisplay);
+    try testing.expectEqual(@as(u32, 60), got.mode.vrefresh);
+    try testing.expectEqual(@as(u32, 256), got.gamma_size);
+
+    // чужой crtc_id → -EINVAL
+    c.crtc_id = 99;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&c));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, fakeOps(), DRM_IOCTL_MODE_GETCRTC, va));
+}
+
+test "drm: GETENCODER + GETCONNECTOR — статусы dumb-KMS" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const va = FakeEnv.USER_BASE;
+    const modes_va = FakeEnv.USER_BASE + 0x300;
+
+    var enc: GetEncoder = .{};
+    @memcpy(e.vaPtr(va).?[0..20], std.mem.asBytes(&enc));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_MODE_GETENCODER, va));
+    const ge: *const GetEncoder = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 5), ge.encoder_type); // VIRTUAL
+    try testing.expectEqual(@as(u32, 1), ge.possible_crtcs);
+
+    var con: GetConnector = .{};
+    con.modes_ptr = modes_va;
+    con.count_modes = 1;
+    @memcpy(e.vaPtr(va).?[0..80], std.mem.asBytes(&con));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, fakeOps(), DRM_IOCTL_MODE_GETCONNECTOR, va));
+    const gc: *const GetConnector = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 15), gc.connector_type); // VIRTUAL
+    try testing.expectEqual(@as(u32, 1), gc.count_modes);
+    try testing.expectEqual(kmsIds()[1], gc.encoder_id); // привязан к энкодеру
+    // modeinfo записан в user-массив (hdisplay — смещение 4, после clock)
+    const md = e.vaPtr(modes_va).?;
+    try testing.expectEqual(@as(u16, 640), std.mem.readInt(u16, md[4..6], .little));
+}
+
+// ─── Тесты: жизненный цикл dumb-буфера ─────────────────────────────────────
+
+test "drm: CREATE→MAP→ADDFB→FLIP→DESTROY — полный жизненный цикл" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+
+    // CREATE_DUMB 320×240×32 → pitch=1280, size=307200 (75 страниц +1).
+    // Значения снимаем в ЛОКАЛЫ сразу после ioctl: va перезаписывается
+    // следующими структурами (урок CSE: *const-указатель в user-памяти
+    // перечитывает СВЕЖИЕ байты).
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const gd: *const CreateDumb = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const dumb_handle = gd.handle;
+    const dumb_pitch = gd.pitch;
+    const dumb_size = gd.size;
+    try testing.expect(dumb_handle != 0);
+    try testing.expectEqual(@as(u32, 1280), dumb_pitch);
+    try testing.expectEqual(@as(u64, 307200), dumb_size);
+    try testing.expectEqual(@as(usize, 1), e.allocs);
+
+    // MAP_DUMB → апертурный offset, резолвится обратно в буфер
+    var m: MapDumb = .{ .handle = dumb_handle };
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&m));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_MAP_DUMB, va));
+    const gm: *const MapDumb = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const dumb_offset = gm.offset;
+    try testing.expectEqual(apertureOffset(dumb_handle), dumb_offset);
+    const buf = lookupAperture(&st, dumb_offset).?;
+    try testing.expectEqual(@as(u32, 320), buf.width);
+    // lookup с чужим offset → null
+    try testing.expect(lookupAperture(&st, dumb_offset + 0x1000) == null);
+    try testing.expect(lookupAperture(&st, 0x1000) == null);
+
+    // ADDFB из handle
+    var f: FbCmd = .{ .handle = dumb_handle, .width = 320, .height = 240, .pitch = dumb_pitch, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..28], std.mem.asBytes(&f));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB, va));
+    const gf: *const FbCmd = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const fb_id = gf.fb_id;
+    const fb_depth = gf.depth;
+    try testing.expect(fb_id != 0);
+    try testing.expectEqual(@as(u32, 24), fb_depth);
+
+    // PAGE_FLIP ×2 → flips=2, scanout=fb (crtc_id обязателен, как drmModePageFlip)
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 2), st.flips);
+    try testing.expectEqual(fb_id, st.crtc_fb_id);
+
+    // GETRESOURCES теперь видит 1 fb (count_fbs) — читаем копиюбэк из user
+    var r: CardRes = .{};
+    @memcpy(e.vaPtr(va).?[0..64], std.mem.asBytes(&r));
+    _ = drmIoctl(&st, ops, DRM_IOCTL_MODE_GETRESOURCES, va);
+    const rback: *const CardRes = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 1), rback.count_fbs);
+
+    // SETCRTC с валидным fb
+    var cr: ModeCrtc = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&cr));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_SETCRTC, va));
+
+    // DESTROY → free_pages вызван
+    var dd: DestroyDumb = .{ .handle = dumb_handle };
+    @memcpy(e.vaPtr(va).?[0..4], std.mem.asBytes(&dd));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_DESTROY_DUMB, va));
+    try testing.expectEqual(@as(usize, 1), e.frees);
+    try testing.expectEqual(@as(u64, 75), e.last_free_pages); // 307200 = ровно 75 страниц
+    // повторный destroy → -EINVAL (слот пуст)
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_DESTROY_DUMB, va));
+}
+
+test "drm: CREATE_DUMB — враждебные параметры → -EINVAL/-ENOMEM" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+
+    // bpp != 32
+    var d: CreateDumb = .{ .width = 64, .height = 64, .bpp = 16 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    // нулевые размеры
+    d = .{ .width = 0, .height = 64, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    // гигантский буфер > MAX_DUMB_BYTES → -ENOMEM
+    d = .{ .width = 8192, .height = 8192, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(-linux.ENOMEM, drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    // измерение за лимитом → -EINVAL
+    d = .{ .width = 9000, .height = 64, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    try testing.expectEqual(@as(usize, 0), e.allocs); // аллокатор не дёргали
+}
+
+test "drm: ADDFB/FLIP с мусорными handle/fb → -EINVAL/-ENOENT" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+
+    // ADDFB несуществующий handle → -EINVAL
+    var f: FbCmd = .{ .handle = 777, .width = 8, .height = 8, .pitch = 32, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..28], std.mem.asBytes(&f));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB, va));
+
+    // PAGE_FLIP несуществующий fb (crtc корректен) → -ENOENT
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = 555 };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+
+    // MAP_DUMB handle=0 → -ENOENT
+    var m: MapDumb = .{ .handle = 0 };
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&m));
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_MAP_DUMB, va));
+}
+
+// ─── CDD №12 p3: ADDFB2 + SET_CLIENT_CAP-гейт + события + misc-волна ───────
+
+test "drm: p3 — ADDFB2 (XR24/AR24) + client-cap гейт + flip-события" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+
+    // 0. сверка ioctl-НОМЕРОВ с include/uapi/drm/drm.h (x86_64, gcc-размеры)
+    try testing.expectEqual(@as(u32, 0xC068_64B8), DRM_IOCTL_MODE_ADDFB2);
+    try testing.expectEqual(@as(u32, 0xC004_64AF), DRM_IOCTL_MODE_RMFB);
+    try testing.expectEqual(@as(u32, 0xC010_6407), DRM_IOCTL_SET_VERSION);
+    try testing.expectEqual(@as(u32, 0xC020_64B9), DRM_IOCTL_MODE_OBJ_GETPROPERTIES);
+    try testing.expectEqual(@as(u32, 0xC010_64AC), DRM_IOCTL_MODE_GETPROPBLOB);
+    try testing.expectEqual(@as(u32, 104), @sizeOf(FbCmd2)); // с u64 modifier[4]
+
+    // 1. SET_CLIENT_CAP: p13-контракт — ATOMIC(5)/UNIVERSAL_PLANES(3)
+    //    ПРИНИМАЮТСЯ (gamescope 3.16 atomic-only: отказ = фатал бэкенда);
+    //    атомарный UAPI транслируется в legacy-скан-аут (MODE_ATOMIC).
+    var cap: DrmSetClientCap = .{ .capability = 5 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+    cap = .{ .capability = 3 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+    cap = .{ .capability = 2 }; // стерео — «принято, не активно»
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(DrmSetClientCap)], std.mem.asBytes(&cap));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_CLIENT_CAP, va));
+
+    // 2. SET_VERSION — libdrm-хендшейк (drmGetBusid)
+    var sv: DrmSetVersion = .{};
+    @memcpy(e.vaPtr(va).?[0..16], std.mem.asBytes(&sv));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_SET_VERSION, va));
+    const gsv: *const DrmSetVersion = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(i32, 1), gsv.drm_di_major);
+    try testing.expectEqual(@as(i32, 19), gsv.drm_di_minor);
+
+    // 3. dumb 320×240 + ADDFB2 XR24 ('XR24'=0x34325258)
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const gd: *const CreateDumb = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const handle = gd.handle;
+    try testing.expect(handle != 0);
+
+    var f2: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    f2.handles[0] = handle;
+    f2.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const gf2: *const FbCmd2 = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const fb_id = gf2.fb_id;
+    try testing.expect(fb_id != 0);
+    // реестр: XR24 → depth 24 (24 полезных бит)
+    try testing.expectEqual(@as(u32, 24), findFb(&st, fb_id).?.depth);
+
+    // AR24 → depth 32
+    var f3: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5241 };
+    f3.handles[0] = handle;
+    f3.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f3));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const fb_id2: u32 = (@as(*const FbCmd2, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+    try testing.expectEqual(@as(u32, 32), findFb(&st, fb_id2).?.depth);
+
+    // края: мусорный fourcc; multi-plane; смещённая плоскость; чужой handle;
+    // рассинхрон pitch; флаги-flip мусор
+    var fx: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3631_3259 }; // YUV
+    fx.handles[0] = handle;
+    fx.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    fx = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    fx.handles[0] = handle;
+    fx.handles[1] = handle; // multi-plane
+    fx.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    fx = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    fx.handles[0] = handle;
+    fx.pitches[0] = 4096; // рассинхрон
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    fx = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    fx.handles[0] = 777; // чужой GEM-handle
+    fx.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&fx));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+
+    // 4. PAGE_FLIP + EVENT → кольцо; read(card0) выдаёт drm_event_vblank
+    const ev_va = FakeEnv.USER_BASE + 0x800;
+    try testing.expectEqual(@as(u32, 0), eventsPending(&st)); // пусто
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    p.flags = DRM_MODE_PAGE_FLIP_EVENT;
+    p.user_data = 0xDEAD;
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 1), eventsPending(&st));
+    try testing.expectEqual(@as(i64, 32), readEvents(&st, e.vaPtr(ev_va).?[0..32]));
+    const gev: *const DrmEventVblank = @ptrCast(@alignCast(e.vaPtr(ev_va).?));
+    try testing.expectEqual(DRM_EVENT_FLIP_COMPLETE, gev.typ);
+    try testing.expectEqual(@as(u32, 32), gev.length);
+    try testing.expectEqual(@as(u64, 0xDEAD), gev.user_data);
+    try testing.expectEqual(@as(u32, 1), gev.sequence);
+    try testing.expect(gev.tv_sec == 0 and gev.tv_usec == 16667); // 60Гц-каркас
+    // очередь пуста → EAGAIN; буфер < 32 → EINVAL
+    try testing.expectEqual(-linux.EAGAIN, readEvents(&st, e.vaPtr(ev_va).?[0..32]));
+    try testing.expectEqual(-linux.EINVAL, readEvents(&st, e.vaPtr(ev_va).?[0..16]));
+
+    // PAGE_FLIP БЕЗ флага EVENT → событие НЕ квантуется; ASYNC(2) → EINVAL
+    p.flags = 0;
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 0), eventsPending(&st));
+    p.flags = 2; // DRM_MODE_PAGE_FLIP_ASYNC
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(-linux.EINVAL, drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+
+    // 5. RMFB: снятие; повтор → ENOENT; скан-аут сброшен
+    var rm: DrmU32 = .{ .val = fb_id };
+    @memcpy(e.vaPtr(va).?[0..4], std.mem.asBytes(&rm));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_RMFB, va));
+    try testing.expect(findFb(&st, fb_id) == null);
+    try testing.expectEqual(@as(u32, 0), st.crtc_fb_id); // флипнутый fb снят
+    @memcpy(e.vaPtr(va).?[0..4], std.mem.asBytes(&rm));
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_RMFB, va));
+
+    // 6. OBJ_GETPROPERTIES: p13-контракт — connector → 2 пропа
+    //    (CRTC_ID + DPMS; атомарная волна либлифтоффа); чужой → ENOENT
+    var op: ObjGetProps = .{ .obj_id = kmsIds()[2] };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ObjGetProps)], std.mem.asBytes(&op));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, va));
+    try testing.expectEqual(@as(u32, 2),
+        (@as(*const ObjGetProps, @ptrCast(@alignCast(e.vaPtr(va).?)))).count_props);
+    op = .{ .obj_id = 999 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ObjGetProps)], std.mem.asBytes(&op));
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, va));
+
+    // 7. GETPROPBLOB → ENOENT (blob'ов нет)
+    try testing.expectEqual(-linux.ENOENT, drmIoctl(&st, ops, DRM_IOCTL_MODE_GETPROPBLOB, va));
+}
+
+// ─── Тесты CDD №12 p4: скан-аут фреймбуфера через PAGE_FLIP/SETCRTC ────────
+
+test "drm: p4 — PAGE_FLIP/SETCRTC → скан-аут vring (phys/габариты/счётчик)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initVirtioGpu(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+    fake_scan_calls = 0;
+    fake_scan_ret = true;
+    defer fake_scan_ret = true;
+
+    // dumb 320×240×32 → pitch 1280, size 307200
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const gd: *const CreateDumb = @ptrCast(@alignCast(e.vaPtr(va).?));
+    const handle = gd.handle;
+
+    // ADDFB2 XR24 (single-plane, pitch 1280) → fb
+    var f2: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    f2.handles[0] = handle;
+    f2.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const fb_id: u32 = (@as(*const FbCmd2, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+
+    // PAGE_FLIP → ПЕРВЫЙ КАДР: скан-аут с физикой dumb-бэкинга + габаритами fb
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 1), st.scanouts);
+    try testing.expectEqual(@as(u32, 1), fake_scan_calls);
+    // fake-физика alloc_pages: 0x5000_0000 + начальный mmap_cursor
+    try testing.expectEqual(@as(u64, 0x5000_0000 + FakeEnv.USER_BASE + FakeEnv.USER_LEN), fake_scan_phys);
+    try testing.expectEqual(@as(u32, 320), fake_scan_w);
+    try testing.expectEqual(@as(u32, 240), fake_scan_h);
+    try testing.expectEqual(@as(u32, 1280), fake_scan_pitch);
+
+    // второй флип (дабл-буферинг) → счётчик растёт, флипы растут
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 2), st.flips);
+    try testing.expectEqual(@as(u32, 2), st.scanouts);
+
+    // SETCRTC с fb → тоже скан-аут (легаси-путь gamescope до первого флипа)
+    var cr: ModeCrtc = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&cr));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_SETCRTC, va));
+    try testing.expectEqual(@as(u32, 3), st.scanouts);
+
+    // SETCRTC fb=0 (dpms off) → БЕЗ скан-аута
+    cr = .{ .crtc_id = kmsIds()[0], .fb_id = 0 };
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(ModeCrtc)], std.mem.asBytes(&cr));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_SETCRTC, va));
+    try testing.expectEqual(@as(u32, 3), st.scanouts);
+}
+
+test "drm: p4 — скан-аут недоступен/линейный-fb → флип валиден, scanouts=0" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+    fake_scan_calls = 0;
+
+    // A. линейный fb (VBE): флип меняет crtc_fb_id, скан-аут НЕ зовётся
+    //    (кадр уже на дисплее — backing = VRAM загрузчика)
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    var d: CreateDumb = .{ .width = 320, .height = 240, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const handle: u32 = (@as(*const CreateDumb, @ptrCast(@alignCast(e.vaPtr(va).?)))).handle;
+    var f: FbCmd = .{ .handle = handle, .width = 320, .height = 240, .pitch = 1280, .bpp = 32 };
+    @memcpy(e.vaPtr(va).?[0..28], std.mem.asBytes(&f));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_ADDFB, va));
+    const fb_id: u32 = (@as(*const FbCmd, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+    var p: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb_id };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 0), st.scanouts);
+    try testing.expectEqual(@as(u32, 0), fake_scan_calls);
+
+    // B. vring-отказ (false): флип валиден (Linux-семантика — буфер
+    //    «принят»), scanouts не растёт (кадр не дошёл)
+    var st2 = DrmState{};
+    initVirtioGpu(&st2, geom640());
+    @memcpy(e.vaPtr(va).?[0..32], std.mem.asBytes(&d));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, ops, DRM_IOCTL_MODE_CREATE_DUMB, va));
+    const h2: u32 = (@as(*const CreateDumb, @ptrCast(@alignCast(e.vaPtr(va).?)))).handle;
+    var f2: FbCmd2 = .{ .width = 320, .height = 240, .pixel_format = 0x3432_5258 };
+    f2.handles[0] = h2;
+    f2.pitches[0] = 1280;
+    @memcpy(e.vaPtr(va).?[0..@sizeOf(FbCmd2)], std.mem.asBytes(&f2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, ops, DRM_IOCTL_MODE_ADDFB2, va));
+    const fb2: u32 = (@as(*const FbCmd2, @ptrCast(@alignCast(e.vaPtr(va).?)))).fb_id;
+    fake_scan_ret = false;
+    defer fake_scan_ret = true;
+    var p2: PageFlip = .{ .crtc_id = kmsIds()[0], .fb_id = fb2 };
+    @memcpy(e.vaPtr(va).?[0..24], std.mem.asBytes(&p2));
+    try testing.expectEqual(@as(i64, 0), drmIoctl(&st2, ops, DRM_IOCTL_MODE_PAGE_FLIP, va));
+    try testing.expectEqual(@as(u32, 0), st2.scanouts);
+    try testing.expectEqual(@as(u32, 0), fake_scan_calls);
+}
+
+// ─── Тесты: враждебные указатели (инвариант нуля паник) ────────────────────
+
+test "drm: мусорный arg-VA → -EFAULT на всех ioctl (ноль паник)" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+
+    const cmds = [_]u32{
+        DRM_IOCTL_VERSION,
+        DRM_IOCTL_GET_CAP,
+        DRM_IOCTL_MODE_GETRESOURCES,
+        DRM_IOCTL_MODE_GETCRTC,
+        DRM_IOCTL_MODE_GETENCODER,
+        DRM_IOCTL_MODE_GETCONNECTOR,
+        DRM_IOCTL_MODE_CREATE_DUMB,
+        DRM_IOCTL_MODE_MAP_DUMB,
+        DRM_IOCTL_MODE_DESTROY_DUMB,
+        DRM_IOCTL_MODE_ADDFB,
+        DRM_IOCTL_MODE_PAGE_FLIP,
+    };
+    // «край» региона: любая структура ≥2Б пересекает границу
+    const bad_vas = [_]u64{ 0, 0xFFFF_8000_0000_0000, 0x30000_0000, FakeEnv.USER_BASE + FakeEnv.USER_LEN - 1 };
+    for (cmds) |cmd| {
+        for (bad_vas) |va| {
+            const r = drmIoctl(&st, ops, cmd, va);
+            try testing.expectEqual(-linux.EFAULT, r);
+        }
+    }
+    // частичный заход за границу fake-региона (64Б-структура на краю)
+    try testing.expectEqual(-linux.EFAULT, drmIoctl(&st, ops, DRM_IOCTL_VERSION, FakeEnv.USER_BASE + FakeEnv.USER_LEN - 8));
+}
+
+// ─── Тесты: fbdev /dev/fb0 ─────────────────────────────────────────────────
+
+test "drm: fb0 — VSCREENINFO/FSCREENINFO из геометрии; PUT идентичной = 0" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{};
+    initLinearFb(&st, geom640());
+    const ops = fakeOps();
+    const va = FakeEnv.USER_BASE;
+
+    // GET var
+    try testing.expectEqual(@as(i64, 0), fbIoctl(&st, ops, FBIOGET_VSCREENINFO, va));
+    const v: *const FbVarScreenInfo = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqual(@as(u32, 640), v.xres);
+    try testing.expectEqual(@as(u32, 480), v.yres);
+    try testing.expectEqual(@as(u32, 32), v.bits_per_pixel);
+    try testing.expectEqual(@as(u32, 16), v.red.offset);
+    try testing.expectEqual(@as(u32, 8), v.red.length);
+    try testing.expectEqual(@as(u32, 0), v.blue.offset);
+
+    // PUT той же геометрии → 0
+    var put: FbVarScreenInfo = v.*;
+    @memcpy(e.vaPtr(va).?[0..160], std.mem.asBytes(&put));
+    try testing.expectEqual(@as(i64, 0), fbIoctl(&st, ops, FBIOPUT_VSCREENINFO, va));
+
+    // PUT чужой геометрии → -EINVAL (режим не переключается fbdev-ом)
+    put.xres = 1920;
+    @memcpy(e.vaPtr(va).?[0..160], std.mem.asBytes(&put));
+    try testing.expectEqual(-linux.EINVAL, fbIoctl(&st, ops, FBIOPUT_VSCREENINFO, va));
+
+    // GET fix
+    @memset(e.mem, 0);
+    try testing.expectEqual(@as(i64, 0), fbIoctl(&st, ops, FBIOGET_FSCREENINFO, va));
+    const fix: *const FbFixScreenInfo = @ptrCast(@alignCast(e.vaPtr(va).?));
+    try testing.expectEqualStrings("poler-fb0", fix.id[0..9]);
+    try testing.expectEqual(@as(u64, 0xFD00_0000), fix.smem_start);
+    try testing.expectEqual(@as(u32, 2560), fix.line_length);
+    try testing.expectEqual(@as(u32, 2), fix.visual); // TRUECOLOR
+    // PUT fix → -EPERM (RO)
+    try testing.expectEqual(-linux.EPERM, fbIoctl(&st, ops, FBIOPUT_FSCREENINFO, va));
+    // неизвестный fb-ioctl → -EINVAL
+    try testing.expectEqual(-linux.EINVAL, fbIoctl(&st, ops, 0x4699, va));
+}
+
+test "drm: fb0 без карты → -ENODEV; devfs-резолв путей" {
+    const e = try envSetup();
+    defer envTeardown(e);
+    var st = DrmState{}; // inactive
+    try testing.expectEqual(-linux.ENODEV, fbIoctl(&st, fakeOps(), FBIOGET_VSCREENINFO, FakeEnv.USER_BASE));
+
+    // файловый фасад: «Всё есть файл»
+    try testing.expectEqual(DevKind.fb0, resolveDevPath("/dev/fb0"));
+    try testing.expectEqual(DevKind.dri_card0, resolveDevPath("/dev/dri/card0"));
+    try testing.expectEqual(DevKind.dri_render, resolveDevPath("/dev/dri/renderD128"));
+    try testing.expect(resolveDevPath("/dev/fb1") == null);
+    try testing.expect(resolveDevPath("/dev/dri/card1") == null);
+    try testing.expect(resolveDevPath("/etc/passwd") == null);
+}
+
+// ─── Тесты: WC/PAT-семантика ───────────────────────────────────────────────
+
+test "drm: PAT Linux-раскладка — PWT-бит выбирает WC-страницу" {
+    // значение MSR 0x277 (байты PA0..PA7):
+    //   PA0=WB PA1=WC PA2=UC- PA3=UC PA4=WB PA5=WC PA6=UC- PA7=UC
+    const pat: [8]u64 = blk: {
+        var b: [8]u64 = undefined;
+        var msr = PAT_LINUX_WC;
+        for (0..8) |i| {
+            b[i] = msr & 0xFF; // младший байт MSR = PA0 (LSB-первый)
+            msr >>= 8;
+        }
+        break :blk b;
+    };
+    // PA1 (PWT=1,PCD=0,PAT=0) = 0x01 = WC — память типа Write-Combining
+    try testing.expectEqual(@as(u64, 0x01), pat[1]);
+    try testing.expectEqual(@as(u64, 0x06), pat[0]); // PA0 = WB
+    try testing.expectEqual(@as(u64, 0x00), pat[3]); // PA3 = UC
+    // PTE_WC = PWT-бит — после PAT-записи страницы фреймбуфера с ним = WC
+    try testing.expectEqual(@as(u64, 0x08), PTE_WC);
+}
+
+test "drm: geomModeinfo — vrefresh/флаги/имя-разрешение" {
+    const m = geomModeinfo(geom640());
+    try testing.expectEqual(@as(u16, 640), m.hdisplay);
+    try testing.expectEqual(@as(u16, 480), m.vdisplay);
+    try testing.expectEqual(@as(u16, 800), m.htotal); // 640+160
+    try testing.expectEqual(@as(u16, 520), m.vtotal); // 480+40
+    try testing.expectEqual(@as(u32, 60), m.vrefresh);
+    try testing.expectEqual(DRM_MODE_TYPE_DRIVER, m.mtype);
+    const name = m.name[0..(std.mem.indexOfScalar(u8, &m.name, 0) orelse 32)];
+    try testing.expectEqualStrings("640x480", name);
+}
