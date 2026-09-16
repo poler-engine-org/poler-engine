@@ -8,3 +8,11 @@ models/
 
 # Суверенный Гиппокамп: локальные бенчмарковые БД знаний
 /.knowledge-bench/
+
+# Python-кэш инструментов (tools/knowledge_engine и др.)
+__pycache__/
+*.pyc
+
+# Zig-артефакты крипто-ядра (os/core)
+os/core/zig-out/
+os/core/.zig-cache/

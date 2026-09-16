@@ -13,11 +13,13 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 ```
 
 > **Документация (v2.0):** полная карта — [`docs/INDEX.md`](docs/INDEX.md).
+> Единая архитектура монорепозитория (M3–M7) — `docs/UNIFIED_ARCHITECTURE.md` ·
+> крипто-ядро Zig PND v8 — `os/core/` (`zig build test`, 23/23) ·
 > Архитектура — `docs/ARCHITECTURE.md` · теория (ε, R(t), RaBitQ, R1CS) —
 > `docs/THEORY.md` · история проекта — `docs/HISTORY.md` · справочник
 > модулей — `docs/MODULES.md` · CLI — `docs/CLI.md` · форматы —
 > `docs/formats/` · глоссарий — `GLOSSARY.md` · контрибуция —
-> `CONTRIBUTING.md` · план монорепозитория — `docs/MERGE_PLAN.md`.
+> `CONTRIBUTING.md` · план монорепозитория (истор.) — `docs/MERGE_PLAN.md`.
 > Этот README — прежде всего чейнджлог; нижние секции частично описывают
 > старые версии (v0.3.x), актуальная структура — в `docs/MODULES.md`.
 
