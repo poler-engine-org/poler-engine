@@ -57,6 +57,17 @@ enum ResonanceArg {
     Poler,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum KnowledgeEmbedderArg {
+    /// Без векторного слоя (только BM25/WebRank) — быстрый инжест.
+    None,
+    /// Детерминированная хэш-проекция 512-d: полный гибридный конвейер
+    /// (RaBitQ+HNSW) без модели — инструментальная проекция, НЕ семантика.
+    Hash,
+    /// Нативный энкодер из --model <path.pqw> (BGE-M3/XLM-R класс).
+    Pqw,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "poler-engine",
@@ -352,6 +363,68 @@ struct Cli {
     #[arg(long = "pqw-selftest")]
     pqw_selftest: bool,
 
+    // ---------- Суверенный Гиппокамп: библиотека POLER → нативный индекс (v0.29) ----------
+
+    /// ИНЖЕСТ БИБЛИОТЕКИ ЗНАНИЙ: PATH = корень POLER_ALL_GENERATED_DOCS
+    /// (слои 01…06 распознаются автоматически). Секции → чанки с якорями
+    /// и эпистемической разметкой (MVR ×1.5 / первоисточник ×1.0 /
+    /// нарратив ×0.7) → полнотекстовый индекс (BM25/WebRank + Semantic
+    /// Bridge) + опционально векторный слой (RaBitQ 144 Б/вектор + HNSW).
+    #[arg(
+        long = "knowledge-ingest",
+        value_name = "PATH",
+        conflicts_with_all = [
+            "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell",
+            "tui", "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_search", "knowledge_stats"
+        ]
+    )]
+    knowledge_ingest: Option<PathBuf>,
+
+    /// Векторный слой инжеста: none (по умолчанию) | hash | pqw.
+    /// pqw требует --model <path.pqw> (суверенные веса).
+    #[arg(
+        long = "knowledge-embedder",
+        value_enum,
+        default_value_t = KnowledgeEmbedderArg::None,
+        requires = "knowledge_ingest"
+    )]
+    knowledge_embedder: KnowledgeEmbedderArg,
+
+    /// ПОИСК ПО БИБЛИОТЕКЕ ЗНАНИЙ: гибрид BM25/WebRank + векторы (если
+    /// индекс построен с векторным слоем), эпистемическая градация и
+    /// фильтр достоверности. Хиты несут файл/строки/байты + прямую цитату.
+    #[arg(
+        long = "knowledge-search",
+        value_name = "QUERY",
+        conflicts_with_all = [
+            "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell",
+            "tui", "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_stats"
+        ]
+    )]
+    knowledge_search: Option<String>,
+
+    /// Минимальный эпистемический статус хитов (с --knowledge-search):
+    /// mvr | source | narrative.
+    #[arg(long = "min-provenance", value_name = "LEVEL", requires = "knowledge_search")]
+    min_provenance: Option<String>,
+
+    /// Путь к БД знаний [default: ~/.local/share/poler-engine/knowledge.db].
+    #[arg(long = "knowledge-db", value_name = "PATH")]
+    knowledge_db: Option<PathBuf>,
+
+    /// Статистика индекса знаний (JSON в stdout).
+    #[arg(
+        long = "knowledge-stats",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_search"
+        ]
+    )]
+    knowledge_stats: bool,
+
     /// AIDDE impact-анализ символа (call graph + upstream/downstream паспорт).
     #[arg(long)]
     impact: Option<String>,
@@ -623,10 +696,21 @@ fn run(cli: Cli) -> ExitCode {
         return ExitCode::from(run_ner(what, &cli) as u8);
     }
 
+    // ---------- Суверенный Гиппокамп: библиотека знаний POLER (v0.29) ----------
+    if cli.knowledge_stats {
+        return ExitCode::from(run_knowledge_stats(&cli) as u8);
+    }
+    if let Some(root) = &cli.knowledge_ingest {
+        return ExitCode::from(run_knowledge_ingest(&cli, root) as u8);
+    }
+    if let Some(query) = &cli.knowledge_search {
+        return ExitCode::from(run_knowledge_search(&cli, query) as u8);
+    }
+
     // ---------- MCP-сервер: stdio JSON-RPC для LLM-агентов ----------
     if cli.mcp {
         let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
-        let code = poler_engine::mcp::run(cli.cdp_port, cli.web_wait_ms, db);
+        let code = poler_engine::mcp::run(cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone());
         return ExitCode::from(code as u8);
     }
 
@@ -669,7 +753,7 @@ fn run(cli: Cli) -> ExitCode {
                 eprintln!("poler-weblens: оконный браузер не запущен: {e}");
             }
         }
-        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db);
+        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone());
         return ExitCode::from(code as u8);
     }
 
@@ -717,7 +801,7 @@ fn run(cli: Cli) -> ExitCode {
             .clone()
             .or_else(|| std::env::var("POLER_MCP_TOKEN").ok())
             .unwrap_or_else(poler_engine::mcp_http::generate_token);
-        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db);
+        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone());
         return ExitCode::from(code as u8);
     }
 
@@ -1567,6 +1651,118 @@ fn run_semantic_corpus_search(
         println!("   {snippet}…");
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Суверенный Гиппокамп (v0.29): раннеры CLI
+// ---------------------------------------------------------------------------
+
+/// БД знаний: --knowledge-db | POLER_KNOWLEDGE_DB | ~/.local/share/…/knowledge.db.
+fn knowledge_db_of(cli: &Cli) -> std::path::PathBuf {
+    cli.knowledge_db
+        .clone()
+        .unwrap_or_else(poler_engine::sources::knowledge::default_db_path)
+}
+
+/// `--knowledge-ingest <PATH>`: библиотека POLER → нативный индекс.
+fn run_knowledge_ingest(cli: &Cli, root: &std::path::Path) -> i32 {
+    use poler_engine::sources::knowledge::{self, IngestOptions, KnowledgeEmbedder};
+
+    let mode = match cli.knowledge_embedder {
+        KnowledgeEmbedderArg::None => "none",
+        KnowledgeEmbedderArg::Hash => "hash",
+        KnowledgeEmbedderArg::Pqw => "pqw",
+    };
+    let mut embedder = match KnowledgeEmbedder::from_mode(mode, cli.model.as_deref()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    let db = knowledge_db_of(cli);
+    eprintln!(
+        "poler-knowledge: инжест {:?} → {:?} (эмбеддер: {mode})",
+        root, db
+    );
+    match knowledge::ingest(root, &db, &mut embedder, &IngestOptions::default()) {
+        Ok(rep) => {
+            print!("{}", rep.render_text());
+            eprintln!(
+                "поиск: poler-engine --knowledge-search \"…\" [--min-provenance mvr] \
+                 [--knowledge-db {:?}]",
+                db
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            2
+        }
+    }
+}
+
+/// `--knowledge-search <QUERY>`: гибридный поиск с эпистемической градацией.
+fn run_knowledge_search(cli: &Cli, query: &str) -> i32 {
+    use poler_engine::retrieval::Provenance;
+    use poler_engine::sources::knowledge::{self, QueryOptions};
+
+    let db = knowledge_db_of(cli);
+    let min_prov = match cli.min_provenance.as_deref() {
+        None => None,
+        Some(s) => match Provenance::parse(s) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!(
+                    "poler-engine: неизвестный --min-provenance {s:?} \
+                     (доступно: mvr | source | narrative)"
+                );
+                return 2;
+            }
+        },
+    };
+    // Векторное русло: восстанавливаем эмбеддер по мета индекса; для .pqw
+    // нужен --model — без него ищем чистым BM25 (честная деградация).
+    let mut embedder = match knowledge::query_embedder(&db, cli.model.as_deref()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            None
+        }
+    };
+    let opts = QueryOptions { top: cli.top.max(1), min_provenance: min_prov, ..Default::default() };
+    match knowledge::query(&db, query, &opts, embedder.as_mut()) {
+        Ok(out) => {
+            print!("{}", knowledge::render_query_text(query, &out));
+            if out.hits.is_empty() {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            2
+        }
+    }
+}
+
+/// `--knowledge-stats`: JSON-статистика индекса знаний.
+fn run_knowledge_stats(cli: &Cli) -> i32 {
+    let db = knowledge_db_of(cli);
+    match poler_engine::sources::knowledge::stats(&db) {
+        Ok(s) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&s).unwrap_or_else(|_| "{}".into())
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            2
+        }
+    }
 }
 
 /// Рекурсивный сбор текстовых файлов (без бинарных, ≤2 МБ).

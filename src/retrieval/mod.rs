@@ -24,7 +24,7 @@ pub mod semantic_bridge;
 pub mod teddy;
 
 pub use chunk::{
-    chunk_document, render_chunks_text, Chunk, ChunkConfig, ChunkFormat, ChunkReport,
+    chunk_document, render_chunks_text, Chunk, ChunkConfig, ChunkFormat, ChunkReport, Provenance,
     DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS,
 };
 pub use grep::{

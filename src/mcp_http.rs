@@ -58,7 +58,14 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Запуск MCP-сервера по HTTP. Блокируется до ошибки акцептора
 /// (Ctrl+C убивает процесс штатно). Возвращает код процесса.
-pub fn run_http(bind: &str, token: &str, cdp_port: u16, wait_ms: u64, db_path: PathBuf) -> i32 {
+pub fn run_http(
+    bind: &str,
+    token: &str,
+    cdp_port: u16,
+    wait_ms: u64,
+    db_path: PathBuf,
+    knowledge_db: Option<PathBuf>,
+) -> i32 {
     // Аудит-фикс №B1: пустой/короткий --mcp-token (или POLER_MCP_TOKEN="")
     // раньше означал, что ЛЮБОЙ запрос с пустым X-Poler-Token проходит
     // проверку (token_eq("", "") == true). Fail-closed: слабый токен
@@ -95,7 +102,11 @@ pub fn run_http(bind: &str, token: &str, cdp_port: u16, wait_ms: u64, db_path: P
     eprintln!("Публичный туннель без аккаунта (URL напечатает сам):");
     eprintln!("  cloudflared tunnel --url http://{bind}");
     eprintln!("Токен: --mcp-token <T> | env POLER_MCP_TOKEN | сгенерирован выше. Ctrl+C — стоп.");
-    let server = Arc::new(McpServer::new(cdp_port, wait_ms, db_path));
+    let mut server = McpServer::new(cdp_port, wait_ms, db_path);
+    if let Some(kdb) = knowledge_db {
+        server = server.with_knowledge_db(kdb);
+    }
+    let server = Arc::new(server);
     serve(listener, server, token)
 }
 

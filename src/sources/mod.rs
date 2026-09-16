@@ -29,6 +29,12 @@
 //!   last_status    TEXT              -- 'ok' | 'fail' | 'unknown'
 //! );
 //! ```
+//!
+//! См. также модуль [`knowledge`] — Суверенный Гиппокамп (v0.29.0): инжест
+//! библиотеки POLER (спеки, трактат, транскрипты) в нативный индекс движка
+//! с эпистемической градацией доверия.
+
+pub mod knowledge;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

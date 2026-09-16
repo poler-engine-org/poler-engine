@@ -102,6 +102,81 @@ impl ChunkConfig {
     }
 }
 
+/// Эпистемический статус происхождения текста чанка (Суверенный Гиппокамп,
+/// v0.29.0).
+///
+/// Боль: RAG-выдачи смешивают машинно доказанные факты, первоисточники и
+/// свободный нарратив в один неотличимый список — агент не может взвесить
+/// доверие к цитате. Решение: чанк несёт метку провенанса, гибридное
+/// ранжирование умножает скор на детерминированный коэффициент. Движок
+/// не решает, что «истинно», — он честно маркирует происхождение.
+///
+/// Порядок вариантов — ВОСХОДЯЩЕЕ доверие (производный `Ord`):
+/// `Narrative < SourceDocument < MvrVerified` — фильтр `min_provenance`
+/// и сортировки сравнивают значения напрямую.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    /// Нарратив без верификации: описания, синтез, манифесты (том VI).
+    /// Коэффициент ×0.7.
+    Narrative,
+    /// Первоисточник: секция 4 PTS, оригинальные тексты и код, транскрипты.
+    /// Коэффициент ×1.0.
+    SourceDocument,
+    /// Машинно доказано: MVR-паспорта (тома I–V трактата), golden-векторы,
+    /// теоремы с инструментальной верификацией. Коэффициент ×1.5.
+    MvrVerified,
+}
+
+impl Provenance {
+    /// Коэффициент ранжирования: гибридный скор умножается на него.
+    pub fn coefficient(self) -> f64 {
+        match self {
+            Provenance::MvrVerified => 1.5,
+            Provenance::SourceDocument => 1.0,
+            Provenance::Narrative => 0.7,
+        }
+    }
+
+    /// Стабильное строковое представление (БД, MCP, CLI, JSON).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provenance::MvrVerified => "mvr_verified",
+            Provenance::SourceDocument => "source_document",
+            Provenance::Narrative => "narrative",
+        }
+    }
+
+    /// Парсинг с короткими синонимами: mvr / source / narrative.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "mvr_verified" | "mvr" | "verified" => Some(Provenance::MvrVerified),
+            "source_document" | "source" | "src" | "original" => {
+                Some(Provenance::SourceDocument)
+            }
+            "narrative" | "nar" => Some(Provenance::Narrative),
+            _ => None,
+        }
+    }
+
+    /// Человекочитаемый бейдж для выдачи.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Provenance::MvrVerified => "MVR-VERIFIED ×1.5",
+            Provenance::SourceDocument => "SOURCE ×1.0",
+            Provenance::Narrative => "NARRATIVE ×0.7",
+        }
+    }
+}
+
+impl Default for Provenance {
+    /// Произвольный документ по умолчанию — первоисточник (сам о себе):
+    /// без явной разметки движок не занижает и не завышает доверие.
+    fn default() -> Self {
+        Provenance::SourceDocument
+    }
+}
+
 /// Один чанк — пассаж с якорями.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
@@ -121,6 +196,11 @@ pub struct Chunk {
     pub breadcrumb: Vec<String>,
     /// Число токенов POLER в чанке.
     pub tokens: usize,
+    /// Эпистемический статус происхождения. Для нарезки произвольных
+    /// документов — `SourceDocument` (по умолчанию); инжест библиотеки
+    /// POLER проставляет послойно/посекционно (Суверенный Гиппокамп).
+    #[serde(default)]
+    pub provenance: Provenance,
 }
 
 /// Итог нарезки документа.
@@ -505,6 +585,7 @@ pub fn chunk_document(text: &str, format: ChunkFormat, cfg: &ChunkConfig) -> Chu
                 line_end: line_of(text, e.saturating_sub(1)),
                 breadcrumb: breadcrumb.clone(),
                 tokens,
+                provenance: Provenance::default(),
             });
         }
     }

@@ -147,6 +147,9 @@ pub struct McpServer {
     cdp_port: u16,
     wait_ms: u64,
     db_path: PathBuf,
+    /// БД знаний Суверенного Гиппокампа (v0.29): отдельная от веб-индекса,
+    /// строится `--knowledge-ingest`.
+    knowledge_db: PathBuf,
 }
 
 impl McpServer {
@@ -156,16 +159,31 @@ impl McpServer {
             cdp_port,
             wait_ms,
             db_path,
+            knowledge_db: crate::sources::knowledge::default_db_path(),
         }
+    }
+
+    /// Переопределить БД знаний (Суверенный Гиппокамп, v0.29).
+    pub fn with_knowledge_db(mut self, path: PathBuf) -> Self {
+        self.knowledge_db = path;
+        self
     }
 }
 
 /// Запуск MCP-сервера (stdio). Возвращает код процесса (0 = чистый EOF stdin).
-pub fn run(cdp_port: u16, wait_ms: u64, db_path: PathBuf) -> i32 {
-    let server = McpServer::new(cdp_port, wait_ms, db_path);
+pub fn run(
+    cdp_port: u16,
+    wait_ms: u64,
+    db_path: PathBuf,
+    knowledge_db: Option<PathBuf>,
+) -> i32 {
+    let mut server = McpServer::new(cdp_port, wait_ms, db_path);
+    if let Some(kdb) = knowledge_db {
+        server = server.with_knowledge_db(kdb);
+    }
     eprintln!(
-        "poler-mcp: stdio JSON-RPC, db={:?}, cdp_port={}, wait_ms={}",
-        server.db_path, server.cdp_port, server.wait_ms
+        "poler-mcp: stdio JSON-RPC, db={:?}, knowledge={:?}, cdp_port={}, wait_ms={}",
+        server.db_path, server.knowledge_db, server.cdp_port, server.wait_ms
     );
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -271,6 +289,7 @@ impl McpServer {
             "poler_chunk" => self.tool_chunk(&args),
             "poler_box_exec" => self.tool_box_exec(&args),
             "poler_box_status" => self.tool_box_status(&args),
+            "query_poler_knowledge" => self.tool_knowledge_query(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -335,6 +354,60 @@ impl McpServer {
             ));
         }
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // query_poler_knowledge: Суверенный Гиппокамп (v0.29)
+    // -----------------------------------------------------------------
+    /// Поиск по библиотеке POLER с эпистемической градацией доверия.
+    ///
+    /// Хиты несут: статус верификации (MVR-паспорт / первоисточник /
+    /// нарратив), файл, номера строк, байтовый диапазон и прямую цитату —
+    /// агент цитирует заземлённо и никогда не путает доказанное с нарративом.
+    /// Библиотека не построена → инструкция (isError=false), не сбой.
+    fn tool_knowledge_query(&self, args: &Value) -> Result<String, String> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент query (строка) обязателен")?;
+        if query.trim().is_empty() {
+            return Err("query пустой — укажи поисковую фразу".into());
+        }
+        let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+        let top = top.clamp(1, 30);
+        let min_provenance = match args.get("min_provenance").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(crate::retrieval::Provenance::parse(s).ok_or_else(|| {
+                format!("неизвестный min_provenance {s:?} (доступно: mvr | source | narrative)")
+            })?),
+        };
+        // Векторное русло (если индекс построен с ним): .pqw-модель из
+        // POLER_KNOWLEDGE_MODEL; без переменной — честная деградация до BM25.
+        let model = std::env::var("POLER_KNOWLEDGE_MODEL").ok().map(PathBuf::from);
+        let mut embedder =
+            match crate::sources::knowledge::query_embedder(&self.knowledge_db, model.as_deref())
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("poler-mcp: векторное русло пропущено: {e}");
+                    None
+                }
+            };
+        let opts = crate::sources::knowledge::QueryOptions {
+            top,
+            min_provenance,
+            ..Default::default()
+        };
+        match crate::sources::knowledge::query(&self.knowledge_db, query, &opts, embedder.as_mut())
+        {
+            Ok(out) => Ok(crate::sources::knowledge::render_query_text(query, &out)),
+            // Библиотека не построена — состояние, не сбой инструмента
+            // (как poler_web_search с пустым индексом — агент получает план).
+            Err(e) if e.contains("--knowledge-ingest") => {
+                Ok(format!("Библиотека знаний ещё не проиндексирована: {e}"))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -941,6 +1014,30 @@ RAG-конвейера chunking→retrieve: нарежь документ, пр�
             }
         }),
         json!({
+            "name": "query_poler_knowledge",
+            "description": "Поиск по библиотеке POLER «Суверенный Гиппокамп»: 300 PTS-спек, \
+6-томный математический трактат, ядро шифра PND, Шнайер (укр), 194 транскрипта. \
+Гибрид BM25/WebRank + векторы (RaBitQ), кросс-языковый Semantic Bridge (рус↔англ). \
+Эпистемическая градация: каждый хит несёт статус достоверности — mvr_verified \
+(машинно доказано, ×1.5) / source_document (первоисточник, ×1.0) / narrative \
+(нарратив, ×0.7), файл, номера строк, байтовый диапазон и прямую цитату. \
+min_provenance отсекает недостоверное ('mvr' — только машинно доказанное). \
+Цитаты точны: text == файл[byte_start..byte_end] — проверяемо.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Поисковая фраза (рус/укр/англ)"},
+                    "top": {"type": "integer", "default": 8, "minimum": 1, "maximum": 30},
+                    "min_provenance": {
+                        "type": "string",
+                        "enum": ["mvr", "source", "narrative"],
+                        "description": "Минимальный эпистемический статус хитов"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
             "name": "poler_box_exec",
             "description": "Двухконтурный брокер (v0.26.0): исполняет команду В ИЗОЛИРОВАННОМ \
 Docker-контейнере и возвращает stdout/stderr/exit-код. Схема: мозг агента \
@@ -1237,5 +1334,92 @@ mod box_broker_tests {
         std::env::remove_var("POLER_BOX_DOCKER");
         std::env::remove_var("POLER_WORKSPACE");
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod knowledge_tool_tests {
+    use super::*;
+
+    /// Сквозной тест Суверенного Гиппокампа: мини-библиотека → инжест →
+    /// tools/list → tools/call query_poler_knowledge (провенанс, цитата,
+    /// фильтр min_provenance, инструкция при отсутствии БД).
+    #[test]
+    fn knowledge_tool_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let d1 = dir.path().join("01_SPECS");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::write(
+            d1.join("PTS-042.md"),
+            "# PTS-042: Спека\n\n## 1. ОБЗОР\nнарративный обзор механики.\n\n\
+             ## 4. ПОЛНЫЙ ТЕХНИЧЕСКИЙ ТЕКСТ\noriginal source text про диффузионный слой pndMix.\n",
+        )
+        .unwrap();
+        let d3 = dir.path().join("03_TREATISE");
+        std::fs::create_dir_all(&d3).unwrap();
+        std::fs::write(
+            d3.join("VOLUME_V_PND.md"),
+            "# Том V\n\n## Теорема\nдиффузионный слой pndMix доказан золотым вектором.\n",
+        )
+        .unwrap();
+
+        let kdb = dir.path().join("knowledge.db");
+        let mut emb = crate::sources::knowledge::KnowledgeEmbedder::None;
+        crate::sources::knowledge::ingest(
+            dir.path(),
+            &kdb,
+            &mut emb,
+            &crate::sources::knowledge::IngestOptions::default(),
+        )
+        .unwrap();
+
+        let srv = McpServer::new(9222, 10, PathBuf::from("/nonexistent-web.db"))
+            .with_knowledge_db(kdb.clone());
+
+        // tools/list содержит новый инструмент
+        let r = srv
+            .dispatch(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .unwrap();
+        assert!(serde_json::to_string(&r).unwrap().contains("query_poler_knowledge"));
+
+        // tools/call: хиты с провенансом и цитатой
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "query_poler_knowledge",
+                           "arguments": {"query": "pndMix диффузионный"}}
+            }))
+            .unwrap();
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains("MVR-VERIFIED"), "бейдж MVR: {text}");
+        assert!(text.contains("TREATISE-V"), "док-ключ: {text}");
+        assert!(text.contains("pndMix"), "цитата: {text}");
+
+        // min_provenance=mvr: нарративные PTS-секции отсечены
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "query_poler_knowledge",
+                           "arguments": {"query": "обзор механики", "min_provenance": "mvr"}}
+            }))
+            .unwrap();
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(
+            text.contains("0 хитов") || text.contains("ничего не найдено"),
+            "mvr-фильтр жёсткий: {text}"
+        );
+
+        // без БД — инструкция, не isError-сбой
+        let srv2 = McpServer::new(9222, 10, PathBuf::from("/nonexistent-web.db"))
+            .with_knowledge_db(dir.path().join("missing.db"));
+        let r = srv2
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "query_poler_knowledge", "arguments": {"query": "x"}}
+            }))
+            .unwrap();
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains("--knowledge-ingest"), "инструкция инжеста: {text}");
+        assert!(!text.contains("\"isError\":true"), "состояние, не сбой: {text}");
     }
 }

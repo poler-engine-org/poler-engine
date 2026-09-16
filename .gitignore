@@ -5,3 +5,6 @@ Cargo.lock.bak
 test-web.db
 models/
 /scratch/
+
+# Суверенный Гиппокамп: локальные бенчмарковые БД знаний
+/.knowledge-bench/
