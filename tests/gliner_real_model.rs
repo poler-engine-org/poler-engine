@@ -120,7 +120,7 @@ fn real_gliner_tokenizer_deberta_and_entities() {
 
     // стадия 0: emb_ln (после LN эмбеддингов) — порог мягче: int8-шум
     let ref_emb = read_f64(&dump.join("emb_ln.bin"));
-    let mut min_cos = cosine_flat(&stages[0], &ref_emb);
+    let min_cos = cosine_flat(&stages[0], &ref_emb);
     eprintln!("emb_ln   cos = {min_cos:.5}");
     assert!(min_cos >= 0.9995, "emb_ln косинус = {min_cos:.5}");
 

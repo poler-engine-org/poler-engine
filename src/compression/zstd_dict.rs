@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn roundtrip_plain_mode() {
-        let mut c = DocStoreCodec::new().unwrap();
+        let c = DocStoreCodec::new().unwrap();
         assert!(!c.has_dict());
         for text in ["короткий", &page(1, "нокс"), &page(2, "резонанс")] {
             let blob = c.compress(text).unwrap();
@@ -201,7 +201,7 @@ mod tests {
         let corpus: Vec<String> = (0..64).map(|i| page(i, "протокол")).collect();
         let refs: Vec<&str> = corpus.iter().map(|s| s.as_str()).collect();
         let dict = DocStoreCodec::train_dict_from_texts(&refs).expect("словарь обязан обучиться");
-        let mut c = DocStoreCodec::with_dict(dict).unwrap();
+        let c = DocStoreCodec::with_dict(dict).unwrap();
         assert!(c.has_dict());
         for text in &corpus {
             let blob = c.compress(text).unwrap();
@@ -216,8 +216,8 @@ mod tests {
         let corpus: Vec<String> = (0..64).map(|i| page(i % 8, "вектор")).collect();
         let refs: Vec<&str> = corpus.iter().map(|s| s.as_str()).collect();
         let dict = DocStoreCodec::train_dict_from_texts(&refs).expect("словарь");
-        let mut plain = DocStoreCodec::new().unwrap();
-        let mut dictc = DocStoreCodec::with_dict(dict).unwrap();
+        let plain = DocStoreCodec::new().unwrap();
+        let dictc = DocStoreCodec::with_dict(dict).unwrap();
         let short: Vec<&str> = corpus.iter().map(|s| s.as_str()).take(8).collect();
         let p: usize = short.iter().map(|t| plain.compress(t).unwrap().len()).sum();
         let d: usize = short.iter().map(|t| dictc.compress(t).unwrap().len()).sum();
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn empty_text_is_empty_blob() {
-        let mut c = DocStoreCodec::new().unwrap();
+        let c = DocStoreCodec::new().unwrap();
         assert!(c.compress("").unwrap().is_empty());
         assert_eq!(c.decompress(&[]).unwrap(), "");
     }
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn legacy_bytes_pass_through() {
         // Не-blob байты (старые строки/повреждение) — как сырой текст.
-        let mut c = DocStoreCodec::new().unwrap();
+        let c = DocStoreCodec::new().unwrap();
         assert_eq!(c.decompress("просто текст".as_bytes()).unwrap(), "просто текст");
         assert_eq!(c.decompress(b"P").unwrap(), "P");
         assert_eq!(c.decompress(b"PZ").unwrap(), "PZ");
@@ -245,10 +245,10 @@ mod tests {
         let corpus: Vec<String> = (0..32).map(|i| page(i, "система")).collect();
         let refs: Vec<&str> = corpus.iter().map(|s| s.as_str()).collect();
         let dict = DocStoreCodec::train_dict_from_texts(&refs).expect("словарь");
-        let mut c = DocStoreCodec::with_dict(dict).unwrap();
+        let c = DocStoreCodec::with_dict(dict).unwrap();
         let blob = c.compress(&corpus[0]).unwrap();
         // Читает кодек БЕЗ словаря — обязан отказаться, а не портить данные.
-        let mut bare = DocStoreCodec::new().unwrap();
+        let bare = DocStoreCodec::new().unwrap();
         assert!(bare.decompress(&blob).is_err());
     }
 

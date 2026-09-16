@@ -142,6 +142,10 @@ mod tests {
     use super::*;
 
     #[test]
+    // 1.5708 — намеренный литерал Display-теста (строка "Ry(q3, 1.5708)"),
+    // не приближение π/2 для математики; poler-side фикс под CI-гейт
+    // clippy::correctness после всасывания в workspace (M2).
+    #[allow(clippy::approx_constant)]
     fn display_is_informative() {
         assert_eq!(Gate::ry(3, 1.5708).to_string(), "Ry(q3, 1.5708)");
         assert_eq!(Gate::cx(0, 1).to_string(), "CX(q0 -> q1)");

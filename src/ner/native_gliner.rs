@@ -186,6 +186,11 @@ pub struct RealGlinerModel {
     tokenizer: crate::pqc::tokenizer::UnigramTokenizer,
     max_width: usize,
     ent_id: u32,
+    /// Спец-токен <<SEP>>: валидируется при open() против секции
+    /// __tokenizer__; в инференсе не читается (промпт кодируется
+    /// текстовыми маркерами) — хранится для отладки и будущих
+    /// SEP-зависимых голов.
+    #[allow(dead_code)]
     sep_id: u32,
 }
 

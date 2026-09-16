@@ -1425,7 +1425,7 @@ mod tests {
         let (orig, kept, reduction) = pipe.stats();
 
         let mut operands = vec![0.0f32; pipe.n_operands()];
-        for (i, v) in operands[..in_d].iter_mut().enumerate() {
+        for v in operands[..in_d].iter_mut() {
             *v = (rng.next() % 97) as f32 / 8.0 - 6.0;
         }
         let mut ref_ops = operands[..in_d].to_vec();

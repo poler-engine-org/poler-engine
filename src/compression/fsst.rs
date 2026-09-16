@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn vocab_arena_matches_hashmap_semantics() {
         let terms = morphology_terms(3000);
-        let mut rng = Rng(0xFEED_FACE_1234);
+        let _rng = Rng(0xFEED_FACE_1234);
         // 60% вставки + повторы, 40% промахи
         let mut probes: Vec<&str> = Vec::new();
         for t in terms.iter().take(1800) {

@@ -1,5 +1,7 @@
 //! Микро-бенчмарк ядер pqc: анзац, вероятности, CDF, сэмплирование,
-//! продуктовый движок. Запуск: `cargo run --release -p pqc --example bench`.
+//! продуктовый движок. Запуск: `cargo run --release -p pqc --example pqc_bench`
+//! (переименован из `bench` при всасывании в workspace poler-engine —
+//! коллизия имён example-таргетов с движком, cargo#6313).
 //!
 //! Совет: `RUSTFLAGS="-C target-cpu=native" cargo run --release ...`
 //! включает AVX2/FMA-генерацию ядер на машине исполнения.

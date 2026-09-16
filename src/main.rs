@@ -1738,7 +1738,9 @@ fn run_llm(mode: &str, cli: &Cli) -> i32 {
             return 2;
         }
     };
-    let (prompt_ids, has_real_tok) = if let Some(tok) = model.tokenizer() {
+    // _has_real_tok: признак «реальный токенизатор vs hash-фолбэк» —
+    // диагностика; поведение генерации от него не ветвится.
+    let (prompt_ids, _has_real_tok) = if let Some(tok) = model.tokenizer() {
         let formatted = if prompt.contains("[gMASK]") || prompt.contains("<|user|>") {
             prompt.clone()
         } else {
