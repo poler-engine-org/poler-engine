@@ -37,6 +37,9 @@ only, нативный инференс через собственное ядр
 
 | Документ | Тема |
 |---|---|
+| [POLER_REVERSE_META_COMPILER.md](POLER_REVERSE_META_COMPILER.md) | Англоязычная техспецификация meta_compiler (параллельная сессия): Reverse/Meta-стадии, dual execution targets, 31 400 проходов/сек — дополнение к [quantum-eri.md](quantum-eri.md) |
+| [MONOREPO_CONSOLIDATION_PLAN.md](MONOREPO_CONSOLIDATION_PLAN.md) | Англоязычный мастер-план монорепо (параллельная сессия): дерево crates/ — дополнение к [MERGE_PLAN.md](MERGE_PLAN.md) (фазы M0–M5 и исторический контекст — там) |
+| [COGNITIVE_ARCHITECTURE_299_SOURCES_SYNTHESIS.md](COGNITIVE_ARCHITECTURE_299_SOURCES_SYNTHESIS.md) | Синтез теоретических столпов из 299 источников (FEP, резонанс фаз) — дополнение к [THEORY.md](THEORY.md) §1–2 и [HISTORY.md](HISTORY.md) (карта тем архива — там) |
 | [algebra_of_sense_trit5.md](algebra_of_sense_trit5.md) | Алгебра смысла и кодек Trit5 (краткая версия, см. THEORY.md §6) |
 | [terminal-gateway-architecture.md](terminal-gateway-architecture.md) | Terminal Gateway v0.22–0.28: двойной контур исполнения, sandbox, root broker |
 | [native-retrieval-analysis.md](native-retrieval-analysis.md) | Разбор GNU grep / text-splitter → дизайн слоёв 0/B/S |
