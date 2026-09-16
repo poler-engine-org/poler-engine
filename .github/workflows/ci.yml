@@ -71,8 +71,30 @@ jobs:
           cd os/core
           zig build test
 
-      - name: "Rust FFI (фича pnd-ffi): golden-связка Zig-Rust"
+      - name: "Rust FFI (фича pnd-ffi): golden-связка Zig-Rust + крипто-слой данных"
         run: cargo test --lib --features pnd-ffi
+
+      - name: "POLER Vault smoke: seal → verify → open → cmp (без ключа и с ключом)"
+        run: |
+          cargo build --release --features pnd-ffi --bin poler-engine
+          head -c 1048576 /dev/urandom > /tmp/vault-src.bin
+          export POLER_VAULT_KEY="ci-smoke-key"
+          ./target/release/poler-engine --memory-seal /tmp/vault-src.bin --memory-content-id
+          unset POLER_VAULT_KEY
+          ./target/release/poler-engine --memory-verify /tmp/vault-src.bin.pvt
+          ./target/release/poler-engine --memory-info /tmp/vault-src.bin.pvt
+          export POLER_VAULT_KEY="ci-smoke-key"
+          ./target/release/poler-engine --memory-open /tmp/vault-src.bin.pvt --memory-out /tmp/vault-out.bin
+          cmp /tmp/vault-src.bin /tmp/vault-out.bin
+          # подмена байта должна ловиться без ключа
+          python3 -c "
+          d = bytearray(open('/tmp/vault-src.bin.pvt','rb').read()); d[5000] ^= 1
+          open('/tmp/vault-bad.pvt','wb').write(bytes(d))"
+          unset POLER_VAULT_KEY
+          if ./target/release/poler-engine --memory-verify /tmp/vault-bad.pvt; then
+            echo "FAIL: подмена не обнаружена"; exit 1
+          fi
+          echo "Vault smoke OK: roundtrip + tamper-detection"
 
       - name: "MVR-верификатор: побитовая сверка Python против Zig (54 626 golden-векторов)"
         run: |

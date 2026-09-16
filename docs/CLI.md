@@ -165,7 +165,34 @@ poler-engine --benchmark --benchmark-json report.json
 BM25-golden · чанкер · vectors · compression/RSS + latency (мс) и RAM
 (VmHWM/VmRSS).
 
-## 10. Удалённое в v2.0 (не возвращать)
+## 10. Крипто-слой данных: POLER Vault `--memory-*` (M4.5, фича pnd-ffi)
+
+Зашифрованная постоянная память: любой поток (документы, логи
+терминала, история чата, ответы ИИ) запечатывается в контейнер `.pvt`
+(CBC PND v8.2, 256-битный ключ из парольной фразы, ланцюговій MAC,
+внешний SHA-256). Контейнер синхронизируется через git/любой транспорт:
+без ключа — нечитаем, но проверяем (`--memory-verify`). Формат:
+`docs/formats/VAULT_FORMAT.md`. Память O(1) — от 500 КБ до сотен ГБ.
+
+```bash
+export POLER_VAULT_KEY="…"   # или строка из stdin, если env нет
+
+poler-engine --memory-seal   logs.txt            # → logs.txt.pvt
+poler-engine --memory-seal   logs.txt --memory-content-id   # + контент-хеш
+poler-engine --memory-verify logs.txt.pvt        # без ключа: FNV + SHA-256
+poler-engine --memory-info   logs.txt.pvt        # метаданные без ключа
+poler-engine --memory-open   logs.txt.pvt        # → logs.txt (проверка MAC)
+poler-engine --memory-open   logs.txt.pvt --memory-out restored.txt
+```
+
+Опции: `--memory-out PATH` (явный выход; по умолчанию существующий файл
+не перезаписывается), `--memory-key-env VAR` (имя env с ключом),
+`--memory-content-id` (публичный контент-хез в заголовок — дедупликация
+ ценой возможности сверки догадок), `--memory-kdf-iters N` (default
+100000, минимум 10000). Требует сборки с `--features pnd-ffi`
+(Zig-ядро, см. INSTALL.md).
+
+## 11. Удалённое в v2.0 (не возвращать)
 
 `--google-*`, `--nlm-*`, `--auth-ui`, `--import-browser-session`,
 `--license-import` — Google/NLM-интеграции вырезаны (суверенный стек,

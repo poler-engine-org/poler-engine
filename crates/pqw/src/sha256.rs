@@ -72,31 +72,79 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
 
 /// SHA-256 от среза (потоковая обработка, без дополнительной аллокации).
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut state = H0;
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
+}
 
-    let mut chunks = data.chunks_exact(64);
-    for block in &mut chunks {
-        compress(&mut state, block.try_into().unwrap());
+/// Потоковый SHA-256 (FIPS 180-4): update() произвольными кусками,
+/// finalize() один раз. Память O(1) — ровно 64-байтовый буфер блока,
+/// поэтому внешний digest контейнеров любого размера (байты … гигабайты)
+/// считается без загрузки файла в RAM.
+pub struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buflen: usize,
+    total: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    /// Инициализировать с стандартными константами IV.
+    pub fn new() -> Self {
+        Sha256 { state: H0, buf: [0u8; 64], buflen: 0, total: 0 }
     }
 
-    // Хвост + паддинг: 0x80, нули, длина в битах (big-endian).
-    let rem = chunks.remainder();
-    let r = rem.len();
-    let mut tail = [0u8; 128];
-    tail[..r].copy_from_slice(rem);
-    tail[r] = 0x80;
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let len_at = if r < 56 { 56 } else { 120 };
-    tail[len_at..len_at + 8].copy_from_slice(&bit_len.to_be_bytes());
-    for block in tail[..len_at + 8].chunks_exact(64) {
-        compress(&mut state, block.try_into().unwrap());
+    /// Подать очередной кусок данных (любой длины, включая 0).
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        if self.buflen > 0 {
+            let need = 64 - self.buflen;
+            let take = need.min(data.len());
+            self.buf[self.buflen..self.buflen + take].copy_from_slice(&data[..take]);
+            self.buflen += take;
+            data = &data[take..];
+            if self.buflen == 64 {
+                let block: [u8; 64] = self.buf;
+                compress(&mut self.state, &block);
+                self.buflen = 0;
+            }
+        }
+        let mut chunks = data.chunks_exact(64);
+        for block in &mut chunks {
+            compress(&mut self.state, block.try_into().unwrap());
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buflen = rem.len();
+        }
     }
 
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    /// Завершить и снять 32-байтовый digest (self больше не используется).
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total.wrapping_mul(8);
+        // Паддинг: 0x80, нули, длина в битах (big-endian).
+        let mut tail = [0u8; 128];
+        tail[..self.buflen].copy_from_slice(&self.buf[..self.buflen]);
+        tail[self.buflen] = 0x80;
+        let len_at = if self.buflen < 56 { 56 } else { 120 };
+        tail[len_at..len_at + 8].copy_from_slice(&bit_len.to_be_bytes());
+        for block in tail[..len_at + 8].chunks_exact(64) {
+            compress(&mut self.state, block.try_into().unwrap());
+        }
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
     }
-    out
 }
 
 /// Первые 24 байта SHA-256 — digest payload в формате `.pqw`.
@@ -155,5 +203,39 @@ mod tests {
         let d = sha256(b"poler");
         let t = sha256_trunc24(b"poler");
         assert_eq!(&d[..24], &t[..]);
+    }
+
+    #[test]
+    fn streaming_equals_oneshot() {
+        // Куски произвольной (не кратной 64) длины — digest идентичен one-shot.
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + 13) as u8).collect();
+        for &chunk_len in &[1usize, 7, 63, 64, 65, 4096, 65537] {
+            let mut h = Sha256::new();
+            for piece in data.chunks(chunk_len) {
+                h.update(piece);
+            }
+            assert_eq!(h.finalize(), sha256(&data), "chunk_len={chunk_len}");
+        }
+    }
+
+    #[test]
+    fn streaming_empty_updates() {
+        let mut h = Sha256::new();
+        h.update(b"");
+        h.update(b"abc");
+        h.update(b"");
+        assert_eq!(h.finalize(), sha256(b"abc"));
+    }
+
+    #[test]
+    fn streaming_boundary_padding() {
+        // Сообщения на границе правила паддинга (55/56/63/64 байта).
+        for n in [55usize, 56, 63, 64, 119, 120, 127, 128] {
+            let data = vec![0xA5u8; n];
+            let mut h = Sha256::new();
+            h.update(&data[..n / 2]);
+            h.update(&data[n / 2..]);
+            assert_eq!(h.finalize(), sha256(&data), "n={n}");
+        }
     }
 }

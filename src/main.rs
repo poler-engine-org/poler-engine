@@ -425,6 +425,102 @@ struct Cli {
     )]
     knowledge_stats: bool,
 
+    // ---------- Крипто-слой данных: POLER Vault (M4.5 CDL, фича pnd-ffi) ----------
+
+    /// ЗАПЕЧАТАТЬ ДАННЫЕ «НАСМЕРТЬ» В ЗАШИФРОВАННЫЙ КОНТЕЙНЕР:
+    /// PATH → PATH.pvt. Крипто-ядро PND v8.2 (CBC, 256-битный ключ из
+    /// парольной фразы, ланцюговий MAC + внешний SHA-256). Контейнер
+    /// синхронизируется через git/любой транспорт: без ключа — нечитаем,
+    /// но проверяем на целостность (--memory-verify). Память O(1):
+    /// файлы от 500 КБ до сотен ГБ.
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(
+        long = "memory-seal",
+        value_name = "PATH",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_search", "knowledge_stats",
+            "memory_open", "memory_verify", "memory_info"
+        ]
+    )]
+    memory_seal: Option<PathBuf>,
+
+    /// ВСКРЫТЬ КОНТЕЙНЕР: VAULT.pvt → открытый текст (проверка MAC
+    /// и транспортного SHA-256 обязательна; неверный ключ = отказ).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(
+        long = "memory-open",
+        value_name = "VAULT",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_search", "knowledge_stats",
+            "memory_seal", "memory_verify", "memory_info"
+        ]
+    )]
+    memory_open: Option<PathBuf>,
+
+    /// ПРОВЕРИТЬ КОНТЕЙНЕР БЕЗ КЛЮЧА: заголовок (FNV-1a64) + внешний
+    /// SHA-256 шифротекста — битый git-sync/диск виден до расшифровки.
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(
+        long = "memory-verify",
+        value_name = "VAULT",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_search", "knowledge_stats",
+            "memory_seal", "memory_open", "memory_info"
+        ]
+    )]
+    memory_verify: Option<PathBuf>,
+
+    /// МЕТАДАННЫЕ КОНТЕЙНЕРА БЕЗ КЛЮЧА: версия, размеры, страницы,
+    /// итерации KDF, флаги (для человека и агента).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(
+        long = "memory-info",
+        value_name = "VAULT",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_search", "knowledge_stats",
+            "memory_seal", "memory_open", "memory_verify"
+        ]
+    )]
+    memory_info: Option<PathBuf>,
+
+    /// Выходной путь (с --memory-seal: PATH.pvt по умолчанию;
+    /// с --memory-open: VAULT без .pvt / с суффиксом .out).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "memory-out", value_name = "PATH")]
+    memory_out: Option<PathBuf>,
+
+    /// Имя переменной окружения с парольной фразой
+    /// [default: POLER_VAULT_KEY]. Если переменной нет — одна строка
+    /// читается из stdin (не попадает в историю shell).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "memory-key-env", value_name = "VAR", default_value = "POLER_VAULT_KEY")]
+    memory_key_env: String,
+
+    /// Записать публичный контент-хеш открытого текста в заголовок
+    /// (дедупликация/адресация между контейнерами; по умолчанию
+    /// отключено — приватность: хеш позволяет сверять догадки о содержимом).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "memory-content-id", requires = "memory_seal")]
+    memory_content_id: bool,
+
+    /// Итерации KDF при печати [default: 100000] (минимум 10000).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(
+        long = "memory-kdf-iters",
+        value_name = "N",
+        default_value_t = poler_engine::crypto::kdf::DEFAULT_ITERATIONS,
+        requires = "memory_seal"
+    )]
+    memory_kdf_iters: u32,
+
     /// AIDDE impact-анализ символа (call graph + upstream/downstream паспорт).
     #[arg(long)]
     impact: Option<String>,
@@ -705,6 +801,23 @@ fn run(cli: Cli) -> ExitCode {
     }
     if let Some(query) = &cli.knowledge_search {
         return ExitCode::from(run_knowledge_search(&cli, query) as u8);
+    }
+
+    // ---------- Крипто-слой данных: POLER Vault (M4.5 CDL) ----------
+    #[cfg(feature = "pnd-ffi")]
+    {
+        if let Some(input) = &cli.memory_seal {
+            return ExitCode::from(run_memory_seal(&cli, input) as u8);
+        }
+        if let Some(vault) = &cli.memory_open {
+            return ExitCode::from(run_memory_open(&cli, vault) as u8);
+        }
+        if let Some(vault) = &cli.memory_verify {
+            return ExitCode::from(run_memory_verify(&cli, vault) as u8);
+        }
+        if let Some(vault) = &cli.memory_info {
+            return ExitCode::from(run_memory_info(&cli, vault) as u8);
+        }
     }
 
     // ---------- MCP-сервер: stdio JSON-RPC для LLM-агентов ----------
@@ -1764,6 +1877,190 @@ fn run_knowledge_stats(cli: &Cli) -> i32 {
         }
     }
 }
+
+// ── Крипто-слой данных: POLER Vault (M4.5 CDL, фича pnd-ffi) ────────────────
+
+/// Парольная фраза: env (по умолчанию POLER_VAULT_KEY) → stdin.
+/// Ключ никогда не пишется в историю shell: env или пайп.
+#[cfg(feature = "pnd-ffi")]
+fn vault_passphrase(key_env: &str) -> Result<String, String> {
+    if let Ok(k) = std::env::var(key_env) {
+        if !k.is_empty() {
+            return Ok(k);
+        }
+    }
+    eprint!("poler-vault: парольная фраза (stdin, не попадёт в историю shell): ");
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("stdin: {e}"))?;
+    let phrase = line.trim_end_matches(['\n', '\r']).to_string();
+    if phrase.is_empty() {
+        return Err("пустая парольная фраза — отказ (защита от случайной печати без ключа)".into());
+    }
+    Ok(phrase)
+}
+
+/// Выходной путь по умолчанию для печати: PATH + ".pvt".
+#[cfg(feature = "pnd-ffi")]
+fn vault_default_seal_output(input: &std::path::Path) -> std::path::PathBuf {
+    let mut s = input.as_os_str().to_os_string();
+    s.push(".pvt");
+    std::path::PathBuf::from(s)
+}
+
+/// Выходной путь по умолчанию для вскрытия: снять .pvt, иначе суффикс .out.
+#[cfg(feature = "pnd-ffi")]
+fn vault_default_open_output(vault: &std::path::Path) -> std::path::PathBuf {
+    match vault.extension().and_then(|e| e.to_str()) {
+        Some("pvt") => vault.with_extension(""),
+        _ => {
+            let mut s = vault.as_os_str().to_os_string();
+            s.push(".out");
+            std::path::PathBuf::from(s)
+        }
+    }
+}
+
+#[cfg(feature = "pnd-ffi")]
+fn run_memory_seal(cli: &Cli, input: &std::path::Path) -> i32 {
+    use poler_engine::crypto::vault::{self, SealOptions};
+
+    let output = cli.memory_out.clone().unwrap_or_else(|| vault_default_seal_output(input));
+    if output.exists() {
+        eprintln!(
+            "poler-vault: выход уже существует: {} (передайте --memory-out или удалите)",
+            output.display()
+        );
+        return 2;
+    }
+    let passphrase = match vault_passphrase(&cli.memory_key_env) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("poler-vault: {e}");
+            return 2;
+        }
+    };
+    let opts = SealOptions {
+        iterations: cli.memory_kdf_iters,
+        content_id: cli.memory_content_id,
+        salt: None,
+    };
+    match vault::seal(input, &output, &passphrase, &opts) {
+        Ok(rep) => {
+            println!("запечатано: {}", rep.output.display());
+            println!(
+                "  источник: {} ({} байт, {} стр. по 4096)",
+                rep.input.display(),
+                rep.original_len,
+                rep.pages
+            );
+            println!("  контейнер: {} байт", rep.vault_len);
+            println!("  время: {} мс ({:.1} МБ/с), KDF {} итераций", rep.duration_ms, rep.mb_per_s, opts.iterations);
+            if let Some(cid) = rep.content_id {
+                println!("  content-id: {}", poler_engine::crypto::hasher::PndHasher::hex(&cid));
+            }
+            println!("  проверка без ключа: poler-engine --memory-verify {}", rep.output.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-vault: {e}");
+            2
+        }
+    }
+}
+
+#[cfg(feature = "pnd-ffi")]
+fn run_memory_open(cli: &Cli, vault_path: &std::path::Path) -> i32 {
+    use poler_engine::crypto::vault;
+
+    let output = cli.memory_out.clone().unwrap_or_else(|| vault_default_open_output(vault_path));
+    if output.exists() {
+        eprintln!(
+            "poler-vault: выход уже существует: {} (передайте --memory-out или удалите)",
+            output.display()
+        );
+        return 2;
+    }
+    let passphrase = match vault_passphrase(&cli.memory_key_env) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("poler-vault: {e}");
+            return 2;
+        }
+    };
+    match vault::open(vault_path, &output, &passphrase) {
+        Ok(rep) => {
+            println!("вскрыто: {}", rep.output.display());
+            println!(
+                "  контейнер: {} ({} байт, {} стр.)",
+                rep.input.display(),
+                rep.original_len,
+                rep.pages
+            );
+            println!(
+                "  транспорт: OK (SHA-256), аутентичность: OK (MAC), {} мс ({:.1} МБ/с)",
+                rep.duration_ms, rep.mb_per_s
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-vault: {e}");
+            eprintln!("  подсказка: неверная фраза ИЛИ подмена — сравните с --memory-verify (без ключа)");
+            2
+        }
+    }
+}
+
+#[cfg(feature = "pnd-ffi")]
+fn run_memory_verify(cli: &Cli, vault_path: &std::path::Path) -> i32 {
+    use poler_engine::crypto::vault;
+
+    match vault::verify(vault_path) {
+        Ok(rep) => {
+            println!("контейнер цел: {}", rep.path.display());
+            println!("  заголовок: OK (FNV-1a64), транспорт: OK (SHA-256 шифротекста)");
+            println!("  страниц: {}, размер: {} байт", rep.pages, rep.vault_len);
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-vault: {e}");
+            2
+        }
+    }
+}
+
+#[cfg(feature = "pnd-ffi")]
+fn run_memory_info(cli: &Cli, vault_path: &std::path::Path) -> i32 {
+    use poler_engine::crypto::vault;
+
+    match vault::info(vault_path) {
+        Ok(h) => {
+            println!("контейнер: {}", vault_path.display());
+            println!("  формат: v{} (magic POLERVLT), flags: {:#x}", h.format_version, h.flags);
+            println!(
+                "  данные: {} байт в {} стр. по 4096 (контейнер: {} байт)",
+                h.original_len,
+                h.page_count,
+                4096 + h.page_count * 4096
+            );
+            println!("  KDF: {} итераций, epsilon: {:#x}", h.kdf_iterations, h.epsilon);
+            if h.flags & poler_engine::crypto::vault::FLAG_CONTENT_ID != 0 {
+                println!("  content-id: {}", poler_engine::crypto::hasher::PndHasher::hex(&h.content_id));
+            } else {
+                println!("  content-id: (не сохранён — приватный режим)");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-vault: {e}");
+            2
+        }
+    }
+}
+
 
 /// Рекурсивный сбор текстовых файлов (без бинарных, ≤2 МБ).
 fn collect_text_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>, max: usize) -> bool {

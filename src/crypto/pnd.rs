@@ -40,6 +40,13 @@ extern "C" {
     fn poler_drbg_next(handle: *mut c_void) -> u32;
     fn poler_drbg_next_range(handle: *mut c_void, max: u32) -> u32;
     fn poler_drbg_free(handle: *mut c_void);
+
+    fn poler_cbc_encrypt(
+        handle: *mut c_void, iv: *const u32, pt: *const u32, pt_words: usize, ct: *mut u32,
+    );
+    fn poler_cbc_decrypt(
+        handle: *mut c_void, iv: *const u32, ct: *const u32, ct_words: usize, pt: *mut u32,
+    );
 }
 
 // ── Скалярные примитивы ─────────────────────────────────────────────────────
@@ -110,6 +117,75 @@ impl PolerCipher {
         let mut pt = [0u32; BLOCK_WORDS];
         unsafe { poler_cipher_decrypt(self.handle, ciphertext.as_ptr(), pt.as_mut_ptr()) };
         pt
+    }
+
+    /// CBC-шифрование потока слов (P0-F2): `iv` — 4 слова, `pt_words`
+    /// кратно 4, `ct.len() >= pt.len()`. Сцепление блоков исключает
+    /// ECB-утечку одинаковых блоков (критерий приёмки аудита Шнайера).
+    pub fn cbc_encrypt_words(
+        &self, iv: &[u32; BLOCK_WORDS], pt: &[u32], ct: &mut [u32],
+    ) {
+        assert!(pt.len() % BLOCK_WORDS == 0, "pt_words must be a multiple of 4");
+        assert!(ct.len() >= pt.len(), "ct buffer too small");
+        unsafe {
+            poler_cbc_encrypt(self.handle, iv.as_ptr(), pt.as_ptr(), pt.len(), ct.as_mut_ptr());
+        }
+    }
+
+    /// CBC-расшифрование потока слов (см. [`Self::cbc_encrypt_words`]).
+    pub fn cbc_decrypt_words(
+        &self, iv: &[u32; BLOCK_WORDS], ct: &[u32], pt: &mut [u32],
+    ) {
+        assert!(ct.len() % BLOCK_WORDS == 0, "ct_words must be a multiple of 4");
+        assert!(pt.len() >= ct.len(), "pt buffer too small");
+        unsafe {
+            poler_cbc_decrypt(self.handle, iv.as_ptr(), ct.as_ptr(), ct.len(), pt.as_mut_ptr());
+        }
+    }
+
+    /// CBC-шифрование байтов: хвост до кратности 16 байт дополняется
+    /// нулями (возвращает вместе с исходной длиной — контракт Vault:
+    /// реальная длина хранится в заголовке). Возвращает (ciphertext, real_len).
+    pub fn cbc_encrypt_bytes(&self, iv: &[u32; BLOCK_WORDS], pt: &[u8]) -> (Vec<u8>, usize) {
+        let real = pt.len();
+        // Число 16-байтовых CBC-блоков → слов (кратно BLOCK_WORDS).
+        let padded_words = real.div_ceil(BLOCK_WORDS * 4) * BLOCK_WORDS;
+        let mut words = vec![0u32; padded_words];
+        for (i, chunk) in pt.chunks_exact(4).enumerate() {
+            words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        let tail = pt.chunks_exact(4).remainder();
+        if !tail.is_empty() {
+            let mut b = [0u8; 4];
+            b[..tail.len()].copy_from_slice(tail);
+            words[real / 4] = u32::from_le_bytes(b);
+        }
+        let mut ct = vec![0u32; padded_words];
+        self.cbc_encrypt_words(iv, &words, &mut ct);
+        let mut out = Vec::with_capacity(padded_words * 4);
+        for w in &ct {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        (out, real)
+    }
+
+    /// CBC-расшифрование байтов: `real` байт результата валидны
+    /// (остальное — нулевой паддинг, отбрасывается).
+    pub fn cbc_decrypt_bytes(&self, iv: &[u32; BLOCK_WORDS], ct: &[u8], real: usize) -> Vec<u8> {
+        assert!(ct.len() % 16 == 0, "ciphertext length must be a multiple of 16");
+        let n_words = ct.len() / 4;
+        let mut words = vec![0u32; n_words];
+        for i in 0..n_words {
+            words[i] = u32::from_le_bytes([ct[4 * i], ct[4 * i + 1], ct[4 * i + 2], ct[4 * i + 3]]);
+        }
+        let mut pt = vec![0u32; n_words];
+        self.cbc_decrypt_words(iv, &words, &mut pt);
+        let mut out = Vec::with_capacity(n_words * 4);
+        for w in &pt {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.truncate(real);
+        out
     }
 }
 
@@ -248,5 +324,62 @@ mod tests {
         // modInverse32: 0x9E3779B9⁻¹ = 0x144CBC89 (golden-значение ядра)
         assert_eq!(mod_inverse32(0x9E3779B9), 0x144CBC89);
         assert_eq!(lhca_step(0x12345678, 0xACACACAC), lhca_step(0x12345678, 0xACACACAC));
+    }
+
+    /// P0-F2: CBC — одинаковые блоки открытого текста дают разные
+    /// шифротексты (анти-ECB). Rust-дубль zig-теста.
+    #[test]
+    fn cbc_identical_blocks_differ() {
+        let key = [0x11111111u32, 0x22222222, 0x33333333, 0x44444444,
+                   0x55555555, 0x66666666, 0x77777777, 0x88888888];
+        let cipher = PolerCipher::new(&key, 0xBEEF).expect("cipher alloc");
+        let iv = [0xA0A1A2A3, 0xB0B1B2B3, 0xC0C1C2C3, 0xD0D1D2D3];
+        // 4 одинаковых блока
+        let mut pt = [0u32; 4 * BLOCK_WORDS];
+        for chunk in pt.chunks_exact_mut(BLOCK_WORDS) {
+            chunk.copy_from_slice(&[0xDEADBEEF, 0xCAFEBABE, 0xBADC0DE, 0xFEEDFACE]);
+        }
+        let mut ct = [0u32; 4 * BLOCK_WORDS];
+        cipher.cbc_encrypt_words(&iv, &pt, &mut ct);
+        for a in 0..4 {
+            for b in (a + 1)..4 {
+                let ca = &ct[a * 4..a * 4 + 4];
+                let cb = &ct[b * 4..b * 4 + 4];
+                assert_ne!(ca, cb, "блоки {a} и {b} идентичны — ECB-утечка");
+            }
+        }
+        // roundtrip
+        let mut back = [0u32; 4 * BLOCK_WORDS];
+        cipher.cbc_decrypt_words(&iv, &ct, &mut back);
+        assert_eq!(back, pt);
+    }
+
+    /// CBC: смена IV полностью меняет шифротекст (соль/IV обязательны).
+    #[test]
+    fn cbc_iv_sensitivity() {
+        let key = [7u32; KEY_WORDS];
+        let cipher = PolerCipher::new(&key, 1).expect("cipher alloc");
+        let pt = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let mut ct1 = [0u32; 8];
+        let mut ct2 = [0u32; 8];
+        cipher.cbc_encrypt_words(&[1, 1, 1, 1], &pt, &mut ct1);
+        cipher.cbc_encrypt_words(&[2, 1, 1, 1], &pt, &mut ct2);
+        assert_ne!(ct1, ct2);
+    }
+
+    /// CBC bytes-обёртка: roundtrip с некратной длиной (паддинг нулями
+    /// + реальная длина из заголовка — контракт Vault).
+    #[test]
+    fn cbc_bytes_roundtrip_partial_tail() {
+        let cipher = PolerCipher::new(&[0xAB; 8], 0x77).expect("cipher alloc");
+        let iv = [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10];
+        for len in [0usize, 1, 15, 16, 17, 31, 4095, 4096, 4097] {
+            let pt: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let (ct, real) = cipher.cbc_encrypt_bytes(&iv, &pt);
+            assert_eq!(real, len);
+            assert_eq!(ct.len(), len.div_ceil(16) * 16);
+            let back = cipher.cbc_decrypt_bytes(&iv, &ct, real);
+            assert_eq!(back, pt, "len={len}");
+        }
     }
 }

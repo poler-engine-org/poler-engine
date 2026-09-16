@@ -31,6 +31,7 @@ only, нативный инференс через собственное ядр
 | [formats/PQW_FORMAT.md](formats/PQW_FORMAT.md) | Спецификация формата весов `.pqw` v2 | конвертеры, ядро pqc |
 | [formats/PRBQ_FORMAT.md](formats/PRBQ_FORMAT.md) | Спецификация хранилища квантованных векторов PRBQ v1 | векторный субстрат |
 | [formats/WEB_INDEX_FORMAT.md](formats/WEB_INDEX_FORMAT.md) | Схема SQLite веб-индекса (pages/terms/links/hosts) | веб-краулер, --web-search |
+| [formats/VAULT_FORMAT.md](formats/VAULT_FORMAT.md) | Спецификация зашифрованного контейнера памяти `.pvt` v1 (M4.5 CDL: CBC PND v8.2, ланцюговій MAC, внешний SHA-256, CLI --memory-*) | крипто-слой данных, синхронизация памяти через git |
 | [../GLOSSARY.md](../GLOSSARY.md) | Глоссарий терминологии POLER (ε, R(t), русла J, сцены, архетипы…) | все |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Как контрибьютить: процесс, инварианты, дисциплина коммитов | контрибьюторы |
 | [../INSTALL.md](../INSTALL.md) | Сборка (включая path-зависимость POLER-Quantum-RS), конвертация моделей | первый запуск |
