@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MVR-v3, цикл A — Теоремы V.1/V.2: криптографическое ядро PND v8.
+"""MVR-v3, цикл A — Теорема V.2′: примитивы S-box x^254 в GF(2⁸).
 
-АРХЕОЛОГИЯ (фаза 0): критика линейности в архиве 299 источников относится к
-PND v6/v7. В v8 (poler-os/zig-kernel) pndMix = Φ(a·b) +% ε·Φ(a⊕b) c S-box
-x^254 до умножения — линейные пути уничтожены (слова владельца + трактат
-Vol V). РЕПОЗИТОРИЙ poler-os НЕ входит в этот монорепо ⇒ код-грундинг
-PENDING; здесь доказывается МАТЕМАТИКА примитивов v8.
+РЕДИЦИЯ 2 (после подключения poler-os): ARX-часть ВЫВЕДЕНА из оборота —
+прежний arx_phi описывал ДРУГУЮ структуру (без mul/xorshift) и Z3 доказывал
+легкую функцию. Биективность РЕАЛЬНОЙ Φ — в verify_pnd_full.py (секция v1:
+пошаговые леммы + Hensel-обратный). Этот скрипт сохраняет свою уникальную
+ценность: GF-представление-независимость и ПОЛНЫЕ таблицы DDT/LAT S-box.
 
 Слои:
   gf    — x^254 == x⁻¹ в GF(2⁸) для ДВУХ неприводимых полиномов (0x11B AES,
           0x165) — представление-независимость (Ферма: x^255 = 1)
   sbox  — биективность S; ПОЛНЫЕ таблицы DDT (256×256) и LAT (256×256):
           δ_S (дифференциальная равномерность), max|W| (линейность), NL
-  z3    — SMT-доказательство биективности ARX-бокса Φ (Vol V Th. V.1):
-          rotl13 → xor → rotl7 → add; коллизии UNSAT на 3 наборах констант
-  rt    — явный обратный Φ⁻¹ и round-trip на 10⁷ случайных + краевых
   json  — паспорт в scratch/passports/cycle_A.json
+
+Сверка с реальным ядром poler-os: значения constantTimeSbox — golden-вектора
+в verify_pnd_full.py (все 256 значений совпали бит-в-бит).
 """
 import argparse, json, sys
 from pathlib import Path
@@ -101,90 +101,22 @@ def run_sbox(poly=0x11B):
                         if delta_S == 4 and NL >= 112 else
                         'ЧАСТИЧНО: δ=%d, NL=%d — см. паспорт' % (delta_S, NL))}
 
-# ───────────────────── 3. Z3: биективность ARX-бокса Φ (Th. V.1) ──────────────
-ARX_CONST_SETS = [
-    (0x9E3779B9, 0x85EBCA6B, 0xC2B2AE35),   # золотое сечение / murmur
-    (0x243F6A88, 0xB7E15162, 0xDEADBEEF),   # pi/frac, blowfish, маркер
-    (0x517CC1B7, 0x27220A94, 0xFE13C8C9),   # произвольные константы
-]
-
-def arx_phi(x, c1, c2, c3):
-    """Φ = rotl7(add(rotl(xor(rotl(x +% C1, 13), C2)), C3)) — порядок Vol V."""
-    def rotl(v, r):
-        return ((v << r) | (v >> (32 - r))) & 0xFFFFFFFF
-    y1 = (x + c1) & 0xFFFFFFFF
-    y2 = rotl(y1, 13)
-    y3 = y2 ^ c2
-    y4 = rotl(y3, 7)
-    y5 = (y4 + c3) & 0xFFFFFFFF
-    return y5
-
+# ───────────────── 3. Z3: биективность ARX Φ — ПЕРЕНЕСЕНО ───────────────────
+# РЕДИЦИЯ 2: прямой запрос на реальную Φ (add→rotl13→χ16→mul→rotl7→add)
+# не решается Z3 за разумное время (>300 c — mul байт-бластится тяжело).
+# Доказательство реальной Φ — пошаговые леммы в verify_pnd_full.py::run_v1
+# (Z3 UNSAT × 4 + Hensel-обратный для mul). Ниже — маркер для паспорта.
 def run_z3():
-    import z3
-    results = {}
-    for (c1, c2, c3) in ARX_CONST_SETS:
-        x1 = z3.BitVec('x1', 32); x2 = z3.BitVec('x2', 32)
-        def phi(x):
-            return z3.RotateLeft(z3.RotateLeft(x + z3.BitVecVal(c1, 32), 13)
-                                 ^ z3.BitVecVal(c2, 32), 7) + z3.BitVecVal(c3, 32)
-        s = z3.Solver()
-        s.add(phi(x1) == phi(x2))       # коллизия
-        s.add(x1 != x2)                 # при разных входах
-        r = s.check()
-        results['Φ(0x%08X,0x%08X,0x%08X)' % (c1, c2, c3)] = (
-            'UNSAT — коллизий нет (инъективность на Z_2³² ⇒ биективность)'
-            if r == z3.unsat else str(r))
-    all_unsat = all('UNSAT' in v for v in results.values())
-    return {'z3_version': z3.get_version_string(), 'proofs': results,
-            'structural_note': 'Каждый шаг (add const, rotl, xor const) — '
-                               'биекция ∀C; композиция биекций биективна для '
-                               'ЛЮБЫХ констант — проверено на 3 наборах',
-            'verdict': 'AXIOM CONFIRMED (∀x1≠x2: Φ(x1)≠Φ(x2))' if all_unsat
-                       else 'REFUTED'}
+    return {'status': 'ПЕРЕНЕСЕНО в verify_pnd_full.py (секция v1)',
+            'reason': 'прошлая Z3-секция доказывала ДРУГУЮ структуру Φ '
+                      '(без mul/xorshift) — легкую функцию; реальная доказана '
+                      'пошаговыми леммами',
+            'verdict': 'см. verify_pnd_full.py / Том V изд. 2 §2'}
 
-# ───────────────────── 4. Явный Φ⁻¹ и round-trip на 10⁷ точек ─────────────────
+# ───────────────────── 4. Явный Φ⁻¹ — ПЕРЕНЕСЕНО ─────────────────────────────
 def run_roundtrip(n=10_000_000, seed=5):
-    rng = np.random.default_rng(seed)
-    def rotr(v, r):
-        return ((v >> r) | (v << (32 - r))) & 0xFFFFFFFF
-    ok_all = True
-    for (c1, c2, c3) in ARX_CONST_SETS:
-        xs = np.concatenate([
-            rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32),
-            np.array([0, 1, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF,
-                      c1, c2, c3], dtype=np.uint32),
-        ])
-        ys = np.array([arx_phi(int(x), c1, c2, c3) for x in
-                       xs[:200000]], dtype=np.uint32)     # питон-путь: 2·10⁵
-        # векторный явный обратный
-        def phi_inv(y):
-            t = (y - c3) & 0xFFFFFFFF                     # y4
-            t = rotr(t, 7)                                # y3
-            t = t ^ c2                                    # y2
-            t = rotr(t, 13)                               # y1
-            return (t - c1) & 0xFFFFFFFF
-        back = phi_inv(ys)
-        ok = bool(np.all(back == xs[:200000]))
-        ok_all &= ok
-    # numpy-векторизованный Φ для полного 10⁷ round-trip (набор констант №1)
-    c1, c2, c3 = ARX_CONST_SETS[0]
-    xs = rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32)
-    y1 = xs + np.uint32(c1)
-    y2 = ((y1 << np.uint32(13)) | (y1 >> np.uint32(19))).astype(np.uint32)
-    y3 = y2 ^ np.uint32(c2)
-    y4 = ((y3 << np.uint32(7)) | (y3 >> np.uint32(25))).astype(np.uint32)
-    y5 = y4 + np.uint32(c3)
-    t = y5 - np.uint32(c3)
-    t = ((t >> np.uint32(7)) | (t << np.uint32(25))).astype(np.uint32)
-    t = t ^ np.uint32(c2)
-    t = ((t >> np.uint32(13)) | (t << np.uint32(19))).astype(np.uint32)
-    back = t - np.uint32(c1)
-    full_ok = bool(np.all(back == xs))
-    return {'samples_python_path': 200000 * len(ARX_CONST_SETS) + 8,
-            'samples_numpy_path': n,
-            'roundtrip_all_ok': bool(ok_all and full_ok),
-            'verdict': ('AXIOM CONFIRMED (Φ⁻¹ явный; round-trip тождественен)'
-                        if ok_all and full_ok else 'REFUTED')}
+    return {'status': 'ПЕРЕНЕСЕНО в verify_pnd_full.py (секция v1)',
+            'verdict': 'Φ⁻¹ для реальной структуры + round-trip 2×10⁶ — там же'}
 
 def main():
     ap = argparse.ArgumentParser()
@@ -195,10 +127,11 @@ def main():
            'archaeology': {
                'source': 'архив 299: критика линейности = PND v6/v7 (устарело); '
                          'v8: pndMix = Φ(a·b) +% ε·Φ(a⊕b), S-box x^254 до умножения',
-               'code_grounding': 'PENDING — poler-os/zig-kernel в ОТДЕЛЬНОМ репо, '
-                                 'не входит в монорепо poler-engine'},
-           'code': ['docs/mathematical-treatise/VOLUME_V (структура Φ и pndMix)'],
-           'commit': '38a862a'}
+               'code_grounding': 'poler-os ПОДКЛЮЧЕН (@fc3ffa8) — полный '
+                                 'код-грундинг в verify_pnd_full.py; этот '
+                                 'скрипт — специалист S-box/GF'},
+           'code': ['docs/mathematical-treatise/VOLUME_V (изд. 2)'],
+           'commit': '36df975'}
     out['gf_inverse'] = run_gf()
     out['sbox_ddt_lat'] = run_sbox()
     out['z3_arx_bijective'] = run_z3()

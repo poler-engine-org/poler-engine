@@ -9,7 +9,8 @@
 | B | `verify_vg8_masks.py` | II.1 (маски {−1,0,+1}) | II | Z3 5.1.0 (FP-теорія), NumPy 2.1.3 | 2026-09-16, commit 38a862a | CONFIRMED WITH CAVEATS (домен: скінченні x; кавет ±0.0) |
 | D | `verify_rotor_norm.py` | I.1 (ротор J=U−Uᵀ) + властивості precess_step | I | SymPy 1.14.0, NumPy 2.1.3, rustc (тест gyro) | 2026-09-16, commit 38a862a | AXIOM CONFIRMED (ротор); CODE PROPERTIES CONFIRMED (lockstep; Σθ НЕ інваріант) |
 | C | `verify_rabitq_arcsin.py` | III.1 (arcsin-MLE), III.2 (стиснення) | III | NumPy 2.1.3 (MC/FWHT/CRB) | 2026-09-16, commit 38a862a | AXIOM CONFIRMED (GW; MLE≈CRB; ADC; 144 Б) |
-| A | `verify_pnd_gf.py` | V.1 (ARX Φ), V.2 (S-box x^254) | V | NumPy 2.1.3 (GF(2⁸), DDT/LAT), Z3 5.1.0 (BV) | 2026-09-16, commit 38a862a | V.1 AXIOM CONFIRMED ∀C; V.2 примітиви CONFIRMED (δ_S=4, NL=112); pndMix — PENDING poler-os |
+| A | `verify_pnd_gf.py` | V.2′ (S-box x^254: δ_S=4, NL=112) | V | NumPy 2.1.3 (GF(2⁸), DDT/LAT) | 2026-09-16, commit 36df975 | CONFIRMED (примітиви; ARX-часть виведена з обігу — див. A-фінал) |
+| A-фінал | `verify_pnd_full.py` | V.1 (реальна Φ), V.2 (δ≤8 — REFUTED), V.3 (MDS ℬ=5), V.4 (LHCA), V.5 (пари раундів), V.6 (SAC) | V (вид. 2) | NumPy 2.1.3, Z3 5.1.0, Zig 0.14.0 (golden), повний перебір 2³² | 2026-09-16 | Див. таблицю вердиктів Тому V; ключове: V.2 REFUTED точно (δ≈2²⁸·²), MDS ℬ=5 AXIOM, Δφ — 8 значень на 2³² |
 | E | `verify_iir_z.py` | IV.1 (IIR ⟺ слід Вольтерри) | IV | SymPy 1.14.0 (rsolve/полюси), NumPy 2.1.3 | 2026-09-16, commit 38a862a | AXIOM CONFIRMED |
 
 ## Rust-тести, народжені верифікацією
@@ -33,10 +34,24 @@
    SMT-контрприклад зафіксував необхідність обмеження домену.
 4. **Том I, містифікація:** неіснуючий тест `test_rotor_energy_conservation`
    (0 збігів grep) видалений; реальні якоря: born.rs#L19 + новий тест gyro.
+5. **Цикл A-фінал, головна знахідка:** теорема V.1 вид. 1 описувала ІНШУ
+   функцію (без mul/xorshift) — Z3 доводив легшу структуру. Після
+   підключення poler-os: V.2 (δ≤8) REFUTED точно — Δφ(t⊕2³¹) приймає
+   РІВНО 8 значень на всьому домені 2³², нульова гілка pndMix P=0.30385
+   (збіг передбачення-вимірювання до 6 знаків), δ рядки ≈2²⁸·². Паритет
+   ключів: парні — імунітет (2³¹·k≡0), непарні — вразливість.
+6. **Цикл A-фінал, барьер:** S-box до pndMix (v8) придушує концентрацію
+   30.4%→0.8% (≈2²³×), але НЕ до випадкового рівня 2⁻³²; DDT-зважене
+   передбачення 2⁻⁷·² збігається з прямим вимірюванням 2⁻⁷·⁰.
+7. **Цикл A-фінал, протокол:** сандбокс вбиває фонові процеси (~5 хв) —
+   важкі 2³²-прогони виконуються усередині окремих викликів по ≤10 хв
+   (секції dphi/v2full верифікатора).
 
 ## Стан інструментів (LOADED/STANDBY)
 
 LOADED: python3.12 + numpy 2.1.3 + sympy 1.14.0 + z3-solver 5.1.0; rustc/cargo
-(rustc ≥1.87). STANDBY: cargo-asm (`cargo install cargo-asm`), galois
-(`pip install galois`), criterion-бенчі (`cargo bench --workspace`).
-НЕ ДОСТУПНО в цьому репо: poler-os/zig-kernel (окремий репозиторій).
+(rustc ≥1.87); Zig 0.14.0 (для регенерації golden). STANDBY: cargo-asm
+(`cargo install cargo-asm`), galois (`pip install galois`), criterion-бенчі
+(`cargo bench --workspace`).
+ПОДКЛЮЧЕНО (колись PENDING): poler-os @ fc3ffa8 — джерело golden-векторів
+(`tools/verifiers/golden/pnd_v8_golden_54626.txt` + `zig_probe/README.md`).
