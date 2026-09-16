@@ -7,23 +7,25 @@
 FROM rust:1.98-slim-bookworm AS builder
 WORKDIR /build
 
-# Квантовое ядро: path-депы pqc/pqw (../POLER-Quantum-RS_repo,
-# см. INSTALL.md §2). Каталог кладётся в контекст сборки:
-#   cp -r ../POLER-Quantum-RS_repo . && docker build .
-COPY POLER-Quantum-RS_repo /POLER-Quantum-RS_repo
+# M2: квантовые крейты pqc/pqw живут в самом репозитории (crates/,
+# единый Cargo Workspace) — контекст сборки больше не требует
+# соседнего клона POLER-Quantum-RS_repo (см. docs/MERGE_PLAN.md).
 
-# Слой зависимостей кэшируется отдельно от исходников
+# Слой зависимостей кэшируется отдельно от исходников движка:
+# манифесты + крейты целиком (внешних зависимостей у pqc/pqw ноль).
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo "pub fn _placeholder() {}" > src/lib.rs && \
-    mkdir -p tests examples && \
+COPY crates ./crates
+RUN mkdir -p src tests examples && \
+    echo "pub fn _placeholder() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/main.rs && \
     cargo build --release 2>/dev/null || true
 
 COPY src ./src
 COPY tests ./tests
 COPY examples ./examples
 RUN touch src/lib.rs src/main.rs && \
-    cargo build --release --locked && \
-    cargo test --release --quiet
+    cargo build --release --locked -p poler-engine && \
+    cargo test --release --quiet -p poler-engine
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
