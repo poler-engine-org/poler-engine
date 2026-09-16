@@ -3142,6 +3142,7 @@ mod tests {
 
     #[test]
     fn host_routes_through_docker_when_jailed() {
+        let _g = docker_env_lock();
         let (mut st, ws) = jailed_state("route");
         // несуществующий бинарник: без jail — «не удалось запустить zzz-…»;
         // с jail — обёртка docker exec (упадёт с docker-ошибкой на фейке)

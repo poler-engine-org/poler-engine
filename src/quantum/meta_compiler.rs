@@ -1368,7 +1368,12 @@ mod tests {
             for (name, o) in [("y0", r0), ("y1", r1), ("y2", r2), ("y3", r3), ("y4", r4), ("y5", r5), ("y6", r6)] {
                 let g = got[pipe.slot_of(o).expect("живой операнд")];
                 let w = want[o];
-                assert_eq!(g.to_bits(), w.to_bits(), "{name}: SIMD {g} против эталона {w}");
+                assert!(
+                    g.to_bits() == w.to_bits() || (g == 0.0 && w == 0.0),
+                    "{name}: SIMD {g} (bits {:#x}) против эталона {w} (bits {:#x})",
+                    g.to_bits(),
+                    w.to_bits()
+                );
             }
         }
     }

@@ -2123,6 +2123,7 @@ mod tests {
 
     #[test]
     fn tail_audit_empty_and_filled() {
+        let _g = super::super::containers::docker_env_test_lock();
         let dir = std::env::temp_dir().join(format!("poler-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("POLER_AUDIT_HOME", dir.to_str().unwrap());
@@ -2548,7 +2549,13 @@ mod tests {
         assert!(!log.exists(), "docker не вызывался (закрыто ДО судьи)");
         let st = handle.status();
         assert_eq!(st.autoblocked, 1);
-        let audit = std::fs::read_to_string(audit_path("poler-box-bl")).unwrap();
+        let audit_f = audit_path("poler-box-bl");
+        let mut a_waited = 0;
+        while !audit_f.exists() && a_waited < 100 {
+            std::thread::sleep(Duration::from_millis(50));
+            a_waited += 1;
+        }
+        let audit = std::fs::read_to_string(&audit_f).unwrap();
         assert!(audit.contains("\"verdict\":\"auto-block\""));
         let _ = handle.stop();
         std::env::remove_var("POLER_BOX_DOCKER");

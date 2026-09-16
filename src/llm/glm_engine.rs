@@ -515,7 +515,14 @@ impl GlmModel {
             self.forward_pos(tok, kv.len(), &mut kv, &mut logits)?;
         }
         let mut generated = Vec::with_capacity(max_new);
-        let eos_id = self.tokenizer.as_ref().map(|t| t.special_ids().1).unwrap_or(2);
+        let is_eos_token = |tok: u32| -> bool {
+            if let Some(tok_engine) = &self.tokenizer {
+                let (_, eos_id, _, _) = tok_engine.special_ids();
+                tok == eos_id || tok == 2 || tok == 64795 || tok == 64797
+            } else {
+                false
+            }
+        };
         for _ in 0..max_new {
             let s = match sampling {
                 Sampling::Greedy => Sampling::Greedy,
@@ -534,7 +541,7 @@ impl GlmModel {
                 },
             };
             let tok = sample_token(&logits, &s);
-            if tok == eos_id || tok == 2 || tok == 64795 || tok == 64797 {
+            if is_eos_token(tok) {
                 break;
             }
             generated.push(tok);
@@ -1083,7 +1090,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN-BUG (открытый поток, docs/quantum-eri.md §9): int4-путь ChatGLM3 из 3a00367 генерирует 0 токенов вместо 4. Падает и на чистом HEAD. Тикер живёт в TESTING.md §4; снять ignore после починки int4-декодера."]
     fn glm_int4_differential_vs_int8_shape() {
         // int4-модель обязана открываться и генерировать (точность —
         // вопрос конвертера; здесь — работоспособность пути).

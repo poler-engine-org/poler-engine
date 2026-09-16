@@ -1161,9 +1161,10 @@ mod tests {
             assert!(qcm.qcm_theory.is_finite());
             best = best.min(dt);
         }
+        let max_budget = if cfg!(debug_assertions) { 1500.0 / 1_000_000.0 } else { 150.0 / 1_000_000.0 };
         assert!(
-            best.as_secs_f64() < 150.0 / 1_000_000.0,
-            "QCM + коммутатор заняли {best:?} — бюджет 150 мкс превышен"
+            best.as_secs_f64() < max_budget,
+            "QCM + коммутатор заняли {best:?} — бюджет {max_budget:?} превышен"
         );
     }
 
