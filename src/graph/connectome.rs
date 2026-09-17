@@ -315,6 +315,18 @@ impl Connectome {
         }))
     }
 
+    /// Вес ребра по позиции в CSR-массивах (без границ — вызывается
+    /// только с idx из срезов строк; см. [`Connectome::out_edges`]).
+    /// C2/v0.33.0: восстановление цепочки кратчайшего пути.
+    pub fn row_edge_weight(&self, idx: usize) -> u16 {
+        self.weights[idx]
+    }
+
+    /// Медиатор ребра по позиции в CSR-массивах.
+    pub fn row_edge_nt(&self, idx: usize) -> u8 {
+        self.nt[idx]
+    }
+
     /// Ребро u→v бинарным поиском по отсортированной CSR-строке.
     pub fn edge(&self, u: usize, v: usize) -> Option<Edge> {
         if u >= self.n_nodes || v >= self.n_nodes {
@@ -540,13 +552,10 @@ impl ConnectomeNodes {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---------- Синтетика: сборка буферов в тестах ----------
-
-    fn synth(core: bool, edges: &[(u32, u32, u16, u8)]) -> Vec<u8> {
-        // 4 узла; edges: (u, v, w, nt)
+pub(crate) mod test_support {
+    /// Синтетический FLYCSR1-буфер: 4 узла, edges: (u, v, w, nt).
+    /// Общий для тестов connectome и flyops.
+    pub(crate) fn synth(core: bool, edges: &[(u32, u32, u16, u8)]) -> Vec<u8> {
         let n_nodes = 4u32;
         let mut rows: Vec<Vec<(u32, u16, u8)>> = vec![vec![]; n_nodes as usize];
         for &(u, v, w, nt) in edges {
@@ -557,7 +566,7 @@ mod tests {
         }
         let n_edges: u32 = edges.len() as u32;
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(super::MAGIC);
         buf.push(core as u8);
         buf.extend_from_slice(&n_nodes.to_le_bytes());
         buf.extend_from_slice(&n_edges.to_le_bytes());
@@ -584,6 +593,12 @@ mod tests {
         }
         buf
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::synth;
 
     // 1. Синтетика: roundtrip + базовые запросы.
     #[test]

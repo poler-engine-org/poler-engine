@@ -697,6 +697,62 @@ struct Cli {
     #[arg(long = "connectome-impact", value_name = "IDX_OR_ROOT_ID", requires = "connectome")]
     connectome_impact: Option<String>,
 
+    /// Полный список партнёров нейрона (по весу; направление: --connectome-dir).
+    #[arg(long = "connectome-neighbors", value_name = "IDX_OR_ROOT_ID", requires = "connectome")]
+    connectome_neighbors: Option<String>,
+
+    /// Кратчайший путь сигнала FROM:TO (BFS с цепочкой прыжков).
+    #[arg(long = "connectome-path", value_name = "FROM:TO", requires = "connectome")]
+    connectome_path: Option<String>,
+
+    /// Общие партнёры набора нейронов, csv: a,b,c (направление: --connectome-dir).
+    #[arg(long = "connectome-common", value_name = "A,B,...", requires = "connectome")]
+    connectome_common: Option<String>,
+
+    /// Хабы: топ степеней + PageRank (сколько: --connectome-top).
+    #[arg(long = "connectome-centrality", requires = "connectome")]
+    connectome_centrality: bool,
+
+    /// Глобальный топ пар по циркуляции J = A − Aᵀ (K пар, порог: --connectome-min-abs).
+    #[arg(long = "connectome-rotor-top", value_name = "K", requires = "connectome")]
+    connectome_rotor_top: Option<usize>,
+
+    /// Мотивы вокруг нейрона: реципрокные, feedforward, feedback.
+    #[arg(long = "connectome-motifs", value_name = "IDX_OR_ROOT_ID", requires = "connectome")]
+    connectome_motifs: Option<String>,
+
+    /// Симуляция распространения сигнала от нейронов, csv-семена.
+    #[arg(long = "connectome-propagate", value_name = "SEEDS", requires = "connectome")]
+    connectome_propagate: Option<String>,
+
+    /// Направление для --connectome-neighbors (out|in) и --connectome-common (down|up).
+    #[arg(long = "connectome-dir", value_name = "DIR", default_value = "out", requires = "connectome")]
+    connectome_dir: String,
+
+    /// Лимит списков (--connectome-neighbors/--connectome-common).
+    #[arg(long = "connectome-limit", value_name = "N", default_value_t = 20, requires = "connectome")]
+    connectome_limit: usize,
+
+    /// Размер топов (--connectome-centrality, --connectome-propagate).
+    #[arg(long = "connectome-top", value_name = "N", default_value_t = 10, requires = "connectome")]
+    connectome_top: usize,
+
+    /// Порог циркуляции для --connectome-rotor-top.
+    #[arg(long = "connectome-min-abs", value_name = "J", default_value_t = 1, requires = "connectome")]
+    connectome_min_abs: i32,
+
+    /// Шагов симуляции --connectome-propagate.
+    #[arg(long = "connectome-steps", value_name = "N", default_value_t = 4, requires = "connectome")]
+    connectome_steps: usize,
+
+    /// Гейн симуляции (γ: разгон возбуждения).
+    #[arg(long = "connectome-gamma", value_name = "G", default_value_t = 0.05, requires = "connectome")]
+    connectome_gamma: f64,
+
+    /// Утечка симуляции (leak: память состояния).
+    #[arg(long = "connectome-leak", value_name = "L", default_value_t = 0.8, requires = "connectome")]
+    connectome_leak: f64,
+
     /// Фильтр знака K-hop: all | exc | inh (поток по возбуждающим/тормозным).
     #[arg(long = "connectome-sign", value_name = "FILTER", default_value = "all", requires = "connectome")]
     connectome_sign: String,
@@ -2242,6 +2298,11 @@ fn thou(n: u64) -> String {
     out
 }
 
+/// Парсинг направления для режимов --connectome-neighbors/--connectome-common.
+fn ct_dir(s: &str) -> Result<poler_engine::graph::flyops::Direction, String> {
+    poler_engine::graph::flyops::Direction::parse(s)
+}
+
 /// Строка ребра для человека: «79529 (root ...) w=17 gaba (-1)».
 fn fmt_con_edge(
     e: &poler_engine::graph::connectome::Edge,
@@ -2318,11 +2379,21 @@ fn run_connectome(cli: &Cli, csr_path: &std::path::Path) -> i32 {
         cli.connectome_edge.is_some(),
         cli.connectome_khop.is_some(),
         cli.connectome_impact.is_some(),
+        cli.connectome_neighbors.is_some(),
+        cli.connectome_path.is_some(),
+        cli.connectome_common.is_some(),
+        cli.connectome_centrality,
+        cli.connectome_rotor_top.is_some(),
+        cli.connectome_motifs.is_some(),
+        cli.connectome_propagate.is_some(),
     ];
     if modes.iter().filter(|&&b| b).count() > 1 {
         eprintln!(
             "poler-connectome: укажите один режим (--connectome-node | --connectome-edge | \
-             --connectome-khop | --connectome-impact); без режима — сводка"
+             --connectome-khop | --connectome-impact | --connectome-neighbors | \
+             --connectome-path | --connectome-common | --connectome-centrality | \
+             --connectome-rotor-top | --connectome-motifs | --connectome-propagate); \
+             без режима — сводка"
         );
         return 2;
     }
@@ -2638,6 +2709,544 @@ fn run_connectome(cli: &Cli, csr_path: &std::path::Path) -> i32 {
             println!("  исходящих: {} — куда управляет он сам", outs.len());
             for e in &top_in {
                 println!("    {}", fmt_con_edge(e, &nodes));
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: соседи (полный список по весу) ----------
+    if let Some(spec) = &cli.connectome_neighbors {
+        let idx = match resolve(spec) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let dir = match ct_dir(&cli.connectome_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let filter = match ct::SignFilter::parse(&cli.connectome_sign) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let csc = con.build_in_edges();
+        let list = match con.neighbors(idx, dir, filter, cli.connectome_limit, &csc) {
+            Some(l) => l,
+            None => {
+                eprintln!("poler-connectome: нейрон {idx} вне диапазона");
+                return 1;
+            }
+        };
+        let dir_name = match dir {
+            poler_engine::graph::flyops::Direction::Out => "исходящие (мишени)",
+            poler_engine::graph::flyops::Direction::In => "входящие (источники)",
+        };
+        let mass: u64 = list.iter().map(|e| e.weight as u64).sum();
+        if json {
+            let j = serde_json::json!({
+                "mode": "neighbors",
+                "artifact": csr_path.display().to_string(),
+                "neuron": idx,
+                "root_id": nodes.as_ref().and_then(|n| n.root_id(idx)),
+                "direction": cli.connectome_dir,
+                "sign_filter": cli.connectome_sign,
+                "limit": cli.connectome_limit,
+                "count": list.len(),
+                "mass": mass,
+                "edges": list.iter().map(|e| con_edge_json(e, &nodes)).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!("Соседи нейрона {idx} — {dir_name} (фильтр {}):", cli.connectome_sign);
+            println!("  партнёров: {} (масса {})", list.len(), thou(mass));
+            for e in &list {
+                println!("  {}", fmt_con_edge(e, &nodes));
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: кратчайший путь FROM:TO ----------
+    if let Some(spec) = &cli.connectome_path {
+        let (fs, ts) = match spec.split_once(':') {
+            Some(pair) => pair,
+            None => {
+                eprintln!(
+                    "poler-connectome: --connectome-path ждёт формат FROM:TO, получено «{spec}»"
+                );
+                return 2;
+            }
+        };
+        let from = match resolve(fs) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let to = match resolve(ts) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let filter = match ct::SignFilter::parse(&cli.connectome_sign) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let r = con.shortest_path(from, to, filter);
+        if json {
+            let j = serde_json::json!({
+                "mode": "path",
+                "artifact": csr_path.display().to_string(),
+                "from": from,
+                "from_root_id": nodes.as_ref().and_then(|n| n.root_id(from)),
+                "to": to,
+                "to_root_id": nodes.as_ref().and_then(|n| n.root_id(to)),
+                "sign_filter": cli.connectome_sign,
+                "found": r.found,
+                "length": r.length(),
+                "total_weight": r.total_weight(),
+                "hops": r.hops.iter().map(|h| serde_json::json!({
+                    "from": h.from,
+                    "to": h.to,
+                    "weight": h.edge.weight,
+                    "nt": h.edge.nt_name(),
+                    "sign": h.edge.sign(),
+                    "signed_weight": h.edge.signed_weight(),
+                })).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else if !r.found {
+            eprintln!(
+                "poler-connectome: путь {from} -> {to} не найден (фильтр {})",
+                cli.connectome_sign
+            );
+            return 1;
+        } else {
+            println!(
+                "Кратчайший путь {from} -> {to}: {} прыжков, масса {}",
+                r.length(),
+                thou(r.total_weight())
+            );
+            for (i, h) in r.hops.iter().enumerate() {
+                println!(
+                    "  {:>2}. {} -> {}: w={} {} ({:+})",
+                    i + 1,
+                    h.from,
+                    h.to,
+                    h.edge.weight,
+                    h.edge.nt_name(),
+                    h.edge.signed_weight()
+                );
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: общие партнёры набора ----------
+    if let Some(spec) = &cli.connectome_common {
+        let idxs: Vec<usize> = match spec
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve(s))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                eprintln!("poler-connectome: --connectome-common: пустой набор нейронов");
+                return 2;
+            }
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let dir = match ct_dir(&cli.connectome_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let filter = match ct::SignFilter::parse(&cli.connectome_sign) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let csc = con.build_in_edges();
+        let mut partners = match con.common_partners(&idxs, dir, filter, &csc) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let count = partners.len();
+        partners.truncate(cli.connectome_limit);
+        let dir_name = match dir {
+            poler_engine::graph::flyops::Direction::Out => "общие мишени (вниз по потоку)",
+            poler_engine::graph::flyops::Direction::In => "общие источники (вверх по потоку)",
+        };
+        if json {
+            let j = serde_json::json!({
+                "mode": "common",
+                "artifact": csr_path.display().to_string(),
+                "neurons": idxs,
+                "direction": cli.connectome_dir,
+                "sign_filter": cli.connectome_sign,
+                "count": count,
+                "partners": partners.iter().map(|p| serde_json::json!({
+                    "node": p.node,
+                    "root_id": nodes.as_ref().and_then(|n| n.root_id(p.node)),
+                    "total_weight": p.total_weight,
+                    "links": p.members.iter().map(|(q, e)| serde_json::json!({
+                        "query": q,
+                        "edge": con_edge_json(e, &nodes),
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!("Набор {:?} — {}:", idxs, dir_name);
+            println!("  общих партнёров: {}", count);
+            for p in partners.iter().take(cli.connectome_limit) {
+                println!(
+                    "  {} (масса {})",
+                    match nodes.as_ref().and_then(|n| n.root_id(p.node)) {
+                        Some(r) => format!("{} (root {})", p.node, r),
+                        None => p.node.to_string(),
+                    },
+                    thou(p.total_weight)
+                );
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: центральность (хабы + PageRank) ----------
+    if cli.connectome_centrality {
+        let filter = match ct::SignFilter::parse(&cli.connectome_sign) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let csc = con.build_in_edges();
+        let top_out = con.degree_ranking(
+            poler_engine::graph::flyops::Direction::Out,
+            cli.connectome_top,
+            &csc,
+        );
+        let top_in = con.degree_ranking(
+            poler_engine::graph::flyops::Direction::In,
+            cli.connectome_top,
+            &csc,
+        );
+        let t1 = std::time::Instant::now();
+        let pr = con.pagerank(filter, 0.85, 30, 1e-9, cli.connectome_top);
+        let pr_ms = t1.elapsed().as_millis();
+        if json {
+            let j = serde_json::json!({
+                "mode": "centrality",
+                "artifact": csr_path.display().to_string(),
+                "sign_filter": cli.connectome_sign,
+                "top": cli.connectome_top,
+                "top_out_degree": top_out.iter().map(|&(u, d)| serde_json::json!({
+                    "neuron": u,
+                    "root_id": nodes.as_ref().and_then(|n| n.root_id(u)),
+                    "out_degree": d,
+                })).collect::<Vec<_>>(),
+                "top_in_degree": top_in.iter().map(|&(v, d)| serde_json::json!({
+                    "neuron": v,
+                    "root_id": nodes.as_ref().and_then(|n| n.root_id(v)),
+                    "in_degree": d,
+                })).collect::<Vec<_>>(),
+                "pagerank": {
+                    "iterations": pr.iterations,
+                    "converged": pr.converged,
+                    "took_ms": pr_ms,
+                    "top": pr.top.iter().map(|&(u, r)| serde_json::json!({
+                        "neuron": u,
+                        "root_id": nodes.as_ref().and_then(|n| n.root_id(u)),
+                        "rank": r,
+                    })).collect::<Vec<_>>(),
+                },
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!("Центральность (топ {}):", cli.connectome_top);
+            println!("  исходящие хабы (куда раздают):");
+            for &(u, d) in &top_out {
+                println!("    нейрон {u}: {d} рёбер");
+            }
+            println!("  входящие хабы (кого бомбардируют):");
+            for &(v, d) in &top_in {
+                println!("    нейрон {v}: {d} рёбер");
+            }
+            println!(
+                "  PageRank ({} итераций, {}):",
+                pr.iterations,
+                if pr.converged { "сошёлся" } else { "потолок итераций" }
+            );
+            for &(u, r) in &pr.top {
+                println!("    нейрон {u}: ранг {r:.9}");
+            }
+            println!("  PageRank занял {} мс", pr_ms);
+        }
+        return 0;
+    }
+
+    // ---------- Режим: глобальный топ циркуляции J ----------
+    if let Some(k) = cli.connectome_rotor_top {
+        let t1 = std::time::Instant::now();
+        let pairs = con.rotor_top(k, cli.connectome_min_abs);
+        let took_ms = t1.elapsed().as_millis();
+        let count = pairs.len();
+        if json {
+            let j = serde_json::json!({
+                "mode": "rotor_top",
+                "artifact": csr_path.display().to_string(),
+                "top": k,
+                "min_abs": cli.connectome_min_abs,
+                "count": count,
+                "took_ms": took_ms,
+                "pairs": pairs.iter().map(|p| serde_json::json!({
+                    "u": p.u,
+                    "u_root_id": nodes.as_ref().and_then(|n| n.root_id(p.u)),
+                    "v": p.v,
+                    "v_root_id": nodes.as_ref().and_then(|n| n.root_id(p.v)),
+                    "J_uv": p.j,
+                    "J_vu": -p.j,
+                    "forward_signed": p.forward,
+                    "backward_signed": p.backward,
+                })).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!(
+                "Топ-{} циркуляции J = A − Aᵀ (порог |J| ≥ {}, найдено {}, {} мс):",
+                k, cli.connectome_min_abs, count, took_ms
+            );
+            for p in &pairs {
+                println!(
+                    "  J[{}][{}] = {:+5} — u доминирует (fwd {:?}, bwd {:?})",
+                    p.u, p.v, p.j, p.forward, p.backward
+                );
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: мотивы вокруг нейрона ----------
+    if let Some(spec) = &cli.connectome_motifs {
+        let idx = match resolve(spec) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let csc = con.build_in_edges();
+        let m = match con.motif_census(idx, &csc, 5) {
+            Some(m) => m,
+            None => {
+                eprintln!("poler-connectome: нейрон {idx} вне диапазона");
+                return 1;
+            }
+        };
+        if json {
+            let j = serde_json::json!({
+                "mode": "motifs",
+                "artifact": csr_path.display().to_string(),
+                "neuron": idx,
+                "root_id": nodes.as_ref().and_then(|n| n.root_id(idx)),
+                "out_degree": m.out_degree,
+                "in_degree": m.in_degree,
+                "reciprocal_count": m.reciprocal.len(),
+                "reciprocal": m.reciprocal.iter().map(|(fwd, bwd)| serde_json::json!({
+                    "partner": fwd.target,
+                    "partner_root_id": nodes.as_ref().and_then(|n| n.root_id(fwd.target as usize)),
+                    "u_to_partner": {"weight": fwd.weight, "nt": fwd.nt_name(), "sign": fwd.sign()},
+                    "partner_to_u": {"weight": bwd.weight, "nt": bwd.nt_name(), "sign": bwd.sign()},
+                })).collect::<Vec<_>>(),
+                "feedforward": m.feedforward,
+                "feedback3": m.feedback3,
+                "ff_examples": m.ff_examples,
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!("Мотивы вокруг нейрона {idx}:",);
+            println!(
+                "  степень: {} исходящих / {} входящих",
+                m.out_degree, m.in_degree
+            );
+            println!("  реципрокных пар (u⇄v): {}", m.reciprocal.len());
+            for (fwd, bwd) in m.reciprocal.iter().take(5) {
+                println!(
+                    "    ⇄ {}: туда w={} {} / обратно w={} {}",
+                    fwd.target,
+                    fwd.weight,
+                    fwd.nt_name(),
+                    bwd.weight,
+                    bwd.nt_name()
+                );
+            }
+            println!("  feedforward-треугольников (u→v→w + u→w): {}", thou(m.feedforward as u64));
+            println!("  feedback-циклов (u→v→w→u): {}", thou(m.feedback3 as u64));
+            if !m.ff_examples.is_empty() {
+                let ex = m
+                    .ff_examples
+                    .iter()
+                    .map(|(v, w)| format!("{v}→{w}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  примеры: {ex}");
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: симуляция распространения сигнала ----------
+    if let Some(spec) = &cli.connectome_propagate {
+        let seeds: Vec<usize> = match spec
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve(s))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                eprintln!("poler-connectome: --connectome-propagate: пустой набор семян");
+                return 2;
+            }
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let filter = match ct::SignFilter::parse(&cli.connectome_sign) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let r = match con.propagate(
+            &seeds,
+            cli.connectome_steps,
+            cli.connectome_gamma,
+            cli.connectome_leak,
+            filter,
+            cli.connectome_top,
+            0.01,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        if json {
+            let round6 = |x: f64| (x * 1e6).round() / 1e6;
+            let j = serde_json::json!({
+                "mode": "propagate",
+                "artifact": csr_path.display().to_string(),
+                "seeds": r.seeds,
+                "params": {
+                    "steps": cli.connectome_steps,
+                    "gamma": cli.connectome_gamma,
+                    "leak": cli.connectome_leak,
+                    "sign_filter": cli.connectome_sign,
+                    "theta": 0.01,
+                },
+                "timeline": r.steps.iter().map(|s| serde_json::json!({
+                    "step": s.step,
+                    "active": s.active,
+                    "positive_mass": round6(s.positive_mass),
+                    "negative_mass": round6(s.negative_mass),
+                })).collect::<Vec<_>>(),
+                "top": r.top.iter().map(|&(v, x)| serde_json::json!({
+                    "neuron": v,
+                    "root_id": nodes.as_ref().and_then(|n| n.root_id(v)),
+                    "potential": round6(x),
+                })).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!(
+                "Симуляция от {:?}: {} шагов, γ = {}, leak = {} (фильтр {}):",
+                r.seeds, cli.connectome_steps, cli.connectome_gamma, cli.connectome_leak,
+                cli.connectome_sign
+            );
+            for s in &r.steps {
+                println!(
+                    "  шаг {}: активных {}, масса +{:.3} / {:.3}",
+                    s.step, s.active, s.positive_mass, s.negative_mass
+                );
+            }
+            println!("  топ возбуждённых:");
+            for &(v, x) in r.top.iter().take(cli.connectome_top) {
+                println!("    нейрон {v}: потенциал {x:+.6}");
             }
         }
         return 0;

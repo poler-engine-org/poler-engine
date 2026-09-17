@@ -20,6 +20,14 @@
 //! v2.0 (sovereign stack): poler_gmail / poler_drive / poler_nlm удалены
 //! вместе с Google/NotebookLM-интеграциями.
 //!
+//! C2/v0.33.0 «Живая муха»: семейство poler_fly_* — резидентный
+//! коннектом FLYCSR1 (мозг мухи FlyWire v783) как матрица A: паспорт
+//! нейрона, ребро/ротор, K-hop, кратчайший путь, общие партнёры,
+//! центральность/PageRank, глобальный топ циркуляции J, мотивы и
+//! симуляция распространения сигнала. Артефакт грузится ОДИН раз
+//! и живёт в RAM между вызовами (WarmFly); тяжёлые запросы уходят
+//! в пул воркеров — агент может допросить муху параллельно.
+//!
 //! Chromium поднимается автоматически при первом poler_crawl/poler_fetch
 //! (см. `web::ensure_chromium`).
 
@@ -29,6 +37,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::graph::connectome::{Connectome, ConnectomeNodes, InEdges, SignFilter};
+use crate::graph::flyops::Direction;
 use crate::web::{self, CdpFetcher, WebIndex};
 use crate::{Engine, EngineConfig};
 
@@ -165,6 +175,10 @@ pub struct McpServer {
     /// E2/v0.32.0: реестр фоновых задач poler_exec_async (отмена/опрос).
     #[cfg(feature = "pnd-ffi")]
     exec_tasks: Arc<crate::exec::TaskRegistry>,
+    /// C2/v0.33.0: резидентная «живая муха» — коннектом + CSC в RAM,
+    /// переиспользуется между вызовами poler_fly_* (холодный старт был
+    /// ~60–300 мс загрузки + ~43 мс CSC на КАЖДЫЙ CLI-вызов агента).
+    warm_fly: Mutex<Option<Arc<WarmFly>>>,
 }
 
 impl McpServer {
@@ -182,6 +196,7 @@ impl McpServer {
             vault_log: None,
             #[cfg(feature = "pnd-ffi")]
             exec_tasks: Arc::new(crate::exec::TaskRegistry::default()),
+            warm_fly: Mutex::new(None),
         }
     }
 
@@ -308,6 +323,70 @@ fn is_exec_tool(msg: &Value) -> bool {
         )
 }
 
+/// C2/v0.33.0: семейство «живой мухи» уходит в пул воркеров — PageRank
+/// полного коннектома и симуляция занимают сотни миллисекунд, а агент
+/// часто допросает муху пачкой независимых запросов.
+fn is_fly_tool(msg: &Value) -> bool {
+    msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(|v| v.as_str()),
+            Some(
+                "poler_fly"
+                    | "poler_fly_node"
+                    | "poler_fly_edge"
+                    | "poler_fly_khop"
+                    | "poler_fly_path"
+                    | "poler_fly_common"
+                    | "poler_fly_centrality"
+                    | "poler_fly_rotor"
+                    | "poler_fly_motifs"
+                    | "poler_fly_propagate"
+            )
+        )
+}
+
+/// Резидентная «живая муха»: коннектом FLYCSR1 + таблица root_id + CSC
+/// (входящие рёбра) в RAM. CSC строится лениво один раз — первый
+/// impact/центральность запрос платит ~43 мс, остальные — ноль.
+pub struct WarmFly {
+    /// Сам коннектом (CSR в RAM).
+    con: Arc<Connectome>,
+    /// Таблица 138 639 root_id (опциональна — для перевода индекс ↔ FlyWire).
+    nodes: Option<ConnectomeNodes>,
+    /// Путь загруженного артефакта (сверка при повторном csr).
+    csr_path: PathBuf,
+    /// Время загрузки артефакта, мс.
+    load_ms: u128,
+    /// CSC-транспонирование (ленивое, один раз).
+    csc: std::sync::OnceLock<InEdges>,
+}
+
+impl WarmFly {
+    /// CSC «кто управляет нейроном» — строится при первом обращении.
+    fn csc(&self) -> &InEdges {
+        self.csc.get_or_init(|| self.con.build_in_edges())
+    }
+
+    /// Построен ли уже CSC (диагностика теплоты).
+    fn csc_ready(&self) -> bool {
+        self.csc.get().is_some()
+    }
+}
+
+/// Загрузка таблицы root_id с проверкой соответствия коннектому.
+fn fly_load_nodes(path: &str, con: &Connectome) -> Result<ConnectomeNodes, String> {
+    let tbl = ConnectomeNodes::load(std::path::Path::new(path))?;
+    if tbl.len() != con.n_nodes() {
+        return Err(format!(
+            "{} содержит {} root_id, а коннектом ждёт {} узлов",
+            path,
+            tbl.len(),
+            con.n_nodes()
+        ));
+    }
+    Ok(tbl)
+}
+
 /// Запуск MCP-сервера (stdio). Возвращает код процесса (0 = чистый EOF stdin).
 /// E2: tools/call poler_exec* исполняются в пуле воркеров параллельно;
 /// ответы пишутся по мере готовности (JSON-RPC допускает внеочередность —
@@ -372,7 +451,17 @@ pub fn run(
             }
         };
         #[cfg(feature = "pnd-ffi")]
-        if is_exec_tool(&msg) {
+        if is_exec_tool(&msg) || is_fly_tool(&msg) {
+            let server = server.clone();
+            let _ = tx.send(Box::new(move || {
+                if let Some(resp) = server.dispatch(&msg) {
+                    let _ = write_line(&mut std::io::stdout().lock(), &resp);
+                }
+            }));
+            continue;
+        }
+        #[cfg(not(feature = "pnd-ffi"))]
+        if is_fly_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -482,6 +571,16 @@ impl McpServer {
             "poler_box_exec" => self.tool_box_exec(&args),
             "poler_box_status" => self.tool_box_status(&args),
             "query_poler_knowledge" => self.tool_knowledge_query(&args),
+            "poler_fly" => self.tool_fly(&args),
+            "poler_fly_node" => self.tool_fly_node(&args),
+            "poler_fly_edge" => self.tool_fly_edge(&args),
+            "poler_fly_khop" => self.tool_fly_khop(&args),
+            "poler_fly_path" => self.tool_fly_path(&args),
+            "poler_fly_common" => self.tool_fly_common(&args),
+            "poler_fly_centrality" => self.tool_fly_centrality(&args),
+            "poler_fly_rotor" => self.tool_fly_rotor(&args),
+            "poler_fly_motifs" => self.tool_fly_motifs(&args),
+            "poler_fly_propagate" => self.tool_fly_propagate(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -1015,6 +1114,550 @@ impl McpServer {
             .collect();
         let count = tasks.len();
         let report = json!({ "tasks": tasks, "count": count });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    // -----------------------------------------------------------------
+    // C2/v0.33.0 «Живая муха»: коннектом FLYCSR1 как резидентный объект
+    // допроса для агента. Get-or-load + 10 инструментов ниже.
+    // -----------------------------------------------------------------
+
+    /// Get-or-load тёплого коннектома: csr — путь к .csr.zst (первый
+    /// вызов обязан его передать; далее артефакт живёт в RAM), nodes —
+    /// путь к nodes.bin (опционально: перевод индекс ↔ root_id FlyWire).
+    fn fly_state(&self, csr: Option<&str>, nodes: Option<&str>) -> Result<Arc<WarmFly>, String> {
+        let mut guard = self
+            .warm_fly
+            .lock()
+            .expect("poler-mcp: отравленный fly-лок");
+        // Тёплый артефакт: тот же путь (или запрос без csr) → reuse.
+        if let Some(warm) = guard.as_ref() {
+            let same = csr.map(|p| PathBuf::from(p) == warm.csr_path).unwrap_or(true);
+            if same {
+                if let Some(p) = nodes {
+                    if warm.nodes.is_none() {
+                        let tbl = fly_load_nodes(p, &warm.con)?;
+                        let upgraded = Arc::new(WarmFly {
+                            con: warm.con.clone(),
+                            nodes: Some(tbl),
+                            csr_path: warm.csr_path.clone(),
+                            load_ms: warm.load_ms,
+                            csc: std::sync::OnceLock::new(),
+                        });
+                        *guard = Some(upgraded.clone());
+                        return Ok(upgraded);
+                    }
+                }
+                return Ok(warm.clone());
+            }
+        }
+        let Some(csr) = csr else {
+            return Err(
+                "коннектом не загружен: передайте csr (путь к .csr.zst) хотя бы \
+                 в одном вызове poler_fly*"
+                    .to_string(),
+            );
+        };
+        guard_path(csr)?;
+        let t0 = std::time::Instant::now();
+        let con = Connectome::load(std::path::Path::new(csr))?;
+        let load_ms = t0.elapsed().as_millis();
+        let tbl = nodes.map(|p| fly_load_nodes(p, &con)).transpose()?;
+        let warm = Arc::new(WarmFly {
+            con: Arc::new(con),
+            nodes: tbl,
+            csr_path: PathBuf::from(csr),
+            load_ms,
+            csc: std::sync::OnceLock::new(),
+        });
+        *guard = Some(warm.clone());
+        Ok(warm)
+    }
+
+    /// Спецификация нейрона из JSON: индекс (число/строка) или root_id.
+    fn fly_spec(v: &Value) -> Option<String> {
+        v.as_str()
+            .map(str::to_string)
+            .or_else(|| v.as_u64().map(|n| n.to_string()))
+    }
+
+    /// Резолв спецификации: индекс CSR либо root_id (нужна таблица узлов).
+    fn fly_resolve(w: &WarmFly, spec: &str) -> Result<usize, String> {
+        if let Ok(idx) = spec.parse::<usize>() {
+            if idx < w.con.n_nodes() {
+                return Ok(idx);
+            }
+        }
+        if let Some(ns) = &w.nodes {
+            if let Ok(rid) = spec.parse::<u64>() {
+                if let Some(i) = ns.idx_of(rid) {
+                    return Ok(i);
+                }
+            }
+        }
+        Err(format!(
+            "нейрон «{spec}» не найден (узлов: {}; формат: индекс 0..{} либо root_id с nodes)",
+            w.con.n_nodes(),
+            w.con.n_nodes().saturating_sub(1)
+        ))
+    }
+
+    /// Обязательный аргумент-нейрон (ключ — имя аргумента).
+    fn fly_neuron_arg(args: &Value, key: &str, w: &WarmFly) -> Result<usize, String> {
+        let raw = args.get(key).ok_or(format!("аргумент {key} обязателен"))?;
+        let spec = Self::fly_spec(raw)
+            .ok_or(format!("аргумент {key}: индекс (число) или root_id (строка)"))?;
+        Self::fly_resolve(w, &spec)
+    }
+
+    /// Массив нейронов (1..=lim) → индексы.
+    fn fly_neurons_arg(args: &Value, key: &str, w: &WarmFly, lim: usize) -> Result<Vec<usize>, String> {
+        let arr = args
+            .get(key)
+            .and_then(|v| v.as_array())
+            .ok_or(format!("аргумент {key} (массив индексов/root_id) обязателен"))?;
+        if arr.is_empty() {
+            return Err(format!("{key}: пустой массив"));
+        }
+        if arr.len() > lim {
+            return Err(format!("{key}: {} элементов — максимум {lim}", arr.len()));
+        }
+        arr.iter()
+            .map(|v| {
+                let spec = Self::fly_spec(v)
+                    .ok_or(format!("{key}: индекс (число) или root_id (строка)"))?;
+                Self::fly_resolve(w, &spec)
+            })
+            .collect()
+    }
+
+    /// Фильтр знака (умолчание all).
+    fn fly_sign_arg(args: &Value) -> Result<SignFilter, String> {
+        match args.get("sign") {
+            None | Some(Value::Null) => Ok(SignFilter::All),
+            Some(v) => SignFilter::parse(v.as_str().ok_or("sign: строка all | exc | inh")?),
+        }
+    }
+
+    /// Направление (умолчание out; для common — down).
+    fn fly_dir_arg(args: &Value) -> Result<Direction, String> {
+        match args.get("direction") {
+            None | Some(Value::Null) => Ok(Direction::Out),
+            Some(v) => Direction::parse(v.as_str().ok_or("direction: строка out | in (down | up)")?),
+        }
+    }
+
+    /// Корень узла (root_id FlyWire, если таблица загружена).
+    fn fly_root(w: &WarmFly, idx: usize) -> Value {
+        w.nodes.as_ref().and_then(|n| n.root_id(idx)).map(Value::from).unwrap_or(Value::Null)
+    }
+
+    /// JSON-объект ребра (other = другой конец).
+    fn fly_edge_json(w: &WarmFly, e: &crate::graph::connectome::Edge) -> Value {
+        json!({
+            "other": e.target,
+            "other_root_id": Self::fly_root(w, e.target as usize),
+            "weight": e.weight,
+            "nt": e.nt_name(),
+            "sign": e.sign(),
+            "signed_weight": e.signed_weight(),
+        })
+    }
+
+    /// poler_fly: загрузка/сводка/выгрузка коннектома. Первый вызов
+    /// грузит артефакт в RAM (csr + опционально nodes), дальше всё
+    /// семейство работает без диска. action: summary (умолчание) | eject.
+    fn tool_fly(&self, args: &Value) -> Result<String, String> {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("summary");
+        if matches!(action, "eject" | "выгрузить") {
+            let mut guard = self
+                .warm_fly
+                .lock()
+                .expect("poler-mcp: отравленный fly-лок");
+            let had = guard.take().is_some();
+            let report = json!({
+                "action": "eject",
+                "unloaded": had,
+                "note": "коннектом выгружен из RAM; следующий poler_fly загрузит заново"
+            });
+            return Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+        }
+        if !matches!(action, "summary" | "сводка") {
+            return Err(format!("неизвестное действие «{action}» (summary | eject)"));
+        }
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let con = &w.con;
+        let m = con.mass_by_nt();
+        let exc = m[1].0 + m[2].0;
+        let inh = m[0].0;
+        let modm = m[3].0 + m[4].0 + m[5].0;
+        let tot = con.total_mass();
+        let pct = |x: u64| format!("{:.1}%", x as f64 / tot as f64 * 100.0);
+        let report = json!({
+            "mode": "summary",
+            "artifact": w.csr_path.display().to_string(),
+            "core": con.is_core(),
+            "n_nodes": con.n_nodes(),
+            "n_edges": con.n_edges(),
+            "total_mass": tot,
+            "load_ms": w.load_ms,
+            "warm": {"csc_built": w.csc_ready(), "has_nodes": w.nodes.is_some()},
+            "nt": (0..6).map(|c| json!({
+                "name": crate::graph::connectome::NT_NAMES[c],
+                "edges": m[c].1,
+                "mass": m[c].0,
+                "sign": crate::graph::connectome::nt_sign(c as u8),
+            })).collect::<Vec<_>>(),
+            "mass_balance": {
+                "excitatory": exc, "inhibitory": inh, "modulatory": modm,
+                "excitatory_pct": pct(exc), "inhibitory_pct": pct(inh), "modulatory_pct": pct(modm),
+            },
+            "hint": "семейство: poler_fly_node/edge/khop/path/common/centrality/rotor/motifs/propagate (csr больше не нужен — муха в RAM)",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_node: паспорт нейрона — степени, массы, топ партнёров
+    /// в обоих направлениях (с root_id, медиаторами и знаками).
+    fn tool_fly_node(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let idx = Self::fly_neuron_arg(args, "neuron", &w)?;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8)
+            .clamp(1, 500) as usize;
+        let con = &w.con;
+        let csc = w.csc();
+        let outs: Vec<crate::graph::connectome::Edge> =
+            con.out_edges(idx).unwrap().collect();
+        let out_mass: u64 = outs.iter().map(|e| e.weight as u64).sum();
+        let ins: Vec<crate::graph::connectome::Edge> =
+            csc.in_edges(con, idx).unwrap().collect();
+        let in_mass: u64 = ins.iter().map(|e| e.weight as u64).sum();
+        let mut top_out = outs.clone();
+        top_out.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        top_out.truncate(limit);
+        let mut top_in = ins.clone();
+        top_in.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        top_in.truncate(limit);
+        let report = json!({
+            "neuron": idx,
+            "root_id": Self::fly_root(&w, idx),
+            "out_degree": outs.len(),
+            "out_mass": out_mass,
+            "in_degree": ins.len(),
+            "in_mass": in_mass,
+            "top_out": top_out.iter().map(|e| Self::fly_edge_json(&w, e)).collect::<Vec<_>>(),
+            "top_in": top_in.iter().map(|e| Self::fly_edge_json(&w, e)).collect::<Vec<_>>(),
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_edge: ребро u→v и ротор J = A − Aᵀ пары (циркуляция
+    /// влияния: однонаправленный поток или реципрокная компенсация).
+    fn tool_fly_edge(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let u = Self::fly_neuron_arg(args, "u", &w)?;
+        let v = Self::fly_neuron_arg(args, "v", &w)?;
+        let con = &w.con;
+        let fwd = con.edge(u, v);
+        let bwd = con.edge(v, u);
+        let rotor = con.rotor(u, v);
+        if fwd.is_none() && bwd.is_none() {
+            let report = json!({
+                "u": u, "u_root_id": Self::fly_root(&w, u),
+                "v": v, "v_root_id": Self::fly_root(&w, v),
+                "found": false,
+                "rotor_Juv": 0,
+            });
+            return Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+        }
+        let report = json!({
+            "u": u, "u_root_id": Self::fly_root(&w, u),
+            "v": v, "v_root_id": Self::fly_root(&w, v),
+            "found": true,
+            "forward": fwd.map(|e| Self::fly_edge_json(&w, &e)),
+            "backward": bwd.map(|e| Self::fly_edge_json(&w, &e)),
+            "rotor_Juv": rotor,
+            "rotor_Jvu": -rotor,
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_khop: BFS потока сигнала от нейрона — размеры фронтов
+    /// по хопам и всего достигнуто (фильтр знака сужает поток).
+    fn tool_fly_khop(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let idx = Self::fly_neuron_arg(args, "neuron", &w)?;
+        let depth = args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2)
+            .clamp(1, 10) as usize;
+        let filter = Self::fly_sign_arg(args)?;
+        let r = w.con.k_hop(idx, depth, filter);
+        let report = json!({
+            "start": idx,
+            "start_root_id": Self::fly_root(&w, idx),
+            "depth": depth,
+            "sign_filter": args.get("sign").and_then(|v| v.as_str()).unwrap_or("all"),
+            "frontier_sizes": r.frontier_sizes,
+            "visited": r.visited,
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_path: кратчайший путь сигнала from→to с цепочкой
+    /// прыжков (вес/медиатор/знак каждого синапса на маршруте).
+    fn tool_fly_path(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let from = Self::fly_neuron_arg(args, "from", &w)?;
+        let to = Self::fly_neuron_arg(args, "to", &w)?;
+        let filter = Self::fly_sign_arg(args)?;
+        let r = w.con.shortest_path(from, to, filter);
+        let report = json!({
+            "from": from, "from_root_id": Self::fly_root(&w, from),
+            "to": to, "to_root_id": Self::fly_root(&w, to),
+            "sign_filter": args.get("sign").and_then(|v| v.as_str()).unwrap_or("all"),
+            "found": r.found,
+            "length": r.length(),
+            "total_weight": r.total_weight(),
+            "hops": r.hops.iter().map(|h| json!({
+                "from": h.from, "from_root_id": Self::fly_root(&w, h.from),
+                "to": h.to, "to_root_id": Self::fly_root(&w, h.to),
+                "weight": h.edge.weight,
+                "nt": h.edge.nt_name(),
+                "sign": h.edge.sign(),
+                "signed_weight": h.edge.signed_weight(),
+            })).collect::<Vec<_>>(),
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_common: пересечение окрестностей набора нейронов —
+    /// общие мишени (down) или общие источники (up): конвергенция
+    /// и дивергенция схемы мозга.
+    fn tool_fly_common(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let idxs = Self::fly_neurons_arg(args, "neurons", &w, 32)?;
+        let dir = Self::fly_dir_arg(args)?;
+        let filter = Self::fly_sign_arg(args)?;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 500) as usize;
+        let mut partners = w.con.common_partners(&idxs, dir, filter, w.csc())?;
+        let count_full = partners.len();
+        partners.truncate(limit);
+        let report = json!({
+            "neurons": idxs,
+            "direction": match dir { Direction::Out => "down", Direction::In => "up" },
+            "sign_filter": args.get("sign").and_then(|v| v.as_str()).unwrap_or("all"),
+            "count": count_full,
+            "partners": partners.iter().map(|p| json!({
+                "node": p.node,
+                "root_id": Self::fly_root(&w, p.node),
+                "total_weight": p.total_weight,
+                "links": p.members.iter().map(|(q, e)| json!({
+                    "query": q,
+                    "edge": Self::fly_edge_json(&w, e),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_centrality: хабы мозга — топ по степеням + взвешенный
+    /// PageRank (модуляторы не проводят ранг; фильтр знака сужает граф).
+    fn tool_fly_centrality(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let top = args
+            .get("top")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 100) as usize;
+        let filter = Self::fly_sign_arg(args)?;
+        let damping = args
+            .get("damping")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.85)
+            .clamp(0.05, 0.99);
+        let iterations = args
+            .get("iterations")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 200) as usize;
+        let con = &w.con;
+        let csc = w.csc();
+        let top_out = con.degree_ranking(Direction::Out, top, csc);
+        let top_in = con.degree_ranking(Direction::In, top, csc);
+        let pr = con.pagerank(filter, damping, iterations, 1e-9, top);
+        let report = json!({
+            "sign_filter": args.get("sign").and_then(|v| v.as_str()).unwrap_or("all"),
+            "top_out_degree": top_out.iter().map(|&(u, d)| json!({
+                "neuron": u, "root_id": Self::fly_root(&w, u), "out_degree": d,
+            })).collect::<Vec<_>>(),
+            "top_in_degree": top_in.iter().map(|&(v, d)| json!({
+                "neuron": v, "root_id": Self::fly_root(&w, v), "in_degree": d,
+            })).collect::<Vec<_>>(),
+            "pagerank": {
+                "damping": damping,
+                "iterations": pr.iterations,
+                "converged": pr.converged,
+                "top": pr.top.iter().map(|&(u, r)| json!({
+                    "neuron": u, "root_id": Self::fly_root(&w, u), "rank": r,
+                })).collect::<Vec<_>>(),
+            },
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_rotor: глобальный топ пар по циркуляции J = A − Aᵀ —
+    /// самые однонаправленные влияния мозга (чистые потоки без
+    /// встречной компенсации).
+    fn tool_fly_rotor(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let top = args
+            .get("top")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 1000) as usize;
+        let min_abs = args
+            .get("min_abs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1)
+            .clamp(1, i32::MAX as i64) as i32;
+        let pairs = w.con.rotor_top(top, min_abs);
+        let count = pairs.len();
+        let report = json!({
+            "top": top,
+            "min_abs": min_abs,
+            "count": count,
+            "pairs": pairs.iter().map(|p| json!({
+                "u": p.u, "u_root_id": Self::fly_root(&w, p.u),
+                "v": p.v, "v_root_id": Self::fly_root(&w, p.v),
+                "J_uv": p.j,
+                "J_vu": -p.j,
+                "forward_signed": p.forward,
+                "backward_signed": p.backward,
+            })).collect::<Vec<_>>(),
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_motifs: перепись мотивов вокруг нейрона — реципрокные
+    /// пары, feedforward-треугольники, feedback-циклы (местные схемы
+    /// усиления и обратной связи).
+    fn tool_fly_motifs(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let idx = Self::fly_neuron_arg(args, "neuron", &w)?;
+        let examples = args
+            .get("examples")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .min(50) as usize;
+        let m = w
+            .con
+            .motif_census(idx, w.csc(), examples)
+            .ok_or(format!("нейрон {idx} вне диапазона (узлов: {})", w.con.n_nodes()))?;
+        let report = json!({
+            "neuron": idx,
+            "root_id": Self::fly_root(&w, idx),
+            "out_degree": m.out_degree,
+            "in_degree": m.in_degree,
+            "reciprocal_count": m.reciprocal.len(),
+            "reciprocal": m.reciprocal.iter().map(|(fwd, bwd)| json!({
+                "partner": fwd.target,
+                "partner_root_id": Self::fly_root(&w, fwd.target as usize),
+                "u_to_partner": {"weight": fwd.weight, "nt": fwd.nt_name(), "sign": fwd.sign()},
+                "partner_to_u": {"weight": bwd.weight, "nt": bwd.nt_name(), "sign": bwd.sign()},
+            })).collect::<Vec<_>>(),
+            "feedforward": m.feedforward,
+            "feedback3": m.feedback3,
+            "ff_examples": m.ff_examples.iter().map(|&(v, t)| json!({
+                "mid": v, "mid_root_id": Self::fly_root(&w, v),
+                "target": t, "target_root_id": Self::fly_root(&w, t),
+            })).collect::<Vec<_>>(),
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_fly_propagate: симуляция распространения сигнала —
+    /// x(t+1) = leak·x(t) + γ·A·x(t) на знаковых весах: возбуждение
+    /// разгоняет, торможение гасит. Муха «думает» прямо в RAM.
+    fn tool_fly_propagate(&self, args: &Value) -> Result<String, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let seeds = Self::fly_neurons_arg(args, "neurons", &w, 64)?;
+        let steps = args
+            .get("steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4)
+            .clamp(1, 64) as usize;
+        let gamma = args
+            .get("gamma")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.05)
+            .clamp(0.0, 10.0);
+        let leak = args
+            .get("leak")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0);
+        let theta = args
+            .get("theta")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.01);
+        let top = args
+            .get("top")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15)
+            .clamp(1, 200) as usize;
+        let filter = Self::fly_sign_arg(args)?;
+        let r = w
+            .con
+            .propagate(&seeds, steps, gamma, leak, filter, top, theta)?;
+        let round6 = |x: f64| (x * 1e6).round() / 1e6;
+        let report = json!({
+            "seeds": r.seeds.iter().map(|&s| json!({
+                "neuron": s, "root_id": Self::fly_root(&w, s),
+            })).collect::<Vec<_>>(),
+            "params": {
+                "steps": steps, "gamma": gamma, "leak": leak,
+                "sign_filter": args.get("sign").and_then(|v| v.as_str()).unwrap_or("all"),
+                "theta": theta,
+            },
+            "timeline": r.steps.iter().map(|s| json!({
+                "step": s.step,
+                "active": s.active,
+                "positive_mass": round6(s.positive_mass),
+                "negative_mass": round6(s.negative_mass),
+            })).collect::<Vec<_>>(),
+            "top": r.top.iter().map(|&(v, x)| json!({
+                "neuron": v, "root_id": Self::fly_root(&w, v), "potential": round6(x),
+            })).collect::<Vec<_>>(),
+        });
         Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
     }
 
@@ -1606,6 +2249,194 @@ command, elapsed_us и — при done — полный JSON исполнени�
             "type": "object",
             "properties": {},
             "required": []
+        }
+    }));
+
+    // C2/v0.33.0 «Живая муха»: коннектом FLYCSR1 (мозг мухи FlyWire v783,
+    // 138 639 нейронов) как резидентная матрица A. Артефакт грузится в RAM
+    // ОДИН раз (csr в первом вызове), дальше всё семейство работает без
+    // диска; тяжёлые запросы исполняются в пуле воркеров параллельно.
+    tools.push(json!({
+        "name": "poler_fly",
+        "description": "ЖИВАЯ МУХА — загрузка/сводка/выгрузка коннектома FLYCSR1 (мозг мухи \
+FlyWire v783: 138 639 нейронов, матрица A со знаками: ach/glut +1 возбуждающие, gaba −1 \
+тормозные, oct/ser/da модуляторные). Первый вызов: csr = путь к .csr.zst (+ опционально \
+nodes = nodes.bin для перевода индекс ↔ root_id FlyWire) — артефакт грузится в RAM и живёт \
+между вызовами (тёплый: повторная сводка без диска). action: summary (умолчание) — сводка \
+(узлы/рёбра/масса/баланс медиаторов), eject — выгрузить из RAM. Дальше вызывай \
+poler_fly_node/edge/khop/path/common/centrality/rotor/motifs/propagate БЕЗ csr.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string", "description": "Путь к .csr.zst (первый вызов; далее опционален)"},
+                "nodes": {"type": "string", "description": "Путь к nodes.bin (root_id FlyWire, опционально)"},
+                "action": {"type": "string", "enum": ["summary", "eject"], "default": "summary"}
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_node",
+        "description": "ПАСПОРТ НЕЙРОНА мухи: исходящие/входящие степени и синаптические массы, \
+топ партнёров обоих направлений (other, root_id, weight, nt, sign, signed_weight). neuron = \
+индекс CSR или root_id (строкой, если загружена nodes). limit усекает топы (умолчание 8).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "neuron": {"type": ["string", "integer"], "description": "Индекс 0..138638 либо root_id FlyWire"},
+                "limit": {"type": "integer", "default": 8, "maximum": 500}
+            },
+            "required": ["neuron"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_edge",
+        "description": "РЕБРО u→v и РОТОР пары J = A − Aᵀ: циркуляция влияния. Однонаправленное \
+ребро — чистый поток (J[u][v] = +w, J[v][u] = −w), реципрокная симметричная пара гасится в 0. \
+forward/backward — знаковые веса обоих направлений.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "u": {"type": ["string", "integer"]},
+                "v": {"type": ["string", "integer"]}
+            },
+            "required": ["u", "v"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_khop",
+        "description": "K-HOP BFS потока сигнала от нейрона: размеры фронтов по хопам + всего \
+достигнуто (signal expansion). sign: all | exc (только возбуждающие) | inh (только тормозные).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "neuron": {"type": ["string", "integer"]},
+                "depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 10},
+                "sign": {"type": "string", "enum": ["all", "exc", "inh"], "default": "all"}
+            },
+            "required": ["neuron"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_path",
+        "description": "КРАТЧАЙШИЙ ПУТЬ СИГНАЛА from→to (BFS): цепочка прыжков — каждый синапс \
+с весом, медиатором и знаком; total_weight — суммарная масса маршрута. Найди маршрут между \
+любыми двумя нейронами мозга за миллисекунды.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "from": {"type": ["string", "integer"]},
+                "to": {"type": ["string", "integer"]},
+                "sign": {"type": "string", "enum": ["all", "exc", "inh"], "default": "all"}
+            },
+            "required": ["from", "to"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_common",
+        "description": "ОБЩИЕ ПАРТНЁРЫ набора нейронов (2..32): direction=down — общие мишени \
+(на кого влияет весь набор), up — общие источники (кто влияет на весь набор). Конвергенция и \
+дивергенция схем мозга; у каждого партнёра — суммарная масса и рёбра от каждого нейрона набора.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "neurons": {"type": "array", "items": {"type": ["string", "integer"]}, "minItems": 1, "maxItems": 32},
+                "direction": {"type": "string", "enum": ["down", "up"], "default": "down"},
+                "sign": {"type": "string", "enum": ["all", "exc", "inh"], "default": "all"},
+                "limit": {"type": "integer", "default": 20, "maximum": 500}
+            },
+            "required": ["neurons"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_centrality",
+        "description": "ХАБЫ МОЗГА: топ нейронов по исходящей/входящей степени + взвешенный \
+PageRank по |A| (модуляторы не проводят ранг; sign сужает граф до возбуждающих/тормозных путей). \
+iterations/converged — диагностика сходимости.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "top": {"type": "integer", "default": 10, "maximum": 100},
+                "sign": {"type": "string", "enum": ["all", "exc", "inh"], "default": "all"},
+                "damping": {"type": "number", "default": 0.85, "minimum": 0.05, "maximum": 0.99},
+                "iterations": {"type": "integer", "default": 30, "maximum": 200}
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_rotor",
+        "description": "ГЛОБАЛЬНЫЙ ТОП ЦИРКУЛЯЦИИ J = A − Aᵀ: самые однонаправленные влияния \
+мозга — чистые потоки без встречной компенсации (J_uv > 0, J_vu = −J_uv). min_abs отсекает \
+слабые пары; forward/backback_signed — компоненты потока.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "top": {"type": "integer", "default": 10, "maximum": 1000},
+                "min_abs": {"type": "integer", "default": 1, "minimum": 1}
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_motifs",
+        "description": "МОТИВЫ ВОКРУГ НЕЙРОНА: реципрокные пары u⇄v (оба ребра с весами), \
+feedforward-треугольники u→v→w + u→w (схемы усиления), feedback-циклы u→v→w→u (кольца \
+обратной связи). examples ограничивает список примеров (счётчики всегда полные).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "neuron": {"type": ["string", "integer"]},
+                "examples": {"type": "integer", "default": 5, "maximum": 50}
+            },
+            "required": ["neuron"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_fly_propagate",
+        "description": "СИМУЛЯЦИЯ РАСПРОСТРАНЕНИЯ СИГНАЛА — муха думает в RAM: \
+x(t+1) = leak·x(t) + γ·A·x(t) на знаковых весах (возбуждение разгоняет, торможение гасит, \
+модуляторы молчат). neurons — семена (до 64), steps — шаги (до 64), gamma/leak — динамика, \
+theta — порог активности. Отчёт: хронология (active, ±масса) + топ возбуждённых нейронов.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "neurons": {"type": "array", "items": {"type": ["string", "integer"]}, "minItems": 1, "maxItems": 64},
+                "steps": {"type": "integer", "default": 4, "maximum": 64},
+                "gamma": {"type": "number", "default": 0.05},
+                "leak": {"type": "number", "default": 0.8},
+                "theta": {"type": "number", "default": 0.01},
+                "top": {"type": "integer", "default": 15, "maximum": 200},
+                "sign": {"type": "string", "enum": ["all", "exc", "inh"], "default": "all"}
+            },
+            "required": ["neurons"]
         }
     }));
 
@@ -2249,5 +3080,234 @@ mod exec_family_tests {
         assert_eq!(report["status"], json!("done"), "{text}");
         assert_eq!(report["exit_code"], json!(0), "{text}");
         assert!(report["stdout"].as_str().unwrap().contains("полер-фон"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod fly_family_tests {
+    use super::*;
+
+    fn server() -> McpServer {
+        McpServer::new(9222, 10, PathBuf::from("/nonexistent-poler-fly-test.db"))
+    }
+
+    fn call(srv: &McpServer, name: &str, arguments: Value) -> Value {
+        srv.dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .expect("dispatch не падает")
+    }
+
+    fn text_of(resp: &Value) -> String {
+        resp.pointer("/result/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn json_of(resp: &Value) -> Value {
+        let text = text_of(resp);
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("не JSON ({e}): {text}"))
+    }
+
+    fn core_csr() -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/flywire-connectome/flywire_v783_core.csr.zst");
+        assert!(p.exists(), "артефакт {} не найден", p.display());
+        p.display().to_string()
+    }
+
+    #[test]
+    fn manifest_contains_fly_family() {
+        let m = tools_manifest();
+        let names: Vec<&str> =
+            m.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
+        for expected in [
+            "poler_fly",
+            "poler_fly_node",
+            "poler_fly_edge",
+            "poler_fly_khop",
+            "poler_fly_path",
+            "poler_fly_common",
+            "poler_fly_centrality",
+            "poler_fly_rotor",
+            "poler_fly_motifs",
+            "poler_fly_propagate",
+        ] {
+            assert!(names.contains(&expected), "нет {expected}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn is_fly_tool_routes_family_only() {
+        for name in ["poler_fly", "poler_fly_node", "poler_fly_propagate"] {
+            assert!(is_fly_tool(&json!({
+                "method": "tools/call", "params": {"name": name, "arguments": {}}
+            })));
+        }
+        assert!(!is_fly_tool(&json!({
+            "method": "tools/call", "params": {"name": "poler_grep", "arguments": {}}
+        })));
+        assert!(!is_fly_tool(&json!({"method": "tools/list"})));
+    }
+
+    // Полный жизненный цикл теплоты: холодная загрузка → тёплый вызов
+    // без csr → eject → отказ без csr.
+    #[test]
+    fn fly_warm_lifecycle() {
+        let srv = server();
+        // 1) холодная загрузка + сводка (золотые числа C1)
+        let r = json_of(&call(&srv, "poler_fly", json!({"csr": core_csr()})));
+        assert_eq!(r["n_nodes"], json!(138_639));
+        assert_eq!(r["n_edges"], json!(2_700_513));
+        assert_eq!(r["total_mass"], json!(34_153_566));
+        assert_eq!(r["core"], json!(true));
+        assert!(r["load_ms"].as_u64().unwrap() > 0, "load_ms: {r}");
+        // 2) тёплый вызов без csr — муха уже в RAM
+        let r2 = json_of(&call(&srv, "poler_fly", json!({})));
+        assert_eq!(r2["n_nodes"], json!(138_639));
+        assert_eq!(r2["warm"]["csc_built"], json!(false), "сводка не строит CSC");
+        assert_eq!(r2["warm"]["has_nodes"], json!(false));
+        // 3) eject
+        let r3 = json_of(&call(&srv, "poler_fly", json!({"action": "eject"})));
+        assert_eq!(r3["unloaded"], json!(true));
+        let r4 = json_of(&call(&srv, "poler_fly", json!({"action": "eject"})));
+        assert_eq!(r4["unloaded"], json!(false), "повторный eject — пусто");
+        // 4) после eject без csr — протокольная ошибка
+        let resp = call(&srv, "poler_fly_node", json!({"neuron": 0}));
+        assert!(
+            resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "ожидался isError без загруженного коннектома: {resp}"
+        );
+        assert!(text_of(&resp).contains("коннектом не загружен"));
+    }
+
+    // Паспорт/ребро/K-hop на золотых числах узла 0.
+    #[test]
+    fn fly_node_edge_khop_golden() {
+        let srv = server();
+        let csr = core_csr();
+        let r = json_of(&call(&srv, "poler_fly_node", json!({"csr": csr, "neuron": 0})));
+        assert_eq!(r["out_degree"], json!(13));
+        assert_eq!(r["in_degree"], json!(13));
+        let top_in = r["top_in"].as_array().unwrap();
+        assert!(!top_in.is_empty());
+        assert_eq!(top_in[0]["other"], json!(79_529));
+        assert_eq!(top_in[0]["weight"], json!(17));
+        assert_eq!(top_in[0]["nt"], json!("gaba"));
+        assert_eq!(top_in[0]["sign"], json!(-1));
+        // root_id без таблицы узлов — null (честно)
+        assert_eq!(top_in[0]["other_root_id"], json!(null));
+        // ребро 0→6135 + ротор
+        let e = json_of(&call(&srv, "poler_fly_edge", json!({"u": 0, "v": 6135})));
+        assert_eq!(e["found"], json!(true));
+        assert_eq!(e["forward"]["weight"], json!(5));
+        assert_eq!(e["forward"]["nt"], json!("ach"));
+        assert_eq!(e["backward"], json!(null));
+        assert_eq!(e["rotor_Juv"], json!(5));
+        assert_eq!(e["rotor_Jvu"], json!(-5));
+        // K-hop: фронты [13, 443], достигнуто 457
+        let k = json_of(&call(&srv, "poler_fly_khop", json!({"neuron": 0, "depth": 2})));
+        assert_eq!(k["frontier_sizes"], json!([13, 443]));
+        assert_eq!(k["visited"], json!(457));
+        // фильтр возбуждающих сужает поток
+        let k2 = json_of(&call(&srv, "poler_fly_khop", json!({"neuron": 0, "depth": 2, "sign": "exc"})));
+        let exc_visited = k2["visited"].as_u64().unwrap();
+        assert!(exc_visited <= 457, "exc-поток не шире полного: {exc_visited}");
+    }
+
+    // Путь/общие партнёры/ротор-топ/центральность на реальном ядре.
+    #[test]
+    fn fly_path_common_rotor_centrality() {
+        let srv = server();
+        let csr = core_csr();
+        // прямой путь 0→6135 (ребро w5 ach)
+        let p = json_of(&call(&srv, "poler_fly_path", json!({"csr": csr, "from": 0, "to": 6135})));
+        assert_eq!(p["found"], json!(true));
+        assert_eq!(p["length"], json!(1));
+        assert_eq!(p["total_weight"], json!(5));
+        let hops = p["hops"].as_array().unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0]["from"], json!(0));
+        assert_eq!(hops[0]["to"], json!(6135));
+        assert_eq!(hops[0]["nt"], json!("ach"));
+        // пустой путь 0→0
+        let p0 = json_of(&call(&srv, "poler_fly_path", json!({"from": 0, "to": 0})));
+        assert_eq!(p0["found"], json!(true));
+        assert_eq!(p0["length"], json!(0));
+        // общие мишени соседей 0 и 6135 — обязаны быть (кольца мозга)
+        let c = json_of(&call(&srv, "poler_fly_common", json!({"neurons": [0, 6135]})));
+        assert!(
+            c["count"].as_u64().unwrap() > 0,
+            "у соседей обязаны быть общие мишени: {c}"
+        );
+        let partners = c["partners"].as_array().unwrap();
+        assert!(!partners.is_empty());
+        assert!(partners[0]["total_weight"].as_u64().unwrap() > 0);
+        // топ ротора: антисимметрия + убывание
+        let rot = json_of(&call(&srv, "poler_fly_rotor", json!({"top": 5, "min_abs": 10})));
+        assert_eq!(rot["count"], json!(5));
+        let pairs = rot["pairs"].as_array().unwrap();
+        let j0 = pairs[0]["J_uv"].as_i64().unwrap();
+        assert!(j0 >= 10, "топ-циркуляция < порога: {j0}");
+        assert_eq!(pairs[0]["J_vu"].as_i64().unwrap(), -j0);
+        for w in pairs.windows(2) {
+            assert!(
+                w[0]["J_uv"].as_i64().unwrap() >= w[1]["J_uv"].as_i64().unwrap(),
+                "ротор не убывает: {w:?}"
+            );
+        }
+        // центральность: хабы + PageRank
+        let cen = json_of(&call(&srv, "poler_fly_centrality", json!({"top": 5})));
+        assert_eq!(cen["top_out_degree"].as_array().unwrap().len(), 5);
+        assert_eq!(cen["top_in_degree"].as_array().unwrap().len(), 5);
+        let pr = cen["pagerank"]["top"].as_array().unwrap();
+        assert_eq!(pr.len(), 5);
+        for w in pr.windows(2) {
+            assert!(
+                w[0]["rank"].as_f64().unwrap() >= w[1]["rank"].as_f64().unwrap(),
+                "ранг не убывает: {w:?}"
+            );
+        }
+        assert!(pr.iter().all(|x| x["rank"].as_f64().unwrap() > 0.0));
+    }
+
+    // Мотивы и симуляция на реальном ядре.
+    #[test]
+    fn fly_motifs_propagate() {
+        let srv = server();
+        let csr = core_csr();
+        let m = json_of(&call(&srv, "poler_fly_motifs", json!({"csr": csr, "neuron": 0})));
+        assert_eq!(m["out_degree"], json!(13));
+        assert_eq!(m["in_degree"], json!(13));
+        assert!(m["reciprocal_count"].is_u64());
+        assert!(m["feedforward"].is_u64());
+        assert!(m["feedback3"].is_u64());
+        // симуляция от узла 0: сигнал расходится по 13 исходящим
+        let p = json_of(&call(
+            &srv,
+            "poler_fly_propagate",
+            json!({"neurons": [0], "steps": 3, "gamma": 0.05, "leak": 0.8}),
+        ));
+        let tl = p["timeline"].as_array().unwrap();
+        assert_eq!(tl.len(), 3);
+        assert_eq!(tl[0]["step"], json!(1));
+        assert!(
+            tl[0]["active"].as_u64().unwrap() >= 2,
+            "сигнал не вышел за семя: {p}"
+        );
+        assert!(tl[0]["positive_mass"].as_f64().unwrap() > 0.0);
+        assert!(p["top"].as_array().unwrap().len() >= 2);
+        // неверный нейрон — протокольная ошибка
+        let resp = call(&srv, "poler_fly_propagate", json!({"neurons": [999_999_999]}));
+        assert!(
+            resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "ожидался isError для нейрона вне диапазона"
+        );
+        // отдельный сервер без загрузки — отказ до валидации аргументов
+        let srv2 = server();
+        let resp = call(&srv2, "poler_fly_propagate", json!({"neurons": [0]}));
+        assert!(text_of(&resp).contains("коннектом не загружен"));
     }
 }

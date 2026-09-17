@@ -157,7 +157,7 @@ poler-engine ./src --impact "run_gateway" --impact-depth 3 --impact-cache db
 `--impact СИМВОЛ` — upstream/downstream паспорт (call graph),
 `--impact-depth`, `--impact-cache` (кэш БД), `--impact-reuse`.
 
-## 7. Коннектом FLYCSR1 (v0.30.0) — мозг мухи как матрица A
+## 7. Коннектом FLYCSR1 (C2/v0.33.0 «Живая муха») — мозг мухи как матрица A
 
 ```bash
 poler-engine --connectome docs/flywire-connectome/flywire_v783_core.csr.zst
@@ -165,6 +165,15 @@ poler-engine --connectome core.csr.zst --connectome-nodes nodes.bin --connectome
 poler-engine --connectome core.csr.zst --connectome-edge 0:6135     # + ротор J = A − Aᵀ
 poler-engine --connectome core.csr.zst --connectome-khop 0 -k 2    # фронты [13, 443], 457
 poler-engine --connectome core.csr.zst --connectome-impact 0       # CSC «кто управляет»
+# C2/v0.33.0 — глубокое взаимодействие:
+poler-engine --connectome core.csr.zst --connectome-neighbors 79529 --connectome-dir in
+poler-engine --connectome core.csr.zst --connectome-path 0:116214  # маршрут с цепочкой синапсов
+poler-engine --connectome core.csr.zst --connectome-common 0,6135 --connectome-dir down
+poler-engine --connectome core.csr.zst --connectome-centrality --connectome-top 5
+poler-engine --connectome core.csr.zst --connectome-rotor-top 5 --connectome-min-abs 50
+poler-engine --connectome core.csr.zst --connectome-motifs 79529
+poler-engine --connectome core.csr.zst --connectome-propagate 0 --connectome-steps 3 \
+  --connectome-gamma 0.05 --connectome-leak 0.8
 ```
 
 | Флаг | Смысл |
@@ -174,8 +183,21 @@ poler-engine --connectome core.csr.zst --connectome-impact 0       # CSC «кт�
 | `--connectome-node IDX` | паспорт нейрона: степени, массы, топ-рёбра |
 | `--connectome-edge U:V` | ребро + обратное + ротор J = A − Aᵀ (циркуляция пары) |
 | `--connectome-khop IDX` | BFS потока сигнала; глубина — общий `-k/--k-hop` (2) |
-| `--connectome-sign all\|exc\|inh` | фильтр знака K-hop (возб/торм/все) |
+| `--connectome-sign all\|exc\|inh` | фильтр знака K-hop/путей/симуляции (возб/торм/все) |
 | `--connectome-impact IDX` | входящие (CSC): «кто управляет нейроном» + топ-источники |
+| `--connectome-neighbors IDX` | партнёры по весу (убывание), направление `--connectome-dir` |
+| `--connectome-path FROM:TO` | кратчайший путь сигнала: прыжки с весом/медиатором/знаком |
+| `--connectome-common A,B,C` | общие партнёры набора (2–32): мишени/источники |
+| `--connectome-centrality` | хабы (топ степеней) + PageRank по \|A\| |
+| `--connectome-rotor-top K` | глобальный топ пар по циркуляции J = A − Aᵀ |
+| `--connectome-motifs IDX` | мотивы: реципрокные пары, feedforward, feedback |
+| `--connectome-propagate SEEDS` | симуляция x(t+1) = leak·x + γ·A·x на знаковых весах |
+| `--connectome-dir out\|in\|down\|up` | направление для neighbors/common (умолчание out) |
+| `--connectome-limit N` | лимит списков neighbors/common (20) |
+| `--connectome-top N` | размер топов centrality/propagate (10) |
+| `--connectome-min-abs J` | порог циркуляции rotor-top (1) |
+| `--connectome-steps N` | шаги симуляции propagate (4) |
+| `--connectome-gamma G` / `--connectome-leak L` | динамика симуляции (0.05 / 0.8) |
 | `--connectome-json` | JSON-вывод любого режима (для агентов) |
 
 Знак связи: **+1** ach/glut, **−1** gaba, **0** модуляторы (oct/ser/da);
