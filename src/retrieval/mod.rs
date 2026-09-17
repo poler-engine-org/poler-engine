@@ -28,8 +28,8 @@ pub use chunk::{
     DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS,
 };
 pub use grep::{
-    grep_buffer, grep_run, render_text, stdout_is_tty, GrepConfig, GrepGroup, GrepLineOut,
-    GrepMode, GrepOutput, GrepReport, GrepStats,
+    collect_archives, grep_buffer, grep_run, render_text, stdout_is_tty, GrepConfig, GrepGroup,
+    GrepLineOut, GrepMode, GrepOutput, GrepReport, GrepStats,
 };
 pub use semantic_bridge::{
     LexiconSensor, QueryExpansion, SemanticBridge, SemanticCandidate, SemanticSensor,

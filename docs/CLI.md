@@ -69,14 +69,55 @@ poler-engine . --grep "TODO" --grep-regex --grep-i --grep-count
 
 Exit-коды как у grep: 0 — найдено, 1 — пусто, 2 — ошибка.
 
+### 3.1. Архивы без распаковки (v0.28.1)
+
+Записи zip / tar / tar.gz / tar.zst / gz / zst внутри PATH читаются
+**напрямую из контейнера в память** — виртуальными файлами
+`архив::запись`. Ни один байт не распаковывается на диск (zip-slip,
+бомбы и краденые inode исключены by design; проверено `find -newer`).
+
+```bash
+poler-engine ~/corpus --grep "Subquantum Kinetics" --archives
+# совпадения: ~/corpus/export.zip::docs/paper.md:12:…
+
+# Листинг контейнера без пароля (осмотр перед вскрытием)
+poler-engine --archive-list export.zip
+poler-engine --archive-list export.zip --archive-json   # для агента
+
+# RAG-чанки конкретной записи — селектор «архив::запись»
+poler-engine "export.zip::docs/paper.md" --chunk --chunk-json
+```
+
+| Флаг | Смысл |
+|---|---|
+| `--archives` | с `--grep`: сканировать недра архивов (параллельно с плоскими файлами) |
+| `--archive-password PASS` | пароль ZipCrypto/AES-архива — прямо в CLI (виден в истории shell) |
+| env `POLER_ARCHIVE_KEY` | то же, но не попадает в историю shell |
+| (TTY-промпт) | интерактивный терминал спросит пароль сам, если нашёл шифрованный архив |
+| `--archive-max-entry-mb N` | лимит несжатой записи [64] — защита от zip-бомб |
+| `--archive-list ARCHIVE` | листинг записей (имя/размеры/шифрование), пароль не нужен |
+| `--archive-json` | JSON-форма листинга |
+
+Форматы: zip (stored/deflate/zstd; шифрование ZipCrypto и AES-256),
+tar, tar.gz, tar.zst, gz (мульти-член — ротация логов), zst, а также
+zip-контейнеры приложений (jar/war/epub/odt). bzip2/xz — вне
+суверенного минимума зависимостей. Локальное основание vision-дока:
+`docs/future-streaming-archives.md`.
+
+MCP: инструмент `poler_grep` принимает аргументы `archives: true` и
+`archive_password: "…"` — агент сканирует недра архивов через MCP.
+
 ## 4. RAG-чанки — слой B
 
 ```bash
 poler-engine document.md --chunk --chunk-size 384 --chunk-json
+# v0.28.1: запись архива без распаковки — селектор «архив::запись»
+poler-engine "export.zip::docs/paper.md" --chunk --chunk-json
 ```
 
 `--chunk` (секция→абзац→предложение, целостность предложений),
 `--chunk-size`, `--chunk-overlap`, `--chunk-json` (byte-range якоря).
+Формат записи определяется по её расширению (не по расширению архива).
 
 ## 5. Суверенный ML (v2.0)
 

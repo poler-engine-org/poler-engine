@@ -873,6 +873,11 @@ fn cmd_grep(args: &[String], stdin: Option<&str>) -> Result<String, String> {
         output,
         include_hidden: hidden,
         respect_ignore: true,
+        // Терминальный гейтвей: архивы не сканируются (v0.28.1 —
+        // уровень CLI/grep; расширение гейтвея — отдельный шаг).
+        scan_archives: false,
+        archive_password: None,
+        archive_max_entry_bytes: 0,
     };
 
     let report = if stdin.is_some() || force_stdin {

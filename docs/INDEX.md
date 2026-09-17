@@ -55,7 +55,7 @@ only, нативный инференс через собственное ядр
 | [algebra_of_sense_trit5.md](algebra_of_sense_trit5.md) | Алгебра смысла и кодек Trit5 (краткая версия, см. THEORY.md §6) |
 | [terminal-gateway-architecture.md](terminal-gateway-architecture.md) | Terminal Gateway v0.22–0.28: двойной контур исполнения, sandbox, root broker |
 | [native-retrieval-analysis.md](native-retrieval-analysis.md) | Разбор GNU grep / text-splitter → дизайн слоёв 0/B/S |
-| [future-streaming-archives.md](future-streaming-archives.md) | Zero-Storage Streaming Archives (дизайн-нок будущего) |
+| [future-streaming-archives.md](future-streaming-archives.md) | Zero-Storage Streaming Archives (дизайн-нок будущего; локальное основание исполнено в M4.6 `src/archive/` — grep `--archives`, `--archive-list`, селектор «архив::запись») |
 | [research/dialogue_tool_vs_ai.md](research/dialogue_tool_vs_ai.md) | Ключевой тезис «инструмент, не ИИ» (основа PLAN_POLER_V2 Part B) |
 | [research/](research/) | SOTA-сурвеи 2026: semantic search, code+agentic, RAG+KG, streaming NLP |
 | [sources-archive/](sources-archive/) | ZIP: 299 первоисточников «Когнитивная архитектура семантического резонанса» — полная интеллектуальная история POLER (карта тем — в HISTORY.md, приложение A) |

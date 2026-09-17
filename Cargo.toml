@@ -28,7 +28,7 @@ authors = ["Kotokvit <213886740+Kotokvit@users.noreply.github.com>"]
 
 [package]
 name = "poler-engine"
-version = "0.28.0"
+version = "0.28.1"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -129,6 +129,17 @@ lz4_flex = "0.11"
 # zstd — doc store веб-краулера (pages.text → BLOB со обученным словарём,
 # ленивое обучение на первых страницах, обратная совместимость старых БД).
 zstd = "0.13"
+
+# v0.28.1 Archives (Native Retrieval: скан архивов без распаковки):
+# чтение записей zip/tar/tar.gz/tar.zst/gz/zst прямо из контейнера,
+# виртуальные пути «архив::запись», распаковка на диск запрещена by design.
+# Политика зависимостей сохранена: rust_backend у flate2 (miniz_oxide,
+# чистый Rust), zstd уже в дереве, aes-crypto — чистый Rust (AES-256
+# зашифрованные zip). bzip2/xz/deflate64 НЕ включены: C-зависимости
+# и редкие форматы — суверенный минимум.
+zip = { version = "2.2", default-features = false, features = ["deflate", "aes-crypto", "zstd"] }
+tar = "0.4"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -83,6 +83,20 @@ pub struct GrepConfig {
     pub include_hidden: bool,
     /// Уважать .gitignore/.ignore (по умолчанию — да, как ripgrep).
     pub respect_ignore: bool,
+    /// Скан архивов без распаковки (v0.28.1): zip/tar/tar.gz/tar.zst/gz/zst
+    /// внутри корней поиска раскрываются виртуальными файлами
+    /// «архив::запись». Сам архивный файл как бинарник НЕ сканируется
+    /// (исключаются дубли-маркеры бинарности).
+    #[serde(default)]
+    pub scan_archives: bool,
+    /// Пароль зашифрованных записей zip (ZipCrypto/AES). CLI резолвит:
+    /// --archive-password → POLER_ARCHIVE_KEY → TTY-промпт.
+    #[serde(default)]
+    pub archive_password: Option<String>,
+    /// Лимит несжатой записи архива, байт (0 → DEFAULT_MAX_ENTRY_BYTES,
+    /// 64 МиБ). Защита от zip-бомб: запись свыше лимита пропускается.
+    #[serde(default)]
+    pub archive_max_entry_bytes: u64,
 }
 
 impl Default for GrepConfig {
@@ -97,6 +111,9 @@ impl Default for GrepConfig {
             output: GrepOutput::Content,
             include_hidden: false,
             respect_ignore: true,
+            scan_archives: false,
+            archive_password: None,
+            archive_max_entry_bytes: 0,
         }
     }
 }
@@ -492,13 +509,126 @@ pub fn grep_run(roots: &[PathBuf], config: &GrepConfig) -> Result<GrepReport, St
     files.sort();
     files.dedup();
 
-    let scans: Vec<FileScan> = files
+    // Архивы (с --archives) сканируются ИЗНУТРИ виртуальными файлами
+    // «архив::запись»; как обычные бинарники они не читаются.
+    let (plain, archives): (Vec<PathBuf>, Vec<PathBuf>) = if config.scan_archives {
+        files
+            .into_iter()
+            .partition(|p| !crate::archive::is_archive(p))
+    } else {
+        (files, Vec::new())
+    };
+
+    // Плоские файлы — параллельно (как раньше); архивы — тоже параллельно,
+    // но каждый архив читается одним потоком последовательно (zip-дескриптор
+    // не разделяем между потоками: seek + несинхронный контекст).
+    let mut scans: Vec<FileScan> = plain
         .par_iter()
         .map(|p| scan_file(p, &matcher, config))
         .collect();
+    if !archives.is_empty() {
+        let pw = config.archive_password.as_deref();
+        let limits = archive_limits(config);
+        // Порядок записей внутри архива уже отсортирован
+        // (archive::for_each_entry); порядок самих архивов задан
+        // отсортированным списком файлов, rayon .collect() сохраняет
+        // индексы — вывод детерминирован.
+        let arch_scans: Vec<FileScan> = archives
+            .par_iter()
+            .map(|a| scan_archive(a, &matcher, config, pw, &limits))
+            .flatten()
+            .collect();
+        scans.extend(arch_scans);
+    }
 
     let report = assemble_report(scans, config, started);
     Ok(report)
+}
+
+/// Лимиты чтения записей архива из конфига grep (0 → 64 МиБ).
+fn archive_limits(config: &GrepConfig) -> crate::archive::ReadLimits {
+    crate::archive::ReadLimits {
+        max_entry_bytes: if config.archive_max_entry_bytes == 0 {
+            crate::archive::DEFAULT_MAX_ENTRY_BYTES
+        } else {
+            config.archive_max_entry_bytes
+        },
+    }
+}
+
+/// Сканирование одного архива: каждая запись — виртуальный файл
+/// «архив::запись», семантика контекста/бинарности идентична плоским
+/// файлам. Ошибки отдельной записи (пароль/лимит/повреждение) —
+/// сканом с error, обход продолжается.
+fn scan_archive(
+    path: &Path,
+    matcher: &Matcher,
+    config: &GrepConfig,
+    password: Option<&str>,
+    limits: &crate::archive::ReadLimits,
+) -> Vec<FileScan> {
+    let mut out: Vec<FileScan> = Vec::new();
+    let res = crate::archive::for_each_entry(path, password, limits, |meta, bytes| {
+        let vname = crate::archive::virtual_name(path, &meta.name);
+        match bytes {
+            Ok(b) => out.push(scan_bytes(&vname, &b, matcher, config)),
+            Err(e) => out.push(FileScan {
+                path: vname,
+                binary: false,
+                matched_lines: 0,
+                occurrences: 0,
+                groups: Vec::new(),
+                error: Some(e),
+            }),
+        }
+    });
+    if let Err(e) = res {
+        out.push(FileScan {
+            path: path.display().to_string(),
+            binary: false,
+            matched_lines: 0,
+            occurrences: 0,
+            groups: Vec::new(),
+            error: Some(e),
+        });
+    }
+    out
+}
+
+/// Сбор архивов по корням поиска (для CLI-резолва пароля до старта
+/// параллельного grep: промпт на TTY нельзя звать из rayon-воркеров).
+pub fn collect_archives(
+    roots: &[PathBuf],
+    include_hidden: bool,
+    respect_ignore: bool,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        if root.is_file() {
+            if crate::archive::is_archive(root) {
+                out.push(root.to_path_buf());
+            }
+            continue;
+        }
+        let walker = WalkBuilder::new(root)
+            .hidden(!include_hidden)
+            .git_ignore(respect_ignore)
+            .git_global(respect_ignore)
+            .git_exclude(respect_ignore)
+            .ignore(respect_ignore)
+            .require_git(false)
+            .filter_entry(move |e| {
+                e.file_type().map_or(true, |t| !t.is_dir())
+                    || !crate::SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
+            })
+            .build();
+        for e in walker.filter_map(|e| e.ok()) {
+            if e.file_type().is_some_and(|t| t.is_file()) && crate::archive::is_archive(e.path()) {
+                out.push(e.into_path());
+            }
+        }
+    }
+    out
 }
 
 /// Сборка GrepReport из набора сканов (общая для grep_run и grep_buffer).
@@ -955,5 +1085,77 @@ mod tests {
             let got: Vec<(usize, usize)> = split_lines(input.as_bytes()).collect();
             assert_eq!(got, expected, "input: {input:?}");
         }
+    }
+
+    // ---------- v0.28.1: скан архивов без распаковки ----------
+
+    fn write_fixture_zip(path: &std::path::Path) {
+        use std::io::Write as _;
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("docs/alpha.md", opts).unwrap();
+        zw.write_all(b"# Title\n\nneedle inside archive\n").unwrap();
+        zw.start_file("docs/beta.md", opts).unwrap();
+        zw.write_all(b"no match here\n").unwrap();
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn archives_grep_without_unpacking() {
+        let dir = TempDir::new().unwrap();
+        write_fixture_zip(&dir.path().join("corpus.zip"));
+        write(&dir, "plain.txt", "needle in plain file\n");
+        let mut config = cfg("needle");
+        config.scan_archives = true;
+        let report = grep_run(&[dir.path().to_path_buf()], &config).unwrap();
+        // Виртуальный путь «архив::запись» в выводе
+        let joined = render_text(&report, false);
+        assert!(
+            joined.contains("corpus.zip::docs/alpha.md"),
+            "виртуальный путь в выводе:\n{joined}"
+        );
+        assert!(!joined.contains("beta.md"), "без совпадений не показывается");
+        assert_eq!(report.stats.files_matched, 2); // запись архива + плоский файл
+        assert_eq!(report.exit_code(), 0);
+        // Записи архива в статистике сканирования
+        assert_eq!(report.stats.files_scanned, 3); // alpha, beta, plain.txt
+    }
+
+    #[test]
+    fn archives_off_by_default() {
+        let dir = TempDir::new().unwrap();
+        write_fixture_zip(&dir.path().join("corpus.zip"));
+        let report = grep_run(&[dir.path().to_path_buf()], &cfg("needle")).unwrap();
+        // Без --archives совпадений из недр архива нет (бинарный zip)
+        assert_eq!(report.stats.lines_matched, 0);
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn archives_encrypted_error_is_reported() {
+        let dir = TempDir::new().unwrap();
+        let zip_path = dir.path().join("enc.zip");
+        std::fs::write(&zip_path, include_bytes!("../archive/fixtures/zipcrypto_poler.zip"))
+            .unwrap();
+        let mut config = cfg("субквантовая");
+        config.scan_archives = true;
+        // Без пароля — ошибка с подсказкой, не падение всего прогона
+        let report = grep_run(&[zip_path], &config).unwrap();
+        assert!(
+            report
+                .stats
+                .errors
+                .iter()
+                .any(|e| e.contains("--archive-password")),
+            "ошибка с подсказкой пароля: {:?}",
+            report.stats.errors
+        );
+        // С паролем — совпадение внутри зашифрованной записи
+        config.archive_password = Some("полер-ключ-2026".to_string());
+        let report = grep_run(&[dir.path().join("enc.zip")], &config).unwrap();
+        assert_eq!(report.stats.lines_matched, 1);
+        assert!(render_text(&report, false).contains("enc.zip::secret_note.md"));
     }
 }

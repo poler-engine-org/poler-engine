@@ -233,6 +233,34 @@ struct Cli {
     #[arg(long = "grep-json", requires = "grep")]
     grep_json: bool,
 
+    // ---------- v0.28.1: Архивы без распаковки ----------
+
+    /// Скан архивов без распаковки (с --grep): записи zip/tar/tar.gz/
+    /// tar.zst/gz/zst внутри PATH читаются напрямую из контейнера
+    /// виртуальными файлами «архив::запись». Ничего не пишется на диск.
+    #[arg(long = "archives", requires = "grep")]
+    archives: bool,
+
+    /// Пароль зашифрованных архивов (ZipCrypto/AES). Вводится прямо
+    /// в CLI человеком или ИИ-агентом. Виден в истории shell — для
+    /// секретности используйте POLER_ARCHIVE_KEY или TTY-промпт.
+    #[arg(long = "archive-password", value_name = "PASS")]
+    archive_password: Option<String>,
+
+    /// Лимит несжатой записи архива, МиБ [default: 64] — защита от
+    /// zip-бомб: запись свыше лимита пропускается с ошибкой в stats.
+    #[arg(long = "archive-max-entry-mb", value_name = "NUM", default_value_t = 64)]
+    archive_max_entry_mb: u64,
+
+    /// ЛИСТИНГ АРХИВА: записи контейнера (имя/размеры/шифрование)
+    /// без распаковки и без пароля — осмотр перед вскрытием.
+    #[arg(long = "archive-list", value_name = "ARCHIVE", conflicts_with_all = ["grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens", "web_lens_install"])]
+    archive_list: Option<PathBuf>,
+
+    /// JSON-вывод листинга архива (с --archive-list) — для агента.
+    #[arg(long = "archive-json", requires = "archive_list")]
+    archive_json: bool,
+
     /// RAG-ЧАНКИ: нарезать документ PATH на фрагменты с якорями
     /// (byte range, номера строк, breadcrumb заголовков) —
     /// passage-уровень для агента вместо чтения документа целиком.
@@ -918,6 +946,11 @@ fn run(cli: Cli) -> ExitCode {
         return ExitCode::from(code as u8);
     }
 
+    // ---------- v0.28.1: Листинг архива без распаковки ----------
+    if let Some(archive) = cli.archive_list.clone() {
+        return ExitCode::from(run_archive_list(&cli, &archive) as u8);
+    }
+
     // ---------- v0.20.0: Native Retrieval — grep-режим (слой 0) ----------
     if let Some(pattern) = cli.grep.clone() {
         use poler_engine::retrieval as nr;
@@ -930,6 +963,26 @@ fn run(cli: Cli) -> ExitCode {
         } else {
             nr::GrepOutput::Content
         };
+        // Корни поиска: позиционный PATH (может повторяться неявно —
+        // несколько аргументов clap не поддерживает, но PATH может быть
+        // каталогом) либо текущий каталог.
+        let roots: Vec<std::path::PathBuf> = match cli.path.clone() {
+            Some(p) => vec![p],
+            None => vec![std::path::PathBuf::from(".")],
+        };
+        // Архивы: пароль резолвится ДО параллельного прогона — промпт
+        // на TTY нельзя звать из rayon-воркеров.
+        let archive_password = if cli.archives {
+            match resolve_archive_password(&cli, &roots, cli.grep_hidden) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("poler-archive: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            None
+        };
         let config = nr::GrepConfig {
             pattern,
             mode: if cli.grep_regex { nr::GrepMode::Regex } else { nr::GrepMode::Literal },
@@ -940,13 +993,9 @@ fn run(cli: Cli) -> ExitCode {
             output,
             include_hidden: cli.grep_hidden,
             respect_ignore: true,
-        };
-        // Корни поиска: позиционный PATH (может повторяться неявно —
-        // несколько аргументов clap не поддерживает, но PATH может быть
-        // каталогом) либо текущий каталог.
-        let roots: Vec<std::path::PathBuf> = match cli.path.clone() {
-            Some(p) => vec![p],
-            None => vec![std::path::PathBuf::from(".")],
+            scan_archives: cli.archives,
+            archive_password,
+            archive_max_entry_bytes: cli.archive_max_entry_mb.saturating_mul(1024 * 1024),
         };
         match nr::grep_run(&roots, &config) {
             Ok(report) => {
@@ -979,6 +1028,60 @@ fn run(cli: Cli) -> ExitCode {
     if cli.chunk {
         use poler_engine::retrieval as nr;
         let path = cli.path.clone().unwrap_or_default();
+        // v0.28.1: селектор «архив::запись» — чанки записи БЕЗ распаковки
+        // (читается только указанная запись, bounded-буфер в памяти).
+        if let Some((archive, entry)) =
+            poler_engine::archive::split_virtual(&path.to_string_lossy())
+        {
+            if archive.exists() && poler_engine::archive::is_archive(&archive) {
+                let limits = poler_engine::archive::ReadLimits {
+                    max_entry_bytes: cli.archive_max_entry_mb.saturating_mul(1024 * 1024),
+                };
+                let roots = vec![archive.clone()];
+                let password = match resolve_archive_password(&cli, &roots, false) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("poler-chunk: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let text = match poler_engine::archive::read_entry_text(
+                    &archive,
+                    &entry,
+                    password.as_deref(),
+                    &limits,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("poler-chunk: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let config = nr::ChunkConfig {
+                    target_tokens: cli.chunk_size,
+                    overlap_tokens: cli.chunk_overlap,
+                    ..Default::default()
+                };
+                // Формат — по расширению записи (не архива).
+                let format = nr::ChunkFormat::detect(std::path::Path::new(&entry));
+                let report = nr::chunk_document(&text, format, &config);
+                let display = poler_engine::archive::virtual_name(&archive, &entry);
+                if cli.chunk_json {
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(json) => println!("{json}"),
+                        Err(e) => {
+                            eprintln!("poler-chunk: сериализация JSON: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    print!("{}", nr::render_chunks_text(&report, &display));
+                }
+                return ExitCode::SUCCESS;
+            }
+            // «::» в имени, но левая часть — не архив: трактуем как
+            // обычный путь (фолбэк, файл с «::» в имени — экзотика).
+        }
         if !path.is_file() {
             eprintln!("poler-chunk: путь не файл (или не найден): {}", path.display());
             return ExitCode::from(2);
@@ -1880,6 +1983,157 @@ fn run_knowledge_stats(cli: &Cli) -> i32 {
 
 // ── Крипто-слой данных: POLER Vault (M4.5 CDL, фича pnd-ffi) ────────────────
 
+// ---------------------------------------------------------------------------
+// v0.28.1: Архивы без распаковки — CLI-хелперы
+// ---------------------------------------------------------------------------
+
+/// `--archive-list <ARCHIVE>`: листинг записей контейнера без распаковки
+/// и без пароля (метаданные читаются raw из центрального каталога /
+/// заголовков tar). `--archive-json` — машинно-читаемая форма для агента.
+fn run_archive_list(cli: &Cli, archive: &std::path::Path) -> i32 {
+    use poler_engine::archive;
+
+    let info = match archive::open_info(archive) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("poler-archive: {e}");
+            return 2;
+        }
+    };
+    let files = info.entries.iter().filter(|e| !e.is_dir).count();
+    let dirs = info.entries.len() - files;
+    let encrypted = info.entries.iter().filter(|e| e.encrypted).count();
+    if cli.archive_json {
+        let listing = serde_json::json!({
+            "archive": info.path.display().to_string(),
+            "kind": info.kind.as_str(),
+            "entries_total": info.entries.len(),
+            "entries_files": files,
+            "entries_dirs": dirs,
+            "entries_encrypted": encrypted,
+            "entries": info.entries.iter().map(|e| serde_json::json!({
+                "name": e.name,
+                "size": e.size,
+                "compressed": e.compressed,
+                "is_dir": e.is_dir,
+                "encrypted": e.encrypted,
+            })).collect::<Vec<_>>(),
+        });
+        match serde_json::to_string_pretty(&listing) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("poler-archive: сериализация JSON: {e}");
+                return 2;
+            }
+        }
+    } else {
+        println!("Архив:  {}", info.path.display());
+        println!(
+            "Тип:    {} · записей: {} (файлов: {}, каталогов: {}) · зашифрованных: {}",
+            info.kind.as_str(),
+            info.entries.len(),
+            files,
+            dirs,
+            encrypted
+        );
+        if encrypted > 0 {
+            println!(
+                "Пароль: --archive-password <PASS> либо env POLER_ARCHIVE_KEY \
+                 (выводится промптом на TTY)"
+            );
+        }
+        println!("{:>12}  {:>12}  {:<4}  {}", "размер", "сжатие", "шифр", "имя");
+        for e in &info.entries {
+            println!(
+                "{:>12}  {:>12}  {:<4}  {}{}",
+                e.size,
+                if e.compressed > 0 {
+                    e.compressed.to_string()
+                } else {
+                    "-".to_string()
+                },
+                if e.encrypted { "да" } else { "-" },
+                e.name,
+                if e.is_dir { "/" } else { "" }
+            );
+        }
+    }
+    0
+}
+
+/// Резолв пароля архивов ДО параллельного прогона: флаг
+/// `--archive-password` (человек/агент вводит прямо в CLI) → env
+/// `POLER_ARCHIVE_KEY` → TTY-промпт (только если среди найденных архивов
+/// есть зашифрованные; промпт нельзя звать из rayon-воркеров).
+fn resolve_archive_password(
+    cli: &Cli,
+    roots: &[std::path::PathBuf],
+    include_hidden: bool,
+) -> Result<Option<String>, String> {
+    // 1. Явный флаг — высший приоритет.
+    if let Some(p) = &cli.archive_password {
+        return Ok(Some(p.clone()));
+    }
+    // 2. Окружение (не попадает в историю shell).
+    if let Ok(p) = std::env::var("POLER_ARCHIVE_KEY") {
+        if !p.trim().is_empty() {
+            return Ok(Some(p));
+        }
+    }
+    // 3. Пароль нужен только если хоть один архив зашифрован.
+    let archives = poler_engine::retrieval::collect_archives(roots, include_hidden, true);
+    let mut encrypted: Vec<std::path::PathBuf> = Vec::new();
+    for a in &archives {
+        match poler_engine::archive::open_info(a) {
+            Ok(info) if info.encrypted() => encrypted.push(a.clone()),
+            Ok(_) => {}
+            // Листинг не удался — не блокируем поиск: сама запись
+            // выдам ошибку в stats прогона.
+            Err(_) => {}
+        }
+    }
+    if encrypted.is_empty() {
+        return Ok(None);
+    }
+    // 4. Интерактивный ввод (как у Vault: stdin, не история shell).
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        eprint!(
+            "poler-archive: пароль для {} (stdin, не попадёт в историю shell): ",
+            encrypted[0].display()
+        );
+        use std::io::Write as _;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("stdin: {e}"))?;
+        let pw = line.trim_end_matches(['\r', '\n']).to_string();
+        if pw.is_empty() {
+            return Err(format!(
+                "пароль пуст; архивы зашифрованы: {} (передайте --archive-password \
+                 или POLER_ARCHIVE_KEY)",
+                encrypted
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Ok(Some(pw));
+    }
+    Err(format!(
+        "архив(ы) зашифрованы: {} — передайте --archive-password <PASS> \
+         или env POLER_ARCHIVE_KEY (в интерактивном терминале движок \
+         спросит пароль сам)",
+        encrypted
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// Парольная фраза: env (по умолчанию POLER_VAULT_KEY) → stdin.
 /// Ключ никогда не пишется в историю shell: env или пайп.
 #[cfg(feature = "pnd-ffi")]
@@ -2015,7 +2269,7 @@ fn run_memory_open(cli: &Cli, vault_path: &std::path::Path) -> i32 {
 }
 
 #[cfg(feature = "pnd-ffi")]
-fn run_memory_verify(cli: &Cli, vault_path: &std::path::Path) -> i32 {
+fn run_memory_verify(_cli: &Cli, vault_path: &std::path::Path) -> i32 {
     use poler_engine::crypto::vault;
 
     match vault::verify(vault_path) {
@@ -2033,7 +2287,7 @@ fn run_memory_verify(cli: &Cli, vault_path: &std::path::Path) -> i32 {
 }
 
 #[cfg(feature = "pnd-ffi")]
-fn run_memory_info(cli: &Cli, vault_path: &std::path::Path) -> i32 {
+fn run_memory_info(_cli: &Cli, vault_path: &std::path::Path) -> i32 {
     use poler_engine::crypto::vault;
 
     match vault::info(vault_path) {

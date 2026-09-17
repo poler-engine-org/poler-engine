@@ -635,6 +635,14 @@ impl McpServer {
             output,
             include_hidden: false,
             respect_ignore: true,
+            // v0.28.1: MCP-агент может включить скан архивов без распаковки
+            // аргументами tools: {"archives": true, "archive_password": "…"}.
+            scan_archives: args.get("archives").and_then(|v| v.as_bool()).unwrap_or(false),
+            archive_password: args
+                .get("archive_password")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            archive_max_entry_bytes: 0,
         };
         let report = nr::grep_run(&[PathBuf::from(path)], &config)
             .map_err(|e| format!("grep: {e}"))?;

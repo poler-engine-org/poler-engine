@@ -47,6 +47,7 @@
 //! памяти ограничено словарём корпуса + одним временным индексом.
 
 pub mod aidde;
+pub mod archive;
 pub mod bench;
 pub mod compression;
 pub mod crypto;
