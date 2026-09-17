@@ -52,6 +52,12 @@ pub mod bench;
 pub mod compression;
 pub mod crypto;
 pub mod engine;
+
+/// E1/v0.31.0: идеальный исполнитель команд — Zig-ядро
+/// (os/core/poler_exec.zig, raw-syscall слой) + безопасная обвязка.
+#[cfg(feature = "pnd-ffi")]
+pub mod exec;
+
 pub mod gateway;
 pub mod graph;
 pub mod license;

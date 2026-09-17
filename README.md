@@ -29,6 +29,24 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 Обновлённые ступени v2.0 (полный план — `PLAN_POLER_V2.md`):
 
+* **E1/v0.31.0 — Идеальный исполнитель команд poler_exec** — рождён
+  диагностикой исходников GNU bash 5.2 самим движком (`docs/EXEC_AUDIT.md`:
+  424 unsafe-строковых вызова в 75 .c-файлах, `free()` в trap-механике
+  trap.c:839, REINSTALL_SIGCHLD-гонка jobs.c:144/319, неограниченный
+  `$(...)`, ноль таймаутов на детях). Ядро `os/core/poler_exec.zig` —
+  Zig с raw-syscall слоем на ассемблере: ребёнок между fork и exec
+  выполняет только `syscall`-инструкции (dup3 → setpgid →
+  close_range(CLOEXEC) → execve). Гарантии by design: жёсткий таймаут
+  (timerfd MONOTONIC + SIGTERM → grace → SIGKILL группе с безопасным
+  наведением), кольцевой захват хвоста вывода (O(1) памяти при любом
+  объёме), зомби-невозможность (pidfd-пробуждение + wait4(WNOHANG)
+  в ppoll-цикле), шелл-инъекции невозможны (argv массивом). Rust-мост
+  `src/exec/mod.rs` (PATH-разрешение, типизированные ошибки), CLI
+  `--exec` (коды: ребёнка/124/127/126), MCP-инструмент `poler_exec`.
+  Тесты: 11 Zig + 9 Rust + CLI/MCP-смоук — 1164/1164. Боевой журнал
+  пяти багов разработки (включая setpgid 154→109 aarch64→x86_64) —
+  в `docs/EXEC_AUDIT.md` §5.
+
 * **Шаг 1 (4b2b282)** — отвязка от Google/NotebookLM/Gmail/Drive/OAuth:
   суверенный стек, никаких внешних облачных API.
 * **Шаг 2 (1354789, 53cc31b)** — Foundation: madvise, whatlang, Snowball,

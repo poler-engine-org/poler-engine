@@ -56,7 +56,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_abi_tests = b.addRunArtifact(abi_tests);
 
-    const test_step = b.step("test", "Run poler_core crypto self-tests + C-ABI parity tests");
+    // E1/v0.31.0: тесты полер-исполнителя (raw-syscall слой + живой fork/exec)
+    const exec_tests = b.addTest(.{
+        .root_source_file = b.path("poler_exec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_exec_tests = b.addRunArtifact(exec_tests);
+
+    const test_step = b.step("test", "Run poler_core crypto self-tests + C-ABI parity tests + exec tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_abi_tests.step);
+    test_step.dependOn(&run_exec_tests.step);
 }

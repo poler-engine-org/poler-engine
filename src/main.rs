@@ -577,6 +577,53 @@ struct Cli {
     #[arg(long)]
     impact: Option<String>,
 
+    // ---------- E1/v0.31.0: полер-исполнитель команд (фича pnd-ffi) ----------
+
+    /// ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД (ядро os/core/poler_exec.zig, raw-syscalls):
+    /// запустить CMD с аргументами, жёстким таймаутом, лимитом захвата вывода
+    /// (хвост) и гарантией отсутствия зомби. Вывод ребёнка — на наши stdout/stderr,
+    /// код выхода — код ребёнка; таймаут — 124 (конвенция GNU timeout);
+    /// не найдено — 127. Без шелл-парсинга — инъекции невозможны.
+    /// ВАЖНО: все флаги (--exec-timeout-ms и др.) — ДО --exec; после --exec
+    /// всё до конца строки — команда и её аргументы (включая -флаги команды).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(
+        long = "exec",
+        value_name = "CMD ARGS...",
+        num_args = 1..,
+        allow_hyphen_values = true,
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "grep", "chunk", "benchmark", "semantic", "license",
+            "knowledge_ingest", "knowledge_search", "knowledge_stats",
+            "memory_seal", "memory_open", "memory_verify", "memory_info"
+        ]
+    )]
+    exec: Vec<String>,
+
+    /// Жёсткий таймаут команды --exec, мс [default: 30000].
+    /// По истечении: SIGTERM группе → grace → SIGKILL.
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-timeout-ms", value_name = "MS", default_value_t = 30_000)]
+    exec_timeout_ms: u64,
+
+    /// Grace между SIGTERM и SIGKILL при таймауте --exec, мс.
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-grace-ms", value_name = "MS", default_value_t = 100)]
+    exec_grace_ms: u64,
+
+    /// Лимит захвата вывода НА ПОТОК для --exec, байт [default: 256 КиБ].
+    /// Удерживается ХВОСТ вывода (кольцевой буфер), превышение — флаг
+    /// truncated и заметка в stderr; O(1) памяти при любом объёме вывода.
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-max-out", value_name = "BYTES", default_value_t = 262_144)]
+    exec_max_out: usize,
+
+    /// Данные в stdin команды --exec (строка целиком).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-stdin", value_name = "DATA")]
+    exec_stdin: Option<String>,
+
     /// Disk-backed таблица символов (SQLite) для AIDDE на гигантских
     /// кодовых базах: RAM ограничен пачками записи, BFS — индексами.
     #[arg(long = "impact-cache")]
@@ -912,6 +959,12 @@ fn run(cli: Cli) -> ExitCode {
         if let Some(vault) = &cli.memory_info {
             return ExitCode::from(run_memory_info(&cli, vault) as u8);
         }
+    }
+
+    // ---------- E1/v0.31.0: полер-исполнитель команд ----------
+    #[cfg(feature = "pnd-ffi")]
+    if !cli.exec.is_empty() {
+        return ExitCode::from(run_exec(&cli) as u8);
     }
 
     // ---------- MCP-сервер: stdio JSON-RPC для LLM-агентов ----------
@@ -3003,6 +3056,66 @@ fn vault_default_open_output(vault: &std::path::Path) -> std::path::PathBuf {
             let mut s = vault.as_os_str().to_os_string();
             s.push(".out");
             std::path::PathBuf::from(s)
+        }
+    }
+}
+
+/// E1/v0.31.0: диспетчер --exec. Вывод ребёнка — в наши потоки как есть
+/// (байты, без перекодировки), код выхода — ребёнка; таймаут — 124
+/// (конвенция GNU timeout), не найдено — 127, отказ права — 126.
+#[cfg(feature = "pnd-ffi")]
+fn run_exec(cli: &Cli) -> i32 {
+    use poler_engine::exec::{self, ExecSpec};
+    use std::io::Write;
+
+    let mut parts = cli.exec.iter();
+    let program = parts.next().unwrap().clone();
+    let args: Vec<String> = parts.cloned().collect();
+    let spec = ExecSpec {
+        program,
+        args,
+        env: None,
+        timeout_ms: cli.exec_timeout_ms,
+        grace_ms: cli.exec_grace_ms,
+        max_out_bytes: cli.exec_max_out,
+        stdin_data: cli.exec_stdin.as_ref().map(|s| s.as_bytes().to_vec()),
+    };
+
+    match exec::run(&spec) {
+        Ok(out) => {
+            let mut so = std::io::stdout();
+            let _ = so.write_all(&out.stdout);
+            let _ = so.flush();
+            let mut se = std::io::stderr();
+            let _ = se.write_all(&out.stderr);
+            if out.truncated {
+                let _ = writeln!(
+                    se,
+                    "poler-exec: вывод превышал {} байт — удержан хвост",
+                    cli.exec_max_out
+                );
+            }
+            let _ = se.flush();
+            if out.timed_out {
+                eprintln!(
+                    "poler-exec: таймаут {} мс — pid {} убит (TERM→KILL), {} мкс",
+                    cli.exec_timeout_ms, out.pid, out.duration_us
+                );
+                return 124;
+            }
+            if let Some(sig) = out.signal {
+                eprintln!("poler-exec: процесс убит сигналом {sig}");
+                return 128 + sig;
+            }
+            out.exit_code.unwrap_or(1)
+        }
+        Err(e) => {
+            eprintln!("poler-exec: {e}");
+            match e {
+                exec::ExecError::NotFound => 127,
+                exec::ExecError::PermissionDenied => 126,
+                _ => 125,
+            }
         }
     }
 }

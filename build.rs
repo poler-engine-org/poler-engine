@@ -33,6 +33,7 @@ fn find_zig() -> Option<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-changed=os/core/poler_core.zig");
     println!("cargo:rerun-if-changed=os/core/abi.zig");
+    println!("cargo:rerun-if-changed=os/core/poler_exec.zig");
     println!("cargo:rerun-if-changed=os/core/build.zig");
     // Смена env-переменных должна перезапускать скрипт: иначе линкер
     // держит устаревший -L (мина, найденная при смене каталога репо

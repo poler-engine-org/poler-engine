@@ -412,6 +412,8 @@ impl McpServer {
             "poler_search" => self.tool_local_search(&args),
             "poler_grep" => self.tool_grep(&args),
             "poler_chunk" => self.tool_chunk(&args),
+            #[cfg(feature = "pnd-ffi")]
+            "poler_exec" => self.tool_exec(&args),
             "poler_box_exec" => self.tool_box_exec(&args),
             "poler_box_status" => self.tool_box_status(&args),
             "query_poler_knowledge" => self.tool_knowledge_query(&args),
@@ -740,6 +742,71 @@ impl McpServer {
     }
 
     // -----------------------------------------------------------------
+    // poler_exec: идеальный исполнитель команд (E1, фича pnd-ffi)
+    // -----------------------------------------------------------------
+    /// Запуск команды через Zig-ядро (raw-syscalls, os/core/poler_exec.zig).
+    /// Возвращает JSON-отчёт: exit_code/signal/stdout/stderr (base64 не нужен —
+    /// текст с потерями замены) /timed_out/truncated/duration_us/pid.
+    #[cfg(feature = "pnd-ffi")]
+    fn tool_exec(&self, args: &Value) -> Result<String, String> {
+        use crate::exec::{self, ExecSpec};
+
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент command (строка) обязателен")?;
+        let cmd_args: Vec<String> = args
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+        let grace_ms = args.get("grace_ms").and_then(|v| v.as_u64()).unwrap_or(100);
+        let max_out_bytes =
+            args.get("max_out_bytes").and_then(|v| v.as_u64()).unwrap_or(65_536) as usize;
+        let stdin = args.get("stdin").and_then(|v| v.as_str()).map(String::from);
+
+        if cmd_args.iter().any(|a| a.contains('\0')) {
+            return Err("аргументы не могут содержать NUL".into());
+        }
+
+        let spec = ExecSpec {
+            program: command.to_string(),
+            args: cmd_args,
+            env: None,
+            timeout_ms,
+            grace_ms,
+            max_out_bytes,
+            stdin_data: stdin.map(|s| s.into_bytes()),
+        };
+        match exec::run(&spec) {
+            Ok(out) => {
+                let report = json!({
+                    "exit_code": out.exit_code,
+                    "signal": out.signal,
+                    "timed_out": out.timed_out,
+                    "truncated": out.truncated,
+                    "stdout": String::from_utf8_lossy(&out.stdout),
+                    "stderr": String::from_utf8_lossy(&out.stderr),
+                    "stdout_bytes": out.stdout.len(),
+                    "stderr_bytes": out.stderr.len(),
+                    "duration_us": out.duration_us,
+                    "pid": out.pid
+                });
+                Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+            }
+            Err(e) => Ok(format!(
+                "{{\n  \"error\": \"{e}\",\n  \"exit_code\": {}\n}}",
+                match e {
+                    exec::ExecError::NotFound => 127,
+                    exec::ExecError::PermissionDenied => 126,
+                    _ => 125,
+                }
+            )),
+        }
+    }
+
+    // -----------------------------------------------------------------
     // poler_grep: точный поиск в семантике grep (слой 0 Native Retrieval)
     // -----------------------------------------------------------------
     fn tool_grep(&self, args: &Value) -> Result<String, String> {
@@ -1055,7 +1122,7 @@ impl McpServer {
 }
 
 fn tools_manifest() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         json!({
             "name": "poler_web_search",
             "description": "Веб-поиск по постоянному индексу poler-engine (собирается poler_crawl). \
@@ -1229,7 +1296,36 @@ poler_box_exec, чтобы понять, поднят ли контур испо
                 "required": []
             }
         }),
-    ]
+    ];
+
+    // E1/v0.31.0: идеальный исполнитель команд (ядро Zig, raw-syscalls).
+    // Требует фичу pnd-ffi (libpoler_core.a).
+    #[cfg(feature = "pnd-ffi")]
+    tools.push(json!({
+        "name": "poler_exec",
+        "description": "ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД (ядро Zig, raw-syscall слой): запустить \
+программу с жёстким таймаутом (SIGTERM → grace → SIGKILL группе), лимитом захвата вывода \
+(кольцевой буфер — хвост max_out_bytes, O(1) памяти) и гарантией отсутствия зомби \
+(pidfd-пробуждение + wait4 в ppoll-цикле). Рождён диагностикой GNU bash 5.2: классы \
+bash-ошибок (free() в signal-handler, REINSTALL_SIGCHLD-гонка, неограниченный $(...), \
+вечные зависания) исключены конструктивно. argv передаётся массивом — шелл-инъекции \
+невозможны. Возвращает JSON: exit_code, signal, timed_out, truncated, stdout, stderr, \
+duration_us, pid.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Программа: имя из PATH или абсолютный путь"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "Аргументы (массив, БЕЗ шелл-парсинга)"},
+                "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1},
+                "grace_ms": {"type": "integer", "default": 100, "minimum": 0},
+                "max_out_bytes": {"type": "integer", "default": 65536, "description": "Лимит захвата НА ПОТОК (хвост)"},
+                "stdin": {"type": "string", "description": "Данные в stdin (опционально)"}
+            },
+            "required": ["command"]
+        }
+    }));
+
+    tools
 }
 
 #[cfg(test)]
