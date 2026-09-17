@@ -15,8 +15,11 @@ import numpy as np
 import pyarrow.feather as feather
 import zstandard as zstd
 
-RAW = "/home/z/my-project/poler-engine/docs/flywire-connectome/raw"
-OUT = "/home/z/my-project/poler-engine/docs/flywire-connectome"
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RAW = os.environ.get("FLYWIRE_RAW", str(REPO_ROOT / "docs" / "flywire-connectome" / "raw"))
+OUT = os.environ.get("FLYWIRE_OUT", str(REPO_ROOT / "docs" / "flywire-connectome"))
 CORE_MIN = 5
 CHUNK = 2_000_000
 NT_NAMES = ["gaba", "ach", "glut", "oct", "ser", "da"]
