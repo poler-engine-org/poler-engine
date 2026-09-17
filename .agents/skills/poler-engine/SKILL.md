@@ -1,6 +1,6 @@
 ---
 name: poler-engine
-description: AI-Native суверенный поисково-аналитический движок POLER v0.31.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД poler_exec E1 (ядро Zig raw-syscalls, рождённое диагностикой bash 5.2 самим движком: жёсткие таймауты TERM→grace→KILL группе, кольцевой захват хвоста вывода O(1), pidfd-пробуждение — зомби и вечные зависания невозможны, шелл-инъекции исключены — argv массивом), CLI --exec и MCP-инструмент poler_exec, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету), Rust-ридер коннектома FLYCSR1 — мозг мухи FlyWire v783 (138 639 нейронов, 54,5 млн синапсов) как живая матрица A: ротор J = A − Aᵀ, K-hop BFS, CSC-impact прямо из zstd-артефакта. Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, НАДЁЖНОГО запуска команд с таймаутами и лимитом вывода, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация), графовых запросов к биологическому эталону связности.
+description: AI-Native суверенный поисково-аналитический движок POLER v0.32.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД poler_exec E2 (ядро Zig raw-syscalls: таймауты TERM→grace→KILL группе, захват голова+маркер+хвост O(1), pidfd — зомби невозможны, PTY 200x50 для isatty-программ, cwd/env, PATH разрешает ребёнок, отмена cancel_flag за ≤25 мс, ФОНОВЫЕ задачи poler_exec_async/kill), CLI --exec и MCP-семейство из 5 инструментов с ПАРАЛЛЕЛЬНЫМ исполнением (пул воркеров), РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету), Rust-ридер коннектома FLYCSR1 — мозг мухи FlyWire v783 (138 639 нейронов, 54,5 млн синапсов) как живая матрица A: ротор J = A − Aᵀ, K-hop BFS, CSC-impact прямо из zstd-артефакта. Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, НАДЁЖНОГО запуска команд с таймаутами/PTY/фоновым режимом и лимитом вывода, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация), графовых запросов к биологическому эталону связности.
 ---
 
 # POLER-Engine — суверенный гиппокамп, крипто-субстрат и нативный инференс для LLM-агентов
@@ -54,7 +54,7 @@ poler-engine ~/corpus --grep "fn main" [--grep-regex] [--grep-i] [-A/-B N] [--gr
 poler-engine ~/corpus --grep "TODO" --grep-json      # byte offsets для агента
 ```
 
-### 2. Идеальный исполнитель команд E1/v0.31.0 (фича pnd-ffi) — замена падающим Bash-инструментам
+### 2. Идеальный исполнитель команд E2/v0.32.0 (фича pnd-ffi) — замена падающим Bash-инструментам
 
 Рождён диагностикой исходников GNU bash 5.2 самим движком
 (docs/EXEC_AUDIT.md: 424 unsafe-вызова в 75 .c-файлах, free() в trap-механике,
@@ -66,13 +66,21 @@ Zig с raw-syscall слоем: классы bash-ошибок исключены
 poler-engine --exec-timeout-ms 5000 --exec make -j4
 poler-engine --exec-max-out 65536 --exec dd if=/dev/zero bs=1M count=64
 poler-engine --exec-stdin "вопрос" --exec cat
-# коды: ребёнка | 124 таймаут | 127 не найдено | 126 без права
+# E2: рабочий каталог, окружение, терминал, голова+хвост
+poler-engine --exec-cwd /var/log --exec ls -la
+poler-engine --exec-env LC_ALL=C --exec-env DEBUG=1 --exec sort file.txt
+poler-engine --exec-pty --exec sudo -n apt-get update      # isatty-программы
+poler-engine --exec-capture head_tail --exec-max-out 4096 --exec make -j8  # и голова, и хвост лога
+# коды: ребёнка | 124 таймаут | 127 не найдено | 126 без права | 125 плохой cwd
 ```
 
 Гарантии: таймаут timerfd(MONOTONIC) + SIGTERM → grace → SIGKILL группе;
-захват — кольцевой хвост max_out байт (O(1) памяти); зомби невозможны
-(pidfd-пробуждение + wait4 в ppoll-цикле); шелл-инъекции невозможны
-(argv массивом, без парсинга); fds-гигиена CLOEXEC.
+захват — O(1) памяти (tail: хвост max_out; head_tail: первые B/2 + маркер
+«dropped N» + последние B/2 — стек-трейс в начале гигантского лога
+не теряется); зомби невозможны (pidfd + wait4 в ppoll-цикле); шелл-инъекции
+невозможны (argv массивом, без парсинга); fds-гигиена CLOEXEC; PTY —
+настоящий терминал 200x50 (stdout/stderr слиты); PATH разрешает сам ребёнок
+(ноль stat в родителе); отмена — атомарный флаг, TERM→KILL за ≤25 мс.
 
 ### 3. Архивы без распаковки (v0.28.1) — виртуальные файлы «архив::запись»
 
@@ -233,10 +241,21 @@ poler-engine --benchmark [--benchmark-json r.json]   # Exact/Lexical/Passage/lat
 `poler_web_search`, `poler_crawl`, `poler_fetch`, `poler_search`,
 `poler_grep` (аргументы `archives: true`, `archive_password: "…"`),
 `poler_chunk`, `poler_box_exec`, `poler_box_status`,
-`poler_exec` (E1: идеальный запуск команд — command/args/timeout_ms/
-grace_ms/max_out_bytes/stdin → JSON exit_code/signal/stdout/stderr/
-timed_out/truncated/duration_us/pid; ядро Zig raw-syscalls),
+`poler_exec` (E2: идеальный запуск команд — command/args/timeout_ms/
+grace_ms/max_out_bytes/stdin/cwd/env/pty/capture → JSON exit_code/signal/
+stdout/stderr/timed_out/cancelled/truncated/duration_us/pid; ядро Zig
+raw-syscalls; умолчание capture=head_tail),
+`poler_exec_async` (фоновый запуск → task_id мгновенно),
+`poler_exec_task` (опрос/ожидание: task_id + wait_ms),
+`poler_exec_kill` (отмена: TERM→KILL за ≤25 мс),
+`poler_exec_list` (обзор фоновых задач),
 `poler_knowledge` (query, top, min_provenance).
+
+**E2: параллельное исполнение.** stdio-сервер исполняет exec-инструменты
+в пуле воркеров (2–8 потоков): агент может отправлять N запросов подряд —
+они выполняются ПАРАЛЛЕЛЬНО, ответы приходят по готовности (JSON-RPC
+сопоставляет по id). Пример: два `sleep 1` параллельно = 1.0 с стеновых,
+а не 2 с.
 
 ### M6: резидентное состояние (real-time, без холодного старта)
 
@@ -259,7 +278,7 @@ poler-engine --mcp-bench 500                          # бенчмарк рез�
 
 ## Верификационные числа (золотой стандарт)
 
-- Rust: **1099/1099** тестов (pnd-ffi; +12 C1: золотые числа FlyWire v783 прямо из git-артефактов — 54 492 922 синапса, массы по 6 медиаторам, K-hop [13, 443]→457, CSC-инварианты); Zig: **33/33**; golden-векторы PND: **54 626 bit-for-bit**.
+- Rust: **1177/1177** тестов (pnd-ffi; E2: +13 exec-семейство), default **1115/1115**; Zig: **21/21** exec + 33/33 крипто/ABI; golden-векторы PND: **54 626 bit-for-bit**.
 - pqw/pqc: дифференциалы против fp32-эталонов — int8 cos > 0.999, int4 > 0.98, fp32 > 0.9999.
 - Токенизатор XLM-R: 40/40 текстов побитово = HF `tokenizers` v0.23.2.
 - BGE-M3 int8 (573 МБ): cos ≥ 0.9999 на всех 24 слоях. GLiNER (urchade/gliner_multi):

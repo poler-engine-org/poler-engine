@@ -197,3 +197,68 @@ let out = run(&ExecSpec{ program:"make".into(), args:vec!["-j4".into()],
 
 Ограничения: Linux x86_64 (comptime-guard); stdin — однократный буфер
 (не стрим); cwd наследуется (смену каталога делает сама команда).
+
+---
+
+## 7. E2/v0.32.0 — устранение узких мест самого инструмента
+
+Стресс-тест на хосте (i7-3770, CachyOS) и само-аудит выявили 7 ограничений
+E1. Каждое закрыто в ядре `os/core/poler_exec.zig` (Zig, raw-syscalls) —
+не обёрткой, а архитектурно.
+
+| # | Узкое место E1 | Решение E2 | Где |
+|---|----------------|------------|-----|
+| 1 | Кольцо держало ТОЛЬКО хвост: стек-трейс в начале 100 МБ лога терялся безвозвратно | `capture=head_tail` (Sink): бюджет B делится — первые B/2 (голова, линейно) + маркер `\n[poler-exec: dropped N bytes]\n` + последние B/2 (кольцо в [B/2, B)). Итог ≤ B+64, один финальный сдвиг хвоста | Sink в poler_exec.zig |
+| 2 | Не было PTY: sudo/fzf/htop и любые isatty-программы не работали | `/dev/ptmx` (O_RDWR\|O_NOCTTY\|O_CLOEXEC) + ioctl TIOCGPTN/TIOCSPTLCK(0)/TIOCSWINSZ(200x50) + в ребёнке setsid + open slave без O_NOCTTY → управляющий терминал. stdout/stderr слиты (природа PTY), группа сессии = pid → таймаут убивает всё | childBootstrap |
+| 3 | $PATH сканировал РОДИТЕЛЬ (stat на каждый каталог до fork) | execvp-семантика в РЕБЁНКЕ: путь с '/' — прямой execve; имя — перебор каталогов PATH из envp, EACCES приоритетнее ENOENT. Ноль stat в родителе, ноль кэшей со стагнацией | childExec |
+| 4 | Не было cwd (chdir процесс-глобален, многопоточный MCP-родитель трогать не может) | chdir в бутстрапе ребёнка; провал → errno в fail-пайп + exit 125 (отличим от 127 exec) | childBootstrap §3 |
+| 5 | Запуск нельзя было отменить извне | `cancel_flag: ?*const u32` в Options: цикл делает @atomicLoad(acquire), ppoll не спит дольше 25 мс при активном флаге → TERM→grace→KILL; `res.cancelled=1`, `timed_out` НЕ трогается | poler_exec_run |
+| 6 | MCP env не пробрасывался | `env` (MCP-объект) и `--exec-env KEY=VALUE` (CLI, повторяемый) | mcp.rs / main.rs |
+| 7 | Утечка fd: in_wr не закрывался при раннем выходе из цикла | флаг `in_wr_open` + страховочный close на выходе; PTY: master == out_rd == in_wr — закрывается ровно один раз | poler_exec_run |
+
+### 7.1 Параллельность MCP (узкое место уровня сервера)
+
+E1: stdio-цикл читал запросы последовательно — один `poler_exec sleep 30`
+блокировал сервер на 30 с; 20 стресс-задач вставали в FIFO-очередь.
+
+E2: пул воркеров (`available_parallelism` clamped 2..=8) + реестр фоновых
+задач:
+
+* `poler_exec_async {command,…}` → `{task_id, status:"running"}` мгновенно;
+  задача живёт в собственном потоке (TaskRegistry, лимит 128 с вытеснением
+  завершённых);
+* `poler_exec_task {task_id, wait_ms≤60000}` — опрос/ожидание: running-снимок
+  или полный JSON исполнения (+command/elapsed_us);
+* `poler_exec_kill {task_id}` — атомарная отмена (см. #5), `killed:true/false`;
+* `poler_exec_list {}` — обзор реестра;
+* tools/call exec-семейства уходит в пул: pipelined-запросы исполняются
+  ПАРАЛЛЕЛЬНО, ответы — по готовности (JSON-RPC допускает внеочередность,
+  клиент сопоставляет по id). Замер: 2×`sleep 1` параллельно = **1.008 с**
+  стеновых (сериально 2 с+).
+
+### 7.2 C-ABI изменения (обе стороны зеркальны, repr(C))
+
+```
+Options: + cwd: ?[*:0]const u8 = null      // chdir в ребёнке
+         + pty: u32 = 0                    // /dev/ptmx + setsid + slave
+         + capture: u32 = 0                // 0=tail, 1=head_tail
+         + cancel_flag: ?*const u32 = null // атомарная отмена
+Result:  + cancelled: u32                  // 1 = отменён (≠ таймаут)
+```
+Контракт head_tail: буфер вызывающего ≥ бюджет + 64 байта (MARKER_MAX).
+Провал chdir: rc = -errno, res.exit_code = 125; провал exec: rc = -errno,
+exit 127 — стадии различимы.
+
+### 7.3 Матрица приёмки E2
+
+| Проверка | Результат |
+|----------|-----------|
+| Zig-тесты ядра (включая PTY/head_tail/cwd/cancel/PATH) | **21/21** |
+| zig build test (крипто 30 + ABI-parity + exec 21) | **зелёные** |
+| Rust pnd-ffi (lib+doc+integration+gateway) | **1177/1177** (+13 новых) |
+| Rust default | **1115/1115** (базовая линия E1 сохранена) |
+| CLI: PATH по имени (echo), cwd (/tmp), env, таймаут 300 мс → 124 за 303 мс | ✅ |
+| CLI: PTY — `tty` = /dev/pts/N, `tput cols` = 200 | ✅ |
+| CLI: head_tail — маркер `dropped 588383 bytes`, голова seq 1…, хвост …100000 | ✅ |
+| MCP: 3 pipelined запроса (2×sleep 1 + echo) | **1.008 с** стеновых (параллельно) |
+| MCP: async-цикл spawn→list→kill→task(wait) | running→killed→done, cancelled=true, timed_out=false |
