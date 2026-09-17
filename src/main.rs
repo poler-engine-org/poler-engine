@@ -624,6 +624,31 @@ struct Cli {
     #[arg(long = "exec-stdin", value_name = "DATA")]
     exec_stdin: Option<String>,
 
+    /// E2: рабочий каталог команды --exec (chdir в бутстрапе ребёнка;
+    /// провал → код 125). Родитель многопоточен — сам chdir не делает.
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-cwd", value_name = "DIR")]
+    exec_cwd: Option<String>,
+
+    /// E2: переменная окружения ребёнка KEY=VALUE (повторяемый флаг;
+    /// без него наследуется окружение процесса).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-env", value_name = "KEY=VALUE")]
+    exec_env: Vec<String>,
+
+    /// E2: запустить под псевдотерминалом 200x50 (sudo/fzf/htop, isatty);
+    /// stdout и stderr сливаются в один поток (природа PTY).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-pty", default_value_t = false)]
+    exec_pty: bool,
+
+    /// E2: режим захвата при переполнении --exec-max-out: tail — только
+    /// хвост; head_tail — первые B/2 + маркер «dropped N» + последние B/2
+    /// (стек-трейс в начале огромного лога больше не теряется).
+    #[cfg(feature = "pnd-ffi")]
+    #[arg(long = "exec-capture", value_name = "MODE", default_value = "tail")]
+    exec_capture: String,
+
     /// Disk-backed таблица символов (SQLite) для AIDDE на гигантских
     /// кодовых базах: RAM ограничен пачками записи, BFS — индексами.
     #[arg(long = "impact-cache")]
@@ -3060,25 +3085,59 @@ fn vault_default_open_output(vault: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// E1/v0.31.0: диспетчер --exec. Вывод ребёнка — в наши потоки как есть
-/// (байты, без перекодировки), код выхода — ребёнка; таймаут — 124
-/// (конвенция GNU timeout), не найдено — 127, отказ права — 126.
+/// E1/v0.31.0 + E2/v0.32.0: диспетчер --exec. Вывод ребёнка — в наши потоки
+/// как есть (байты, без перекодировки), код выхода — ребёнка; таймаут — 124
+/// (конвенция GNU timeout), не найдено — 127, отказ права — 126, плохой
+/// cwd — 125. E2: --exec-cwd/--exec-env/--exec-pty/--exec-capture.
 #[cfg(feature = "pnd-ffi")]
 fn run_exec(cli: &Cli) -> i32 {
-    use poler_engine::exec::{self, ExecSpec};
+    use poler_engine::exec::{self, CaptureMode, ExecSpec};
     use std::io::Write;
 
     let mut parts = cli.exec.iter();
     let program = parts.next().unwrap().clone();
     let args: Vec<String> = parts.cloned().collect();
+
+    // --exec-env KEY=VALUE (повторяемый): явное окружение вместо наследования.
+    let env = if cli.exec_env.is_empty() {
+        None
+    } else {
+        let mut pairs = Vec::with_capacity(cli.exec_env.len());
+        for kv in &cli.exec_env {
+            match kv.split_once('=') {
+                Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
+                None => {
+                    eprintln!("poler-exec: --exec-env ожидает KEY=VALUE, получено {kv:?}");
+                    return 2;
+                }
+            }
+        }
+        Some(pairs)
+    };
+
+    let capture = match CaptureMode::parse(&cli.exec_capture) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "poler-exec: неизвестный --exec-capture {:?} (доступно: tail | head_tail)",
+                cli.exec_capture
+            );
+            return 2;
+        }
+    };
+
     let spec = ExecSpec {
         program,
         args,
-        env: None,
+        env,
         timeout_ms: cli.exec_timeout_ms,
         grace_ms: cli.exec_grace_ms,
         max_out_bytes: cli.exec_max_out,
         stdin_data: cli.exec_stdin.as_ref().map(|s| s.as_bytes().to_vec()),
+        cwd: cli.exec_cwd.clone(),
+        pty: cli.exec_pty,
+        capture,
+        cancel: None,
     };
 
     match exec::run(&spec) {
@@ -3087,15 +3146,29 @@ fn run_exec(cli: &Cli) -> i32 {
             let _ = so.write_all(&out.stdout);
             let _ = so.flush();
             let mut se = std::io::stderr();
-            let _ = se.write_all(&out.stderr);
+            if !out.pty {
+                // PTY: stderr уже слит в stdout — не дублируем
+                let _ = se.write_all(&out.stderr);
+            }
             if out.truncated {
                 let _ = writeln!(
                     se,
-                    "poler-exec: вывод превышал {} байт — удержан хвост",
-                    cli.exec_max_out
+                    "poler-exec: вывод превышал {} байт — удержан {}",
+                    cli.exec_max_out,
+                    match capture {
+                        CaptureMode::Tail => "хвост".to_string(),
+                        CaptureMode::HeadTail => "голова+маркер+хвост".to_string(),
+                    }
                 );
             }
             let _ = se.flush();
+            if out.cancelled {
+                eprintln!(
+                    "poler-exec: запуск отменён — pid {} убит (TERM→KILL), {} мкс",
+                    out.pid, out.duration_us
+                );
+                return 130; // 128+SIGINT-конвенция отмены
+            }
             if out.timed_out {
                 eprintln!(
                     "poler-exec: таймаут {} мс — pid {} убит (TERM→KILL), {} мкс",
@@ -3111,11 +3184,7 @@ fn run_exec(cli: &Cli) -> i32 {
         }
         Err(e) => {
             eprintln!("poler-exec: {e}");
-            match e {
-                exec::ExecError::NotFound => 127,
-                exec::ExecError::PermissionDenied => 126,
-                _ => 125,
-            }
+            e.exit_code()
         }
     }
 }

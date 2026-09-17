@@ -25,9 +25,7 @@
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
-#[cfg(feature = "pnd-ffi")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -164,6 +162,9 @@ pub struct McpServer {
     /// Шифропоток журнала операций (стриминг логов в Vault, --vault-log).
     #[cfg(feature = "pnd-ffi")]
     vault_log: Option<Arc<Mutex<crate::crypto::vault::VaultAppender>>>,
+    /// E2/v0.32.0: реестр фоновых задач poler_exec_async (отмена/опрос).
+    #[cfg(feature = "pnd-ffi")]
+    exec_tasks: Arc<crate::exec::TaskRegistry>,
 }
 
 impl McpServer {
@@ -179,6 +180,8 @@ impl McpServer {
             file_cache: crate::retrieval::filecache::FileCache::new(DEFAULT_RAM_BUDGET),
             #[cfg(feature = "pnd-ffi")]
             vault_log: None,
+            #[cfg(feature = "pnd-ffi")]
+            exec_tasks: Arc::new(crate::exec::TaskRegistry::default()),
         }
     }
 
@@ -287,7 +290,28 @@ impl McpServerOptions {
     }
 }
 
+/// E2/v0.32.0: инструменты исполнителя уходят в пул воркеров — агент может
+/// запускать команды ПАРАЛЛЕЛЬНО (в E1 один poler_exec блокировал весь
+/// stdio-цикл: 20 стресс-тестов вставали в очередь).
+#[cfg(feature = "pnd-ffi")]
+fn is_exec_tool(msg: &Value) -> bool {
+    msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(|v| v.as_str()),
+            Some(
+                "poler_exec"
+                    | "poler_exec_async"
+                    | "poler_exec_task"
+                    | "poler_exec_kill"
+                    | "poler_exec_list"
+            )
+        )
+}
+
 /// Запуск MCP-сервера (stdio). Возвращает код процесса (0 = чистый EOF stdin).
+/// E2: tools/call poler_exec* исполняются в пуле воркеров параллельно;
+/// ответы пишутся по мере готовности (JSON-RPC допускает внеочередность —
+/// клиент сопоставляет по id).
 pub fn run(
     cdp_port: u16,
     wait_ms: u64,
@@ -300,12 +324,35 @@ pub fn run(
         server = server.with_knowledge_db(kdb);
     }
     server = opts.apply(server);
+    let server = Arc::new(server);
+
+    // Пул воркеров: перекладывает долгие tools/call (exec-семейство) из
+    // читающего потока. Лок на recv держится только на время ОЖИДАНИЯ —
+    // полученные задачи исполняются параллельно.
+    let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+    let rx = Arc::new(Mutex::new(rx));
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 8);
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let rx = rx.clone();
+        handles.push(std::thread::spawn(move || loop {
+            let job = {
+                let guard = rx.lock().expect("poler-mcp: отравленный лок пула");
+                guard.recv()
+            };
+            let Ok(job) = job else { break };
+            job();
+        }));
+    }
+
     eprintln!(
-        "poler-mcp: stdio JSON-RPC, db={:?}, knowledge={:?}, cdp_port={}, wait_ms={}",
-        server.db_path, server.knowledge_db, server.cdp_port, server.wait_ms
+        "poler-mcp: stdio JSON-RPC, db={:?}, knowledge={:?}, cdp_port={}, wait_ms={}, workers={} (параллельный poler_exec)",
+        server.db_path, server.knowledge_db, server.cdp_port, server.wait_ms, workers
     );
     let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -316,7 +363,7 @@ pub fn run(
             Ok(v) => v,
             Err(e) => {
                 let _ = write_line(
-                    &mut out,
+                    &mut std::io::stdout().lock(),
                     &json!({"jsonrpc":"2.0","id":null,"error":{
                         "code":-32700,"message":format!("parse error: {e}")
                     }}),
@@ -324,7 +371,23 @@ pub fn run(
                 continue;
             }
         };
-        server.handle(&mut out, msg);
+        #[cfg(feature = "pnd-ffi")]
+        if is_exec_tool(&msg) {
+            let server = server.clone();
+            let _ = tx.send(Box::new(move || {
+                if let Some(resp) = server.dispatch(&msg) {
+                    let _ = write_line(&mut std::io::stdout().lock(), &resp);
+                }
+            }));
+            continue;
+        }
+        if let Some(resp) = server.dispatch(&msg) {
+            let _ = write_line(&mut std::io::stdout().lock(), &resp);
+        }
+    }
+    drop(tx);
+    for h in handles {
+        let _ = h.join();
     }
     0
 }
@@ -374,12 +437,6 @@ impl McpServer {
         })
     }
 
-    fn handle(&self, out: &mut impl Write, msg: Value) {
-        if let Some(resp) = self.dispatch(&msg) {
-            let _ = write_line(out, &resp);
-        }
-    }
-
     fn handle_initialize(&self, params: &Value) -> Value {
         // отвечаем версией клиента, если она известна, иначе свежей
         let client_pv = params
@@ -414,6 +471,14 @@ impl McpServer {
             "poler_chunk" => self.tool_chunk(&args),
             #[cfg(feature = "pnd-ffi")]
             "poler_exec" => self.tool_exec(&args),
+            #[cfg(feature = "pnd-ffi")]
+            "poler_exec_async" => self.tool_exec_async(&args),
+            #[cfg(feature = "pnd-ffi")]
+            "poler_exec_task" => self.tool_exec_task(&args),
+            #[cfg(feature = "pnd-ffi")]
+            "poler_exec_kill" => self.tool_exec_kill(&args),
+            #[cfg(feature = "pnd-ffi")]
+            "poler_exec_list" => self.tool_exec_list(&args),
             "poler_box_exec" => self.tool_box_exec(&args),
             "poler_box_status" => self.tool_box_status(&args),
             "query_poler_knowledge" => self.tool_knowledge_query(&args),
@@ -742,68 +807,215 @@ impl McpServer {
     }
 
     // -----------------------------------------------------------------
-    // poler_exec: идеальный исполнитель команд (E1, фича pnd-ffi)
+    // poler_exec (E2/v0.32.0): идеальный исполнитель + фоновые задачи
     // -----------------------------------------------------------------
-    /// Запуск команды через Zig-ядро (raw-syscalls, os/core/poler_exec.zig).
-    /// Возвращает JSON-отчёт: exit_code/signal/stdout/stderr (base64 не нужен —
-    /// текст с потерями замены) /timed_out/truncated/duration_us/pid.
+    /// Разбор общих аргументов запуска. Умолчание capture для агентов —
+    /// head_tail: и голова, и хвост огромного вывода (E1 терял голову).
     #[cfg(feature = "pnd-ffi")]
-    fn tool_exec(&self, args: &Value) -> Result<String, String> {
-        use crate::exec::{self, ExecSpec};
+    fn exec_spec_from_args(args: &Value) -> Result<crate::exec::ExecSpec, String> {
+        use crate::exec::{CaptureMode, ExecSpec};
 
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or("аргумент command (строка) обязателен")?;
+            .ok_or("аргумент command (строка) обязателен")?
+            .to_string();
+        if command.contains('\0') {
+            return Err("command не может содержать NUL".into());
+        }
         let cmd_args: Vec<String> = args
             .get("args")
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
-        let grace_ms = args.get("grace_ms").and_then(|v| v.as_u64()).unwrap_or(100);
-        let max_out_bytes =
-            args.get("max_out_bytes").and_then(|v| v.as_u64()).unwrap_or(65_536) as usize;
-        let stdin = args.get("stdin").and_then(|v| v.as_str()).map(String::from);
-
         if cmd_args.iter().any(|a| a.contains('\0')) {
             return Err("аргументы не могут содержать NUL".into());
         }
-
-        let spec = ExecSpec {
-            program: command.to_string(),
-            args: cmd_args,
-            env: None,
-            timeout_ms,
-            grace_ms,
-            max_out_bytes,
-            stdin_data: stdin.map(|s| s.into_bytes()),
+        let capture = match args.get("capture").and_then(|v| v.as_str()) {
+            None => CaptureMode::HeadTail,
+            Some(s) => CaptureMode::parse(s)
+                .ok_or_else(|| format!("неизвестный capture {s:?} (доступно: tail | head_tail)"))?,
         };
+        let env = args.get("env").and_then(|v| v.as_object()).map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<Vec<_>>()
+        });
+        Ok(ExecSpec {
+            program: command,
+            args: cmd_args,
+            env,
+            timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000),
+            grace_ms: args.get("grace_ms").and_then(|v| v.as_u64()).unwrap_or(100),
+            max_out_bytes: args
+                .get("max_out_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(65_536) as usize,
+            stdin_data: args.get("stdin").and_then(|v| v.as_str()).map(|s| s.as_bytes().to_vec()),
+            cwd: args.get("cwd").and_then(|v| v.as_str()).map(String::from),
+            pty: args.get("pty").and_then(|v| v.as_bool()).unwrap_or(false),
+            capture,
+            cancel: None,
+        })
+    }
+
+    /// JSON-отчёт исполнения (общий для poler_exec и poler_exec_task).
+    #[cfg(feature = "pnd-ffi")]
+    fn exec_report_json(out: &crate::exec::ExecOutcome) -> Value {
+        json!({
+            "exit_code": out.exit_code,
+            "signal": out.signal,
+            "timed_out": out.timed_out,
+            "cancelled": out.cancelled,
+            "truncated": out.truncated,
+            "pty": out.pty,
+            "stdout": String::from_utf8_lossy(&out.stdout),
+            "stderr": String::from_utf8_lossy(&out.stderr),
+            "stdout_bytes": out.stdout.len(),
+            "stderr_bytes": out.stderr.len(),
+            "duration_us": out.duration_us,
+            "pid": out.pid
+        })
+    }
+
+    /// Запуск команды через Zig-ядро (raw-syscalls, os/core/poler_exec.zig).
+    /// Блокирует до завершения/таймаута/отмены. Для фонового запуска —
+    /// poler_exec_async; JSON-отчёт: exit_code/signal/stdout/stderr/
+    /// timed_out/cancelled/truncated/duration_us/pid.
+    #[cfg(feature = "pnd-ffi")]
+    fn tool_exec(&self, args: &Value) -> Result<String, String> {
+        use crate::exec::{self, ExecSpec};
+
+        let spec: ExecSpec = Self::exec_spec_from_args(args)?;
         match exec::run(&spec) {
-            Ok(out) => {
-                let report = json!({
-                    "exit_code": out.exit_code,
-                    "signal": out.signal,
-                    "timed_out": out.timed_out,
-                    "truncated": out.truncated,
-                    "stdout": String::from_utf8_lossy(&out.stdout),
-                    "stderr": String::from_utf8_lossy(&out.stderr),
-                    "stdout_bytes": out.stdout.len(),
-                    "stderr_bytes": out.stderr.len(),
-                    "duration_us": out.duration_us,
-                    "pid": out.pid
-                });
-                Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
-            }
+            Ok(out) => Ok(serde_json::to_string_pretty(&Self::exec_report_json(&out))
+                .unwrap_or_else(|_| "{}".into())),
             Err(e) => Ok(format!(
                 "{{\n  \"error\": \"{e}\",\n  \"exit_code\": {}\n}}",
-                match e {
-                    exec::ExecError::NotFound => 127,
-                    exec::ExecError::PermissionDenied => 126,
-                    _ => 125,
-                }
+                e.exit_code()
             )),
         }
+    }
+
+    /// Фоновый запуск: task_id сразу, результат — через poler_exec_task.
+    /// Задача живёт в собственном потоке реестра; отмена — poler_exec_kill.
+    #[cfg(feature = "pnd-ffi")]
+    fn tool_exec_async(&self, args: &Value) -> Result<String, String> {
+        use crate::exec::ExecSpec;
+
+        let spec: ExecSpec = Self::exec_spec_from_args(args)?;
+        let display = if spec.args.is_empty() {
+            spec.program.clone()
+        } else {
+            format!("{} {}", spec.program, spec.args.join(" "))
+        };
+        let id = crate::exec::TaskRegistry::spawn(&self.exec_tasks, display, spec);
+        let report = json!({
+            "task_id": id,
+            "status": "running",
+            "hint": "опрос: poler_exec_task {task_id} (+wait_ms); отмена: poler_exec_kill {task_id}"
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// Опрос/ожидание фоновой задачи: wait_ms — сколько ждать завершения
+    /// (0 — мгновенный снимок). Возвращает running-статус или полный отчёт.
+    #[cfg(feature = "pnd-ffi")]
+    fn tool_exec_task(&self, args: &Value) -> Result<String, String> {
+        use crate::exec::TaskSnapshot;
+
+        let id = args
+            .get("task_id")
+            .and_then(|v| v.as_u64())
+            .ok_or("аргумент task_id (число) обязателен")?;
+        let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(0).min(60_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            match self.exec_tasks.snapshot(id) {
+                None => return Err(format!("задача {id} не найдена")),
+                Some(TaskSnapshot::Running { command, elapsed_us }) => {
+                    if std::time::Instant::now() >= deadline {
+                        let report = json!({
+                            "task_id": id, "status": "running",
+                            "command": command, "elapsed_us": elapsed_us
+                        });
+                        return Ok(serde_json::to_string_pretty(&report)
+                            .unwrap_or_else(|_| "{}".into()));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Some(TaskSnapshot::Done { command, elapsed_us, result }) => {
+                    let report = match result {
+                        Ok(out) => {
+                            let mut r = Self::exec_report_json(&out);
+                            r["task_id"] = json!(id);
+                            r["command"] = json!(command);
+                            r["elapsed_us"] = json!(elapsed_us);
+                            r["status"] = json!("done");
+                            r
+                        }
+                        Err(e) => json!({
+                            "task_id": id, "status": "done", "command": command,
+                            "elapsed_us": elapsed_us,
+                            "error": e.to_string(), "exit_code": e.exit_code()
+                        }),
+                    };
+                    return Ok(serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|_| "{}".into()));
+                }
+            }
+        }
+    }
+
+    /// Отмена фоновой задачи: атомарный флаг → TERM → grace → KILL
+    /// (ядро замечает отмену за ≤25 мс). Результат — через poler_exec_task.
+    #[cfg(feature = "pnd-ffi")]
+    fn tool_exec_kill(&self, args: &Value) -> Result<String, String> {
+        let id = args
+            .get("task_id")
+            .and_then(|v| v.as_u64())
+            .ok_or("аргумент task_id (число) обязателен")?;
+        match self.exec_tasks.kill(id) {
+            Some(true) => Ok(format!(
+                "{{\n  \"task_id\": {id},\n  \"killed\": true,\n  \"note\": \"TERM→KILL отправлен; результат — poler_exec_task {id}\"\n}}"
+            )),
+            Some(false) => Ok(format!(
+                "{{\n  \"task_id\": {id},\n  \"killed\": false,\n  \"note\": \"задача уже завершена\"\n}}"
+            )),
+            None => Err(format!("задача {id} не найдена")),
+        }
+    }
+
+    /// Список фоновых задач (живые + завершённые, до 128 в реестре).
+    #[cfg(feature = "pnd-ffi")]
+    fn tool_exec_list(&self, _args: &Value) -> Result<String, String> {
+        use crate::exec::TaskSnapshot;
+
+        let tasks: Vec<Value> = self
+            .exec_tasks
+            .list()
+            .into_iter()
+            .map(|(id, snap)| match snap {
+                TaskSnapshot::Running { command, elapsed_us } => json!({
+                    "task_id": id, "status": "running",
+                    "command": command, "elapsed_us": elapsed_us
+                }),
+                TaskSnapshot::Done { command, elapsed_us, result } => match result {
+                    Ok(out) => json!({
+                        "task_id": id, "status": "done", "command": command,
+                        "elapsed_us": elapsed_us, "exit_code": out.exit_code,
+                        "cancelled": out.cancelled, "timed_out": out.timed_out
+                    }),
+                    Err(e) => json!({
+                        "task_id": id, "status": "done", "command": command,
+                        "elapsed_us": elapsed_us, "error": e.to_string()
+                    }),
+                },
+            })
+            .collect();
+        let count = tasks.len();
+        let report = json!({ "tasks": tasks, "count": count });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
     }
 
     // -----------------------------------------------------------------
@@ -1298,30 +1510,102 @@ poler_box_exec, чтобы понять, поднят ли контур испо
         }),
     ];
 
-    // E1/v0.31.0: идеальный исполнитель команд (ядро Zig, raw-syscalls).
-    // Требует фичу pnd-ffi (libpoler_core.a).
+    // E1/v0.31.0 + E2/v0.32.0: идеальный исполнитель команд (ядро Zig,
+    // raw-syscalls). Требует фичу pnd-ffi (libpoler_core.a).
     #[cfg(feature = "pnd-ffi")]
     tools.push(json!({
         "name": "poler_exec",
         "description": "ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД (ядро Zig, raw-syscall слой): запустить \
 программу с жёстким таймаутом (SIGTERM → grace → SIGKILL группе), лимитом захвата вывода \
-(кольцевой буфер — хвост max_out_bytes, O(1) памяти) и гарантией отсутствия зомби \
-(pidfd-пробуждение + wait4 в ppoll-цикле). Рождён диагностикой GNU bash 5.2: классы \
-bash-ошибок (free() в signal-handler, REINSTALL_SIGCHLD-гонка, неограниченный $(...), \
-вечные зависания) исключены конструктивно. argv передаётся массивом — шелл-инъекции \
-невозможны. Возвращает JSON: exit_code, signal, timed_out, truncated, stdout, stderr, \
-duration_us, pid.",
+(O(1) памяти) и гарантией отсутствия зомби (pidfd + wait4 в ppoll-цикле). Рождён диагностикой \
+GNU bash 5.2: классы bash-ошибок исключены конструктивно. argv передаётся массивом — шелл-инъекции \
+невозможны. E2: capture=head_tail (голова B/2 + маркер dropped N + хвост B/2 — умолчание), \
+cwd (рабочий каталог), env (явное окружение), pty (настоящий терминал 200x50 для sudo/fzf/htop), \
+PATH разрешает сам ребёнок (ноль stat в родителе). Возвращает JSON: exit_code, signal, timed_out, \
+cancelled, truncated, pty, stdout, stderr, duration_us, pid.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Программа: имя из PATH или абсолютный путь"},
+                "command": {"type": "string", "description": "Программа: имя из PATH или путь с '/'"},
                 "args": {"type": "array", "items": {"type": "string"}, "description": "Аргументы (массив, БЕЗ шелл-парсинга)"},
                 "timeout_ms": {"type": "integer", "default": 30000, "minimum": 1},
                 "grace_ms": {"type": "integer", "default": 100, "minimum": 0},
-                "max_out_bytes": {"type": "integer", "default": 65536, "description": "Лимит захвата НА ПОТОК (хвост)"},
-                "stdin": {"type": "string", "description": "Данные в stdin (опционально)"}
+                "max_out_bytes": {"type": "integer", "default": 65536, "description": "Лимит захвата НА ПОТОК"},
+                "stdin": {"type": "string", "description": "Данные в stdin (опционально)"},
+                "cwd": {"type": "string", "description": "Рабочий каталог ребёнка (chdir в бутстрапе)"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Явное окружение (иначе наследуется)"},
+                "pty": {"type": "boolean", "default": false, "description": "Псевдотерминал 200x50; stdout/stderr слиты"},
+                "capture": {"type": "string", "enum": ["tail", "head_tail"], "default": "head_tail", "description": "Режим при переполнении: хвост | голова+маркер+хвост"}
             },
             "required": ["command"]
+        }
+    }));
+
+    #[cfg(feature = "pnd-ffi")]
+    tools.push(json!({
+        "name": "poler_exec_async",
+        "description": "ФОНОВЫЙ запуск команды (E2): возвращает task_id мгновенно, команда живёт \
+в собственном потоке. Опрос результата — poler_exec_task, отмена — poler_exec_kill, обзор — \
+poler_exec_list. Аргументы совпадают с poler_exec (command/args/timeout_ms/…/cwd/env/pty/capture). \
+Для долгих сборок/сканов: запустил — и продолжил работу.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "args": {"type": "array", "items": {"type": "string"}},
+                "timeout_ms": {"type": "integer", "default": 30000},
+                "grace_ms": {"type": "integer", "default": 100},
+                "max_out_bytes": {"type": "integer", "default": 65536},
+                "stdin": {"type": "string"},
+                "cwd": {"type": "string"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                "pty": {"type": "boolean", "default": false},
+                "capture": {"type": "string", "enum": ["tail", "head_tail"], "default": "head_tail"}
+            },
+            "required": ["command"]
+        }
+    }));
+
+    #[cfg(feature = "pnd-ffi")]
+    tools.push(json!({
+        "name": "poler_exec_task",
+        "description": "ОПРОС/ОЖИДАНИЕ фоновой задачи poler_exec_async: task_id + необязательный \
+wait_ms (сколько миллисекунд ждать завершения, до 60000). Отчёт: task_id, status (running|done), \
+command, elapsed_us и — при done — полный JSON исполнения (exit_code, stdout, stderr, cancelled, …).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer", "description": "id из poler_exec_async"},
+                "wait_ms": {"type": "integer", "default": 0, "maximum": 60000}
+            },
+            "required": ["task_id"]
+        }
+    }));
+
+    #[cfg(feature = "pnd-ffi")]
+    tools.push(json!({
+        "name": "poler_exec_kill",
+        "description": "ОТМЕНА фоновой задачи: атомарный флаг → SIGTERM → grace → SIGKILL группе \
+(ядро замечает отмену за ≤25 мс, зомби невозможны). Итог — через poler_exec_task \
+(cancelled: true).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"}
+            },
+            "required": ["task_id"]
+        }
+    }));
+
+    #[cfg(feature = "pnd-ffi")]
+    tools.push(json!({
+        "name": "poler_exec_list",
+        "description": "ОБЗОР фоновых задач реестра: живые (running, elapsed_us) и завершённые \
+(done, exit_code/cancelled/timed_out) — до 128 последних.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
         }
     }));
 
@@ -1803,4 +2087,167 @@ mod knowledge_tool_tests {
         std::env::remove_var("POLER_MCP_ALLOW_ANY_PATH");
     }
 
+}
+
+#[cfg(all(test, feature = "pnd-ffi"))]
+mod exec_family_tests {
+    use super::*;
+
+    fn server() -> McpServer {
+        McpServer::new(9222, 10, PathBuf::from("/nonexistent-poler-exec-test.db"))
+    }
+
+    fn call(srv: &McpServer, name: &str, arguments: Value) -> Value {
+        srv.dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .expect("dispatch не падает")
+    }
+
+    fn text_of(resp: &Value) -> String {
+        resp.pointer("/result/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn manifest_contains_exec_family() {
+        let m = tools_manifest();
+        let names: Vec<&str> =
+            m.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
+        for expected in
+            ["poler_exec", "poler_exec_async", "poler_exec_task", "poler_exec_kill", "poler_exec_list"]
+        {
+            assert!(names.contains(&expected), "нет {expected}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn is_exec_tool_routes_exec_family_only() {
+        assert!(is_exec_tool(&json!({
+            "method": "tools/call", "params": {"name": "poler_exec", "arguments": {}}
+        })));
+        assert!(is_exec_tool(&json!({
+            "method": "tools/call", "params": {"name": "poler_exec_kill", "arguments": {}}
+        })));
+        assert!(!is_exec_tool(&json!({
+            "method": "tools/call", "params": {"name": "poler_grep", "arguments": {}}
+        })));
+        assert!(!is_exec_tool(&json!({"method": "tools/list"})));
+    }
+
+    #[test]
+    fn tool_exec_head_tail_cwd_env() {
+        let srv = server();
+        let resp = call(
+            &srv,
+            "poler_exec",
+            json!({
+                "command": "sh",
+                "args": ["-c", "printf HEAD7; dd if=/dev/zero bs=1024 count=64 2>/dev/null; printf TAIL7"],
+                "cwd": "/tmp",
+                "env": {"PATH": "/bin:/usr/bin"},
+                "max_out_bytes": 1024,
+                "timeout_ms": 10_000
+            }),
+        );
+        let text = text_of(&resp);
+        let report: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("не JSON ({e}): {text}"));
+        assert_eq!(report["exit_code"], json!(0));
+        assert_eq!(report["truncated"], json!(true));
+        let stdout = report["stdout"].as_str().unwrap();
+        assert!(stdout.starts_with("HEAD7"), "голова потеряна: {stdout:?}");
+        assert!(stdout.ends_with("TAIL7"), "хвост потерян: {stdout:?}");
+        assert!(stdout.contains("dropped"), "нет маркера: {stdout:?}");
+    }
+
+    #[test]
+    fn tool_exec_rejects_unknown_capture() {
+        let srv = server();
+        let resp = call(
+            &srv,
+            "poler_exec",
+            json!({"command": "echo", "args": ["x"], "capture": "sideways"}),
+        );
+        // ошибка аргумента → isError: true, но протокол отвечает 200-образно
+        assert!(
+            resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "ожидался isError: {resp}"
+        );
+    }
+
+    #[test]
+    fn async_lifecycle_spawn_poll_kill() {
+        let srv = server();
+        // 1) фоновый запуск долгой задачи
+        let resp = call(
+            &srv,
+            "poler_exec_async",
+            json!({"command": "sleep", "args": ["30"], "timeout_ms": 60_000}),
+        );
+        let text = text_of(&resp);
+        let report: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("не JSON ({e}): {text}"));
+        let id = report["task_id"].as_u64().expect("task_id в отчёте");
+        assert_eq!(report["status"], json!("running"));
+
+        // 2) мгновенный опрос — running
+        let resp = call(&srv, "poler_exec_task", json!({"task_id": id}));
+        assert!(text_of(&resp).contains("running"), "ожидался running");
+
+        // 3) kill → killed: true
+        let resp = call(&srv, "poler_exec_kill", json!({"task_id": id}));
+        assert!(text_of(&resp).contains("\"killed\": true"), "ожидался killed: true");
+
+        // 4) ожидание завершения с cancelled: true
+        let resp = call(&srv, "poler_exec_task", json!({"task_id": id, "wait_ms": 5000}));
+        let text = text_of(&resp);
+        let report: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("не JSON ({e}): {text}"));
+        assert_eq!(report["status"], json!("done"), "задача не завершилась: {text}");
+        assert_eq!(report["cancelled"], json!(true), "ожидалась отмена: {text}");
+        assert_eq!(report["timed_out"], json!(false), "отмена ≠ таймаут");
+
+        // 5) повторный kill по завершённой — killed: false
+        let resp = call(&srv, "poler_exec_kill", json!({"task_id": id}));
+        assert!(text_of(&resp).contains("\"killed\": false"));
+
+        // 6) list видит задачу
+        let resp = call(&srv, "poler_exec_list", json!({}));
+        let text = text_of(&resp);
+        let report: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("не JSON ({e}): {text}"));
+        let listed = report["tasks"].as_array().unwrap();
+        assert!(listed.iter().any(|t| t["task_id"] == json!(id)), "list не видит задачу");
+
+        // 7) несуществующая задача — ошибка протокола (isError)
+        let resp = call(&srv, "poler_exec_kill", json!({"task_id": 999_999}));
+        assert!(
+            resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "ожидался isError для неизвестной задачи"
+        );
+    }
+
+    #[test]
+    fn async_completes_normally() {
+        let srv = server();
+        let resp = call(
+            &srv,
+            "poler_exec_async",
+            json!({"command": "echo", "args": ["полер-фон"], "timeout_ms": 10_000}),
+        );
+        let report: Value = serde_json::from_str(&text_of(&resp)).expect("JSON");
+        let id = report["task_id"].as_u64().unwrap();
+
+        let resp = call(&srv, "poler_exec_task", json!({"task_id": id, "wait_ms": 10_000}));
+        let text = text_of(&resp);
+        let report: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("не JSON ({e}): {text}"));
+        assert_eq!(report["status"], json!("done"), "{text}");
+        assert_eq!(report["exit_code"], json!(0), "{text}");
+        assert!(report["stdout"].as_str().unwrap().contains("полер-фон"), "{text}");
+    }
 }
