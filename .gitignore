@@ -16,3 +16,6 @@ __pycache__/
 # Zig-артефакты крипто-ядра (os/core)
 os/core/zig-out/
 os/core/.zig-cache/
+
+# FlyWire v783: сырые исходники Zenodo (1.1 ГБ) — вне git, см. docs/flywire-connectome/README.md
+docs/flywire-connectome/raw/
