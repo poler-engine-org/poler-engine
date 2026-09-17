@@ -299,6 +299,30 @@ struct Cli {
     #[arg(long = "mcp-token", value_name = "TOKEN", requires = "mcp_http")]
     mcp_token: Option<String>,
 
+    /// M6: ШИФРОПОТОК ЖУРНАЛА операций MCP-сервера (--mcp/--mcp-http)
+    /// в Vault .pvt — стриминг логов: каждое JSON-RPC-сообщение дописывается
+    /// зашифованной строкой (ts, method, tool, латентность мкс, ok) без
+    /// пере-печати файла. Читается как обычный --memory-open (на любом
+    /// коммите файл валиден). Фраза: --vault-log-pass | env POLER_VAULT_PASS
+    /// | интерактивный вопрос (как у --memory-seal).
+    #[arg(long = "vault-log", value_name = "FILE.pvt")]
+    vault_log: Option<std::path::PathBuf>,
+
+    /// Парольная фраза для --vault-log (иначе env POLER_VAULT_PASS/stdin).
+    #[arg(long = "vault-log-pass", value_name = "PASS", requires = "vault_log")]
+    vault_log_pass: Option<String>,
+
+    /// M6: RAM-бюджет резидентного файл-кэша grep (МиБ; 0 = безлимит).
+    #[arg(long = "mcp-ram-budget", value_name = "MIB", default_value_t = 48)]
+    mcp_ram_budget: usize,
+
+    /// M6: БЕНЧМАРК РЕЗИДЕНТНОСТИ: N итераций poler_grep и
+    /// query_poler_knowledge холодный-против-тёплого (p50/p95/p99),
+    /// RAM кэша и проверка бюджета <5 мс. Без --path/--knowledge-db
+    /// строит временный корпус (самодостаточная верификация M6).
+    #[arg(long = "mcp-bench", value_name = "N", num_args = 0..=1, default_missing_value = "200", conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "license", "semantic_expand"])]
+    mcp_bench: Option<usize>,
+
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
 
     /// TERMINAL GATEWAY (v0.22.0): единый терминальный шлюз — двойной
@@ -849,9 +873,25 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     // ---------- MCP-сервер: stdio JSON-RPC для LLM-агентов ----------
+    if let Some(n) = cli.mcp_bench {
+        return ExitCode::from(run_mcp_bench(&cli, n) as u8);
+    }
+
+    // ---------- M6: шифропоток журнала (--vault-log с --mcp/--mcp-http) ----------
+    if cli.vault_log.is_some() && !cli.mcp && cli.mcp_http.is_none() {
+        eprintln!("poler-vault-log: --vault-log работает вместе с --mcp или --mcp-http");
+        return ExitCode::from(2);
+    }
+
     if cli.mcp {
         let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
-        let code = poler_engine::mcp::run(cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone());
+        let code = poler_engine::mcp::run(
+            cli.cdp_port,
+            cli.web_wait_ms,
+            db,
+            cli.knowledge_db.clone(),
+            mcp_server_options(&cli),
+        );
         return ExitCode::from(code as u8);
     }
 
@@ -894,7 +934,7 @@ fn run(cli: Cli) -> ExitCode {
                 eprintln!("poler-weblens: оконный браузер не запущен: {e}");
             }
         }
-        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone());
+        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone(), mcp_server_options(&cli));
         return ExitCode::from(code as u8);
     }
 
@@ -942,7 +982,7 @@ fn run(cli: Cli) -> ExitCode {
             .clone()
             .or_else(|| std::env::var("POLER_MCP_TOKEN").ok())
             .unwrap_or_else(poler_engine::mcp_http::generate_token);
-        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone());
+        let code = poler_engine::mcp_http::run_http(&bind, &token, cli.cdp_port, cli.web_wait_ms, db, cli.knowledge_db.clone(), poler_engine::mcp::McpServerOptions::default());
         return ExitCode::from(code as u8);
     }
 
@@ -2163,6 +2203,226 @@ fn vault_default_seal_output(input: &std::path::Path) -> std::path::PathBuf {
     let mut s = input.as_os_str().to_os_string();
     s.push(".pvt");
     std::path::PathBuf::from(s)
+}
+
+// ── M6: опции резидентного MCP + стриминг логов ────────────────────────────
+
+/// Собрать опции резидентного сервера из CLI (--mcp-ram-budget, --vault-log).
+/// Ошибка создания шифропотока — фатальна ДО старта сервера (не молчим).
+fn mcp_server_options(cli: &Cli) -> poler_engine::mcp::McpServerOptions {
+    // mut нужен только при pnd-ffi (стриминг --vault-log ниже);
+    // без фичи конфигурация неизменяема после конструирования.
+    #[cfg_attr(not(feature = "pnd-ffi"), allow(unused_mut))]
+    let mut opts = poler_engine::mcp::McpServerOptions {
+        ram_budget: cli.mcp_ram_budget.saturating_mul(1024 * 1024),
+        ..Default::default()
+    };
+    #[cfg(feature = "pnd-ffi")]
+    if let Some(vl) = &cli.vault_log {
+        let phrase = match vault_log_passphrase(cli) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("poler-vault-log: {e}");
+                std::process::exit(2);
+            }
+        };
+        let appender = match poler_engine::crypto::vault::VaultAppender::create(
+            vl,
+            &phrase,
+            &poler_engine::crypto::vault::SealOptions::default(),
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("poler-vault-log: {}: {e}", vl.display());
+                std::process::exit(2);
+            }
+        };
+        eprintln!(
+            "poler-vault-log: журнал операций шифропотоком → {} (стрим, коммит на каждое событие)",
+            vl.display()
+        );
+        opts.vault_log = Some(appender);
+    }
+    opts
+}
+
+/// Фраза шифропотока журнала: --vault-log-pass | env POLER_VAULT_PASS | stdin.
+#[cfg(feature = "pnd-ffi")]
+fn vault_log_passphrase(cli: &Cli) -> Result<String, String> {
+    if let Some(p) = &cli.vault_log_pass {
+        if !p.is_empty() {
+            return Ok(p.clone());
+        }
+    }
+    if let Ok(k) = std::env::var("POLER_VAULT_PASS") {
+        if !k.is_empty() {
+            return Ok(k);
+        }
+    }
+    eprint!("poler-vault-log: парольная фраза журнала (stdin): ");
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("stdin: {e}"))?;
+    let phrase = line.trim_end_matches(['\n', '\r']).to_string();
+    if phrase.is_empty() {
+        return Err("пустая парольная фраза — отказ".into());
+    }
+    Ok(phrase)
+}
+
+/// M6: бенчмарк резидентности — холодный против тёплого.
+///
+/// Строит (или берёт по --path/--knowledge-db) корпус, поднимает
+/// in-process McpServer и гонит N итераций poler_grep +
+/// query_poler_knowledge, замеряя латентность каждой dispatch.
+/// Отчёт: cold (итерация 1) и warm p50/p95/p99; бюджет <5 мс —
+/// критерий приёмки M6 (exit 0/1).
+fn run_mcp_bench(cli: &Cli, iterations: usize) -> i32 {
+    use poler_engine::mcp::McpServer;
+    use serde_json::json;
+
+    let tmp = std::env::temp_dir().join(format!("poler-mcp-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Корпус: --path пользователя или временный (60 файлов × ~8 КиБ).
+    let corpus: std::path::PathBuf = cli
+        .path
+        .clone()
+        .unwrap_or_else(|| {
+            eprintln!("poler-bench: --path не задан — строю временный корпус 60×8 КиБ");
+            let dir = tmp.join("corpus");
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..60 {
+                let body = format!(
+                    "раздел {i}: каноническое уравнение dp/dt и резонансный аттрактор H Psi\n\
+                     строка шума {i} для объёма и правдоподобия корпуса\n"
+                );
+                std::fs::write(dir.join(format!("doc{i:03}.md")), body.repeat(64)).unwrap();
+            }
+            dir
+        })
+        .into();
+
+    // Гиппокамп: --knowledge-db пользователя или временный инжест.
+    let kdb: std::path::PathBuf = cli
+        .knowledge_db
+        .clone()
+        .unwrap_or_else(|| {
+            eprintln!("poler-bench: --knowledge-db не задан — строю временную библиотеку");
+            let dir = tmp.join("lib");
+            let spec = dir.join("01_SPECS");
+            std::fs::create_dir_all(&spec).unwrap();
+            std::fs::write(
+                spec.join("PTS-BENCH.md"),
+                "# PTS-BENCH\n\n## 4. ПОЛНЫЙ ТЕХНИЧЕСКИЙ ТЕКСТ\nрезонансный аттрактор канона: dp/dt = -eta Pi Lambda D p.\n",
+            )
+            .unwrap();
+            let db = tmp.join("bench-knowledge.db");
+            let mut emb = poler_engine::sources::knowledge::KnowledgeEmbedder::None;
+            poler_engine::sources::knowledge::ingest(
+                &dir,
+                &db,
+                &mut emb,
+                &poler_engine::sources::knowledge::IngestOptions::default(),
+            )
+            .unwrap();
+            db
+        })
+        .into();
+
+    // path-guard: разрешаем корпус (временный или пользовательский).
+    std::env::set_var("POLER_MCP_EXTRA_ROOTS", &corpus);
+
+    let server = McpServer::new(9222, 10, tmp.join("no-web.db"))
+        .with_knowledge_db(kdb)
+        .with_ram_budget(cli.mcp_ram_budget.saturating_mul(1024 * 1024));
+
+    let dispatch_timed = |msg: serde_json::Value| -> (u128, serde_json::Value) {
+        let t0 = std::time::Instant::now();
+        let r = server.dispatch(&msg).unwrap_or(serde_json::Value::Null);
+        (t0.elapsed().as_micros(), r)
+    };
+
+    let grep_msg = |q: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "poler_grep",
+                       "arguments": {"pattern": q, "path": corpus.to_str().unwrap(), "output": "count"}}
+        })
+    };
+    let know_msg = |q: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "query_poler_knowledge", "arguments": {"query": q}}
+        })
+    };
+
+    let print_report = |title: &str, samples: &[u128]| -> bool {
+        let mut s = samples.to_vec();
+        s.sort_unstable();
+        let pick = |p: f64| -> u128 {
+            if s.is_empty() { 0 } else { s[((s.len() as f64 - 1.0) * p).round() as usize] }
+        };
+        let p50 = pick(0.50);
+        let p95 = pick(0.95);
+        let p99 = pick(0.99);
+        let ok = p99 < 5_000;
+        println!(
+            "{title}: n={} · cold={} мкс · warm p50={} p95={} p99={} мкс · бюджет <5000 мкс: {}",
+            samples.len(),
+            samples.first().copied().unwrap_or(0),
+            p50, p95, p99,
+            if ok { "ДА" } else { "НЕТ" }
+        );
+        ok
+    };
+
+    println!("poler-mcp-bench (M6 резидентность): итераций = {iterations}, бюджет RAM = {} МиБ", cli.mcp_ram_budget);
+
+    // Серия grep: итерация 0 = холодная (чтение диска), остальные тёплые.
+    let mut grep_samples = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        let (us, r) = dispatch_timed(grep_msg(if i % 2 == 0 { "резонансный" } else { "dp/dt" }));
+        let ok = serde_json::to_string(&r).unwrap().contains("poler-grep");
+        if !ok {
+            eprintln!("poler-bench: grep-вызов не прошёл: {r}");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return 2;
+        }
+        grep_samples.push(us);
+    }
+    let grep_ok = print_report("poler_grep        ", &grep_samples);
+
+    // Серия знаний: итерация 0 = холодная (открытие SQLite/векторов).
+    let mut know_samples = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        let (us, r) = dispatch_timed(know_msg(if i % 2 == 0 { "резонансный аттрактор" } else { "dp/dt канон" }));
+        let txt = serde_json::to_string(&r).unwrap();
+        if !txt.contains("poler knowledge") && !txt.contains("не проиндексирована") {
+            eprintln!("poler-bench: knowledge-вызов не прошёл: {r}");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return 2;
+        }
+        know_samples.push(us);
+    }
+    let know_ok = print_report("knowledge (warm)  ", &know_samples);
+
+    // RAM-кэш и тёплые хэндлы.
+    let stats = serde_json::to_string_pretty(&server.resident_stats()).unwrap();
+    println!("резидентное состояние: {stats}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    if grep_ok && know_ok {
+        println!("M6: ПРИЁМКА ПРОЙДЕНА — тёплые p99 в бюджете <5 мс");
+        0
+    } else {
+        eprintln!("M6: ПРИЁМКА ПРОВАЛЕНА — тёплые p99 выше 5 мс");
+        1
+    }
 }
 
 /// Выходной путь по умолчанию для вскрытия: снять .pvt, иначе суффикс .out.

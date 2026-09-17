@@ -189,12 +189,23 @@ poler-engine --gateway              # Terminal Gateway (sandbox-контур)
 poler-engine --gateway --dangerously-allow-all   # аварийный люк host-контура
 poler-engine --mcp                  # MCP-сервер stdio (JSON-RPC)
 poler-engine --mcp-http 127.0.0.1:8765 --mcp-token X   # MCP HTTP + Bearer
+poler-engine --mcp --vault-log session.pvt             # M6: стриминг логов вызовов в Vault .pvt
+poler-engine --mcp --vault-log session.pvt --vault-log-pass "фраза"
+POLER_VAULT_PASS="фраза" poler-engine --mcp --vault-log session.pvt
+poler-engine --mcp --mcp-ram-budget 64    # M6: бюджет RAM-кэша файлов (МиБ, умолч. 48)
+poler-engine --mcp-bench 500              # M6: бенчмарк резидентности (cold vs warm p50/p95/p99)
 poler-engine --license              # статус EULA
 ```
 
 MCP-инструменты: `poler_web_search`, `poler_crawl`, `poler_fetch`,
 `poler_search`, `poler_grep`, `poler_chunk`, `poler_box_exec`,
 `poler_box_status`.
+
+M6 (резидентность): Гиппокамп/WebIndex/кэш файлов живут в RAM между
+запросами (тёплые p99: grep ≤2 мс, knowledge ≈250 мкс на release);
+`--vault-log` пишет каждый вызов инструмента зашифрованной JSON-строкой
+(`{"ts","method","tool","us","ok"}`) — контейнер валиден на каждом коммите
+и читается штатным `--memory-open`.
 
 ## 9. Бенчмарк
 

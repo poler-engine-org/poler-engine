@@ -42,6 +42,17 @@ pub const DOMAIN_VAULT_MAC: &str = "POLER.PNDHASHER.VAULT_MAC.v1";
 /// Домен цепочки Vault (ключевой фолд листьев — порядок страниц).
 pub const DOMAIN_VAULT_CHAIN: &str = "POLER.PNDHASHER.VAULT_CHAIN.v1";
 
+/// M6 (VaultAppender): снапшот plain-состояния [`PndHasher`].
+/// Переносим между вызовами/коммитами; шифр восстанавливается
+/// из ключа детерминированно (`PndHasher::resume`).
+#[derive(Clone, Debug)]
+pub struct PndHasherParts {
+    pub state: [u32; KEY_WORDS],
+    pub buf: [u8; 16],
+    pub buflen: usize,
+    pub total: u64,
+}
+
 /// Потоковый 256-битный хешer над крипто-ядром PND.
 pub struct PndHasher {
     cipher: PolerCipher,
@@ -135,6 +146,39 @@ impl PndHasher {
         h.finalize()
     }
 
+    /// M6 (VaultAppender): снапшот plain-состояния хешера. Шифр НЕ входит
+    /// в снапшот (владеет Zig-handle) — он пересоздаётся детерминированно
+    /// из того же ключа и ε домена через [`Self::resume`]. Снапшот + живой
+    /// шифр эквивалентны клону: состояние резюмируется побайтово.
+    pub fn parts(&self) -> PndHasherParts {
+        PndHasherParts {
+            state: self.state,
+            buf: self.buf,
+            buflen: self.buflen,
+            total: self.total,
+        }
+    }
+
+    /// M6: восстановить хешер из снапшота. `cipher` обязан быть создан
+    /// тем же ключом и доменом (ε выводится из ключа+домена в
+    /// `new_keyed` — пере-вывод здесь детерминирован).
+    pub fn resume(parts: &PndHasherParts, key: &[u32; KEY_WORDS], domain: &str) -> Self {
+        // Точная копия ε-вывода new_keyed: тот же аккмулятор.
+        let mut eps_acc = key[0] ^ key[4];
+        for b in domain.bytes() {
+            eps_acc = phi(eps_acc ^ (b as u32));
+        }
+        let epsilon = eps_acc | 1;
+        let cipher = PolerCipher::new(key, epsilon).expect("возобновление шифра: выделение контекста");
+        Self {
+            cipher,
+            state: parts.state,
+            buf: parts.buf,
+            buflen: parts.buflen,
+            total: parts.total,
+        }
+    }
+
     /// One-shot ключевой MAC буфера.
     pub fn mac(key: &[u32; KEY_WORDS], domain: &str, data: &[u8]) -> [u32; KEY_WORDS] {
         let mut h = Self::new_keyed(key, domain);
@@ -191,7 +235,8 @@ impl PndHasher {
 }
 
 /// Свёртка доменной строки в 8 слов (публичный «ключ» для контентного режима).
-fn domain_seed(domain: &str) -> [u32; KEY_WORDS] {
+/// M6: публична — VaultAppender возобновляет content_id-цепь с тем же ключом.
+pub fn domain_seed(domain: &str) -> [u32; KEY_WORDS] {
     let mut seed = [0u32; KEY_WORDS];
     for (i, b) in domain.bytes().enumerate() {
         let j = i % KEY_WORDS;
@@ -287,5 +332,34 @@ mod tests {
         let a = PndHasher::digest(&data);
         let b = PndHasher::digest(&data);
         assert_eq!(a, b);
+    }
+
+    /// M6: resume(parts) побайтово эквивалентен продолжению живого
+    /// хешера — фундамент снапшотов MAC-цепи VaultAppender.
+    #[test]
+    fn resume_equivalence() {
+        let key = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let domain = DOMAIN_VAULT_CHAIN;
+        let mut live = PndHasher::new_keyed(&key, domain);
+        live.update("POLER-LOG-STREAM: первая пачка байт страницы 0..N".as_bytes());
+
+        // снапшот в середине потока
+        let snap = live.parts();
+
+        // путь 1: живой хешер продолжает
+        live.update(" + вторая пачка (события лога, коммит 2)".as_bytes());
+        let direct = live.finalize();
+
+        // путь 2: resume из снапшота + та же вторая пачка
+        let mut resumed = PndHasher::resume(&snap, &key, domain);
+        resumed.update(" + вторая пачка (события лога, коммит 2)".as_bytes());
+        let resumed_digest = resumed.finalize();
+
+        assert_eq!(direct, resumed_digest, "resume обязан побайтово совпадать с живым продолжением");
+
+        // снапшот не мутировал: повторный resume даёт тот же результат
+        let mut again = PndHasher::resume(&snap, &key, domain);
+        again.update(" + вторая пачка (события лога, коммит 2)".as_bytes());
+        assert_eq!(resumed_digest, again.finalize(), "снапшот переиспользуем");
     }
 }

@@ -57,7 +57,10 @@ use pqw_core::checksum::fnv1a64;
 use pqw_core::sha256::Sha256;
 use rayon::prelude::*;
 
-use super::hasher::{PndHasher, DOMAIN_VAULT_CHAIN, DOMAIN_VAULT_MAC};
+use super::hasher::{
+    domain_seed, PndHasher, PndHasherParts, DOMAIN_CONTENT, DOMAIN_VAULT_CHAIN,
+    DOMAIN_VAULT_MAC,
+};
 use super::kdf;
 use super::pnd::{phi, pnd_mix, PolerCipher, KEY_WORDS};
 
@@ -512,6 +515,296 @@ pub fn seal(
 
 // ── Вскрытие ────────────────────────────────────────────────────────────────
 
+// ── M6: потоковый аппарат логов (VaultAppender) ─────────────────────────────
+
+/// Информация о коммите стрима.
+#[derive(Clone, Debug)]
+pub struct StreamCommit {
+    /// Полных страниц в контейнере после коммита.
+    pub page_count: u64,
+    /// Байт открытого текста (реальных, без паддинга).
+    pub plain_bytes: u64,
+    /// Длина файла контейнера.
+    pub vault_len: u64,
+}
+
+/// Потоковая печать логов в Vault: инкрементальный аппенд без
+/// пере-печати файла (M6 — «стриминг логов в Vault»).
+///
+/// ## Контракт консистентности
+///
+/// `commit()` переписывает страницу-заголовок так, что **в момент после
+/// каждого коммит файл побайтово валиден как обычный .pvt v1**: `verify`
+/// и `open` (с той же фразой) работают на любом срезе. Дальнейшие
+/// аппенды расширяют частичную хвостовую страницу **на месте**
+/// (IV страницы детерминирован индексом — перезапись безопасна) и
+/// дописывают новые страницы за ней; следующий коммит снова фиксирует
+/// согласованное состояние.
+///
+/// Между коммитами файл может содержать «рваный» хвост за пределами
+/// `page_count` заголовка — `verify`/`open` читают ровно `page_count`
+/// страниц и хвост игнорируют (краш теряет незакоммиченное — это
+/// ожидаемая семантика лог-стрима).
+///
+/// ## Эквивалентность seal()
+///
+/// Аппенд N байт + финальный коммит даёт файл, **побайтово идентичный**
+/// `seal()` тех же N байт при той же соли (IV из соли+индекса, нули
+/// паддинга последней страницы, порядок фолда цепей) — тест
+/// `appender_matches_seal_bit_for_bit`.
+pub struct VaultAppender {
+    file: File,
+    path: PathBuf,
+    key: [u32; KEY_WORDS],
+    epsilon: u32,
+    salt: [u32; KEY_WORDS],
+    iterations: u32,
+    content_flag: bool,
+    /// Живой шифр (только для новых страниц; создавался из key+epsilon).
+    cipher: PolerCipher,
+    /// Снапшот MAC-цепи на границе «последняя ПОЛНАЯ страница»
+    /// (частичная страница в цепь НЕ сфолдена — её лист живёт только
+    /// в копиях на время commit).
+    chain_parts: PndHasherParts,
+    /// Внешний SHA-256 шифротекста на той же границе (Clone-снапшот).
+    outer: Sha256,
+    /// content_id-цепь на той же границе (если включена).
+    content_parts: Option<PndHasherParts>,
+    /// Ключ content_id-цепи (new_content использует domain_seed, НЕ ключ
+    /// Vault — resume обязан восстанавливать тем же ключом).
+    content_key: [u32; KEY_WORDS],
+    /// Полных страниц сфолдено в цепи (= индекс частичной страницы).
+    full_pages: u64,
+    /// Реальные байты частичной страницы (хвост < PAGE_SIZE).
+    tail: Vec<u8>,
+    /// Всего байт открытого текста (включая хвост).
+    total_plain: u64,
+}
+
+impl VaultAppender {
+    /// Начать новый потоковый Vault. Файл создаётся (или усекается!).
+    pub fn create(
+        path: &Path,
+        passphrase: &str,
+        opts: &SealOptions,
+    ) -> Result<Self, String> {
+        let salt = match opts.salt {
+            Some(s) => s,
+            None => fresh_salt()?,
+        };
+        let key = kdf::derive_key(passphrase, &salt, opts.iterations)?;
+        let epsilon = phi(salt[0] ^ salt[4]) | 1;
+        let cipher =
+            PolerCipher::new(&key, epsilon).ok_or_else(|| "шифр: выделение контекста".to_string())?;
+        let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Зарезервировать страницу-заголовок (нулями; запишется при commit).
+        let mut app = Self {
+            file,
+            path: path.to_path_buf(),
+            key,
+            epsilon,
+            salt,
+            iterations: opts.iterations,
+            content_flag: opts.content_id,
+            cipher,
+            chain_parts: PndHasher::new_keyed(&key, DOMAIN_VAULT_CHAIN).parts(),
+            outer: Sha256::new(),
+            content_parts: if opts.content_id {
+                Some(PndHasher::new_content().parts())
+            } else {
+                None
+            },
+            content_key: domain_seed(DOMAIN_CONTENT),
+            full_pages: 0,
+            tail: Vec::new(),
+            total_plain: 0,
+        };
+        app.file.write_all(&[0u8; PAGE_SIZE]).map_err(|e| format!("заголовок: {e}"))?;
+        Ok(app)
+    }
+
+    /// Дописать байты в поток (буферизуются до полной страницы).
+    pub fn append(&mut self, data: &[u8]) -> Result<(), String> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.tail.extend_from_slice(data);
+        self.total_plain += data.len() as u64;
+        // Полные страницы финализируются немедленно: они больше не меняются.
+        while self.tail.len() >= PAGE_SIZE {
+            let page: Box<[u8; PAGE_SIZE]> =
+                Box::new(self.tail[..PAGE_SIZE].try_into().expect("ровно страница"));
+            self.seal_page_at(self.full_pages, &page, PAGE_SIZE)?;
+            self.fold_page(&page[..], PAGE_SIZE)?;
+            self.full_pages += 1;
+            self.tail.drain(..PAGE_SIZE);
+        }
+        Ok(())
+    }
+
+    /// Дописать строку лога (с '\n').
+    pub fn append_line(&mut self, line: &str) -> Result<(), String> {
+        let mut b = line.as_bytes().to_vec();
+        b.push(b'\n');
+        self.append(&b)
+    }
+
+    /// Зафиксировать согласованное состояние: хвостовая страница
+    /// пишется (с паддингом нулями, на месте своего слота), заголовок
+    /// переписывается, fsync. После возврата файл — валидный .pvt v1.
+    pub fn commit(&mut self) -> Result<StreamCommit, String> {
+        self.commit_impl(true)
+    }
+
+    /// Мягкий коммит (M6, горячий путь резидентного сервера): то же
+    /// согласованное состояние, но БЕЗ fsync — ОС сбрасывает страницы
+    /// фоново. Латентность события лога ~микросекунды против ~миллисекунд
+    /// fsync; durability уступает скорости (краш ОС может потерять хвост).
+    pub fn commit_soft(&mut self) -> Result<StreamCommit, String> {
+        self.commit_impl(false)
+    }
+
+    fn commit_impl(&mut self, sync: bool) -> Result<StreamCommit, String> {
+        // Копии цепей на границе full_pages (частичная НЕ сфолдена).
+        let mut mac = PndHasher::resume(&self.chain_parts, &self.key, DOMAIN_VAULT_CHAIN);
+        let mut outer = self.outer.clone();
+        let mut content = self
+            .content_parts
+            .as_ref()
+            .map(|p| PndHasher::resume(p, &self.content_key, DOMAIN_CONTENT));
+
+        let mut page_count = self.full_pages;
+        if !self.tail.is_empty() {
+            let real = self.tail.len();
+            let mut page = [0u8; PAGE_SIZE];
+            page[..real].copy_from_slice(&self.tail[..real]);
+            self.seal_page_at(self.full_pages, &page, real)?;
+            // Фолд ТОЛЬКО в копии: граница цепей остаётся на full_pages,
+            // чтобы будущее расширение страницы перефолдило её заново.
+            let iv = page_iv(&self.salt, self.full_pages);
+            let pt_words = bytes_to_words(&page[..]);
+            let mut ct_words = vec![0u32; PAGE_SIZE / 4];
+            self.cipher.cbc_encrypt_words(&iv, &pt_words, &mut ct_words);
+            let ct_bytes = words_to_bytes(&ct_words);
+            outer.update(&ct_bytes);
+            let leaf = mac_leaf(&self.key, &iv, &last_ct_block(&ct_bytes), self.full_pages);
+            for w in leaf {
+                mac.update(&w.to_le_bytes());
+            }
+            if let Some(chain) = content.as_mut() {
+                let cleaf = content_leaf(&page[..real], self.full_pages);
+                for w in cleaf {
+                    chain.update(&w.to_le_bytes());
+                }
+            }
+            page_count = self.full_pages + 1;
+        }
+
+        let inner_mac = mac.finalize();
+        let outer_digest = outer.finalize();
+        let content_digest = content.map(|c| c.finalize());
+
+        let header = VaultHeader {
+            format_version: FORMAT_VERSION,
+            flags: if self.content_flag { FLAG_CONTENT_ID } else { 0 },
+            kdf_iterations: self.iterations,
+            epsilon: self.epsilon,
+            salt: self.salt,
+            original_len: self.total_plain,
+            page_count,
+            inner_mac,
+            outer_digest,
+            content_id: content_digest.unwrap_or([0u32; KEY_WORDS]),
+        };
+        self.file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek: {e}"))?;
+        self.file.write_all(&header.to_page()).map_err(|e| format!("заголовок: {e}"))?;
+        self.file.flush().map_err(|e| format!("flush: {e}"))?;
+        if sync {
+            self.file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+        }
+
+        Ok(StreamCommit {
+            page_count,
+            plain_bytes: self.total_plain,
+            vault_len: PAGE_SIZE as u64 + page_count * PAGE_SIZE as u64,
+        })
+    }
+
+    /// Путь стрима.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Байт открытого текста в стриме (включая незакоммиченный хвост).
+    pub fn plain_bytes(&self) -> u64 {
+        self.total_plain
+    }
+
+    /// Зашифровать и записать страницу `index` в её слот
+    /// `(1+index)*PAGE_SIZE` (сияние на месте при расширении хвоста).
+    fn seal_page_at(&mut self, index: u64, page: &[u8; PAGE_SIZE], real: usize) -> Result<(), String> {
+        let iv = page_iv(&self.salt, index);
+        let pt_words = bytes_to_words(page);
+        let mut ct_words = vec![0u32; PAGE_SIZE / 4];
+        self.cipher.cbc_encrypt_words(&iv, &pt_words, &mut ct_words);
+        let ct_bytes = words_to_bytes(&ct_words);
+        self.file
+            .seek(SeekFrom::Start((PAGE_SIZE as u64) * (1 + index)))
+            .map_err(|e| format!("seek: {e}"))?;
+        self.file.write_all(&ct_bytes).map_err(|e| format!("запись: {e}"))?;
+        let _ = real; // real нужен только фолду листьев
+        Ok(())
+    }
+
+    /// Фолд ПОЛНОЙ страницы в живые границы цепей.
+    fn fold_page(&mut self, page: &[u8], real: usize) -> Result<(), String> {
+        let iv = page_iv(&self.salt, self.full_pages);
+        let pt_words = bytes_to_words(page);
+        let mut ct_words = vec![0u32; PAGE_SIZE / 4];
+        self.cipher.cbc_encrypt_words(&iv, &pt_words, &mut ct_words);
+        let ct_bytes = words_to_bytes(&ct_words);
+        // Внешний digest: Clone-хешер продолжаем напрямую.
+        self.outer.update(&ct_bytes);
+        // MAC-цепь: возобновить из снапшота, сфолдить, снять новый снапшот.
+        let mut mac = PndHasher::resume(&self.chain_parts, &self.key, DOMAIN_VAULT_CHAIN);
+        let leaf = mac_leaf(&self.key, &iv, &last_ct_block(&ct_bytes), self.full_pages);
+        for w in leaf {
+            mac.update(&w.to_le_bytes());
+        }
+        self.chain_parts = mac.parts();
+        if self.content_parts.is_some() {
+            let mut chain = PndHasher::resume(
+                self.content_parts.as_ref().unwrap(),
+                &self.content_key,
+                DOMAIN_CONTENT,
+            );
+            let cleaf = content_leaf(&page[..real], self.full_pages);
+            for w in cleaf {
+                chain.update(&w.to_le_bytes());
+            }
+            self.content_parts = Some(chain.parts());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VaultAppender {
+    /// Best-effort финальный коммит: лог-стрим не должен терять хвост
+    /// молча. Ошибка коммита в деструкторе проглатывается (паника в
+    /// Drop запрещена) — крайний случай виден по несоответствию
+    /// page_count/verify у следующего читателя.
+    fn drop(&mut self) {
+        let _ = self.commit();
+    }
+}
+
+// SAFETY: контекст шифра (Zig-handle) неизменяем после создания;
+// C-ABI-операции только ЧИТАЮТ его (копируют по значению — контракт
+// `os/core/abi.zig`, тот же аргумент, что у SharedCipher выше).
+// Перенос аппендера между потоками (резидентный MCP за Arc) безопасен:
+// взаимное исключение даёт Mutex владельца, гонок на контекст нет.
+unsafe impl Send for VaultAppender {}
+
 /// Вскрыть контейнер: PATH.pvt → открытый текст (проверка MAC обязательна).
 pub fn open(input: &Path, output: &Path, passphrase: &str) -> Result<OpenReport, String> {
     if input == output {
@@ -763,7 +1056,7 @@ mod tests {
         let vault = dir.join("v.pvt");
         seal(&input, &vault, "k", &quick_opts(Some([3u32; 8]), false)).unwrap();
 
-        let mut bytes = std::fs::read(&vault).unwrap();
+        let bytes = std::fs::read(&vault).unwrap();
         for &offset in &[PAGE_SIZE + 100, 2 * PAGE_SIZE + 4000] {
             let mut b = bytes.clone();
             b[offset] ^= 0x01;
@@ -938,6 +1231,144 @@ mod tests {
             s.duration_ms, s.mb_per_s, o.duration_ms, o.mb_per_s, kdf::DEFAULT_ITERATIONS
         );
         assert!(std::fs::read(&out).unwrap() == data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── M6: VaultAppender — стриминг логов ─────────────────────────────
+
+    /// Аппенд-поток побайтово идентичен seal() тех же данных при той же
+    /// соли: главный инвариант эквивалентности формата.
+    #[test]
+    fn appender_matches_seal_bit_for_bit() {
+        let dir = tmpdir("appender-seal");
+        for (name, len) in [
+            ("empty", 0usize),
+            ("tiny", 42),
+            ("page", PAGE_SIZE),
+            ("page-plus", PAGE_SIZE + 17),
+            ("multi", 3 * PAGE_SIZE + 999),
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let salt = [42u32, 1, 2, 3, 4, 5, 6, 7];
+
+            let input = write_input(&dir, &format!("s-{name}.bin"), &data);
+            let sealed = dir.join(format!("s-{name}.pvt"));
+            seal(&input, &sealed, "стрим-фраза", &quick_opts(Some(salt), false)).unwrap();
+
+            let streamed = dir.join(format!("a-{name}.pvt"));
+            let mut app = VaultAppender::create(&streamed, "стрим-фраза", &quick_opts(Some(salt), false))
+                .unwrap();
+            // аппендим мелкими кусками через границу страниц
+            for chunk in data.chunks(997) {
+                app.append(chunk).unwrap();
+            }
+            app.commit().unwrap();
+            drop(app);
+
+            let a = std::fs::read(&sealed).unwrap();
+            let b = std::fs::read(&streamed).unwrap();
+            assert_eq!(a, b, "{name}: стрим обязан побайтово совпасть с seal()");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Файл валиден (verify+open) на КАЖДОМ промежуточном коммите —
+    /// контракт «срез стрима читаем без финализации».
+    #[test]
+    fn appender_snapshot_valid_at_each_commit() {
+        let dir = tmpdir("appender-snap");
+        let stream = dir.join("log.pvt");
+        let mut app =
+            VaultAppender::create(&stream, "фраза", &quick_opts(None, false)).unwrap();
+        let mut emitted = Vec::new();
+        for i in 0..40 {
+            let line = format!("{{\"ts\":{i},\"event\":\"tool_call\",\"tool\":\"poler_grep\",\"us\":{}}}", 120 + i);
+            emitted.extend_from_slice(line.as_bytes());
+            emitted.push(b'\n');
+            app.append_line(&line).unwrap();
+            let c = app.commit().unwrap();
+            // срез на диск: копия текущего состояния стрима
+            let snap = dir.join(format!("snap-{i}.pvt"));
+            std::fs::copy(&stream, &snap).unwrap();
+            let v = verify(&snap).unwrap();
+            assert_eq!(v.pages, c.page_count, "коммит {i}: страницы заголовка");
+            let out = dir.join(format!("snap-{i}.out"));
+            open(&snap, &out, "фраза").unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), emitted, "коммит {i}: открытый текст среза");
+        }
+        drop(app);
+        // финальный (Drop-)коммит тоже валиден и полон
+        let out = dir.join("final.out");
+        open(&stream, &out, "фраза").unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), emitted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Расширение частичной страницы после коммита: страница
+    /// перепечатывается на месте, цепи не двоятся, итог = seal().
+    #[test]
+    fn appender_extends_partial_page_across_commits() {
+        let dir = tmpdir("appender-extend");
+        let salt = [7u32, 7, 7, 7, 7, 7, 7, 7];
+        let data: Vec<u8> = (0..(2 * PAGE_SIZE + 100)).map(|i| (i * 13 + 5) as u8).collect();
+
+        let stream = dir.join("log.pvt");
+        let mut app = VaultAppender::create(&stream, "ф", &quick_opts(Some(salt), false)).unwrap();
+        // коммит с частичной страницей посреди первых PAGE_SIZE байт
+        app.append(&data[..PAGE_SIZE / 2]).unwrap();
+        app.commit().unwrap();
+        // расширяем хвост за границу страницы + вторая страница + хвост
+        app.append(&data[PAGE_SIZE / 2..]).unwrap();
+        app.commit().unwrap();
+        drop(app);
+
+        let input = write_input(&dir, "ref.bin", &data);
+        let sealed = dir.join("ref.pvt");
+        seal(&input, &sealed, "ф", &quick_opts(Some(salt), false)).unwrap();
+        assert_eq!(
+            std::fs::read(&stream).unwrap(),
+            std::fs::read(&sealed).unwrap(),
+            "расширение частичной страницы обязано дать тот же файл, что seal()"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Тампер стрима ловится: бит в середине → open отказывает.
+    #[test]
+    fn appender_tamper_detected() {
+        let dir = tmpdir("appender-tamper");
+        let stream = dir.join("log.pvt");
+        let mut app = VaultAppender::create(&stream, "ф", &quick_opts(None, false)).unwrap();
+        for i in 0..3000 {
+            app.append_line(&format!("event-{i}: квантовый прыжок резонанса")).unwrap();
+        }
+        drop(app);
+        let mut raw = std::fs::read(&stream).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0xFF;
+        let tampered = dir.join("tampered.pvt");
+        std::fs::write(&tampered, &raw).unwrap();
+        let out = dir.join("t.out");
+        assert!(open(&tampered, &out, "ф").is_err(), "тампер обязан ловиться MAC/outer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// content_id-цепь стрима совпадает с seal() (второй домен цепей).
+    #[test]
+    fn appender_content_id_matches_seal() {
+        let dir = tmpdir("appender-cid");
+        let salt = [9u32, 8, 7, 6, 5, 4, 3, 2];
+        let data: Vec<u8> = (0..(PAGE_SIZE + 500)).map(|i| (i * 3 + 1) as u8).collect();
+
+        let stream = dir.join("log.pvt");
+        let mut app = VaultAppender::create(&stream, "ф", &quick_opts(Some(salt), true)).unwrap();
+        app.append(&data).unwrap();
+        drop(app); // Drop-коммит
+
+        let input = write_input(&dir, "ref.bin", &data);
+        let sealed = dir.join("ref.pvt");
+        seal(&input, &sealed, "ф", &quick_opts(Some(salt), true)).unwrap();
+        assert_eq!(std::fs::read(&stream).unwrap(), std::fs::read(&sealed).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

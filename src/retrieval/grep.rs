@@ -277,7 +277,8 @@ struct FileScan {
 }
 
 /// Сканирование одного файла: построчный проход с контекстом.
-fn scan_file(path: &Path, matcher: &Matcher, config: &GrepConfig) -> FileScan {
+/// M6: `cache` — резидентный RAM-кэш (None — классическое чтение с диска).
+fn scan_file(path: &Path, matcher: &Matcher, config: &GrepConfig, cache: Option<&crate::retrieval::filecache::FileCache>) -> FileScan {
     let mut scan = FileScan {
         path: path.display().to_string(),
         binary: false,
@@ -299,12 +300,21 @@ fn scan_file(path: &Path, matcher: &Matcher, config: &GrepConfig) -> FileScan {
             return scan;
         }
     }
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            scan.error = Some(format!("{}: {e}", path.display()));
-            return scan;
-        }
+    let bytes: std::sync::Arc<Vec<u8>> = match cache {
+        Some(c) => match c.get_or_read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                scan.error = Some(format!("{}: {e}", path.display()));
+                return scan;
+            }
+        },
+        None => match std::fs::read(path) {
+            Ok(b) => std::sync::Arc::new(b),
+            Err(e) => {
+                scan.error = Some(format!("{}: {e}", path.display()));
+                return scan;
+            }
+        },
     };
     scan_bytes(&scan.path.clone(), &bytes, matcher, config)
 }
@@ -496,6 +506,24 @@ fn collect_grep_files(root: &Path, config: &GrepConfig) -> Vec<PathBuf> {
 /// Полный прогон точного поиска. `roots` — файлы или каталоги
 /// (несуществующий корень → Err, exit 2).
 pub fn grep_run(roots: &[PathBuf], config: &GrepConfig) -> Result<GrepReport, String> {
+    grep_run_inner(roots, config, None)
+}
+
+/// M6: grep с резидентным RAM-кэшем файлов — тёплые запросы
+/// резидентного MCP-сервера идут без дискового чтения корпуса.
+pub fn grep_run_cached(
+    roots: &[PathBuf],
+    config: &GrepConfig,
+    cache: &crate::retrieval::filecache::FileCache,
+) -> Result<GrepReport, String> {
+    grep_run_inner(roots, config, Some(cache))
+}
+
+fn grep_run_inner(
+    roots: &[PathBuf],
+    config: &GrepConfig,
+    cache: Option<&crate::retrieval::filecache::FileCache>,
+) -> Result<GrepReport, String> {
     let started = std::time::Instant::now();
     let matcher = Matcher::build(config)?;
 
@@ -524,7 +552,7 @@ pub fn grep_run(roots: &[PathBuf], config: &GrepConfig) -> Result<GrepReport, St
     // не разделяем между потоками: seek + несинхронный контекст).
     let mut scans: Vec<FileScan> = plain
         .par_iter()
-        .map(|p| scan_file(p, &matcher, config))
+        .map(|p| scan_file(p, &matcher, config, cache))
         .collect();
     if !archives.is_empty() {
         let pw = config.archive_password.as_deref();
@@ -1157,5 +1185,39 @@ mod tests {
         let report = grep_run(&[dir.path().join("enc.zip")], &config).unwrap();
         assert_eq!(report.stats.lines_matched, 1);
         assert!(render_text(&report, false).contains("enc.zip::secret_note.md"));
+    }
+
+    /// M6: кэшированный grep даёт ТОТ ЖЕ отчёт, что и холодный,
+    /// а второй прогон идёт из RAM (hits > 0, misses не растут).
+    #[test]
+    fn grep_cached_matches_cold_and_warms_up() {
+        use crate::retrieval::filecache::FileCache;
+        let dir = TempDir::new().unwrap();
+        for i in 0..12 {
+            std::fs::write(
+                dir.path().join(format!("doc{i}.md")),
+                format!("трактат {i}: резонанс семантики повтор {i}\nпосторонняя строка\n"),
+            )
+            .unwrap();
+        }
+        let config = cfg("резонанс");
+
+        let cold = grep_run(&[dir.path().to_path_buf()], &config).unwrap();
+        let cache = FileCache::new(0);
+        let warm1 = grep_run_cached(&[dir.path().to_path_buf()], &config, &cache).unwrap();
+        assert_eq!(
+            render_text(&cold, false), render_text(&warm1, false),
+            "кэшированный прогон обязан совпадать побайтово с холодным"
+        );
+
+        let s1 = cache.stats();
+        assert_eq!(s1.misses, 12, "первый прогон читает с диска");
+
+        let warm2 = grep_run_cached(&[dir.path().to_path_buf()], &config, &cache).unwrap();
+        assert_eq!(render_text(&cold, false), render_text(&warm2, false));
+        let s2 = cache.stats();
+        assert_eq!(s2.hits, 12, "второй прогон целиком из RAM");
+        assert_eq!(s2.misses, 12, "повторных чтений диска нет");
+        assert_eq!(s2.invalidated, 0);
     }
 }

@@ -19,6 +19,7 @@
 //! `ignore`, `memchr`, `rayon` уже были в дереве движка.
 
 pub mod chunk;
+pub mod filecache;
 pub mod grep;
 pub mod semantic_bridge;
 pub mod teddy;
@@ -28,8 +29,8 @@ pub use chunk::{
     DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS,
 };
 pub use grep::{
-    collect_archives, grep_buffer, grep_run, render_text, stdout_is_tty, GrepConfig, GrepGroup,
-    GrepLineOut, GrepMode, GrepOutput, GrepReport, GrepStats,
+    collect_archives, grep_buffer, grep_run, grep_run_cached, render_text, stdout_is_tty,
+    GrepConfig, GrepGroup, GrepLineOut, GrepMode, GrepOutput, GrepReport, GrepStats,
 };
 pub use semantic_bridge::{
     LexiconSensor, QueryExpansion, SemanticBridge, SemanticCandidate, SemanticSensor,

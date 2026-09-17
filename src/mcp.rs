@@ -25,6 +25,9 @@
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
+#[cfg(feature = "pnd-ffi")]
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -150,6 +153,17 @@ pub struct McpServer {
     /// БД знаний Суверенного Гиппокампа (v0.29): отдельная от веб-индекса,
     /// строится `--knowledge-ingest`.
     knowledge_db: PathBuf,
+    // ── M6: резидентное (тёплое) состояние ──────────────────────────
+    /// Открытый веб-индекс — переиспользуется между вызовами
+    /// (холодный старт открывал SQLite на КАЖДЫЙ web_search/crawl).
+    warm_web: Mutex<Option<WebIndex>>,
+    /// Тёплый Гиппокамп: SQLite + RaBitQ + HNSW + эмбеддер.
+    warm_knowledge: Mutex<Option<crate::sources::knowledge::WarmKnowledge>>,
+    /// RAM-кэш файлов для poler_grep (mtime-инвалидация, LRU).
+    file_cache: crate::retrieval::filecache::FileCache,
+    /// Шифропоток журнала операций (стриминг логов в Vault, --vault-log).
+    #[cfg(feature = "pnd-ffi")]
+    vault_log: Option<Arc<Mutex<crate::crypto::vault::VaultAppender>>>,
 }
 
 impl McpServer {
@@ -160,6 +174,11 @@ impl McpServer {
             wait_ms,
             db_path,
             knowledge_db: crate::sources::knowledge::default_db_path(),
+            warm_web: Mutex::new(None),
+            warm_knowledge: Mutex::new(None),
+            file_cache: crate::retrieval::filecache::FileCache::new(DEFAULT_RAM_BUDGET),
+            #[cfg(feature = "pnd-ffi")]
+            vault_log: None,
         }
     }
 
@@ -167,6 +186,104 @@ impl McpServer {
     pub fn with_knowledge_db(mut self, path: PathBuf) -> Self {
         self.knowledge_db = path;
         self
+    }
+
+    /// M6: RAM-бюджет файл-кэша grep (байт).
+    pub fn with_ram_budget(mut self, bytes: usize) -> Self {
+        self.file_cache = crate::retrieval::filecache::FileCache::new(bytes);
+        self
+    }
+
+    /// M6: подключить шифропоток журнала операций (Vault .pvt).
+    #[cfg(feature = "pnd-ffi")]
+    pub fn with_vault_log(mut self, app: crate::crypto::vault::VaultAppender) -> Self {
+        self.vault_log = Some(Arc::new(Mutex::new(app)));
+        self
+    }
+
+    /// M6: снапшот статистики резидентного состояния (бенч/диагностика).
+    pub fn resident_stats(&self) -> serde_json::Value {
+        let cs = self.file_cache.stats();
+        let warm_k = self.warm_knowledge.lock().map(|g| g.is_some()).unwrap_or(false);
+        let warm_w = self.warm_web.lock().map(|g| g.is_some()).unwrap_or(false);
+        serde_json::json!({
+            "file_cache": {
+                "files": cs.files,
+                "bytes": cs.bytes,
+                "hits": cs.hits,
+                "misses": cs.misses,
+                "invalidated": cs.invalidated,
+                "evictions": cs.evictions,
+                "budget_bytes": self.file_cache.cap_bytes(),
+            },
+            "warm_knowledge_open": warm_k,
+            "warm_web_open": warm_w,
+        })
+    }
+
+    /// M6: выполнить операцию над тёплым веб-индексом (get-or-open).
+    fn with_web_index<T>(
+        &self,
+        f: impl FnOnce(&mut WebIndex) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self.warm_web.lock().expect("poler-mcp: отравленный веб-лок");
+        if guard.is_none() {
+            *guard = Some(WebIndex::open(&self.db_path).map_err(|e| e.to_string())?);
+        }
+        f(guard.as_mut().expect("только что открыли"))
+    }
+
+    /// M6: событие журнала — шифропоток Vault (+ мягкий коммит):
+    /// {"ts":мс,"method":"tools/call","tool":…,"us":мкс,"ok":bool}.
+    /// Ошибка журнала НЕ роняет запрос — лог не может ломать сервис.
+    #[cfg(feature = "pnd-ffi")]
+    fn log_event(&self, method: &str, tool: Option<&str>, us: u64, ok: bool) {
+        let Some(vl) = &self.vault_log else { return };
+        let Ok(mut g) = vl.lock() else { return };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let tool_js = match tool {
+            Some(t) => format!(",\"tool\":\"{t}\""),
+            None => String::new(),
+        };
+        let _ = g.append_line(&format!(
+            "{{\"ts\":{ts},\"method\":\"{method}\"{tool_js},\"us\":{us},\"ok\":{}}}",
+            ok
+        ));
+        let _ = g.commit_soft();
+    }
+
+    #[cfg(not(feature = "pnd-ffi"))]
+    fn log_event(&self, _method: &str, _tool: Option<&str>, _us: u64, _ok: bool) {}
+}
+
+/// RAM-бюджет файл-кэша по умолчанию (48 МиБ — в рамках лимита M6 ≤64 МиБ).
+pub const DEFAULT_RAM_BUDGET: usize = 48 * 1024 * 1024;
+
+/// M6: опции резидентного MCP-сервера (общие для stdio и HTTP).
+#[derive(Default)]
+pub struct McpServerOptions {
+    /// RAM-бюджет файл-кэша grep (байт; 0 = default 48 МиБ).
+    pub ram_budget: usize,
+    /// Шифропоток журнала операций (Vault .pvt, --vault-log).
+    #[cfg(feature = "pnd-ffi")]
+    pub vault_log: Option<crate::crypto::vault::VaultAppender>,
+}
+
+impl McpServerOptions {
+    /// Применить к серверу (builder-стиль).
+    pub fn apply(self, srv: McpServer) -> McpServer {
+        let mut srv = srv;
+        if self.ram_budget > 0 {
+            srv = srv.with_ram_budget(self.ram_budget);
+        }
+        #[cfg(feature = "pnd-ffi")]
+        if let Some(app) = self.vault_log {
+            srv = srv.with_vault_log(app);
+        }
+        srv
     }
 }
 
@@ -176,11 +293,13 @@ pub fn run(
     wait_ms: u64,
     db_path: PathBuf,
     knowledge_db: Option<PathBuf>,
+    opts: McpServerOptions,
 ) -> i32 {
     let mut server = McpServer::new(cdp_port, wait_ms, db_path);
     if let Some(kdb) = knowledge_db {
         server = server.with_knowledge_db(kdb);
     }
+    server = opts.apply(server);
     eprintln!(
         "poler-mcp: stdio JSON-RPC, db={:?}, knowledge={:?}, cdp_port={}, wait_ms={}",
         server.db_path, server.knowledge_db, server.cdp_port, server.wait_ms
@@ -219,17 +338,18 @@ fn write_line(out: &mut impl Write, v: &Value) -> std::io::Result<()> {
 impl McpServer {
     /// Диспетчер одного JSON-RPC-сообщения: возвращает ответ (None —
     /// уведомление без id, ответ не нужен). Общий для stdio и HTTP.
+    /// M6: каждое сообщение таймируется и (если подключён --vault-log)
+    /// попадает в шифропоток журнала с латентностью в микросекундах.
     pub fn dispatch(&self, msg: &Value) -> Option<Value> {
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let t0 = std::time::Instant::now();
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
         let id = msg.get("id").cloned();
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         // уведомления (без id) не требуют ответа
-        let Some(id) = id else {
-            return None;
-        };
+        let Some(id) = id else { return None };
 
-        let result: Result<Value, (i64, String)> = match method {
+        let result: Result<Value, (i64, String)> = match method.as_str() {
             "initialize" => Ok(self.handle_initialize(&params)),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools_manifest()})),
@@ -239,6 +359,11 @@ impl McpServer {
             "prompts/list" => Ok(json!({"prompts": []})),
             _ => Err((-32601, format!("method not found: {method}"))),
         };
+
+        let ok = result.is_ok();
+        let tool = params.get("name").and_then(|n| n.as_str()).map(str::to_string);
+        let us = t0.elapsed().as_micros() as u64;
+        self.log_event(&method, tool.as_deref(), us, ok);
 
         Some(match result {
             Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
@@ -314,7 +439,8 @@ impl McpServer {
             .ok_or("аргумент query (строка) обязателен")?;
         let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let top = top.clamp(1, 50);
-        let mut ix = WebIndex::open(&self.db_path).map_err(|e| e.to_string())?;
+        // M6: тёплый веб-индекс — SQLite открыт резидентно.
+        self.with_web_index(|ix| {
         if ix.page_count() == 0 {
             return Ok(format!(
                 "Веб-индекс пуст ({:?}). Сначала вызови poler_crawl с seed_url — \
@@ -354,6 +480,7 @@ impl McpServer {
             ));
         }
         Ok(out)
+        })
     }
 
     // -----------------------------------------------------------------
@@ -383,26 +510,41 @@ impl McpServer {
         };
         // Векторное русло (если индекс построен с ним): .pqw-модель из
         // POLER_KNOWLEDGE_MODEL; без переменной — честная деградация до BM25.
+        // M6: тёплый Гиппокамп — SQLite/RaBitQ/HNSW/эмбеддер открываются
+        // один раз и живут в резидентном сервере (get-or-open ниже).
         let model = std::env::var("POLER_KNOWLEDGE_MODEL").ok().map(PathBuf::from);
-        let mut embedder =
-            match crate::sources::knowledge::query_embedder(&self.knowledge_db, model.as_deref())
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("poler-mcp: векторное русло пропущено: {e}");
-                    None
-                }
-            };
         let opts = crate::sources::knowledge::QueryOptions {
             top,
             min_provenance,
             ..Default::default()
         };
-        match crate::sources::knowledge::query(&self.knowledge_db, query, &opts, embedder.as_mut())
-        {
+        let mut guard = self
+            .warm_knowledge
+            .lock()
+            .expect("poler-mcp: отравленный лок Гиппокампа");
+        if guard.is_none() {
+            let embedder =
+                match crate::sources::knowledge::query_embedder(&self.knowledge_db, model.as_deref()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("poler-mcp: векторное русло пропущено: {e}");
+                        None
+                    }
+                };
+            match crate::sources::knowledge::WarmKnowledge::open(&self.knowledge_db, embedder) {
+                Ok(wk) => *guard = Some(wk),
+                // Библиотека не построена — состояние, не сбой инструмента
+                Err(e) if e.contains("--knowledge-ingest") => {
+                    return Ok(format!("Библиотека знаний ещё не проиндексирована: {e}"))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let wk = guard
+            .as_mut()
+            .expect("тёплый Гиппокамп только что открыт");
+        match crate::sources::knowledge::query_warm(wk, query, &opts) {
             Ok(out) => Ok(crate::sources::knowledge::render_query_text(query, &out)),
-            // Библиотека не построена — состояние, не сбой инструмента
-            // (как poler_web_search с пустым индексом — агент получает план).
             Err(e) if e.contains("--knowledge-ingest") => {
                 Ok(format!("Библиотека знаний ещё не проиндексирована: {e}"))
             }
@@ -444,24 +586,30 @@ impl McpServer {
             .unwrap_or(true);
 
         web::ensure_chromium(self.cdp_port)?;
-        let mut fetcher = CdpFetcher::new(self.cdp_port, wait_ms, page_timeout_ms)?;
-        let mut ix = WebIndex::open(&self.db_path).map_err(|e| e.to_string())?;
-        let cfg = web::CrawlConfig {
-            max_pages: max_pages.clamp(1, 500),
-            max_depth: depth.min(5),
-            delay_ms,
-            cross_site,
-            wait_ms,
-            page_timeout_ms,
-            respect_robots,
-        };
-        eprintln!("poler-mcp: crawl seed={seed} depth={} max={}", cfg.max_depth, cfg.max_pages);
-        let stats = web::crawl::crawl(&mut ix, &mut fetcher, seed, &cfg, false)
-            .map_err(|e| e.to_string())?;
+        // M6: тёплый веб-индекс — краулинг дописывает в резидентное
+        // соединение (виден последующим web_search без пере-открытия).
+        // Лок индекса держится на весь обход: SQLite-соединение одно,
+        // параллельный web_search честно ждёт (защита от SQLITE_BUSY).
+        let db_path = self.db_path.clone();
+        let cdp_port = self.cdp_port;
+        let stats = self.with_web_index(|ix| {
+            let cfg = web::CrawlConfig {
+                max_pages: max_pages.clamp(1, 500),
+                max_depth: depth.min(5),
+                delay_ms,
+                cross_site,
+                wait_ms,
+                page_timeout_ms,
+                respect_robots,
+            };
+            eprintln!("poler-mcp: crawl seed={seed} depth={} max={}", cfg.max_depth, cfg.max_pages);
+            let mut fetcher = CdpFetcher::new(cdp_port, wait_ms, page_timeout_ms)?;
+            web::crawl::crawl(ix, &mut fetcher, seed, &cfg, false).map_err(|e| e.to_string())
+        })?;
         Ok(format!(
             "Краулинг завершён: {} загружено, {} проиндексировано, {} без изменений, \
              {} дубликатов (SimHash), {} отклонено robots.txt, {} ошибок, {} мс. \
-             Индекс: {} страниц в {:?}. Теперь доступен poler_web_search.",
+             Индекс: {:?}.",
             stats.fetched,
             stats.indexed,
             stats.unchanged,
@@ -469,8 +617,7 @@ impl McpServer {
             stats.skipped_robots,
             stats.errors,
             stats.elapsed_ms,
-            ix.page_count(),
-            self.db_path
+            db_path
         ))
     }
 
@@ -644,7 +791,7 @@ impl McpServer {
                 .map(String::from),
             archive_max_entry_bytes: 0,
         };
-        let report = nr::grep_run(&[PathBuf::from(path)], &config)
+        let report = nr::grep_run_cached(&[PathBuf::from(path)], &config, &self.file_cache)
             .map_err(|e| format!("grep: {e}"))?;
         if args.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
             return serde_json::to_string_pretty(&report)
@@ -1430,4 +1577,134 @@ mod knowledge_tool_tests {
         assert!(text.contains("--knowledge-ingest"), "инструкция инжеста: {text}");
         assert!(!text.contains("\"isError\":true"), "состояние, не сбой: {text}");
     }
+    // ── M6: резидентное состояние + стриминг логов ────────────────────
+
+    /// Тёплый Гиппокамп: вторая dispatch переиспользует открытый хэндл
+    /// (resident_stats) и даёт идентичный результат.
+    #[test]
+    fn warm_knowledge_reused_across_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("01_SPECS");
+        std::fs::create_dir_all(&spec).unwrap();
+        std::fs::write(
+            spec.join("PTS-777.md"),
+            "# PTS-777\n\n## 4. ПОЛНЫЙ ТЕХНИЧЕСКИЙ ТЕКСТ\nрезонансный аттрактор H Psi нулевой.\n",
+        )
+        .unwrap();
+        let kdb = dir.path().join("knowledge.db");
+        let mut emb = crate::sources::knowledge::KnowledgeEmbedder::None;
+        crate::sources::knowledge::ingest(
+            dir.path(),
+            &kdb,
+            &mut emb,
+            &crate::sources::knowledge::IngestOptions::default(),
+        )
+        .unwrap();
+
+        let srv = McpServer::new(9222, 10, PathBuf::from("/nonexistent-web.db"))
+            .with_knowledge_db(kdb.clone());
+        let call = |srv: &McpServer, id: i64| {
+            srv.dispatch(&json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "query_poler_knowledge",
+                           "arguments": {"query": "резонансный аттрактор"}}
+            }))
+            .unwrap()
+        };
+        let text_of = |v: serde_json::Value| {
+            v["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+        };
+        let r1 = text_of(call(&srv, 1));
+        assert!(
+            serde_json::to_value(&srv.resident_stats()).unwrap()["warm_knowledge_open"]
+                == serde_json::json!(true),
+            "хэндл Гиппокампа обязан быть тёплым после первого вызова"
+        );
+        let r2 = text_of(call(&srv, 2));
+        // первая строка содержит рендер латентности («N мс») — она не
+        // часть контракта эквивалентности; сравниваем тело выдачи.
+        let body = |t: &str| t.split('\n').skip(1).collect::<Vec<_>>().join("\n");
+        assert_eq!(body(&r1), body(&r2), "повторный тёплый вызов идентичен (кроме id и мс)");
+        assert!(!r1.is_empty(), "выдача не пуста: {r1}");
+    }
+
+    /// poler_grep через резидентный кэш: второй вызов без чтения диска.
+    #[test]
+    fn grep_dispatch_uses_warm_file_cache() {
+        let _env = crate::gateway::containers::docker_env_test_lock();
+        std::env::set_var("POLER_MCP_ALLOW_ANY_PATH", "1");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("canon.md"),
+            "канон: резонанс семантический повторяется\n".repeat(64),
+        )
+        .unwrap();
+        let srv = McpServer::new(9222, 10, PathBuf::from("/nonexistent-web.db"));
+        let call = || {
+            srv.dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "poler_grep",
+                           "arguments": {"pattern": "резонанс", "path": dir.path().to_str().unwrap()}}
+            }))
+            .unwrap()
+        };
+        call();
+        let s1 = srv.resident_stats();
+        assert!(s1["file_cache"]["misses"].as_u64().unwrap() >= 1, "первый вызов читает диск");
+        call();
+        let s2 = srv.resident_stats();
+        assert!(
+            s2["file_cache"]["hits"].as_u64().unwrap() >= 1,
+            "второй вызов обязан идти из RAM: {s2}"
+        );
+        assert_eq!(
+            s2["file_cache"]["misses"], s1["file_cache"]["misses"],
+            "повторных чтений диска нет"
+        );
+        std::env::remove_var("POLER_MCP_ALLOW_ANY_PATH");
+    }
+
+    /// Стриминг логов в Vault: dispatch-события попадают в шифропоток,
+    /// файл читается как обычный .pvt после Drop (финальный коммит).
+    #[cfg(feature = "pnd-ffi")]
+    #[test]
+    fn vault_log_tee_records_dispatch() {
+        use crate::crypto::vault::{open as vault_open, SealOptions, VaultAppender};
+
+        let _env = crate::gateway::containers::docker_env_test_lock();
+        std::env::set_var("POLER_MCP_ALLOW_ANY_PATH", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let stream = dir.path().join("mcp-session.pvt");
+        let app = VaultAppender::create(
+            &stream,
+            "сессионная-фраза",
+            &SealOptions { iterations: crate::crypto::kdf::MIN_ITERATIONS, ..Default::default() },
+        )
+        .unwrap();
+        let srv = McpServer::new(9222, 10, PathBuf::from("/nonexistent-web.db"))
+            .with_vault_log(app);
+
+        srv.dispatch(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})).unwrap();
+        srv.dispatch(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "poler_grep",
+                           "arguments": {"pattern": "x", "path": dir.path().to_str().unwrap()}}
+            }))
+            .unwrap();
+        assert!(serde_json::to_string(&r).unwrap().contains("poler-grep"));
+        drop(srv); // Drop аппендера = финальный коммит
+
+        let out = dir.path().join("session.log");
+        vault_open(&stream, &out, "сессионная-фраза").unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("\"method\":\"ping\""), "ping в журнале: {text}");
+        assert!(text.contains("\"method\":\"tools/list\""), "tools/list в журнале");
+        assert!(text.contains("\"tool\":\"poler_grep\""), "tool-имя в журнале");
+        assert!(text.contains("\"us\":"), "латентность в микросекундах в журнале");
+        assert!(text.contains("\"ok\":true"), "статус в журнале");
+        std::env::remove_var("POLER_MCP_ALLOW_ANY_PATH");
+    }
+
 }

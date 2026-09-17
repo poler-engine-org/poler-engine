@@ -1214,12 +1214,99 @@ fn quote_window(text: &str, query: &str, max_chars: usize) -> String {
     q.replace('\n', " ")
 }
 
-/// Гибридный запрос по библиотеке знаний.
+// ------------------------------------------------------------------
+// M6: резидентный (тёплый) доступ без холодного старта на каждый запрос.
+// `query_warm` переиспользует SQLite-соединение (кэш страниц FTS5),
+// RaBitQ-хранилище и HNSW-граф.
+// ------------------------------------------------------------------
+
+/// Резидентное (тёплое) состояние Гиппокампа.
+pub struct WarmKnowledge {
+    /// Путь БД (для векторов/графа и диагностики).
+    pub db_path: PathBuf,
+    /// Открытый веб-индекс (SQLite, FTS5) — переиспользуется.
+    pub ix: WebIndex,
+    /// Квантованные векторы (открыты, если файлы присутствовали).
+    pub view: Option<QuantizedStoreView>,
+    /// HNSW-граф (открыт, если файл присутствовал).
+    pub graph: Option<HnswIndex>,
+    /// Эмбеддер запроса (hash-фолбэк или .pqw-модель) — держится
+    /// открытым между запросами (mmap весов).
+    pub embedder: Option<KnowledgeEmbedder>,
+}
+
+impl WarmKnowledge {
+    /// Открыть все хранилища один раз. Ошибки векторов/графа не фатальны —
+    /// русло деградирует до BM25 (та же семантика, что у холодного query).
+    pub fn open(db_path: &Path, embedder: Option<KnowledgeEmbedder>) -> Result<Self, String> {
+        if !db_path.exists() {
+            return Err(format!(
+                "БД знаний не найдена: {}. Сначала инжест: poler-engine --knowledge-ingest <корень POLER_ALL_GENERATED_DOCS>",
+                db_path.display()
+            ));
+        }
+        let ix = WebIndex::open(db_path)
+            .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+        let vp = vectors_path(db_path);
+        let gp = graph_path(db_path);
+        let view = if vp.exists() { QuantizedStoreView::open(&vp).ok() } else { None };
+        let graph = if gp.exists() { HnswIndex::open(&gp, HnswConfig::default()).ok() } else { None };
+        Ok(Self { db_path: db_path.to_path_buf(), ix, view, graph, embedder })
+    }
+}
+
+/// M6: запрос к Гиппокампу по тёплым хэндлам — без открытия SQLite и
+/// загрузки векторных структур. Результат обязан совпадать с холодным
+/// [`query`] (тест `warm_query_matches_cold`).
+pub fn query_warm(
+    wk: &mut WarmKnowledge,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryOutcome, String> {
+    let embedder = wk.embedder.as_mut();
+    query_core(&mut wk.ix, wk.view.as_ref(), wk.graph.as_ref(), &wk.db_path, q, opts, embedder)
+}
+
+/// Гибридный запрос по библиотеке знаний (холодный: открывает БД на вызов;
+/// для резидентного сервера — [`query_warm`]).
 ///
 /// Порядок детерминирован: сортировка по `final_score` (total_cmp), при
 /// равенстве — по `chunk_id`. Векторное русло включается, если индекс
 /// построен с векторным слоем и передан согласующийся `embedder`.
 pub fn query(
+    db_path: &Path,
+    q: &str,
+    opts: &QueryOptions,
+    embedder: Option<&mut KnowledgeEmbedder>,
+) -> Result<QueryOutcome, String> {
+    if !db_path.exists() {
+        return Err(format!(
+            "БД знаний не найдена: {}. Сначала инжест: poler-engine --knowledge-ingest <корень POLER_ALL_GENERATED_DOCS>",
+            db_path.display()
+        ));
+    }
+    let mut ix = WebIndex::open(db_path)
+        .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+    let vp = vectors_path(db_path);
+    let gp = graph_path(db_path);
+    let (view, graph) = if vp.exists() && gp.exists() {
+        (
+            QuantizedStoreView::open(&vp).ok(),
+            HnswIndex::open(&gp, HnswConfig::default()).ok(),
+        )
+    } else {
+        (None, None)
+    };
+    query_core(&mut ix, view.as_ref(), graph.as_ref(), db_path, q, opts, embedder)
+}
+
+/// Общее тело поиска: два русла (BM25+мост, векторы) и слияние с
+/// провенансом. `t0` фиксируется здесь — единая честная метрика.
+#[allow(clippy::too_many_arguments)]
+fn query_core(
+    ix: &mut WebIndex,
+    view: Option<&QuantizedStoreView>,
+    graph: Option<&HnswIndex>,
     db_path: &Path,
     q: &str,
     opts: &QueryOptions,
@@ -1232,8 +1319,6 @@ pub fn query(
             db_path.display()
         ));
     }
-    let mut ix = WebIndex::open(db_path)
-        .map_err(|e| format!("open {}: {e}", db_path.display()))?;
     let bridge = SemanticBridge::offline();
     let pool = opts.candidate_pool.max(opts.top * 4).min(256);
 
@@ -1253,29 +1338,29 @@ pub fn query(
     }
 
     // ---- русло 2: векторы (RaBitQ + HNSW) ----
+    // M6: хранилище и граф приходят ИНЪЕКЦИЕЙ (тёплые хэндлы резидентного
+    // сервера); файловые проверки остаются guard'ом против гонки удаления.
     let vp = vectors_path(db_path);
     let gp = graph_path(db_path);
     let mut vector_used = false;
     let mut vec_by_id: HashMap<i64, f64> = HashMap::new();
-    if vp.exists() && gp.exists() {
-        if let Some(emb) = embedder {
-            match emb.embed_query(q) {
-                Ok(qv) => {
-                    if let (Ok(view), Ok(graph)) =
-                        (QuantizedStoreView::open(&vp), HnswIndex::open(&gp, HnswConfig::default()))
-                    {
+    if let (Some(view), Some(graph)) = (view, graph) {
+        if vp.exists() && gp.exists() {
+            if let Some(emb) = embedder {
+                match emb.embed_query(q) {
+                    Ok(qv) => {
                         if view.count() > 0 && view.dim() == qv.len() {
                             let prep = view.prepare_query(&qv);
                             let k = pool.min(view.count());
                             let ef = pool.max(64);
-                            for (cos, slot) in graph.search(&view, &prep, k, ef) {
+                            for (cos, slot) in graph.search(view, &prep, k, ef) {
                                 vec_by_id.insert(view.id(slot) as i64, cos.clamp(0.0, 1.0));
                             }
                             vector_used = true;
                         }
                     }
+                    Err(e) => eprintln!("poler-knowledge: векторное русло пропущено: {e}"),
                 }
-                Err(e) => eprintln!("poler-knowledge: векторное русло пропущено: {e}"),
             }
         }
     }
@@ -1811,3 +1896,60 @@ mod tests {
 
 
 
+
+#[cfg(test)]
+mod m6_tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("poler-wk-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// M6: тёплый запрос обязан давать ТОТ ЖЕ результат, что холодный
+    /// (оба русла, слияние, провенанс), без пере-открытия хранилищ.
+    #[test]
+    fn warm_query_matches_cold() {
+        let dir = tmpdir("same");
+        let spec = dir.join("01_SPECS");
+        std::fs::create_dir_all(&spec).unwrap();
+        std::fs::write(
+            spec.join("PTS-900.md"),
+            "# PTS-900\n\n## 4. ПОЛНЫЙ ТЕХНИЧЕСКИЙ ТЕКСТ\nрезонансный контур pndMix в золотом векторе.\n",
+        )
+        .unwrap();
+        let kdb = dir.join("knowledge.db");
+        let mut emb = KnowledgeEmbedder::None;
+        ingest(&dir, &kdb, &mut emb, &IngestOptions::default()).unwrap();
+
+        let opts = QueryOptions { top: 5, ..QueryOptions::default() };
+        let cold = query(&kdb, "резонансный контур pndMix", &opts, None).unwrap();
+
+        let mut warm = WarmKnowledge::open(&kdb, None).unwrap();
+        let w1 = query_warm(&mut warm, "резонансный контур pndMix", &opts).unwrap();
+        assert_eq!(cold.hits.len(), w1.hits.len(), "число хитов совпадает");
+        for (c, w) in cold.hits.iter().zip(w1.hits.iter()) {
+            assert_eq!(c.chunk_id, w.chunk_id);
+            assert_eq!(c.final_score.to_bits(), w.final_score.to_bits(), "скор побитово");
+            assert_eq!(c.quote, w.quote, "цитаты совпадают");
+        }
+        assert_eq!(cold.bridge_why, w1.bridge_why);
+
+        // Повторный тёплый запрос по тому же хэндлу стабилен.
+        let w2 = query_warm(&mut warm, "резонансный контур pndMix", &opts).unwrap();
+        assert_eq!(w1.hits.len(), w2.hits.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M6: WarmKnowledge честно ошибается на отсутствующей БД.
+    #[test]
+    fn warm_open_missing_db_errors() {
+        let e = match WarmKnowledge::open(Path::new("/nonexistent/warm.db"), None) {
+            Err(e) => e,
+            Ok(_) => panic!("отсутствующая БД обязана давать ошибку, не Ok"),
+        };
+        assert!(e.contains("--knowledge-ingest"), "подсказка: {e}");
+    }
+}

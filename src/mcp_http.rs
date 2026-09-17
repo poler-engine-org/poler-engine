@@ -65,6 +65,7 @@ pub fn run_http(
     wait_ms: u64,
     db_path: PathBuf,
     knowledge_db: Option<PathBuf>,
+    opts: crate::mcp::McpServerOptions,
 ) -> i32 {
     // Аудит-фикс №B1: пустой/короткий --mcp-token (или POLER_MCP_TOKEN="")
     // раньше означал, что ЛЮБОЙ запрос с пустым X-Poler-Token проходит
@@ -106,6 +107,7 @@ pub fn run_http(
     if let Some(kdb) = knowledge_db {
         server = server.with_knowledge_db(kdb);
     }
+    server = opts.apply(server);
     let server = Arc::new(server);
     serve(listener, server, token)
 }

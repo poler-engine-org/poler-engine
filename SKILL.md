@@ -1,6 +1,6 @@
 ---
 name: poler-engine
-description: AI-Native суверенный поисково-аналитический движок POLER v0.28.1 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), AIDDE impact-анализ, MCP-сервер для LLM-агентов. Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация).
+description: AI-Native суверенный поисково-аналитический движок POLER v0.29.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), AIDDE impact-анализ, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету). Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация).
 ---
 
 # POLER-Engine — суверенный гиппокамп, крипто-субстрат и нативный инференс для LLM-агентов
@@ -198,9 +198,28 @@ poler-engine --benchmark [--benchmark-json r.json]   # Exact/Lexical/Passage/lat
 `poler_chunk`, `poler_box_exec`, `poler_box_status`,
 `poler_knowledge` (query, top, min_provenance).
 
+### M6: резидентное состояние (real-time, без холодного старта)
+
+Сервер держит в RAM между запросами: тёплый Гиппокамп (SQLite/RaBitQ/HNSW/
+эмбеддер — открыты один раз), LRU-кэш файлов для grep (инвалидация mtime+len)
+и WebIndex. Каждый dispatch замеряется и (опционально) стримится в
+зашифрованный журнал.
+
+```bash
+poler-engine --mcp --vault-log session.pvt          # + стриминг логов вызовов в Vault .pvt
+POLER_VAULT_PASS="фраза" poler-engine --mcp --vault-log session.pvt  # пароль через env
+poler-engine --mcp --mcp-ram-budget 64               # бюджет RAM-кэша, МиБ (по умолч. 48)
+poler-engine --mcp-bench 500                          # бенчмарк резидентности: cold vs warm p50/p95/p99
+```
+
+- Формат журнала в `.pvt`: JSON-строки `{"ts","method","tool","us","ok"}` —
+  файл **валиден на каждом коммите**, читается штатным `--memory-open/verify`.
+- `--mcp-bench` — приёмка M6: тёплые p99 < 5 мс (exit 0/1); на release-сборке
+  grep p50≈650 мкс / p99≤2 мс, knowledge p99≈250 мкс.
+
 ## Верификационные числа (золотой стандарт)
 
-- Rust: **1072/1072** тестов (pnd-ffi); Zig: **33/33**; golden-векторы PND: **54 626 bit-for-bit**.
+- Rust: **1089/1089** тестов (pnd-ffi; +17 M6: стрим↔seal побитово, warm==cold); Zig: **33/33**; golden-векторы PND: **54 626 bit-for-bit**.
 - pqw/pqc: дифференциалы против fp32-эталонов — int8 cos > 0.999, int4 > 0.98, fp32 > 0.9999.
 - Токенизатор XLM-R: 40/40 текстов побитово = HF `tokenizers` v0.23.2.
 - BGE-M3 int8 (573 МБ): cos ≥ 0.9999 на всех 24 слоях. GLiNER (urchade/gliner_multi):
