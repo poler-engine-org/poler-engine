@@ -1,6 +1,6 @@
 ---
 name: poler-engine
-description: AI-Native суверенный поисково-аналитический движок POLER v0.30.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), AIDDE impact-анализ, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету), Rust-ридер коннектома FLYCSR1 — мозг мухи FlyWire v783 (138 639 нейронов, 54,5 млн синапсов) как живая матрица A: ротор J = A − Aᵀ, K-hop BFS, CSC-impact прямо из zstd-артефакта. Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация), графовых запросов к биологическому эталону связности.
+description: AI-Native суверенный поисково-аналитический движок POLER v0.31.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД poler_exec E1 (ядро Zig raw-syscalls, рождённое диагностикой bash 5.2 самим движком: жёсткие таймауты TERM→grace→KILL группе, кольцевой захват хвоста вывода O(1), pidfd-пробуждение — зомби и вечные зависания невозможны, шелл-инъекции исключены — argv массивом), CLI --exec и MCP-инструмент poler_exec, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету), Rust-ридер коннектома FLYCSR1 — мозг мухи FlyWire v783 (138 639 нейронов, 54,5 млн синапсов) как живая матрица A: ротор J = A − Aᵀ, K-hop BFS, CSC-impact прямо из zstd-артефакта. Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, НАДЁЖНОГО запуска команд с таймаутами и лимитом вывода, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация), графовых запросов к биологическому эталону связности.
 ---
 
 # POLER-Engine — суверенный гиппокамп, крипто-субстрат и нативный инференс для LLM-агентов
@@ -54,7 +54,27 @@ poler-engine ~/corpus --grep "fn main" [--grep-regex] [--grep-i] [-A/-B N] [--gr
 poler-engine ~/corpus --grep "TODO" --grep-json      # byte offsets для агента
 ```
 
-### 2. Архивы без распаковки (v0.28.1) — виртуальные файлы «архив::запись»
+### 2. Идеальный исполнитель команд E1/v0.31.0 (фича pnd-ffi) — замена падающим Bash-инструментам
+
+Рождён диагностикой исходников GNU bash 5.2 самим движком
+(docs/EXEC_AUDIT.md: 424 unsafe-вызова в 75 .c-файлах, free() в trap-механике,
+REINSTALL_SIGCHLD-гонка, неограниченный $(...), ноль таймаутов). Ядро —
+Zig с raw-syscall слоем: классы bash-ошибок исключены конструктивно.
+
+```bash
+# флаги — ДО --exec; после --exec — команда целиком (включая её -флаги)
+poler-engine --exec-timeout-ms 5000 --exec make -j4
+poler-engine --exec-max-out 65536 --exec dd if=/dev/zero bs=1M count=64
+poler-engine --exec-stdin "вопрос" --exec cat
+# коды: ребёнка | 124 таймаут | 127 не найдено | 126 без права
+```
+
+Гарантии: таймаут timerfd(MONOTONIC) + SIGTERM → grace → SIGKILL группе;
+захват — кольцевой хвост max_out байт (O(1) памяти); зомби невозможны
+(pidfd-пробуждение + wait4 в ppoll-цикле); шелл-инъекции невозможны
+(argv массивом, без парсинга); fds-гигиена CLOEXEC.
+
+### 3. Архивы без распаковки (v0.28.1) — виртуальные файлы «архив::запись»
 
 ```bash
 poler-engine ~/corpus --grep "Subquantum" --archives # zip/tar/tar.gz/tar.zst/gz/zst in-place
@@ -66,14 +86,14 @@ env POLER_ARCHIVE_KEY="PASS" poler-engine ~/corpus --grep "secret" --archives
 poler-engine ~/corpus --grep "x" --archives --archive-max-entry-mb 128     # лимит бомб
 ```
 
-### 3. RAG-чанки (слой B) — секция→абзац→предложение, byte-якоря + breadcrumb
+### 4. RAG-чанки (слой B) — секция→абзац→предложение, byte-якоря + breadcrumb
 
 ```bash
 poler-engine document.md --chunk [--chunk-size 384] [--chunk-overlap N] [--chunk-json]
 poler-engine "dump.zip::17-Active_inference.md" --chunk --chunk-json  # запись архива
 ```
 
-### 4. Резонансный POLER-поиск — ε-плотность, IIR-резонанс R(t), сцены, K-hop граф
+### 5. Резонансный POLER-поиск — ε-плотность, IIR-резонанс R(t), сцены, K-hop граф
 
 ```bash
 poler-engine ~/corpus -q "Алексей" --format ai-json    # машинный JSON с ε и R(t)
@@ -84,7 +104,7 @@ poler-engine ~/corpus -q "тема" -k 4                   # K-hop подгра�
 #   --poler-eta 0.01 --poler-gamma 0.1 --poler-mix 0.1 --poler-dissipator 0.02
 ```
 
-### 5. Нативный суверенный ML (.pqw, без Python/ONNX/GPU)
+### 6. Нативный суверенный ML (.pqw, без Python/ONNX/GPU)
 
 ```bash
 poler-engine --pqw-selftest                        # автономный цикл 6/6 (энкодер→GLiNER→GLM)
@@ -102,7 +122,7 @@ python3 scripts/convert_chatglm_to_pqw.py# ChatGLM3-6B → .pqw int4
 python3 scripts/gen_demo_pqw.py          # демо-модели для смоук-тестов
 ```
 
-### 6. Защищённая память Vault (.pvt CDL) — «насмерть», git-переносимая
+### 7. Защищённая память Vault (.pvt CDL) — «насмерть», git-переносимая
 
 ```bash
 export POLER_VAULT_KEY="парольная_фраза"            # или ввод с stdin/TTY
@@ -113,7 +133,7 @@ poler-engine --memory-info <ФАЙЛ.pvt>               # страницы, со
 # Ключ через env: --memory-key-env ИМЯ_ПЕРЕМЕННОЙ; KDF: --memory-kdf-iters N
 ```
 
-### 7. Суверенный Гиппокамп — база знаний с эпистемической градацией
+### 8. Суверенный Гиппокамп — база знаний с эпистемической градацией
 
 ```bash
 poler-engine --knowledge-ingest ~/library/          # 6 слоёв, FNV-дедуп, MVR-разметка
@@ -123,13 +143,13 @@ poler-engine --knowledge-stats                      # источники/чан�
 # БД по умолчанию knowledge.db (+ .graph/.vectors спутники); --knowledge-db PATH
 ```
 
-### 8. AIDDE impact-анализ — call graph + паспорт символа
+### 9. AIDDE impact-анализ — call graph + паспорт символа
 
 ```bash
 poler-engine ./src --impact "run_gateway" [--impact-depth 3] [--impact-cache db]
 ```
 
-### 9. Коннектом FLYCSR1 (v0.30.0) — мозг мухи как матрица A
+### 10. Коннектом FLYCSR1 (v0.30.0) — мозг мухи как матрица A
 
 ```bash
 poler-engine --connectome docs/flywire-connectome/flywire_v783_core.csr.zst
@@ -146,7 +166,7 @@ poler-engine --connectome ... --connectome-json            # JSON для аге�
 - Артефакты в git (~43 МБ): full 35 МБ / core 7 МБ / nodes 1.1 МБ; загрузка
   core ≈ 70 мс (≈ 25 МБ RAM), full ≈ 400 мс; сырьё 852 МБ feather не нужно.
 
-### 10. Веб (локальный индекс, не облако)
+### 11. Веб (локальный индекс, не облако)
 
 ```bash
 poler-engine https://example.com --crawl --crawl-depth 2 --crawl-max 25
@@ -154,7 +174,7 @@ poler-engine --web-search "запрос"                  # Semantic Bridge ru�
 poler-engine --semantic-expand "запрос"             # диагностика моста
 ```
 
-### 11. Интерфейсы и сервисы
+### 12. Интерфейсы и сервисы
 
 ```bash
 poler-engine --mcp                                   # MCP-сервер (stdio JSON-RPC)
@@ -213,6 +233,9 @@ poler-engine --benchmark [--benchmark-json r.json]   # Exact/Lexical/Passage/lat
 `poler_web_search`, `poler_crawl`, `poler_fetch`, `poler_search`,
 `poler_grep` (аргументы `archives: true`, `archive_password: "…"`),
 `poler_chunk`, `poler_box_exec`, `poler_box_status`,
+`poler_exec` (E1: идеальный запуск команд — command/args/timeout_ms/
+grace_ms/max_out_bytes/stdin → JSON exit_code/signal/stdout/stderr/
+timed_out/truncated/duration_us/pid; ядро Zig raw-syscalls),
 `poler_knowledge` (query, top, min_provenance).
 
 ### M6: резидентное состояние (real-time, без холодного старта)
