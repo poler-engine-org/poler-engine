@@ -34,6 +34,11 @@ fn main() {
     println!("cargo:rerun-if-changed=os/core/poler_core.zig");
     println!("cargo:rerun-if-changed=os/core/abi.zig");
     println!("cargo:rerun-if-changed=os/core/build.zig");
+    // Смена env-переменных должна перезапускать скрипт: иначе линкер
+    // держит устаревший -L (мина, найденная при смене каталога репо
+    // с включённой фичей pnd-ffi — POLER_CORE_LIB указывал в старый клон).
+    println!("cargo:rerun-if-env-changed=POLER_CORE_LIB");
+    println!("cargo:rerun-if-env-changed=POLER_ZIG");
 
     if env::var_os("CARGO_FEATURE_PND_FFI").is_none() {
         return; // фича выключена — нулевые требования к окружению

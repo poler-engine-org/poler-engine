@@ -591,6 +591,48 @@ struct Cli {
     #[arg(long = "impact-depth", default_value_t = 3)]
     impact_depth: usize,
 
+    /// Коннектом FLYCSR1 (FlyWire v783): мозг мухи как матрица A —
+    /// node/edge/khop/impact-запросы прямо из zstd-артефакта.
+    #[arg(
+        long = "connectome",
+        value_name = "CSR_ZST",
+        conflicts_with_all = [
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "archive_list"
+        ]
+    )]
+    connectome: Option<PathBuf>,
+
+    /// Таблица нейронов (flywire_v783_nodes.bin): имена root_id в выводе
+    /// и поиск нейрона по root_id (не только по индексу).
+    #[arg(long = "connectome-nodes", value_name = "NODES_BIN", requires = "connectome")]
+    connectome_nodes: Option<PathBuf>,
+
+    /// Паспорт нейрона: степени, синаптическая масса, топ-рёбра.
+    #[arg(long = "connectome-node", value_name = "IDX_OR_ROOT_ID", requires = "connectome")]
+    connectome_node: Option<String>,
+
+    /// Ребро U:V — вес, медиатор, знак и ротор J = A − Aᵀ пары.
+    #[arg(long = "connectome-edge", value_name = "U:V", requires = "connectome")]
+    connectome_edge: Option<String>,
+
+    /// K-hop BFS потока сигнала от нейрона (глубина: --k-hop).
+    #[arg(long = "connectome-khop", value_name = "IDX_OR_ROOT_ID", requires = "connectome")]
+    connectome_khop: Option<String>,
+
+    /// Входящие связи нейрона (CSC): «кто управляет» — impact-слой AIDDE.
+    #[arg(long = "connectome-impact", value_name = "IDX_OR_ROOT_ID", requires = "connectome")]
+    connectome_impact: Option<String>,
+
+    /// Фильтр знака K-hop: all | exc | inh (поток по возбуждающим/тормозным).
+    #[arg(long = "connectome-sign", value_name = "FILTER", default_value = "all", requires = "connectome")]
+    connectome_sign: String,
+
+    /// JSON-вывод режима --connectome (для агентов).
+    #[arg(long = "connectome-json", requires = "connectome")]
+    connectome_json: bool,
+
     /// Watcher-режим: инкрементальный рескан по mtime/size.
     #[arg(long)]
     watch: bool,
@@ -989,6 +1031,11 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- v0.28.1: Листинг архива без распаковки ----------
     if let Some(archive) = cli.archive_list.clone() {
         return ExitCode::from(run_archive_list(&cli, &archive) as u8);
+    }
+
+    // ---------- v0.30.0: Коннектом FLYCSR1 — мозг мухи как матрица A ----------
+    if let Some(csr) = cli.connectome.clone() {
+        return ExitCode::from(run_connectome(&cli, &csr) as u8);
     }
 
     // ---------- v0.20.0: Native Retrieval — grep-режим (слой 0) ----------
@@ -2097,6 +2144,528 @@ fn run_archive_list(cli: &Cli, archive: &std::path::Path) -> i32 {
                 if e.is_dir { "/" } else { "" }
             );
         }
+    }
+    0
+}
+
+// ---------- v0.30.0: Коннектом FLYCSR1 — мозг мухи как матрица A ----------
+
+/// Разделение разрядов: 54492922 → «54 492 922».
+fn thou(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Строка ребра для человека: «79529 (root ...) w=17 gaba (-1)».
+fn fmt_con_edge(
+    e: &poler_engine::graph::connectome::Edge,
+    nodes: &Option<poler_engine::graph::connectome::ConnectomeNodes>,
+) -> String {
+    let who = match nodes {
+        Some(ns) => match ns.root_id(e.target as usize) {
+            Some(r) => format!("{} (root {})", e.target, r),
+            None => e.target.to_string(),
+        },
+        None => e.target.to_string(),
+    };
+    let sign = match e.sign() {
+        1 => "+1",
+        -1 => "-1",
+        _ => "0",
+    };
+    format!("{who} w={} {} ({sign})", e.weight, e.nt_name())
+}
+
+/// JSON-объект ребра (цель/источник + вес/медиатор/знак).
+fn con_edge_json(
+    e: &poler_engine::graph::connectome::Edge,
+    nodes: &Option<poler_engine::graph::connectome::ConnectomeNodes>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "other": e.target,
+        "other_root_id": nodes.as_ref().and_then(|n| n.root_id(e.target as usize)),
+        "weight": e.weight,
+        "nt": e.nt_name(),
+        "sign": e.sign(),
+        "signed_weight": e.signed_weight(),
+    })
+}
+
+fn run_connectome(cli: &Cli, csr_path: &std::path::Path) -> i32 {
+    use poler_engine::graph::connectome as ct;
+
+    let t0 = std::time::Instant::now();
+    let con = match ct::Connectome::load(csr_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("poler-connectome: {e}");
+            return 2;
+        }
+    };
+    let load_ms = t0.elapsed().as_millis();
+
+    let nodes = match &cli.connectome_nodes {
+        Some(p) => match ct::ConnectomeNodes::load(p) {
+            Ok(n) => {
+                if n.len() != con.n_nodes() {
+                    eprintln!(
+                        "poler-connectome: {} содержит {} root_id, а коннектом ждёт {} узлов",
+                        p.display(),
+                        n.len(),
+                        con.n_nodes()
+                    );
+                    return 2;
+                }
+                Some(n)
+            }
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+
+    // Режимы взаимно исключают друг друга.
+    let modes = [
+        cli.connectome_node.is_some(),
+        cli.connectome_edge.is_some(),
+        cli.connectome_khop.is_some(),
+        cli.connectome_impact.is_some(),
+    ];
+    if modes.iter().filter(|&&b| b).count() > 1 {
+        eprintln!(
+            "poler-connectome: укажите один режим (--connectome-node | --connectome-edge | \
+             --connectome-khop | --connectome-impact); без режима — сводка"
+        );
+        return 2;
+    }
+
+    // Резолв нейрона: индекс (< n_nodes) либо root_id (с --connectome-nodes).
+    let resolve = |spec: &str| -> Result<usize, String> {
+        if let Ok(idx) = spec.parse::<usize>() {
+            if idx < con.n_nodes() {
+                return Ok(idx);
+            }
+        }
+        if let Some(ns) = &nodes {
+            if let Ok(rid) = spec.parse::<u64>() {
+                if let Some(i) = ns.idx_of(rid) {
+                    return Ok(i);
+                }
+            }
+        }
+        Err(format!(
+            "нейрон «{spec}» не найден (узлов: {}; формат: индекс 0..{} либо root_id с --connectome-nodes)",
+            con.n_nodes(),
+            con.n_nodes().saturating_sub(1)
+        ))
+    };
+
+    let json = cli.connectome_json;
+
+    // ---------- Режим: паспорт нейрона ----------
+    if let Some(spec) = &cli.connectome_node {
+        let idx = match resolve(spec) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let outs: Vec<ct::Edge> = con.out_edges(idx).unwrap().collect();
+        let out_mass: u64 = outs.iter().map(|e| e.weight as u64).sum();
+        let csc = con.build_in_edges();
+        let ins: Vec<ct::Edge> = csc.in_edges(&con, idx).unwrap().collect();
+        let in_mass: u64 = ins.iter().map(|e| e.weight as u64).sum();
+        let mut top_out = outs.clone();
+        top_out.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        top_out.truncate(5);
+        let mut top_in = ins.clone();
+        top_in.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        top_in.truncate(5);
+        if json {
+            let j = serde_json::json!({
+                "mode": "node",
+                "artifact": csr_path.display().to_string(),
+                "core": con.is_core(),
+                "neuron": idx,
+                "root_id": nodes.as_ref().and_then(|n| n.root_id(idx)),
+                "out_degree": outs.len(),
+                "out_mass": out_mass,
+                "in_degree": ins.len(),
+                "in_mass": in_mass,
+                "top_out": top_out.iter().map(|e| con_edge_json(e, &nodes)).collect::<Vec<_>>(),
+                "top_in": top_in.iter().map(|e| con_edge_json(e, &nodes)).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!("Нейрон {}:", idx);
+            println!(
+                "  исходящих: {} (масса {}) · входящих: {} (масса {})",
+                outs.len(),
+                thou(out_mass),
+                ins.len(),
+                thou(in_mass)
+            );
+            if !top_out.is_empty() {
+                let list = top_out
+                    .iter()
+                    .map(|e| fmt_con_edge(e, &nodes))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                println!("  топ исходящие: {list}");
+            }
+            if !top_in.is_empty() {
+                let list = top_in
+                    .iter()
+                    .map(|e| fmt_con_edge(e, &nodes))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                println!("  топ входящие:  {list}");
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: ребро U:V + ротор J = A − Aᵀ ----------
+    if let Some(spec) = &cli.connectome_edge {
+        let (us, vs) = match spec.split_once(':') {
+            Some(pair) => pair,
+            None => {
+                eprintln!(
+                    "poler-connectome: --connectome-edge ждёт формат U:V, получено «{spec}»"
+                );
+                return 2;
+            }
+        };
+        let u = match resolve(us) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let v = match resolve(vs) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let fwd = con.edge(u, v);
+        let bwd = con.edge(v, u);
+        if fwd.is_none() && bwd.is_none() {
+            if json {
+                let j = serde_json::json!({
+                    "mode": "edge", "artifact": csr_path.display().to_string(),
+                    "u": u, "v": v, "found": false,
+                    "forward": serde_json::Value::Null,
+                    "backward": serde_json::Value::Null,
+                    "rotor": 0,
+                });
+                println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default());
+            } else {
+                eprintln!("poler-connectome: связи {u} -> {v} нет (в обоих направлениях)");
+            }
+            return 1;
+        }
+        let rotor = con.rotor(u, v);
+        if json {
+            let j = serde_json::json!({
+                "mode": "edge",
+                "artifact": csr_path.display().to_string(),
+                "core": con.is_core(),
+                "u": u,
+                "u_root_id": nodes.as_ref().and_then(|n| n.root_id(u)),
+                "v": v,
+                "v_root_id": nodes.as_ref().and_then(|n| n.root_id(v)),
+                "found": true,
+                "forward": fwd.map(|e| con_edge_json(&e, &nodes)),
+                "backward": bwd.map(|e| con_edge_json(&e, &nodes)),
+                "rotor_Juu": rotor, // J[u][v] = A(u,v) − A(v,u); J[v][u] = −rotor
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            match fwd {
+                Some(e) => println!("Ребро {u} -> {v}: {}", fmt_con_edge(&e, &nodes)),
+                None => println!("Ребро {u} -> {v}: связи нет"),
+            }
+            match bwd {
+                Some(e) => println!("Обратное {v} -> {u}: {}", fmt_con_edge(&e, &nodes)),
+                None => println!("Обратное {v} -> {u}: связи нет"),
+            }
+            match (fwd, bwd) {
+                (Some(_), Some(_)) => println!(
+                    "J = A − Aᵀ: J[{u}][{v}] = {rotor:+} (реципрокная пара, циркуляция {rotor})"
+                ),
+                _ => println!(
+                    "J = A − Aᵀ: J[{u}][{v}] = {rotor:+}, J[{v}][{u}] = {:-} — однонаправленный поток",
+                    -rotor
+                ),
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Режим: K-hop BFS потока сигнала ----------
+    if let Some(spec) = &cli.connectome_khop {
+        let idx = match resolve(spec) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let filter = match ct::SignFilter::parse(&cli.connectome_sign) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 2;
+            }
+        };
+        let r = con.k_hop(idx, cli.k_hop, filter);
+        let frontiers = r
+            .frontier_sizes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if json {
+            let j = serde_json::json!({
+                "mode": "khop",
+                "artifact": csr_path.display().to_string(),
+                "core": con.is_core(),
+                "start": idx,
+                "start_root_id": nodes.as_ref().and_then(|n| n.root_id(idx)),
+                "depth": cli.k_hop,
+                "sign_filter": cli.connectome_sign,
+                "frontier_sizes": r.frontier_sizes,
+                "visited": r.visited,
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            let label = match filter {
+                ct::SignFilter::All => "все связи".to_string(),
+                ct::SignFilter::Excitatory => "только возбуждающие (+1)".to_string(),
+                ct::SignFilter::Inhibitory => "только тормозные (-1)".to_string(),
+            };
+            println!(
+                "K-hop от {idx} (глубина {}): фронты [{frontiers}], достигнуто {} нейронов (сигнал: {label})",
+                cli.k_hop,
+                r.visited
+            );
+        }
+        return 0;
+    }
+
+    // ---------- Режим: impact — «кто управляет нейроном» (CSC) ----------
+    if let Some(spec) = &cli.connectome_impact {
+        let idx = match resolve(spec) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("poler-connectome: {e}");
+                return 1;
+            }
+        };
+        let t1 = std::time::Instant::now();
+        let csc = con.build_in_edges();
+        let csc_ms = t1.elapsed().as_millis();
+        let outs: Vec<ct::Edge> = con.out_edges(idx).unwrap().collect();
+        let ins: Vec<ct::Edge> = csc.in_edges(&con, idx).unwrap().collect();
+        if ins.is_empty() && outs.is_empty() {
+            if json {
+                let j = serde_json::json!({
+                    "mode": "impact", "artifact": csr_path.display().to_string(),
+                    "neuron": idx, "in_degree": 0, "out_degree": 0, "found": false,
+                });
+                println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default());
+            } else {
+                eprintln!("poler-connectome: нейрон {idx} изолирован (ни входящих, ни исходящих)");
+            }
+            return 1;
+        }
+        let in_mass: u64 = ins.iter().map(|e| e.weight as u64).sum();
+        let inh_mass: u64 = ins
+            .iter()
+            .filter(|e| e.sign() == -1)
+            .map(|e| e.weight as u64)
+            .sum();
+        let exc_mass: u64 = ins
+            .iter()
+            .filter(|e| e.sign() == 1)
+            .map(|e| e.weight as u64)
+            .sum();
+        let mut top_in = ins.clone();
+        top_in.sort_by_key(|e| std::cmp::Reverse(e.weight));
+        top_in.truncate(10);
+        if json {
+            let j = serde_json::json!({
+                "mode": "impact",
+                "artifact": csr_path.display().to_string(),
+                "core": con.is_core(),
+                "neuron": idx,
+                "root_id": nodes.as_ref().and_then(|n| n.root_id(idx)),
+                "in_degree": ins.len(),
+                "in_mass": in_mass,
+                "in_exc_mass": exc_mass,
+                "in_inh_mass": inh_mass,
+                "out_degree": outs.len(),
+                "csc_build_ms": csc_ms,
+                "top_sources": top_in.iter().map(|e| con_edge_json(e, &nodes)).collect::<Vec<_>>(),
+            });
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("poler-connectome: сериализация JSON: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            println!("Impact нейрона {idx} (кто управляет):");
+            println!(
+                "  входящих: {} (масса {}) · возбуждающая масса {} / тормозная {} · CSC за {} мс",
+                ins.len(),
+                thou(in_mass),
+                thou(exc_mass),
+                thou(inh_mass),
+                csc_ms
+            );
+            println!("  исходящих: {} — куда управляет он сам", outs.len());
+            for e in &top_in {
+                println!("    {}", fmt_con_edge(e, &nodes));
+            }
+        }
+        return 0;
+    }
+
+    // ---------- Сводка (режим по умолчанию) ----------
+    let m = con.mass_by_nt();
+    let exc = m[1].0 + m[2].0;
+    let inh = m[0].0;
+    let modm = m[3].0 + m[4].0 + m[5].0;
+    let tot = con.total_mass();
+    let pct = |x: u64| format!("{:.1}%", x as f64 / tot as f64 * 100.0);
+    // топ нейронов по исходящей степени
+    let mut top_deg: Vec<(u32, usize)> = (0..con.n_nodes())
+        .map(|u| (con.out_degree(u).unwrap_or(0), u))
+        .collect();
+    top_deg.sort_by(|a, b| b.cmp(a));
+    top_deg.truncate(5);
+    if json {
+        let j = serde_json::json!({
+            "mode": "summary",
+            "artifact": csr_path.display().to_string(),
+            "format": "FLYCSR1",
+            "core": con.is_core(),
+            "core_min_synapses": if con.is_core() { serde_json::json!(ct::CORE_MIN_SYNAPSES) } else { serde_json::json!(null) },
+            "n_nodes": con.n_nodes(),
+            "n_edges": con.n_edges(),
+            "total_mass": tot,
+            "load_ms": load_ms,
+            "nt": (0..6).map(|c| serde_json::json!({
+                "name": ct::NT_NAMES[c],
+                "edges": m[c].1,
+                "mass": m[c].0,
+                "sign": ct::nt_sign(c as u8),
+            })).collect::<Vec<_>>(),
+            "mass_balance": {
+                "excitatory": exc, "inhibitory": inh, "modulatory": modm,
+                "excitatory_pct": pct(exc), "inhibitory_pct": pct(inh), "modulatory_pct": pct(modm),
+            },
+            "top_out_degree": top_deg.iter().map(|&(d, u)| serde_json::json!({
+                "neuron": u,
+                "root_id": nodes.as_ref().and_then(|n| n.root_id(u)),
+                "out_degree": d,
+            })).collect::<Vec<_>>(),
+        });
+        match serde_json::to_string_pretty(&j) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("poler-connectome: сериализация JSON: {e}");
+                return 2;
+            }
+        }
+    } else {
+        println!("Коннектом: {}", csr_path.display());
+        println!(
+            "Формат: FLYCSR1 · {} · загрузка {} мс (zstd -> CSR в RAM)",
+            if con.is_core() {
+                format!("ядро (рёбра >= {} синапсов)", ct::CORE_MIN_SYNAPSES)
+            } else {
+                "полный граф".to_string()
+            },
+            load_ms
+        );
+        println!(
+            "Нейронов: {} · рёбер: {} · синаптическая масса: {}",
+            thou(con.n_nodes() as u64),
+            thou(con.n_edges() as u64),
+            thou(tot)
+        );
+        println!("{:<8} {:>12} {:>12}   знак", "медиатор", "рёбра", "масса");
+        for c in 0..6 {
+            let s = ct::nt_sign(c as u8);
+            println!(
+                "{:<8} {:>12} {:>12}   {}",
+                ct::NT_NAMES[c],
+                thou(m[c].1),
+                thou(m[c].0),
+                match s {
+                    1 => "+1".to_string(),
+                    -1 => "-1".to_string(),
+                    _ => "0".to_string(),
+                }
+            );
+        }
+        println!(
+            "Баланс массы: {} возб / {} торм / {} мод",
+            pct(exc),
+            pct(inh),
+            pct(modm)
+        );
+        let tops = top_deg
+            .iter()
+            .map(|&(d, u)| match &nodes {
+                Some(ns) => match ns.root_id(u) {
+                    Some(r) => format!("{u} (root {r}) — {d}"),
+                    None => format!("{u} — {d}"),
+                },
+                None => format!("{u} — {d}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        println!("Топ по исходящей степени: {tops}");
+        println!(
+            "Запросы: --connectome-node | --connectome-edge U:V | --connectome-khop | \
+             --connectome-impact (аргумент: индекс или root_id с --connectome-nodes)"
+        );
     }
     0
 }

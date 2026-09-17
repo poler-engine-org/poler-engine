@@ -157,7 +157,31 @@ poler-engine ./src --impact "run_gateway" --impact-depth 3 --impact-cache db
 `--impact СИМВОЛ` — upstream/downstream паспорт (call graph),
 `--impact-depth`, `--impact-cache` (кэш БД), `--impact-reuse`.
 
-## 7. Веб
+## 7. Коннектом FLYCSR1 (v0.30.0) — мозг мухи как матрица A
+
+```bash
+poler-engine --connectome docs/flywire-connectome/flywire_v783_core.csr.zst
+poler-engine --connectome core.csr.zst --connectome-nodes nodes.bin --connectome-node 0
+poler-engine --connectome core.csr.zst --connectome-edge 0:6135     # + ротор J = A − Aᵀ
+poler-engine --connectome core.csr.zst --connectome-khop 0 -k 2    # фронты [13, 443], 457
+poler-engine --connectome core.csr.zst --connectome-impact 0       # CSC «кто управляет»
+```
+
+| Флаг | Смысл |
+|---|---|
+| `--connectome CSR_ZST` | артефакт FLYCSR1 (zstd + CSR): full 35 МБ / core 7 МБ в git |
+| `--connectome-nodes NODES_BIN` | таблица root_id: имена в выводе, поиск по root_id |
+| `--connectome-node IDX` | паспорт нейрона: степени, массы, топ-рёбра |
+| `--connectome-edge U:V` | ребро + обратное + ротор J = A − Aᵀ (циркуляция пары) |
+| `--connectome-khop IDX` | BFS потока сигнала; глубина — общий `-k/--k-hop` (2) |
+| `--connectome-sign all\|exc\|inh` | фильтр знака K-hop (возб/торм/все) |
+| `--connectome-impact IDX` | входящие (CSC): «кто управляет нейроном» + топ-источники |
+| `--connectome-json` | JSON-вывод любого режима (для агентов) |
+
+Знак связи: **+1** ach/glut, **−1** gaba, **0** модуляторы (oct/ser/da);
+модуляторы не входят в J. Exit-коды grep: 0 найдено / 1 нет / 2 ошибка.
+
+## 8. Веб
 
 ```bash
 poler-engine https://example.com --web                # рендер CDP → поиск
@@ -180,7 +204,7 @@ poler-engine --web-lens-install                        # установка в �
 | `--cross-site` | межсайтовый обход |
 | `--web-search` | поиск по индексу + авто-расширение Semantic Bridge |
 
-## 8. Интерфейсы
+## 9. Интерфейсы
 
 ```bash
 poler-engine --shell                # REPL + Tab-completion
@@ -207,7 +231,7 @@ M6 (резидентность): Гиппокамп/WebIndex/кэш файлов
 (`{"ts","method","tool","us","ok"}`) — контейнер валиден на каждом коммите
 и читается штатным `--memory-open`.
 
-## 9. Бенчмарк
+## 10. Бенчмарк
 
 ```bash
 poler-engine --benchmark --benchmark-json report.json
@@ -217,7 +241,7 @@ poler-engine --benchmark --benchmark-json report.json
 BM25-golden · чанкер · vectors · compression/RSS + latency (мс) и RAM
 (VmHWM/VmRSS).
 
-## 10. Крипто-слой данных: POLER Vault `--memory-*` (M4.5, фича pnd-ffi)
+## 11. Крипто-слой данных: POLER Vault `--memory-*` (M4.5, фича pnd-ffi)
 
 Зашифрованная постоянная память: любой поток (документы, логи
 терминала, история чата, ответы ИИ) запечатывается в контейнер `.pvt`
@@ -244,7 +268,7 @@ poler-engine --memory-open   logs.txt.pvt --memory-out restored.txt
 100000, минимум 10000). Требует сборки с `--features pnd-ffi`
 (Zig-ядро, см. INSTALL.md).
 
-## 11. Удалённое в v2.0 (не возвращать)
+## 12. Удалённое в v2.0 (не возвращать)
 
 `--google-*`, `--nlm-*`, `--auth-ui`, `--import-browser-session`,
 `--license-import` — Google/NLM-интеграции вырезаны (суверенный стек,

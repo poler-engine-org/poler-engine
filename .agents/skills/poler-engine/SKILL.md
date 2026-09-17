@@ -1,6 +1,6 @@
 ---
 name: poler-engine
-description: AI-Native суверенный поисково-аналитический движок POLER v0.29.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), AIDDE impact-анализ, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету). Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация).
+description: AI-Native суверенный поисково-аналитический движок POLER v0.30.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), AIDDE impact-анализ, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету), Rust-ридер коннектома FLYCSR1 — мозг мухи FlyWire v783 (138 639 нейронов, 54,5 млн синапсов) как живая матрица A: ротор J = A − Aᵀ, K-hop BFS, CSC-impact прямо из zstd-артефакта. Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация), графовых запросов к биологическому эталону связности.
 ---
 
 # POLER-Engine — суверенный гиппокамп, крипто-субстрат и нативный инференс для LLM-агентов
@@ -129,7 +129,24 @@ poler-engine --knowledge-stats                      # источники/чан�
 poler-engine ./src --impact "run_gateway" [--impact-depth 3] [--impact-cache db]
 ```
 
-### 9. Веб (локальный индекс, не облако)
+### 9. Коннектом FLYCSR1 (v0.30.0) — мозг мухи как матрица A
+
+```bash
+poler-engine --connectome docs/flywire-connectome/flywire_v783_core.csr.zst
+poler-engine --connectome ...core.csr.zst --connectome-nodes ...nodes.bin \
+  --connectome-node 0                # паспорт нейрона (индекс или root_id)
+poler-engine --connectome ... --connectome-edge 0:6135       # вес/медиатор/знак + J = A − Aᵀ
+poler-engine --connectome ... --connectome-khop 0 -k 2      # BFS потока сигнала: [13, 443], 457
+poler-engine --connectome ... --connectome-impact 0         # CSC «кто управляет нейроном»
+poler-engine --connectome ... --connectome-json            # JSON для агентов
+```
+
+- Знак связи: **+1** ach/glut, **−1** gaba, **0** модуляторы (oct/ser/da);
+  фильтр потока: `--connectome-sign all|exc|inh`. Exit-коды grep: 0 найдено / 1 нет / 2 ошибка.
+- Артефакты в git (~43 МБ): full 35 МБ / core 7 МБ / nodes 1.1 МБ; загрузка
+  core ≈ 70 мс (≈ 25 МБ RAM), full ≈ 400 мс; сырьё 852 МБ feather не нужно.
+
+### 10. Веб (локальный индекс, не облако)
 
 ```bash
 poler-engine https://example.com --crawl --crawl-depth 2 --crawl-max 25
@@ -137,7 +154,7 @@ poler-engine --web-search "запрос"                  # Semantic Bridge ru�
 poler-engine --semantic-expand "запрос"             # диагностика моста
 ```
 
-### 10. Интерфейсы и сервисы
+### 11. Интерфейсы и сервисы
 
 ```bash
 poler-engine --mcp                                   # MCP-сервер (stdio JSON-RPC)
@@ -219,7 +236,7 @@ poler-engine --mcp-bench 500                          # бенчмарк рез�
 
 ## Верификационные числа (золотой стандарт)
 
-- Rust: **1089/1089** тестов (pnd-ffi; +17 M6: стрим↔seal побитово, warm==cold); Zig: **33/33**; golden-векторы PND: **54 626 bit-for-bit**.
+- Rust: **1099/1099** тестов (pnd-ffi; +12 C1: золотые числа FlyWire v783 прямо из git-артефактов — 54 492 922 синапса, массы по 6 медиаторам, K-hop [13, 443]→457, CSC-инварианты); Zig: **33/33**; golden-векторы PND: **54 626 bit-for-bit**.
 - pqw/pqc: дифференциалы против fp32-эталонов — int8 cos > 0.999, int4 > 0.98, fp32 > 0.9999.
 - Токенизатор XLM-R: 40/40 текстов побитово = HF `tokenizers` v0.23.2.
 - BGE-M3 int8 (573 МБ): cos ≥ 0.9999 на всех 24 слоях. GLiNER (urchade/gliner_multi):
