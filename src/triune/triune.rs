@@ -46,6 +46,7 @@ use crate::ssn::vortex::{SynapticVortex, VortexConfig, VortexTelemetry};
 use crate::triune::crystal::{Crystal, ARCHETYPES};
 use crate::triune::flypulse::{FlyPulse, PulseOrigin};
 use crate::triune::motor::{self, MotorIntent};
+use crate::triune::neuron::{Inject, NeuralPopulation, NeuronConfig, NeuronTelemetry};
 
 /// Конфигурация Триединства.
 #[derive(Debug, Clone)]
@@ -78,6 +79,11 @@ pub struct TriuneConfig {
     pub dynamic_vocab: bool,
     /// Предел динамических слов за сессию (сверх — subword-фолбек).
     pub dynamic_vocab_cap: usize,
+    /// Нейронная популяция поверх трит-синапсов (v0.38.0):
+    /// резонансная память + энергогейтная пластичность.
+    pub neurons: NeuronConfig,
+    /// Вес активности нейрона в счёте кандидата.
+    pub w_act: f64,
 }
 
 impl Default for TriuneConfig {
@@ -96,6 +102,8 @@ impl Default for TriuneConfig {
             echo_scale: 0.25,
             dynamic_vocab: true,
             dynamic_vocab_cap: 2048,
+            neurons: NeuronConfig::default(),
+            w_act: 1.6,
         }
     }
 }
@@ -121,6 +129,8 @@ pub struct TokenTrace {
     pub tau: f64,
     /// Активность вихря в момент слова.
     pub activity: f64,
+    /// Активность нейрона токена в популяции (v0.38.0).
+    pub act: f64,
 }
 
 /// Высказывание: текст + трейс + финальная телеметрия + интенты.
@@ -136,6 +146,8 @@ pub struct Utterance {
     pub fly_origin: PulseOrigin,
     /// Словарь кристалла.
     pub crystal_vocab: usize,
+    /// Телеметрия нейронной популяции (v0.38.0).
+    pub neurons: NeuronTelemetry,
 }
 
 /// Триединое ядро: резидентная говорящая система.
@@ -154,6 +166,8 @@ pub struct TriuneCore {
     ctx: Vec<u32>,
     /// Сколько новых слов добавлено динамически за сессию.
     dynamic_added: usize,
+    /// Нейронная популяция токен-нейронов (v0.38.0).
+    pub neurons: NeuralPopulation,
     /// Сенсорных инъекций сделано.
     pub injections: usize,
     /// Всего токенов произнесено.
@@ -164,6 +178,7 @@ impl TriuneCore {
     /// Новое Триединство. `fly` — настоящая каста или виртуальная муха.
     pub fn new(crystal: Crystal, cfg: TriuneConfig, fly: FlyPulse, seed: u64) -> TriuneCore {
         let vortex = SynapticVortex::new(cfg.vortex, seed);
+        let neurons = NeuralPopulation::new(crystal.vocab(), cfg.neurons.clone());
         TriuneCore {
             vortex,
             fly,
@@ -173,6 +188,7 @@ impl TriuneCore {
             usage: HashMap::new(),
             ctx: Vec::new(),
             dynamic_added: 0,
+            neurons,
             injections: 0,
             tokens_spoken: 0,
         }
@@ -223,6 +239,12 @@ impl TriuneCore {
             .iter()
             .filter_map(|w| self.resolve_prompt_token(w))
             .collect();
+        // Промпт — в нейронную популяцию: слова вспыхивают и держат
+        // резонансную память всю фразу (контекст = активации, не окно).
+        self.neurons.ensure_vocab(self.crystal.vocab());
+        for &id in &prompt_ids {
+            self.neurons.inject(id, Inject::Sense);
+        }
         self.ctx = prompt_ids.iter().rev().take(self.cfg.ctx_window).cloned().rev().collect();
         let prompt_tail: String = prompt_ids
             .iter()
@@ -246,6 +268,10 @@ impl TriuneCore {
             // 2. Муха крутит фазу касты.
             let drift = self.fly.step();
             let drift_max = drift.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+
+            // 2b. Нейроны релаксируют: активация течёт по трит-синапсам,
+            //     популяция догоняет контекст (v0.38.0).
+            self.neurons.settle(&self.crystal);
 
             // 3. Контекст (CSE) для семантики и гейта.
             let ctx_str = if self.ctx.is_empty() {
@@ -279,12 +305,16 @@ impl TriuneCore {
                 let fly = (drift[self.crystal.anchor(idx)] / drift_max).tanh() as f64;
                 let used = *self.usage.get(&idx).unwrap_or(&0);
                 let rep = -self.cfg.lambda_rep * used.min(3) as f64;
+                let act = self.neurons.activation(idx) as f64;
                 sems[idx as usize] = sem;
                 gates[idx as usize] = gate;
                 syns[idx as usize] = syn;
                 flies[idx as usize] = fly;
-                scores[idx as usize] =
-                    self.cfg.w_sem * sem * gate + self.cfg.w_syn * syn as f64 + self.cfg.w_fly * fly + rep;
+                scores[idx as usize] = self.cfg.w_sem * sem * gate
+                    + self.cfg.w_syn * syn as f64
+                    + self.cfg.w_fly * fly
+                    + self.cfg.w_act * act
+                    + rep;
             }
 
             // 5. WTA(k): разреженный код лидеров (MindOS).
@@ -330,6 +360,7 @@ impl TriuneCore {
             }
             self.tokens_spoken += 1;
             words.push(self.crystal.tokens[idx as usize].clone());
+            let act_spoken = self.neurons.activation(idx) as f64;
             trace.push(TokenTrace {
                 token: self.crystal.tokens[idx as usize].clone(),
                 idx,
@@ -341,7 +372,17 @@ impl TriuneCore {
                 score: scores[chosen],
                 tau,
                 activity: tel.activity,
+                act: act_spoken,
             });
+
+            // 7b. Нейронный контур (v0.38.0): энергия удивления →
+            //     Хеббовский сдвиг синапса → эхо в популяцию.
+            self.neurons.observe(&self.crystal, idx);
+            if let Some(p) = prev {
+                self.neurons
+                    .hebbian(&mut self.crystal, p, idx, gates[chosen].max(0.0));
+            }
+            self.neurons.inject(idx, Inject::Echo);
 
             // 8. Мозг слышит собственную речь (замкнутый контур, эхо
             //    приглушено: самослушание — не крик в собственное ухо).
@@ -351,6 +392,7 @@ impl TriuneCore {
         }
 
         let telemetry = self.vortex.telemetry();
+        let neurons = self.neurons.telemetry();
         let text = words.join(" ");
         let intents = motor::scan(&text);
         Utterance {
@@ -361,6 +403,7 @@ impl TriuneCore {
             trace,
             intents,
             text,
+            neurons,
         }
     }
 
@@ -587,5 +630,97 @@ mod tests {
             v0,
             "при выключенном dynamic_vocab словарь не растёт"
         );
+    }
+
+    /// Нейронная популяция (v0.38.0): речь учится — Хеббовские сдвиги
+    /// синапсов происходят прямо во время говорения.
+    #[test]
+    fn speech_updates_synapses_while_speaking() {
+        let mut core = TriuneCore::new(
+            test_crystal(),
+            TriuneConfig::default(),
+            FlyPulse::synthetic(51, 0.8),
+            17,
+        );
+        let u = core.speak("кристалл знаний живёт", 24);
+        assert!(
+            u.neurons.hebb_updates > 0,
+            "нейронный контур должен обновлять синапсы во время речи"
+        );
+        assert!(u.neurons.active_k > 0, "популяция жива");
+        assert!(u.neurons.energy >= 0.0);
+        // Трейс несёт активацию нейрона каждого токена.
+        assert!(u.trace.iter().all(|t| t.act >= 0.0));
+    }
+
+    /// Выключенная пластичность: кристалл побитово заморожен.
+    #[test]
+    fn no_learn_freezes_crystal_bits() {
+        let mut cfg = TriuneConfig::default();
+        cfg.neurons.learn = false;
+        cfg.dynamic_vocab = false; // и словарь не растёт — чистый эксперимент
+        let mut core =
+            TriuneCore::new(test_crystal(), cfg, FlyPulse::synthetic(61, 0.8), 23);
+        let before = core.crystal.to_bytes();
+        let u = core.speak("замороженный кристалл молчит правду", 20);
+        let after = core.crystal.to_bytes();
+        assert_eq!(before, after, "learn=false: байты .t5c не меняются");
+        assert_eq!(u.neurons.hebb_updates, 0);
+    }
+
+    /// Резонансная память (v0.38.0): нейроны промпта живут в
+    /// популяции дольше, чем окно ctx_window = 2 токена. Контекст —
+    /// в активациях, а не в буфере.
+    #[test]
+    fn population_remembers_prompt_beyond_ctx_window() {
+        let mut core = TriuneCore::new(
+            test_crystal(),
+            TriuneConfig::default(),
+            FlyPulse::synthetic(3, 0.8),
+            9,
+        );
+        let prompt_words = ["живой", "мозг", "говорит", "система"];
+        let _ = core.speak("живой мозг говорит", 4); // 4 токена речи
+        // ctx_window = 2 давно вытеснил бы промпт; популяция держит.
+        let alive: Vec<&str> = prompt_words
+            .iter()
+            .copied()
+            .filter(|w| {
+                core.crystal
+                    .id_of(w)
+                    .map(|id| core.neurons.activation(id) > 0.009)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            alive.len() >= 2,
+            "нейроны промпта должны жить за пределами окна: живы {alive:?}"
+        );
+    }
+
+    /// Кристалл после обучения речи сериализуется и переживает
+    /// загрузку (накопленная пластичность не теряется).
+    #[test]
+    fn learned_crystal_survives_roundtrip() {
+        let mut core = TriuneCore::new(
+            test_crystal(),
+            TriuneConfig::default(),
+            FlyPulse::synthetic(71, 0.8),
+            29,
+        );
+        let _ = core.speak("живой мозг учится говорить", 20);
+        let bytes = core.crystal.to_bytes();
+        let reloaded = Crystal::load(&bytes, core.cfg.dims).expect("перезагрузка выученного");
+        assert_eq!(reloaded.vocab(), core.crystal.vocab());
+        // Хеббовские сдвиги видны и после загрузки.
+        let mut mismatches = 0;
+        for p in 0..reloaded.vocab() as u32 {
+            for n in 0..reloaded.vocab() as u32 {
+                if reloaded.bigram_trit(p, n) != core.crystal.bigram_trit(p, n) {
+                    mismatches += 1;
+                }
+            }
+        }
+        assert_eq!(mismatches, 0, "триты синапсов должны пережить round-trip");
     }
 }

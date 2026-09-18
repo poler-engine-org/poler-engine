@@ -943,6 +943,14 @@ struct Cli {
     #[arg(long = "triune-crystal", value_name = "T5C")]
     triune_crystal: Option<PathBuf>,
 
+    /// Сохранить кристалл ПОСЛЕ речи (синапсы, обученные в сессии) [v0.38.0].
+    #[arg(long = "triune-out", value_name = "T5C")]
+    triune_out: Option<PathBuf>,
+
+    /// Выключить Хеббовскую пластичность во время речи [v0.38.0].
+    #[arg(long = "triune-no-learn", default_value_t = false)]
+    triune_no_learn: bool,
+
     /// JSON-вывод режима --triune-* (для агентов).
     #[arg(long = "triune-json", default_value_t = false)]
     triune_json: bool,
@@ -5054,7 +5062,7 @@ fn triune_utterance_json(u: &poler_engine::triune::Utterance) -> serde_json::Val
                 "token": t.token, "idx": t.idx,
                 "sem": r(t.sem), "gate": r(t.gate), "syn": t.syn,
                 "fly": r(t.fly), "rep": r(t.rep), "score": r(t.score),
-                "tau": r(t.tau), "activity": r(t.activity),
+                "tau": r(t.tau), "activity": r(t.activity), "act": r(t.act),
             })
         })
         .collect();
@@ -5107,7 +5115,10 @@ fn run_triune(cli: &Cli) -> i32 {
             return 2;
         }
     };
-    let cfg = TriuneConfig::default();
+    let mut cfg = TriuneConfig::default();
+    if cli.triune_no_learn {
+        cfg.neurons.learn = false;
+    }
     let mut core = TriuneCore::new(crystal, cfg, fly, cli.triune_seed);
 
     let prompts: Vec<String> = if cli.triune_demo {
@@ -5155,6 +5166,11 @@ fn run_triune(cli: &Cli) -> i32 {
     println!("вихрь:   SSN v0.35.0, гомеостаз 5%, критичность на краю хаоса");
     println!("кристалл: {} токенов, Trit5 (5 тритов/байт), зашит в бинарник",
         utterances.first().map(|(_, u)| u.crystal_vocab).unwrap_or(0));
+    println!("нейроны: v0.38.0, {} живых, ε={:.2}, S={:.2}, Хебб-обновлений: {}",
+        utterances.last().map(|(_, u)| u.neurons.active_k).unwrap_or(0),
+        utterances.last().map(|(_, u)| u.neurons.energy).unwrap_or(0.0),
+        utterances.last().map(|(_, u)| u.neurons.entropy).unwrap_or(0.0),
+        utterances.last().map(|(_, u)| u.neurons.hebb_updates).unwrap_or(0));
     for (prompt, u) in &utterances {
         println!("\n─ промпт: «{prompt}» ─────────────────────────────────");
         println!("речь: {text}", text = u.text);
@@ -5162,8 +5178,8 @@ fn run_triune(cli: &Cli) -> i32 {
         println!("мозг: активность {:.1}%, S={:.2}, C={:.2}, DA={:.2} 5HT={:.2} NE={:.2}",
             t.activity * 100.0, t.synchrony, t.criticality, t.da, t.ht, t.ne);
         if let Some(first) = u.trace.first() {
-            println!("первый токен: sem={:+.3} gate={:.3} syn={:+} fly={:+.3} τ={:.2}",
-                first.sem, first.gate, first.syn, first.fly, first.tau);
+            println!("первый токен: sem={:+.3} gate={:.3} syn={:+} fly={:+.3} act={:.3} τ={:.2}",
+                first.sem, first.gate, first.syn, first.fly, first.act, first.tau);
         }
         if !u.intents.is_empty() {
             println!("моторный слой (S2):");
@@ -5179,6 +5195,17 @@ fn run_triune(cli: &Cli) -> i32 {
     let (inj, spoken, _) = core.state_summary();
     println!("\nитог: {} фраз, {} токенов, {} сенсорных инъекций, {} мс",
         utterances.len(), spoken, inj, t0.elapsed().as_millis());
+    // v0.38.0: сохранение синапсов, обученных в сессии.
+    if let Some(out) = &cli.triune_out {
+        match core.crystal.save(out) {
+            Ok(()) => println!("кристалл сохранён: {} ({} токенов, {} синапсов)",
+                out.display(), core.crystal.vocab(), core.crystal.bigram_nonzeros),
+            Err(e) => {
+                eprintln!("triune-out: {e}");
+                return 2;
+            }
+        }
+    }
     0
 }
 

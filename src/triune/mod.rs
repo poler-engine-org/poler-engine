@@ -39,6 +39,7 @@ pub mod flypulse;
 pub mod ingest;
 pub mod jit_loop;
 pub mod motor;
+pub mod neuron;
 pub mod stream_quant;
 pub mod triune;
 
@@ -51,6 +52,7 @@ pub use flypulse::{FlyPulse, PulseOrigin};
 pub use ingest::{IngestConfig, IngestStats, IngestingFetcher, StreamCrystalBuilder};
 pub use jit_loop::{CycleReport, ExecutableKernel, JitLoop, WeightsInCode};
 pub use motor::{MotorIntent, MotorOp};
+pub use neuron::{Inject, NeuralPopulation, NeuronConfig, NeuronTelemetry};
 pub use stream_quant::{stream_quantize, verify_t5q, StreamQuantConfig, StreamQuantStats};
 pub use triune::{TokenTrace, TriuneConfig, TriuneCore, Utterance};
 

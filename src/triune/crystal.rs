@@ -99,6 +99,7 @@ fn sentences(text: &str) -> Vec<&str> {
 
 /// Кристалл Знаний: словарь + троичная биграммная топология +
 /// производные CSE-вложения.
+#[derive(Clone)]
 pub struct Crystal {
     /// Токены словаря в каноническом порядке (порядок = id).
     pub tokens: Vec<String>,
@@ -277,6 +278,50 @@ impl Crystal {
         Trit5Codec::unpack_5(byte)[next as usize % 5]
     }
 
+    /// Строка синапсов нейрона `prev`: Trit5-упакованные триты
+    /// `prev → *` (stride байт; столбцы ≥ V — вакуум). Горячий путь
+    /// нейронной популяции: скан без распаковки всей матрицы.
+    pub fn bigram_row(&self, prev: u32) -> &[u8] {
+        let from = prev as usize * self.stride;
+        &self.bigram[from..from + self.stride]
+    }
+
+    /// Шаг упаковки (байт на строку синапсов).
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Хеббовский сдвиг синапса (v0.38.0): трит `prev → next` ползёт к
+    /// ±1, насыщаясь на краях решётки {−1, 0, +1}. Возврат — новый трит.
+    ///
+    /// Это и есть пластичность «вес зашит в синапс»: пара (prev, next)
+    /// совпала (NMDA-гейт открыт, энергия удивления высока) — синапс
+    /// укрепляется на +1; промах — ослабляется на −1. Один проход, без
+    /// эпох градиентного спуска — потому данных нужно меньше.
+    pub fn bigram_bump(&mut self, prev: u32, next: u32, delta: i8) -> i8 {
+        let v = self.tokens.len();
+        if (prev as usize) >= v || (next as usize) >= v || delta == 0 {
+            return self.bigram_trit(prev, next);
+        }
+        let byte_idx = prev as usize * self.stride + next as usize / 5;
+        let mut five = Trit5Codec::unpack_5(self.bigram[byte_idx]);
+        let cur = five[next as usize % 5];
+        let new = (cur + delta).clamp(-1, 1);
+        if new != cur {
+            if cur != 0 {
+                self.bigram_nonzeros -= 1;
+            }
+            if new != 0 {
+                self.bigram_nonzeros += 1;
+            }
+        }
+        five[next as usize % 5] = new;
+        if let Some(b) = Trit5Codec::pack_5(&five) {
+            self.bigram[byte_idx] = b;
+        }
+        new
+    }
+
     /// Троичное вложение токена (No-Mul SIMD-сторона).
     pub fn embed_trit(&self, idx: u32) -> &TritState {
         &self.embeds_trit[idx as usize]
@@ -290,6 +335,95 @@ impl Crystal {
     /// Якорь архетипа токена (0..12).
     pub fn anchor(&self, idx: u32) -> usize {
         self.anchors[idx as usize] as usize
+    }
+
+    /// Топ-k семантических соседей токена — ассоциативные
+    /// (симметричные) синапсы популяции: взаимная поддержка
+    /// тематического кластера. Ранжирование по трит-скалярному
+    /// произведению CSE-вложений (No-Mul SIMD).
+    pub fn semantic_neighbors(&self, idx: u32, k: usize) -> Vec<u32> {
+        let v = self.tokens.len();
+        if idx as usize >= v || k == 0 {
+            return Vec::new();
+        }
+        let probe = self.embeds_trit[idx as usize].dequantize();
+        let mut sims: Vec<(u32, f32)> = (0..v as u32)
+            .filter(|&j| j != idx)
+            .map(|j| (j, self.embeds_trit[j as usize].dot(&probe)))
+            .collect();
+        sims.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        sims.into_iter().take(k).map(|(j, _)| j).collect()
+    }
+
+    /// Ассоциативные соседи нейрона — симметричное Хеббовское
+    /// замыкание синапсов для резонансного бассейна популяции:
+    ///
+    /// - семантические соседи (топ `sem_k` по трит-скалярному
+    ///   произведению CSE — морфология/форма слова);
+    /// - партнёры по совместной встречаемости: `bigram(i→j) = +1`
+    ///   ИЛИ `bigram(j→i) = +1` («срабатывали вместе — связаны»),
+    ///   до `bi_k` в каждую сторону.
+    ///
+    /// Направленность синтаксиса живёт в волне (step популяции);
+    /// здесь — только взаимная поддержка темы.
+    pub fn assoc_neighbors(&self, idx: u32, sem_k: usize, bi_k: usize) -> Vec<u32> {
+        let v = self.tokens.len();
+        if idx as usize >= v {
+            return Vec::new();
+        }
+        let mut out: Vec<u32> = Vec::with_capacity(sem_k + 2 * bi_k);
+        let push_unique = |j: u32, out: &mut Vec<u32>| {
+            if j != idx && !out.contains(&j) {
+                out.push(j);
+            }
+        };
+        // 1. Семантика.
+        for j in self.semantic_neighbors(idx, sem_k) {
+            push_unique(j, &mut out);
+        }
+        // 2. Прямые партнёры (+1 в строке).
+        let row = self.bigram_row(idx);
+        let mut found = 0usize;
+        for (byte_idx, &byte) in row.iter().enumerate() {
+            if byte == 121 {
+                continue; // вакуум
+            }
+            let five = crate::pqc::tensor::Trit5Codec::unpack_5(byte);
+            for (slot, &w) in five.iter().enumerate() {
+                if w != 1 {
+                    continue;
+                }
+                let j = byte_idx * 5 + slot;
+                if j >= v {
+                    break;
+                }
+                push_unique(j as u32, &mut out);
+                found += 1;
+                if found >= bi_k {
+                    break;
+                }
+            }
+            if found >= bi_k {
+                break;
+            }
+        }
+        // 3. Обратные партнёры (+1 в столбце): встречались рядом —
+        //    связь симметрична для памяти, какой бы ни была стрелка.
+        found = 0;
+        for j in 0..v as u32 {
+            if self.bigram_trit(j, idx) == 1 {
+                push_unique(j, &mut out);
+                found += 1;
+                if found >= bi_k {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// id токена или None (вне словаря).
@@ -739,7 +873,7 @@ mod tests {
 
     #[test]
     fn subword_fallback_decomposes_unknown_words() {
-        let mut c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
+        let c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
         // «мозговой» не в корпусе, но «мозг» есть… проверяем общий механизм
         // на гарантированно разложимом случае: склейке двух словарных слов.
         let w1 = c.tokens[0].clone();
