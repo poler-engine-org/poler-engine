@@ -61,6 +61,7 @@ pub mod exec;
 pub mod gateway;
 pub mod graph;
 pub mod license;
+pub mod literary;
 pub mod llm;
 pub mod mcp;
 pub mod mcp_http;

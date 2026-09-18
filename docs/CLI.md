@@ -226,7 +226,44 @@ poler-engine --web-lens-install                        # установка в �
 | `--cross-site` | межсайтовый обход |
 | `--web-search` | поиск по индексу + авто-расширение Semantic Bridge |
 
-## 9. Интерфейсы
+## 9. Литературный Двигатель POLER[Ψ] (L1/v0.34.0) — физика смысла
+
+Полная матричная форма канонического уравнения: замысел → Ω(o) → фазовая
+траектория к когнитивному покою H^Ψ = 0. Без мухи — сходимость
+(«сверхпроводимость смысла»); с мухой (`--literary-csr`) — предельный
+цикл: живой мозг не даёт нарративу замереть. Руководство: `docs/LITERARY.md`.
+
+```bash
+poler-engine --literary-field "герой идёт в поход против тьмы и бездны"
+poler-engine --literary-generate "текст замысла" --literary-steps 128
+# мушиная калибровка: каста от семян, ротор J = A − Aᵀ закручивает нарратив
+poler-engine --literary-generate "текст" \
+  --literary-csr docs/flywire-connectome/flywire_v783_core.csr.zst \
+  --literary-nodes docs/flywire-connectome/flywire_v783_nodes.bin \
+  --literary-seeds 0,116214 --literary-khop 2 --literary-max-cast 32
+poler-engine --literary-generate "текст" --literary-no-mul --literary-json
+```
+
+| Флаг | Смысл |
+|---|---|
+| `--literary-field TEXT` | анализ поля интенции: термы-инварианты + архетипы (℘→O) |
+| `--literary-generate TEXT` | полный прогон до H^Ψ = 0: акты, конфликты, телеметрия |
+| `--literary-csr CSR_ZST` | мушиная калибровка: каста → J = A−Aᵀ (циркуляция) + D = L·Lᵀ (Ляпунов) |
+| `--literary-nodes NODES_BIN` | таблица root_id (семена по root_id) |
+| `--literary-seeds A,B,…` | семена касты, индексы или root_id (умолчание 0) |
+| `--literary-khop N` | BFS-глубина касты (1–4, умолч. 2) |
+| `--literary-max-cast N` | максимум нейронов касты (2–64, умолч. 48) |
+| `--literary-dims N` | осей фазового пространства (16–256, умолч. 64) |
+| `--literary-steps N` | шагов генерации (умолч. 48) |
+| `--literary-eta F` / `--literary-eta-r F` | η шаг интегратора / η_r резонансный (0.1 / 0.05) |
+| `--literary-rho F` | ρ затухания темпорального эха R[n] (0.9) |
+| `--literary-kappa F` | κ масштаб энергии значимости ε (1.2) |
+| `--literary-gamma F` | γ баланс циркуляции J — сила мушиного ротора (1.0) |
+| `--literary-lambda F` | λ вес логической регуляризации (0.01) |
+| `--literary-no-mul` | Trit5-квантование p_t в {−1,0,+1} (No-Mul, SIMD) |
+| `--literary-json` | JSON-вывод для агентов |
+
+## 10. Интерфейсы
 
 ```bash
 poler-engine --shell                # REPL + Tab-completion
@@ -253,7 +290,7 @@ M6 (резидентность): Гиппокамп/WebIndex/кэш файлов
 (`{"ts","method","tool","us","ok"}`) — контейнер валиден на каждом коммите
 и читается штатным `--memory-open`.
 
-## 10. Бенчмарк
+## 11. Бенчмарк
 
 ```bash
 poler-engine --benchmark --benchmark-json report.json
@@ -263,7 +300,7 @@ poler-engine --benchmark --benchmark-json report.json
 BM25-golden · чанкер · vectors · compression/RSS + latency (мс) и RAM
 (VmHWM/VmRSS).
 
-## 11. Крипто-слой данных: POLER Vault `--memory-*` (M4.5, фича pnd-ffi)
+## 12. Крипто-слой данных: POLER Vault `--memory-*` (M4.5, фича pnd-ffi)
 
 Зашифрованная постоянная память: любой поток (документы, логи
 терминала, история чата, ответы ИИ) запечатывается в контейнер `.pvt`
@@ -290,7 +327,7 @@ poler-engine --memory-open   logs.txt.pvt --memory-out restored.txt
 100000, минимум 10000). Требует сборки с `--features pnd-ffi`
 (Zig-ядро, см. INSTALL.md).
 
-## 12. Удалённое в v2.0 (не возвращать)
+## 13. Удалённое в v2.0 (не возвращать)
 
 `--google-*`, `--nlm-*`, `--auth-ui`, `--import-browser-session`,
 `--license-import` — Google/NLM-интеграции вырезаны (суверенный стек,

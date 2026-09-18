@@ -39,6 +39,10 @@ use serde_json::{json, Value};
 
 use crate::graph::connectome::{Connectome, ConnectomeNodes, InEdges, SignFilter};
 use crate::graph::flyops::Direction;
+use crate::literary::{
+    flybridge::build_cast, LiteraryEngine, LiteraryParams, NarrativeReport, PsiMode,
+    StepTelemetry,
+};
 use crate::web::{self, CdpFetcher, WebIndex};
 use crate::{Engine, EngineConfig};
 
@@ -179,6 +183,10 @@ pub struct McpServer {
     /// переиспользуется между вызовами poler_fly_* (холодный старт был
     /// ~60–300 мс загрузки + ~43 мс CSC на КАЖДЫЙ CLI-вызов агента).
     warm_fly: Mutex<Option<Arc<WarmFly>>>,
+    /// L1/v0.34.0: резидентные сессии Литературного Двигателя POLER[Ψ]
+    /// — латентное состояние p_t, эхо и мушиная калибровка живут между
+    /// вызовами poler_literary_step (агент ведёт нарратив шаг за шагом).
+    warm_psi: Mutex<PsiSessions>,
 }
 
 impl McpServer {
@@ -197,6 +205,7 @@ impl McpServer {
             #[cfg(feature = "pnd-ffi")]
             exec_tasks: Arc::new(crate::exec::TaskRegistry::default()),
             warm_fly: Mutex::new(None),
+            warm_psi: Mutex::new(PsiSessions::default()),
         }
     }
 
@@ -345,6 +354,23 @@ fn is_fly_tool(msg: &Value) -> bool {
         )
 }
 
+/// L1/v0.34.0: семейство Литературного Двигателя — в пул воркеров:
+/// полная генерация с мушиной калибровкой (загрузка коннектома +
+/// каста + 48 шагов) занимает десятки/сотни миллисекунд, а запросы
+/// step/generate независимы между сессиями.
+fn is_psi_tool(msg: &Value) -> bool {
+    msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(|v| v.as_str()),
+            Some(
+                "poler_literary_field"
+                    | "poler_literary_step"
+                    | "poler_literary_generate"
+                    | "poler_literary_eject"
+            )
+        )
+}
+
 /// Резидентная «живая муха»: коннектом FLYCSR1 + таблица root_id + CSC
 /// (входящие рёбра) в RAM. CSC строится лениво один раз — первый
 /// impact/центральность запрос платит ~43 мс, остальные — ноль.
@@ -370,6 +396,78 @@ impl WarmFly {
     /// Построен ли уже CSC (диагностика теплоты).
     fn csc_ready(&self) -> bool {
         self.csc.get().is_some()
+    }
+}
+
+/// Округление f32 до 6 знаков для JSON-телеметрии Ψ (в fly-семействе
+/// аналогичный round6 — локальное замыкание).
+fn psi_round(x: f32) -> f64 {
+    ((x as f64) * 1e6).round() / 1e6
+}
+
+/// Резидентные сессии POLER[Ψ]: LRU-очередь + карта двигателей.
+/// Лимит 8 — агенты редко ведут больше пары нарративов одновременно,
+/// а каждая сессия держит фазовое состояние + эхо (десятки КБ).
+#[derive(Default)]
+struct PsiSessions {
+    /// Живые сессии: id → двигатель.
+    map: std::collections::HashMap<String, Arc<Mutex<LiteraryEngine>>>,
+    /// Порядок создания (LRU-вытеснение самых старых).
+    order: std::collections::VecDeque<String>,
+    /// Счётчик для детерминированных id внутри процесса.
+    counter: u64,
+}
+
+impl PsiSessions {
+    const CAP: usize = 8;
+
+    /// Зарегистрировать новую сессию (с вытеснением старых за лимитом).
+    fn insert(&mut self, eng: LiteraryEngine) -> (String, Arc<Mutex<LiteraryEngine>>) {
+        self.counter += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let id = format!(
+            "psi-{:x}-{:x}",
+            self.counter,
+            crate::literary::qualia::fnv1a64(&nanos.to_le_bytes()) & 0xffff
+        );
+        let arc = Arc::new(Mutex::new(eng));
+        self.order.push_back(id.clone());
+        self.map.insert(id.clone(), arc.clone());
+        while self.map.len() > Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        (id, arc)
+    }
+
+    /// Сессия по id (и её позиция в LRU — для диагностики).
+    fn get(&self, id: &str) -> Option<Arc<Mutex<LiteraryEngine>>> {
+        self.map.get(id).cloned()
+    }
+
+    /// Число живых сессий.
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Выгрузить сессию (или все — id = "all"). Возвращает число выгруженных.
+    fn eject(&mut self, id: &str) -> usize {
+        if id == "all" || id == "все" {
+            let n = self.map.len();
+            self.map.clear();
+            self.order.clear();
+            return n;
+        }
+        if self.map.remove(id).is_some() {
+            self.order.retain(|x| x != id);
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -451,7 +549,7 @@ pub fn run(
             }
         };
         #[cfg(feature = "pnd-ffi")]
-        if is_exec_tool(&msg) || is_fly_tool(&msg) {
+        if is_exec_tool(&msg) || is_fly_tool(&msg) || is_psi_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -461,7 +559,7 @@ pub fn run(
             continue;
         }
         #[cfg(not(feature = "pnd-ffi"))]
-        if is_fly_tool(&msg) {
+        if is_fly_tool(&msg) || is_psi_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -581,6 +679,10 @@ impl McpServer {
             "poler_fly_rotor" => self.tool_fly_rotor(&args),
             "poler_fly_motifs" => self.tool_fly_motifs(&args),
             "poler_fly_propagate" => self.tool_fly_propagate(&args),
+            "poler_literary_field" => self.tool_literary_field(&args),
+            "poler_literary_step" => self.tool_literary_step(&args),
+            "poler_literary_generate" => self.tool_literary_generate(&args),
+            "poler_literary_eject" => self.tool_literary_eject(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -1662,6 +1764,332 @@ impl McpServer {
     }
 
     // -----------------------------------------------------------------
+    // L1/v0.34.0: Литературный Двигатель POLER[Ψ]
+    // -----------------------------------------------------------------
+
+    /// Гиперпараметры POLER[Ψ] из аргументов (умолчания — манифест).
+    fn psi_params_from_args(args: &Value) -> LiteraryParams {
+        let mut p = LiteraryParams::default();
+        if let Some(v) = args.get("dims").and_then(|v| v.as_u64()) {
+            p.dims = v as usize;
+        }
+        if let Some(v) = args.get("steps").and_then(|v| v.as_u64()) {
+            p.max_steps = v as usize;
+        }
+        if let Some(v) = args.get("eta").and_then(|v| v.as_f64()) {
+            p.eta = v as f32;
+        }
+        if let Some(v) = args.get("eta_r").and_then(|v| v.as_f64()) {
+            p.eta_r = v as f32;
+        }
+        if let Some(v) = args.get("rho").and_then(|v| v.as_f64()) {
+            p.rho = v as f32;
+        }
+        if let Some(v) = args.get("kappa").and_then(|v| v.as_f64()) {
+            p.kappa = v as f32;
+        }
+        if let Some(v) = args.get("gamma").and_then(|v| v.as_f64()) {
+            p.gamma = v as f32;
+        }
+        if let Some(v) = args.get("lambda").and_then(|v| v.as_f64()) {
+            p.lambda_rl = v as f32;
+        }
+        if let Some(v) = args.get("no_mul").and_then(|v| v.as_bool()) {
+            p.no_mul = v;
+        }
+        p
+    }
+
+    /// Ограничения причинности из аргументов: массив {i, j, c}
+    /// (пустой/отсутствует — канонический замок p₀ − p₁ = 0).
+    fn psi_constraints_from_args(args: &Value) -> Result<Vec<(usize, usize, f32)>, String> {
+        let Some(arr) = args.get("constraints").and_then(|v| v.as_array()) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for (k, c) in arr.iter().enumerate() {
+            let i = c
+                .get("i")
+                .and_then(|v| v.as_u64())
+                .ok_or(format!("constraints[{k}].i: целое обязательно"))?;
+            let j = c
+                .get("j")
+                .and_then(|v| v.as_u64())
+                .ok_or(format!("constraints[{k}].j: целое обязательно"))?;
+            let w = c.get("c").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            out.push((i as usize, j as usize, w));
+        }
+        Ok(out)
+    }
+
+    /// Мушиная калибровка из аргументов: csr (+nodes) → WarmFly (тёплый
+    /// артефакт!) → каста от seeds (умолчание [0]) на khop шагов.
+    /// None — аргумента csr нет, чистая физика текста.
+    fn psi_maybe_cast(&self, args: &Value) -> Result<Option<crate::literary::FlyCast>, String> {
+        let csr = args.get("csr").and_then(|v| v.as_str());
+        if csr.is_none() {
+            return Ok(None);
+        }
+        let nodes = args.get("nodes").and_then(|v| v.as_str());
+        let w = self.fly_state(csr, nodes)?;
+        let seeds = match args.get("seeds").and_then(|v| v.as_array()) {
+            Some(arr) if !arr.is_empty() => Self::fly_neurons_arg(args, "seeds", &w, 16)?,
+            _ => vec![0],
+        };
+        let khop = args
+            .get("khop")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2)
+            .clamp(1, 4) as usize;
+        let max_cast = args
+            .get("max_cast")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(48)
+            .clamp(2, crate::literary::flybridge::MAX_CAST as u64) as usize;
+        Ok(Some(build_cast(&w.con, &seeds, khop, max_cast)?))
+    }
+
+    /// poler_literary_field: анализ поля интенции — перцепция ℘,
+    /// архетипическая топология O, оценка свободной энергии и
+    /// опциональная мушиная калибровка (каста + конфликты).
+    fn tool_literary_field(&self, args: &Value) -> Result<String, String> {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент text (строка-замысел) обязателен")?;
+        let params = Self::psi_params_from_args(args);
+        let constraints = Self::psi_constraints_from_args(args)?;
+        let cast = self.psi_maybe_cast(args)?;
+        let eng = LiteraryEngine::new(params, text, &constraints, cast)?;
+        let top = crate::literary::qualia::cosine_topology(&eng.field);
+        let mut report = json!({
+            "phase": "℘→O",
+            "dims": eng.params.dims,
+            "tokens": eng.field.n_tokens,
+            "terms": eng.field.n_terms,
+            "intent_terms": eng.field.term_mass.iter().map(|(t, w)| json!({
+                "term": t, "mass": psi_round(*w),
+            })).collect::<Vec<_>>(),
+            "archetypes": top.iter().take(6).map(|&(i, w)| json!({
+                "name": crate::literary::qualia::archetype_name(i),
+                "cosine": psi_round(w),
+            })).collect::<Vec<_>>(),
+            "constraints": constraints.len(),
+            "f_initial": psi_round(eng.free_energy()),
+            "causality_residual_initial": psi_round(eng.projector.residual(&eng.p)),
+        });
+        if let Some(c) = &eng.cast {
+            report["fly"] = json!({
+                "members": c.members.len(),
+                "reached": c.stats.reached,
+                "inner_edges": c.stats.inner_edges,
+                "inner_abs_mass": c.stats.inner_abs_mass as i64,
+                "top_rotor": c.stats.top_rotor.map(|(u, v, j)| json!({
+                    "u": u, "v": v, "j": j,
+                })),
+                "archetype_load": c.anchors.iter().fold(
+                    [0usize; 12],
+                    |mut acc, &a| { acc[a] += 1; acc }
+                ),
+                "note": "ротор J = A − Aᵀ касты закрутит нарратив (γJ·p); метрика Ляпунова D = L·Lᵀ гасит пертурбации",
+            });
+        }
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_literary_step: создать сессию (text) или сделать один шаг
+    /// фазового обновления p_t → p_{t+1} (session + опционально
+    /// observation — эволюция замысла).
+    fn tool_literary_step(&self, args: &Value) -> Result<String, String> {
+        let session_id = args.get("session").and_then(|v| v.as_str());
+        let text = args.get("text").and_then(|v| v.as_str());
+        let observation = args.get("observation").and_then(|v| v.as_str());
+
+        let (id, arc) = match (session_id, text) {
+            (Some(id), _) => {
+                let arc = self
+                    .warm_psi
+                    .lock()
+                    .expect("poler-mcp: отравленный psi-лок")
+                    .get(id)
+                    .ok_or_else(|| {
+                        format!("сессия «{id}» не найдена (создайте: text=..., или poler_literary_eject all для очистки)")
+                    })?;
+                (id.to_string(), arc)
+            }
+            (None, Some(t)) => {
+                let params = Self::psi_params_from_args(args);
+                let constraints = Self::psi_constraints_from_args(args)?;
+                let cast = self.psi_maybe_cast(args)?;
+                let eng = LiteraryEngine::new(params, t, &constraints, cast)?;
+                let mut guard = self
+                    .warm_psi
+                    .lock()
+                    .expect("poler-mcp: отравленный psi-лок");
+                let (id, arc) = guard.insert(eng);
+                let live = guard.len();
+                let _ = live;
+                (id, arc)
+            }
+            (None, None) => {
+                return Err(
+                    "укажите text (создать сессию) либо session (продолжить существующую)"
+                        .into(),
+                );
+            }
+        };
+
+        let mut eng = arc
+            .lock()
+            .map_err(|_| "poler-mcp: сессия psi отравлена".to_string())?;
+        let t = eng.step(observation);
+        let report = json!({
+            "session": id,
+            "step": t.step,
+            "f_free": psi_round(t.f_free),
+            "epsilon": psi_round(t.epsilon),
+            "sigma_t": psi_round(t.sigma_t),
+            "resonance_norm": psi_round(t.resonance_norm),
+            "phase_inertia": psi_round(t.phase_inertia),
+            "causality_residual": psi_round(t.causality_residual),
+            "plasticity": psi_round(t.plasticity),
+            "h_psi": psi_round(t.h_psi),
+            "mode": Self::psi_mode_name(t.mode),
+            "refractions": t.refractions,
+            "note": "поле шагнуло: p_t → p_t+1; H^Ψ → 0 = когнитивный покой",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_literary_generate: полный прогон до сверхпроводимости —
+    /// либо one-shot (text), либо на резидентной сессии (session).
+    fn tool_literary_generate(&self, args: &Value) -> Result<String, String> {
+        let session_id = args.get("session").and_then(|v| v.as_str());
+        let text = args.get("text").and_then(|v| v.as_str());
+        let report = match (session_id, text) {
+            (Some(id), _) => {
+                let arc = self
+                    .warm_psi
+                    .lock()
+                    .expect("poler-mcp: отравленный psi-лок")
+                    .get(id)
+                    .ok_or_else(|| format!("сессия «{id}» не найдена"))?;
+                let mut eng = arc
+                    .lock()
+                    .map_err(|_| "poler-mcp: сессия psi отравлена".to_string())?;
+                eng.generate()
+            }
+            (None, Some(t)) => {
+                let params = Self::psi_params_from_args(args);
+                let constraints = Self::psi_constraints_from_args(args)?;
+                let cast = self.psi_maybe_cast(args)?;
+                LiteraryEngine::new(params, t, &constraints, cast)?.generate()
+            }
+            (None, None) => {
+                return Err("укажите text (one-shot) либо session (резидентная)".into());
+            }
+        };
+        let report = Self::psi_report_json(&report, session_id);
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_literary_eject: выгрузить сессию (id) или все ("all").
+    fn tool_literary_eject(&self, args: &Value) -> Result<String, String> {
+        let id = args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all");
+        let n = self
+            .warm_psi
+            .lock()
+            .expect("poler-mcp: отравленный psi-лок")
+            .eject(id);
+        let report = json!({
+            "ejected": n,
+            "requested": id,
+            "note": "латентные состояния выгружены из RAM",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// Имя режима Ψ для JSON.
+    fn psi_mode_name(m: PsiMode) -> &'static str {
+        match m {
+            PsiMode::Attraction => "attraction",
+            PsiMode::Refraction => "refraction",
+            PsiMode::ObserverKill => "observer_kill",
+            PsiMode::Superconductivity => "superconductivity",
+        }
+    }
+
+    /// NarrativeReport → JSON (телеметрия сжата до ключевых точек).
+    fn psi_report_json(r: &NarrativeReport, session: Option<&str>) -> Value {
+        let tel_cap = 12;
+        let stride = (r.telemetry.len() / tel_cap).max(1);
+        let mut timeline: Vec<Value> = r
+            .telemetry
+            .iter()
+            .step_by(stride)
+            .map(Self::psi_step_json)
+            .collect();
+        // Финальный шаг — всегда в отчёте (даже если stride его пропустил).
+        if let Some(t) = r.telemetry.last() {
+            let last_step = t.step as u64;
+            if !timeline
+                .iter()
+                .any(|x| x.get("step").and_then(|s| s.as_u64()) == Some(last_step))
+            {
+                timeline.push(Self::psi_step_json(t));
+            }
+        }
+        json!({
+            "session": session,
+            "steps": r.steps,
+            "converged": r.converged,
+            "f_final": psi_round(r.final_f),
+            "h_psi_final": psi_round(r.final_h_psi),
+            "sigma_final": psi_round(r.final_sigma),
+            "causality_clean": r.causality_clean,
+            "refractions": r.refractions,
+            "params": {
+                "dims": r.params.dims,
+                "eta": r.params.eta,
+                "eta_r": r.params.eta_r,
+                "rho": r.params.rho,
+                "kappa": r.params.kappa,
+                "gamma": r.params.gamma,
+                "lambda": r.params.lambda_rl,
+                "no_mul": r.params.no_mul,
+            },
+            "acts": r.acts.iter().map(|a| json!({
+                "steps": [a.steps.0, a.steps.1],
+                "f": [psi_round(a.f_start), psi_round(a.f_end)],
+                "dominants": a.dominants.iter().map(|d| json!({
+                    "archetype": d.name, "weight": psi_round(d.weight),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "dramatic_pairs": r.dramatic_pairs.iter().map(|p| json!({
+                "u": p.u, "v": p.v, "j": psi_round(p.j),
+                "u_archetype": p.u_archetype, "v_archetype": p.v_archetype,
+            })).collect::<Vec<_>>(),
+            "timeline": timeline,
+            "text": r.text,
+        })
+    }
+
+    /// Шаг телеметрии → компактный JSON.
+    fn psi_step_json(t: &StepTelemetry) -> Value {
+        json!({
+            "step": t.step,
+            "f": psi_round(t.f_free),
+            "epsilon": psi_round(t.epsilon),
+            "sigma": psi_round(t.sigma_t),
+            "h_psi": psi_round(t.h_psi),
+            "mode": Self::psi_mode_name(t.mode),
+        })
+    }
+
+    // -----------------------------------------------------------------
     // poler_grep: точный поиск в семантике grep (слой 0 Native Retrieval)
     // -----------------------------------------------------------------
     fn tool_grep(&self, args: &Value) -> Result<String, String> {
@@ -2437,6 +2865,108 @@ theta — порог активности. Отчёт: хронология (act
                 "sign": {"type": "string", "enum": ["all", "exc", "inh"], "default": "all"}
             },
             "required": ["neurons"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_literary_field",
+        "description": "ЛИТЕРАТУРНЫЙ ДВИГАТЕЛЬ POLER[Ψ] — анализ поля интенции (фазы ℘→O): \
+текст-замысел → инвариантный вектор Ω(o) (детерминированный FNV-хэш термов, ноль RNG) + \
+косинусная топология 12 архетипов (Кэмпбелл + канон POLER). Опционально — мушиная \
+калибровка (csr+seeds+khop): каста нейронов FLYCSR1 и её ротор J = A − Aᵀ. \
+Отчёт: термы по массе, архетипы по косинусу, F/причинность на старте, статистика касты.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Замысел: текст любого языка"},
+                "dims": {"type": "integer", "default": 64, "minimum": 16, "maximum": 256},
+                "csr": {"type": "string", "description": "FLYCSR1 .csr.zst для мушиной калибровки"},
+                "nodes": {"type": "string"},
+                "seeds": {"type": "array", "items": {"type": ["string", "integer"]}, "maxItems": 16},
+                "khop": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+                "max_cast": {"type": "integer", "default": 48, "minimum": 2, "maximum": 64},
+                "constraints": {"type": "array", "items": {"type": "object", "properties": {
+                    "i": {"type": "integer"}, "j": {"type": "integer"}, "c": {"type": "number"}
+                }}}
+            },
+            "required": ["text"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_literary_step",
+        "description": "ПОЛИГОН ФАЗЫ: один шаг канонического уравнения POLER[Ψ] \
+p_{t+1} = p_t − η·Π_Λ(∇F + D·p + γJ·p) + η_r·Π_Λ(κ·(echo − p)). text — создать сессию \
+(мушиная калибровка: csr/seeds/khop), session — шагнуть существующую (observation — \
+эволюция замысла). Телеметрия шага: F, ε, Σ(t), H^Ψ, причинность, режим (attraction / \
+refraction / observer_kill / superconductivity). Сессии резидентны в RAM (LRU 8).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Замысел — создаёт новую сессию"},
+                "session": {"type": "string", "description": "id существующей сессии"},
+                "observation": {"type": "string", "description": "Новый замысел — эволюция Ω(o)"},
+                "dims": {"type": "integer", "default": 64, "minimum": 16, "maximum": 256},
+                "steps": {"type": "integer", "default": 48},
+                "eta": {"type": "number", "default": 0.1},
+                "eta_r": {"type": "number", "default": 0.05},
+                "rho": {"type": "number", "default": 0.9},
+                "kappa": {"type": "number", "default": 1.2},
+                "gamma": {"type": "number", "default": 1.0},
+                "lambda": {"type": "number", "default": 0.01},
+                "no_mul": {"type": "boolean", "default": false, "description": "Trit5-квантование p_t (No-Mul, SIMD)"},
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "seeds": {"type": "array", "items": {"type": ["string", "integer"]}, "maxItems": 16},
+                "khop": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+                "max_cast": {"type": "integer", "default": 48, "minimum": 2, "maximum": 64},
+                "constraints": {"type": "array", "items": {"type": "object", "properties": {
+                    "i": {"type": "integer"}, "j": {"type": "integer"}, "c": {"type": "number"}
+                }}}
+            }
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_literary_generate",
+        "description": "ГЕНЕРАЦИЯ НАРРАТИВА: полный прогон POLER[Ψ] до сверхпроводимости \
+смысла (H^Ψ = 0) либо до лимита шагов. text — one-shot, session — на резидентной сессии. \
+Отчёт: три акта (доминанты-архетипы, кривая F), драматургические пары (роторные пары \
+мухи: кто доминирует над кем), сжатая телеметрия и детерминированный текст-разметка. \
+Без мухи — чистая физика текста (сходимость); с мухой (csr) — предельный цикл: живой \
+мозг не даёт нарративу замереть.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "session": {"type": "string"},
+                "dims": {"type": "integer", "default": 64, "minimum": 16, "maximum": 256},
+                "steps": {"type": "integer", "default": 48, "maximum": 512},
+                "eta": {"type": "number", "default": 0.1},
+                "gamma": {"type": "number", "default": 1.0},
+                "no_mul": {"type": "boolean", "default": false},
+                "csr": {"type": "string"},
+                "nodes": {"type": "string"},
+                "seeds": {"type": "array", "items": {"type": ["string", "integer"]}, "maxItems": 16},
+                "khop": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+                "max_cast": {"type": "integer", "default": 48, "minimum": 2, "maximum": 64},
+                "constraints": {"type": "array", "items": {"type": "object", "properties": {
+                    "i": {"type": "integer"}, "j": {"type": "integer"}, "c": {"type": "number"}
+                }}}
+            }
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_literary_eject",
+        "description": "Выгрузить резидентные сессии POLER[Ψ] из RAM: конкретную (session=id) \
+или все (по умолчанию). Латентные состояния, эхо и мушиные касты освобождаются; следующий \
+poler_literary_step с text создаст сессию заново.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "id сессии либо all (умолчание)"}
+            }
         }
     }));
 
@@ -3309,5 +3839,222 @@ mod fly_family_tests {
         let srv2 = server();
         let resp = call(&srv2, "poler_fly_propagate", json!({"neurons": [0]}));
         assert!(text_of(&resp).contains("коннектом не загружен"));
+    }
+}
+
+#[cfg(test)]
+mod psi_family_tests {
+    use super::*;
+
+    fn server() -> McpServer {
+        McpServer::new(9222, 10, PathBuf::from("/nonexistent-poler-psi-test.db"))
+    }
+
+    fn call(srv: &McpServer, name: &str, arguments: Value) -> Value {
+        srv.dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .expect("dispatch не падает")
+    }
+
+    fn text_of(resp: &Value) -> String {
+        resp.pointer("/result/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn json_of(resp: &Value) -> Value {
+        let text = text_of(resp);
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("не JSON ({e}): {text}"))
+    }
+
+    fn core_csr() -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/flywire-connectome/flywire_v783_core.csr.zst");
+        assert!(p.exists(), "артефакт {} не найден", p.display());
+        p.display().to_string()
+    }
+
+    const INTENT: &str =
+        "герой идёт в поход против тьмы и бездны, наставник даёт совет и знание";
+
+    #[test]
+    fn manifest_contains_psi_family() {
+        let m = tools_manifest();
+        let names: Vec<&str> =
+            m.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
+        for expected in [
+            "poler_literary_field",
+            "poler_literary_step",
+            "poler_literary_generate",
+            "poler_literary_eject",
+        ] {
+            assert!(names.contains(&expected), "нет {expected}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn is_psi_tool_routes_family_only() {
+        for name in ["poler_literary_step", "poler_literary_generate"] {
+            assert!(is_psi_tool(&json!({
+                "method": "tools/call", "params": {"name": name, "arguments": {}}
+            })));
+        }
+        assert!(!is_psi_tool(&json!({
+            "method": "tools/call", "params": {"name": "poler_grep", "arguments": {}}
+        })));
+        assert!(!is_psi_tool(&json!({"method": "tools/list"})));
+    }
+
+    // Полный жизненный цикл сессии: создать → шагнуть (эволюция
+    // замысла) → сгенерировать → eject → шагнуть в пустоту (отказ).
+    #[test]
+    fn psi_session_lifecycle() {
+        let srv = server();
+        // 1) анализ поля: архетипы ранжированы, термы на месте
+        let f = json_of(&call(&srv, "poler_literary_field", json!({"text": INTENT})));
+        assert_eq!(f["dims"], json!(64));
+        assert!(f["tokens"].as_u64().unwrap() >= 10);
+        assert!(f["archetypes"].as_array().unwrap().len() == 6);
+        assert!(f["f_initial"].as_f64().unwrap() > 0.9, "F₀ ≈ ‖o‖² = 1");
+
+        // 2) создать сессию и шагнуть (запас шагов: после смены
+        // замысла траектории нужно время на пере-притяжение)
+        let s1 = json_of(&call(
+            &srv,
+            "poler_literary_step",
+            json!({"text": INTENT, "steps": 128}),
+        ));
+        let id = s1["session"].as_str().expect("session id").to_string();
+        assert_eq!(s1["step"], json!(1));
+        assert!(s1["f_free"].as_f64().unwrap() < 1.0, "первый шаг уже снижает F");
+
+        // 3) эволюция замысла: observation меняет Ω(o)
+        let s2 = json_of(&call(
+            &srv,
+            "poler_literary_step",
+            json!({"session": id, "observation": "тишина зимнего сада и покой"}),
+        ));
+        assert_eq!(s2["step"], json!(2));
+        assert_eq!(s2["session"], json!(id));
+
+        // 4) генерация на резидентной сессии — сходится
+        let g = json_of(&call(&srv, "poler_literary_generate", json!({"session": id})));
+        assert_eq!(g["converged"], json!(true), "чистая физика текста сходится");
+        assert!(g["f_final"].as_f64().unwrap() < 1e-3);
+        assert_eq!(g["causality_clean"], json!(true));
+        assert!(g["acts"].as_array().unwrap().len() == 3);
+        assert!(g["text"].as_str().unwrap().contains("СВЕРХПРОВОДИМОСТЬ"));
+
+        // 5) eject конкретной сессии
+        let e = json_of(&call(&srv, "poler_literary_eject", json!({"session": id})));
+        assert_eq!(e["ejected"], json!(1));
+        // шаг в выгруженную сессию — протокольная ошибка
+        let resp = call(&srv, "poler_literary_step", json!({"session": id}));
+        assert!(
+            resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "сессия обязана исчезнуть"
+        );
+    }
+
+    // Мушиная калибровка через один и тот же тёплый коннектом:
+    // field → generate с csr (предельный цикл!) → eject all.
+    #[test]
+    fn psi_fly_calibrated_golden() {
+        let srv = server();
+        // 1) field с мушиной калибровкой: каста от нейрона 0
+        let f = json_of(&call(
+            &srv,
+            "poler_literary_field",
+            json!({"text": INTENT, "csr": core_csr()}),
+        ));
+        assert_eq!(f["fly"]["members"], json!(48), "каста золото L1");
+        assert_eq!(f["fly"]["reached"], json!(457));
+        assert_eq!(f["fly"]["inner_edges"], json!(252));
+
+        // 2) generate с мушиной калибровкой: предельный цикл
+        let g = json_of(&call(
+            &srv,
+            "poler_literary_generate",
+            json!({"text": INTENT, "csr": core_csr()}),
+        ));
+        assert_eq!(g["converged"], json!(false), "муха не даёт замереть");
+        let ff = g["f_final"].as_f64().unwrap();
+        assert!((ff - 0.2572).abs() < 5e-3, "плато цикла: {ff}");
+        assert_eq!(g["causality_clean"], json!(true));
+        // драматургические пары мухи
+        let pairs = g["dramatic_pairs"].as_array().expect("пары");
+        assert!(!pairs.is_empty());
+        assert_eq!(pairs[0]["u"], json!(13_609));
+        assert_eq!(pairs[0]["v"], json!(41_414));
+        // коннектом остался тёплым (переиспользование WarmFly)
+        let summary = json_of(&call(&srv, "poler_fly", json!({})));
+        assert_eq!(summary["n_nodes"], json!(138_639), "муха всё ещё в RAM");
+
+        // 3) чистка: сессий нет, но коннектом выгружаем отдельно
+        let e = json_of(&call(&srv, "poler_literary_eject", json!({})));
+        assert_eq!(e["ejected"], json!(0), "one-shot сессий не было");
+        let fe = json_of(&call(&srv, "poler_fly", json!({"action": "eject"})));
+        assert_eq!(fe["unloaded"], json!(true));
+    }
+
+    // No-Mul сессия: Trit5-квантование на резидентном полигоне.
+    #[test]
+    fn psi_no_mul_session_and_guards() {
+        let srv = server();
+        let s = json_of(&call(
+            &srv,
+            "poler_literary_step",
+            json!({"text": "бунт против шторма и свобода огня", "no_mul": true}),
+        ));
+        let id = s["session"].as_str().unwrap().to_string();
+        assert_eq!(s["step"], json!(1));
+        // гварды: без text и session — ошибка
+        let resp = call(&srv, "poler_literary_step", json!({}));
+        assert!(resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false));
+        // ограничение вне диапазона — ошибка
+        let resp = call(
+            &srv,
+            "poler_literary_generate",
+            json!({"text": "текст", "constraints": [{"i": 0, "j": 999}]}),
+        );
+        assert!(resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false));
+        // session и text вместе — session приоритетен, не падаем
+        let s2 = json_of(&call(
+            &srv,
+            "poler_literary_step",
+            json!({"session": id, "text": "ignored"}),
+        ));
+        assert_eq!(s2["session"], json!(id));
+        assert_eq!(s2["step"], json!(2));
+        let _ = call(&srv, "poler_literary_eject", json!({"session": "all"}));
+    }
+
+    // LRU: 9+ сессий вытесняют старейшую.
+    #[test]
+    fn psi_sessions_lru_cap() {
+        let srv = server();
+        let mut first_id = String::new();
+        for i in 0..10 {
+            let s = json_of(&call(
+                &srv,
+                "poler_literary_step",
+                json!({"text": format!("замысел номер {i}")}),
+            ));
+            if i == 0 {
+                first_id = s["session"].as_str().unwrap().to_string();
+            }
+        }
+        // первая сессия вытеснена (лимит 8)
+        let resp = call(&srv, "poler_literary_step", json!({"session": first_id}));
+        assert!(
+            resp.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "LRU обязан вытеснить старейшую"
+        );
+        // но 9-я и 10-я живы
+        let e = json_of(&call(&srv, "poler_literary_eject", json!({"session": "all"})));
+        assert_eq!(e["ejected"], json!(8));
     }
 }

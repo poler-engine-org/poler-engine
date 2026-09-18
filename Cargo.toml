@@ -28,7 +28,7 @@ authors = ["Kotokvit <213886740+Kotokvit@users.noreply.github.com>"]
 
 [package]
 name = "poler-engine"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]

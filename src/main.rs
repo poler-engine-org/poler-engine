@@ -761,6 +761,95 @@ struct Cli {
     #[arg(long = "connectome-json", requires = "connectome")]
     connectome_json: bool,
 
+    // ── L1/v0.34.0: Литературный Двигатель POLER[Ψ] ────────────────
+
+    /// Анализ поля интенции: замысел → Ω(o) + архетипы (фазы ℘→O).
+    #[arg(
+        long = "literary-field",
+        value_name = "TEXT",
+        conflicts_with_all = [
+            "literary_generate", "grep", "chunk", "web", "crawl", "web_search",
+            "web_stats", "mcp", "mcp_http", "shell", "tui", "impact",
+            "browser_index", "web_lens", "web_lens_install", "archive_list",
+            "connectome"
+        ]
+    )]
+    literary_field: Option<String>,
+
+    /// Генерация нарратива: полный прогон до H^Ψ = 0 (+ текст-разметка).
+    #[arg(
+        long = "literary-generate",
+        value_name = "TEXT",
+        conflicts_with_all = [
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "archive_list", "connectome"
+        ]
+    )]
+    literary_generate: Option<String>,
+
+    /// Коннектом FLYCSR1 — мушиная калибровка двигателя (каста от семян:
+    /// ротор J = A − Aᵀ закручивает нарратив, D = L·Lᵀ гасит пертурбации).
+    #[arg(long = "literary-csr", value_name = "CSR_ZST")]
+    literary_csr: Option<PathBuf>,
+
+    /// Таблица root_id для --literary-csr (семена по root_id).
+    #[arg(long = "literary-nodes", value_name = "NODES_BIN", requires = "literary_csr")]
+    literary_nodes: Option<PathBuf>,
+
+    /// Семена касты, csv: индексы или root_id [default: 0].
+    #[arg(long = "literary-seeds", value_name = "A,B,...", default_value = "0")]
+    literary_seeds: String,
+
+    /// K-hop BFS касты [default: 2].
+    #[arg(long = "literary-khop", value_name = "N", default_value_t = 2)]
+    literary_khop: usize,
+
+    /// Максимум нейронов в касте [default: 48, max 64].
+    #[arg(long = "literary-max-cast", value_name = "N", default_value_t = 48)]
+    literary_max_cast: usize,
+
+    /// Осей фазового пространства [default: 64].
+    #[arg(long = "literary-dims", value_name = "N", default_value_t = 64)]
+    literary_dims: usize,
+
+    /// Шагов генерации --literary-generate [default: 48].
+    #[arg(long = "literary-steps", value_name = "N", default_value_t = 48)]
+    literary_steps: usize,
+
+    /// η — шаг интегратора [default: 0.1].
+    #[arg(long = "literary-eta", value_name = "F", default_value_t = 0.1)]
+    literary_eta: f64,
+
+    /// η_r — резонансный шаг [default: 0.05].
+    #[arg(long = "literary-eta-r", value_name = "F", default_value_t = 0.05)]
+    literary_eta_r: f64,
+
+    /// ρ — затухание темпорального эха R[n] [default: 0.9].
+    #[arg(long = "literary-rho", value_name = "F", default_value_t = 0.9)]
+    literary_rho: f64,
+
+    /// κ — масштаб энергии значимости ε [default: 1.2].
+    #[arg(long = "literary-kappa", value_name = "F", default_value_t = 1.2)]
+    literary_kappa: f64,
+
+    /// γ — баланс циркуляции J (мушиный ротор) [default: 1.0].
+    #[arg(long = "literary-gamma", value_name = "F", default_value_t = 1.0)]
+    literary_gamma: f64,
+
+    /// λ — вес логической регуляризации [default: 0.01].
+    #[arg(long = "literary-lambda", value_name = "F", default_value_t = 0.01)]
+    literary_lambda: f64,
+
+    /// No-Mul: Trit5-квантование латентного состояния p_t ({−1,0,+1},
+    /// SIMD-скалярные произведения без f32-математики).
+    #[arg(long = "literary-no-mul", default_value_t = false)]
+    literary_no_mul: bool,
+
+    /// JSON-вывод режима --literary-* (для агентов).
+    #[arg(long = "literary-json", default_value_t = false)]
+    literary_json: bool,
+
     /// Watcher-режим: инкрементальный рескан по mtime/size.
     #[arg(long)]
     watch: bool,
@@ -1170,6 +1259,11 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- v0.30.0: Коннектом FLYCSR1 — мозг мухи как матрица A ----------
     if let Some(csr) = cli.connectome.clone() {
         return ExitCode::from(run_connectome(&cli, &csr) as u8);
+    }
+
+    // ---------- L1/v0.34.0: Литературный Двигатель POLER[Ψ] ----------
+    if cli.literary_field.is_some() || cli.literary_generate.is_some() {
+        return ExitCode::from(run_literary(&cli) as u8);
     }
 
     // ---------- v0.20.0: Native Retrieval — grep-режим (слой 0) ----------
@@ -4275,5 +4369,222 @@ fn run_ner(what: &str, cli: &Cli) -> i32 {
     if entities.len() > 20 {
         println!("  … и ещё {}", entities.len() - 20);
     }
+    0
+}
+
+// ══════════════════════════════════════════════════════════════════
+// L1/v0.34.0: Литературный Двигатель POLER[Ψ]
+// ══════════════════════════════════════════════════════════════════
+
+/// Режим CLI Литературного Двигателя.
+fn run_literary(cli: &Cli) -> i32 {
+    use poler_engine::literary as lit;
+
+    // Гиперпараметры из флагов.
+    let params = lit::LiteraryParams {
+        eta: cli.literary_eta as f32,
+        eta_r: cli.literary_eta_r as f32,
+        rho: cli.literary_rho as f32,
+        kappa: cli.literary_kappa as f32,
+        gamma: cli.literary_gamma as f32,
+        lambda_rl: cli.literary_lambda as f32,
+        dims: cli.literary_dims,
+        max_steps: cli.literary_steps,
+        no_mul: cli.literary_no_mul,
+        ..Default::default()
+    };
+
+    // Мушиная калибровка: коннектом + семена → каста.
+    let cast = match &cli.literary_csr {
+        Some(csr) => {
+            let t0 = std::time::Instant::now();
+            let con = match poler_engine::graph::connectome::Connectome::load(csr) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("poler-literary: {e}");
+                    return 1;
+                }
+            };
+            let nodes = cli
+                .literary_nodes
+                .as_ref()
+                .map(|p| match poler_engine::graph::connectome::ConnectomeNodes::load(p) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("poler-literary: {e}");
+                        std::process::exit(1);
+                    }
+                });
+            // Резолв семян: индекс либо root_id.
+            let mut seeds = Vec::new();
+            for spec in cli.literary_seeds.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let resolved = spec
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&i| i < con.n_nodes())
+                    .or_else(|| {
+                        nodes
+                            .as_ref()
+                            .and_then(|n| spec.parse::<u64>().ok().and_then(|r| n.idx_of(r)))
+                    });
+                match resolved {
+                    Some(i) => seeds.push(i),
+                    None => {
+                        eprintln!("poler-literary: нейрон-семя «{spec}» не найден");
+                        return 1;
+                    }
+                }
+            }
+            if seeds.is_empty() {
+                eprintln!("poler-literary: семена пусты (--literary-seeds)");
+                return 1;
+            }
+            match lit::flybridge::build_cast(&con, &seeds, cli.literary_khop, cli.literary_max_cast)
+            {
+                Ok(c) => {
+                    eprintln!(
+                        "poler-literary: каста мухи — {} нейронов (BFS достиг {}), {} внутренних \
+                         рёбер, масса {}, за {} мс",
+                        c.members.len(),
+                        c.stats.reached,
+                        c.stats.inner_edges,
+                        c.stats.inner_abs_mass as u64,
+                        t0.elapsed().as_millis()
+                    );
+                    Some(c)
+                }
+                Err(e) => {
+                    eprintln!("poler-literary: {e}");
+                    return 1;
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mode = if cli.literary_field.is_some() {
+        "field"
+    } else {
+        "generate"
+    };
+    let text = cli
+        .literary_field
+        .clone()
+        .or_else(|| cli.literary_generate.clone())
+        .expect("режим literary проверен выше");
+
+    // ── Режим: анализ поля (℘→O) ────────────────────────────────────
+    if mode == "field" {
+        let eng = match lit::LiteraryEngine::new(params, &text, &[], cast) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("poler-literary: {e}");
+                return 1;
+            }
+        };
+        let top = lit::qualia::cosine_topology(&eng.field);
+        if cli.literary_json {
+            let mut report = serde_json::json!({
+                "mode": "field",
+                "dims": eng.params.dims,
+                "tokens": eng.field.n_tokens,
+                "terms": eng.field.n_terms,
+                "intent_terms": eng.field.term_mass.iter().map(|(t, w)| serde_json::json!({
+                    "term": t, "mass": (w * 1e4).round() / 1e4,
+                })).collect::<Vec<_>>(),
+                "archetypes": top.iter().take(6).map(|&(i, w)| serde_json::json!({
+                    "name": lit::qualia::archetype_name(i),
+                    "cosine": (w * 1e4).round() / 1e4,
+                })).collect::<Vec<_>>(),
+                "f_initial": (eng.free_energy() * 1e6).round() / 1e6,
+            });
+            if let Some(c) = &eng.cast {
+                report["fly"] = serde_json::json!({
+                    "members": c.members.len(),
+                    "reached": c.stats.reached,
+                    "inner_edges": c.stats.inner_edges,
+                    "inner_abs_mass": c.stats.inner_abs_mass as i64,
+                    "top_rotor": c.stats.top_rotor,
+                });
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+            return 0;
+        }
+        println!("ПОЛЕ ЗАМЫСЛА (℘→O)");
+        println!(
+            "  Токенов: {}, уникальных термов: {}, осей: {}",
+            eng.field.n_tokens, eng.field.n_terms, eng.params.dims
+        );
+        println!("  Инвариант (топ термов):");
+        for (t, w) in eng.field.term_mass.iter().take(8) {
+            println!("    {t:<16} {w:.3}", w = *w as f64);
+        }
+        println!("  Архетипическая топология:");
+        for &(i, w) in top.iter().take(6) {
+            println!("    {:<22} {:>+7.4}", lit::qualia::archetype_name(i), w);
+        }
+        println!(
+            "  F₀ = {:.4} (‖Ω(o)‖² = 1), причинный замок: p₀ − p₁ = 0",
+            eng.free_energy()
+        );
+        if let Some(c) = &eng.cast {
+            println!(
+                "  МУХА: каста {} нейронов, {} внутренних рёбер, топ-ротор {:?}",
+                c.members.len(),
+                c.stats.inner_edges,
+                c.stats.top_rotor
+            );
+        }
+        return 0;
+    }
+
+    // ── Режим: генерация нарратива ─────────────────────────────────
+    let mut eng = match lit::LiteraryEngine::new(params, &text, &[], cast) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("poler-literary: {e}");
+            return 1;
+        }
+    };
+    let t0 = std::time::Instant::now();
+    let report = eng.generate();
+    if cli.literary_json {
+        let mut jr = serde_json::json!({
+            "mode": "generate",
+            "steps": report.steps,
+            "converged": report.converged,
+            "f_final": (report.final_f * 1e6).round() / 1e6,
+            "h_psi_final": (report.final_h_psi * 1e6).round() / 1e6,
+            "causality_clean": report.causality_clean,
+            "refractions": report.refractions,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
+            "acts": report.acts.iter().map(|a| serde_json::json!({
+                "steps": [a.steps.0, a.steps.1],
+                "f": [(a.f_start * 1e4).round() / 1e4, (a.f_end * 1e4).round() / 1e4],
+                "dominants": a.dominants.iter().map(|d| serde_json::json!({
+                    "archetype": d.name, "weight": (d.weight * 1e4).round() / 1e4,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "dramatic_pairs": report.dramatic_pairs.iter().map(|p| serde_json::json!({
+                "u": p.u, "v": p.v, "j": (p.j * 1e4).round() / 1e4,
+                "u_archetype": p.u_archetype, "v_archetype": p.v_archetype,
+            })).collect::<Vec<_>>(),
+        });
+        jr["text"] = serde_json::json!(report.text);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&jr).unwrap_or_else(|_| "{}".into())
+        );
+        return 0;
+    }
+    println!("{}", report.text);
+    println!(
+        "  Время: {} мс ({} шагов)",
+        t0.elapsed().as_millis(),
+        report.steps
+    );
     0
 }
