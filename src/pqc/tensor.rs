@@ -676,23 +676,46 @@ pub fn argmax(x: &[f32]) -> usize {
 /// Таблицы RoPE: предвычисленные cos/sin на каждую позицию и пару
 /// координат. Никаких тяжёлых тригонометрических вызовов в рантайме —
 /// только табличные lookups (быстрее CORDIC, требование Part F).
+///
+/// Поддерживает частичный (partial/half) rotary: `rot_dim ≤ head_dim` —
+/// поворачиваются только первые `rot_dim` измерений головы, хвост
+/// проходит напрямую (семантика ChatGLM2/3: `rot_dim = kv_channels/2`).
 pub struct RopeTable {
     head_dim: usize,
+    /// Сколько первых измерений головы вращается (≤ head_dim, чётное).
+    rot_dim: usize,
     max_pos: usize,
     cos: Vec<f32>,
     sin: Vec<f32>,
 }
 
 impl RopeTable {
-    /// Частоты `inv_freq[i] = 10000^(−2i/d)`, угол = pos · inv_freq[i].
+    /// Полный rotary: частоты `inv_freq[i] = 10000^(−2i/d)`, угол = pos · inv_freq[i].
     pub fn new(head_dim: usize, max_pos: usize) -> Self {
+        Self::new_partial(head_dim, head_dim, max_pos)
+    }
+
+    /// Частичный (half) rotary — семантика ChatGLM2/3:
+    /// поворачиваются только первые `rot_dim` измерений из `head_dim`,
+    /// частоты считаются по `rot_dim` (как будто rotary-пространство
+    /// у́же головы): `inv_freq[i] = 10000^(−2i/rot_dim)`.
+    ///
+    /// В reference `modeling_chatglm.py`: `rotary_dim = kv_channels`,
+    /// `RotaryEmbedding(rotary_dim // 2)` → применяемый rot_dim =
+    /// `kv_channels/2`, а `x[..., rot_dim:]` проходит без поворота.
+    pub fn new_partial(head_dim: usize, rot_dim: usize, max_pos: usize) -> Self {
         debug_assert!(head_dim % 2 == 0, "RoPE: head_dim должен быть чётным");
-        let pairs = head_dim / 2;
+        debug_assert!(rot_dim % 2 == 0, "RoPE: rot_dim должен быть чётным");
+        debug_assert!(
+            rot_dim <= head_dim,
+            "RoPE: rot_dim {rot_dim} > head_dim {head_dim}"
+        );
+        let pairs = rot_dim / 2;
         let mut cos = vec![0f32; max_pos * pairs];
         let mut sin = vec![0f32; max_pos * pairs];
         for pos in 0..max_pos {
             for i in 0..pairs {
-                let freq = (10000f64).powf(-(2.0 * i as f64) / head_dim as f64);
+                let freq = (10000f64).powf(-(2.0 * i as f64) / rot_dim as f64);
                 let angle = pos as f64 * freq;
                 cos[pos * pairs + i] = angle.cos() as f32;
                 sin[pos * pairs + i] = angle.sin() as f32;
@@ -700,6 +723,7 @@ impl RopeTable {
         }
         Self {
             head_dim,
+            rot_dim,
             max_pos,
             cos,
             sin,
@@ -708,6 +732,11 @@ impl RopeTable {
 
     pub fn head_dim(&self) -> usize {
         self.head_dim
+    }
+
+    /// Вращаемая часть головы (первые rot_dim измерений).
+    pub fn rot_dim(&self) -> usize {
+        self.rot_dim
     }
 
     pub fn max_pos(&self) -> usize {
@@ -728,7 +757,7 @@ impl RopeTable {
 
     fn rotate_signed(&self, x: &mut [f32], pos: usize, sign: f32) {
         debug_assert_eq!(x.len(), self.head_dim, "RoPE: длина не равна head_dim");
-        let pairs = self.head_dim / 2;
+        let pairs = self.rot_dim / 2;
         for i in 0..pairs {
             let c = self.cos[pos * pairs + i];
             let s = sign * self.sin[pos * pairs + i];
@@ -737,6 +766,7 @@ impl RopeTable {
             x[2 * i] = a * c - b * s;
             x[2 * i + 1] = a * s + b * c;
         }
+        // Хвост [rot_dim..head_dim] — pass-through (ChatGLM half-rotary).
     }
 }
 
@@ -988,6 +1018,63 @@ mod tests {
         rope.rotate(&mut y, 17);
         let norm2 = y.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - norm2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rope_half_rotary_chatglm_semantics() {
+        // Семантика ChatGLM3: rot_dim = 64 из head_dim = 128.
+        // 1) хвост [64..128] — pass-through (не меняется);
+        // 2) первые 64 dims: interleaved-пары (x[2i], x[2i+1]) вращаются
+        //    комплексным умножением на e^{i·pos·θ_i}, θ_i = 10000^(-2i/64);
+        // 3) roundtrip rotate+rotate_inv = тождество;
+        // 4) new_partial(d, d, m) == new(d, m) — полная обратная совместимость.
+        let rope = RopeTable::new_partial(128, 64, 48);
+        assert_eq!(rope.head_dim(), 128);
+        assert_eq!(rope.rot_dim(), 64);
+
+        let x: Vec<f32> = (0..128u32).map(|i| ((i as f32) * 0.137 - 8.7).sin()).collect();
+        let pos = 17usize;
+        let mut y = x.clone();
+        rope.rotate(&mut y, pos);
+
+        // 1) Хвост не тронут — бит-в-бит.
+        for i in 64..128 {
+            assert_eq!(y[i].to_bits(), x[i].to_bits(), "pass-through нарушен: i={i}");
+        }
+        // 2) Формула reference по парам.
+        for i in 0..32usize {
+            let theta = (10000f64).powf(-(2.0 * i as f64) / 64.0) * pos as f64;
+            let (c, s) = (theta.cos() as f32, theta.sin() as f32);
+            let (a, b) = (x[2 * i], x[2 * i + 1]);
+            let expect0 = a * c - b * s;
+            let expect1 = a * s + b * c;
+            assert!(
+                (y[2 * i] - expect0).abs() < 1e-5,
+                "пара {i}: {} vs {expect0}",
+                y[2 * i]
+            );
+            assert!(
+                (y[2 * i + 1] - expect1).abs() < 1e-5,
+                "пара {i}: {} vs {expect1}",
+                y[2 * i + 1]
+            );
+        }
+        // 3) Roundtrip.
+        let mut z = y.clone();
+        rope.rotate_inv(&mut z, pos);
+        for i in 0..128 {
+            assert!((z[i] - x[i]).abs() < 1e-5, "roundtrip: i={i}");
+        }
+        // 4) Полный поворот через new_partial == new (частоты и геометрия).
+        let full_a = RopeTable::new(16, 24);
+        let full_b = RopeTable::new_partial(16, 16, 24);
+        let v: Vec<f32> = (0..16u32).map(|i| (i as f32) * 0.11 - 0.8).collect();
+        let (mut a, mut b) = (v.clone(), v.clone());
+        full_a.rotate(&mut a, 13);
+        full_b.rotate(&mut b, 13);
+        for i in 0..16 {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "new != new_partial(d,d)");
+        }
     }
 
     #[test]

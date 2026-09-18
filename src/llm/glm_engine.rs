@@ -286,7 +286,11 @@ impl GlmModel {
             Some(t) => Some(crate::pqc::tokenizer::UnigramTokenizer::parse(t.raw_bytes()?)?),
             None => None,
         };
-        let rope = tensor::RopeTable::new(head_dim, h.max_pos);
+        // ChatGLM3 — half-rotary: вращаются только первые 64 из 128
+        // измерений головы (reference: rotary_dim = kv_channels,
+        // RotaryEmbedding(rotary_dim // 2) → apply rot_dim = 64;
+        // частоты 10000^(-2i/64), хвост — pass-through).
+        let rope = tensor::RopeTable::new_partial(head_dim, head_dim / 2, h.max_pos);
         Ok(Self {
             hidden: h.hidden,
             heads: h.heads,
@@ -804,7 +808,8 @@ pub fn reference_glm_logits(w: &Fp32Glm, ids: &[u32]) -> Vec<Vec<f32>> {
     let heads = w.heads;
     let kv_heads = w.kv_heads;
     let seq = ids.len();
-    let rope = tensor::RopeTable::new(hd, seq.max(1));
+    // Half-rotary ChatGLM3: первые 64 из 128 dims (см. конструктор движка).
+    let rope = tensor::RopeTable::new_partial(hd, hd / 2, seq.max(1));
     // Скрытые состояния всех позиций.
     let mut hs: Vec<Vec<f32>> = ids
         .iter()
