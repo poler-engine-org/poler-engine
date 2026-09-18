@@ -52,6 +52,7 @@ pub mod bench;
 pub mod compression;
 pub mod crypto;
 pub mod engine;
+pub mod universal_archetype_asm;
 pub mod universal_letters;
 
 /// E1/v0.31.0: идеальный исполнитель команд — Zig-ядро
