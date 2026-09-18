@@ -254,6 +254,10 @@ pub struct GlmModel {
     max_pos: usize,
     experts: usize,
     top_k: usize,
+    /// ChatGLM-класс: scores/(layer_number·√hd), слои с 1.
+    qk_layer_scaling: bool,
+    /// eps RMSNorm из заголовка (ChatGLM3: 1e-5).
+    rms_eps: f32,
     rope: tensor::RopeTable,
 }
 
@@ -294,6 +298,8 @@ impl GlmModel {
             max_pos: h.max_pos,
             experts: h.experts,
             top_k: h.top_k.max(1),
+            qk_layer_scaling: h.qk_layer_scaling(),
+            rms_eps: h.rms_eps,
             rope,
             tokenizer,
             view,
@@ -355,14 +361,22 @@ impl GlmModel {
         let mut ctx = vec![0f32; q_dim];
         let mut attn_out = vec![0f32; h];
         let mut scores = vec![0f32; pos + 1];
-        let scale = 1.0 / (hd as f32).sqrt();
 
         for layer in 0..self.layers {
             let p = |s: &str| format!("layers.{layer}.{s}");
 
+            // ChatGLM-класс (apply_query_key_layer_scaling): дополнительно
+            // делится на номер слоя (нумерация с 1) — иначе поздние слои
+            // перегревают softmax.
+            let scale = if self.qk_layer_scaling {
+                1.0 / ((hd as f32).sqrt() * (layer as f32 + 1.0))
+            } else {
+                1.0 / (hd as f32).sqrt()
+            };
+
             // --- Внимание (pre-norm) ---
             let attn_norm = self.view.require(&p("attn_norm_gamma"))?;
-            tensor::rms_norm(&x, attn_norm.f32s()?, 1e-6, &mut hn);
+            tensor::rms_norm(&x, attn_norm.f32s()?, self.rms_eps, &mut hn);
 
             let q_w = self.view.tensor(&p("attn_q_w"))
                 .or_else(|| self.view.tensor(&p("q_proj_w")))
@@ -378,6 +392,27 @@ impl GlmModel {
             k_w.matvec(&hn, &mut k)?;
             v_w.matvec(&hn, &mut v)?;
 
+            // ChatGLM3 (add_qkv_bias): bias QKV-проекции хранится одним
+            // f32-тензором [q_dim + 2·kv_dim] и добавляется посрезово.
+            if let Some(b) = self.view.tensor(&p("qkv_b")) {
+                let bf = b.f32s()?;
+                if bf.len() != q_dim + 2 * kv_dim {
+                    return Err(format!(
+                        "тензор {}: длина {} != q_dim+2·kv_dim = {}",
+                        p("qkv_b"),
+                        bf.len(),
+                        q_dim + 2 * kv_dim
+                    ));
+                }
+                for i in 0..q_dim {
+                    q[i] += bf[i];
+                }
+                for i in 0..kv_dim {
+                    k[i] += bf[q_dim + i];
+                    v[i] += bf[q_dim + kv_dim + i];
+                }
+            }
+
             // RoPE: каждую q-голову и kv-голову по позиции pos.
             for head in 0..self.heads {
                 self.rope.rotate(&mut q[head * hd..(head + 1) * hd], pos);
@@ -387,9 +422,13 @@ impl GlmModel {
             }
             kv.append(layer, pos, &k, &v);
 
-            // MQA/GQA: q-голова head читает kv-голову head % kv_heads.
+            // GQA-раскладка HF/ChatGLM: q-головы сгруппированы БЛОКАМИ
+            // по heads/kv_heads (expand+view в modeling_chatglm: головы
+            // 0..n_rep-1 → группа 0), а не чередованием. MQA/MHA
+            // вырождаются в head и 0 соответственно.
+            let n_rep = self.heads / self.kv_heads;
             for head in 0..self.heads {
-                let kv_head = head % self.kv_heads;
+                let kv_head = head / n_rep;
                 let qs = &q[head * hd..(head + 1) * hd];
                 for j in 0..=pos {
                     scores[j] = tensor::dot_f32(qs, kv.k_at(layer, j, kv_head)) * scale;
@@ -414,7 +453,7 @@ impl GlmModel {
 
             // --- FFN (pre-norm): SwiGLU или MoE ---
             let ffn_norm = self.view.require(&p("ffn_norm_gamma"))?;
-            tensor::rms_norm(&x, ffn_norm.f32s()?, 1e-6, &mut hn);
+            tensor::rms_norm(&x, ffn_norm.f32s()?, self.rms_eps, &mut hn);
 
             if self.experts > 0 {
                 // Роутер: гейт по hn → топ-k экспертов → взвешенная сумма.
@@ -459,7 +498,7 @@ impl GlmModel {
 
         // --- Финальная норма + LM head ---
         let final_norm = self.view.require("final_norm_gamma")?;
-        tensor::rms_norm(&x, final_norm.f32s()?, 1e-6, &mut hn);
+        tensor::rms_norm(&x, final_norm.f32s()?, self.rms_eps, &mut hn);
         match self.view.tensor("lm_head_w") {
             Some(lm) => lm.matvec(&hn, logits)?,
             None => {
@@ -594,6 +633,9 @@ pub struct Fp32Glm {
     pub vocab: usize,
     pub experts: usize,
     pub top_k: usize,
+    /// Семантика ChatGLM-класса (флаги .pqw).
+    pub qk_layer_scaling: bool,
+    pub rms_eps: f32,
 }
 
 pub struct Fp32GlmLayer {
@@ -603,6 +645,8 @@ pub struct Fp32GlmLayer {
     pub o_w: Vec<f32>,
     pub attn_norm_g: Vec<f32>,
     pub ffn_norm_g: Vec<f32>,
+    /// ChatGLM3: bias QKV [q_dim + 2·kv_dim] (пусто = без bias).
+    pub qkv_b: Vec<f32>,
     /// MoE: гейт-матрица [experts, hidden] и тройки экспертов
     /// (gate, up, down). Плотный FFN — один «эксперт» в moe_experts[0].
     pub moe_gate: Vec<f32>,
@@ -644,6 +688,10 @@ pub fn synth_glm(
         let bm = b.with_moe(experts, top_k);
         b = bm;
     }
+
+    // Ссылочная семантика — старые файлы без флагов (масштаб 1/√hd, eps 1e-6).
+    let qk_layer_scaling = false;
+    let rms_eps = 1e-6;
 
     let mat = |name: &str,
                    rows: usize,
@@ -691,6 +739,10 @@ pub fn synth_glm(
 
         let mut moe_gate = Vec::new();
         let mut moe_experts = Vec::new();
+        // ChatGLM3-стиль: небольшой ненулевой bias QKV.
+        let mut qkv_b = vec![0f32; q_dim + 2 * kv_dim];
+        rng.fill(&mut qkv_b, -0.05, 0.05);
+        b.add_f32(&p("qkv_b"), vec![qkv_b.len()], &qkv_b);
         if experts > 0 {
             // Гейт-роутер — маленький, храним fp32.
             moe_gate = vec![0f32; experts * hidden];
@@ -716,6 +768,7 @@ pub fn synth_glm(
             o_w,
             attn_norm_g,
             ffn_norm_g,
+            qkv_b,
             moe_gate,
             moe_experts,
         });
@@ -738,6 +791,8 @@ pub fn synth_glm(
         vocab,
         experts,
         top_k,
+        qk_layer_scaling,
+        rms_eps,
     };
     (b, fp32)
 }
@@ -755,15 +810,23 @@ pub fn reference_glm_logits(w: &Fp32Glm, ids: &[u32]) -> Vec<Vec<f32>> {
         .iter()
         .map(|&id| w.word[id as usize * h..(id as usize + 1) * h].to_vec())
         .collect();
-    let scale = 1.0 / (hd as f32).sqrt();
-    for layer in w.layers.iter() {
+    for (layer_idx, layer) in w.layers.iter().enumerate() {
+        // Тот же масштаб, что в движке: 1/√hd или 1/((layer+1)·√hd).
+        let scale = if w.qk_layer_scaling {
+            1.0 / ((hd as f32).sqrt() * (layer_idx as f32 + 1.0))
+        } else {
+            1.0 / (hd as f32).sqrt()
+        };
+        let q_dim = heads * hd;
+        let kv_dim = kv_heads * hd;
+        let has_qkv_b = !layer.qkv_b.is_empty();
         // Проекции + RoPE для всех позиций.
         let mut qs: Vec<Vec<f32>> = Vec::with_capacity(seq);
         let mut ks: Vec<Vec<f32>> = Vec::with_capacity(seq);
         let mut vs: Vec<Vec<f32>> = Vec::with_capacity(seq);
         for t in 0..seq {
             let mut hn = vec![0f32; h];
-            tensor::rms_norm(&hs[t], &layer.attn_norm_g, 1e-6, &mut hn);
+            tensor::rms_norm(&hs[t], &layer.attn_norm_g, w.rms_eps, &mut hn);
             let mut q = vec![0f32; heads * hd];
             let mut k = vec![0f32; kv_heads * hd];
             let mut v = vec![0f32; kv_heads * hd];
@@ -773,6 +836,15 @@ pub fn reference_glm_logits(w: &Fp32Glm, ids: &[u32]) -> Vec<Vec<f32>> {
             for i in 0..kv_heads * hd {
                 k[i] = dot_naive(&layer.k_w[i * h..(i + 1) * h], &hn);
                 v[i] = dot_naive(&layer.v_w[i * h..(i + 1) * h], &hn);
+            }
+            if has_qkv_b {
+                for i in 0..q_dim {
+                    q[i] += layer.qkv_b[i];
+                }
+                for i in 0..kv_dim {
+                    k[i] += layer.qkv_b[q_dim + i];
+                    v[i] += layer.qkv_b[q_dim + kv_dim + i];
+                }
             }
             for head in 0..heads {
                 rope.rotate(&mut q[head * hd..(head + 1) * hd], t);
@@ -784,11 +856,12 @@ pub fn reference_glm_logits(w: &Fp32Glm, ids: &[u32]) -> Vec<Vec<f32>> {
             ks.push(k);
             vs.push(v);
         }
-        // Каузальное внимание.
+        // Каузальное внимание (блочная GQA-раскладка, как в движке).
         for t in 0..seq {
             let mut ctx = vec![0f32; heads * hd];
+            let n_rep = heads / kv_heads;
             for head in 0..heads {
-                let kv_head = head % kv_heads;
+                let kv_head = head / n_rep;
                 let mut scores = vec![0f32; t + 1];
                 for j in 0..=t {
                     let mut d = 0f32;
@@ -817,7 +890,7 @@ pub fn reference_glm_logits(w: &Fp32Glm, ids: &[u32]) -> Vec<Vec<f32>> {
         // FFN (SwiGLU / MoE).
         for t in 0..seq {
             let mut hn = vec![0f32; h];
-            tensor::rms_norm(&hs[t], &layer.ffn_norm_g, 1e-6, &mut hn);
+            tensor::rms_norm(&hs[t], &layer.ffn_norm_g, w.rms_eps, &mut hn);
             let (g0, _, _) = &layer.moe_experts[0];
             let intermediate = g0.len() / h;
             let mut add = vec![0f32; h];
@@ -867,7 +940,7 @@ pub fn reference_glm_logits(w: &Fp32Glm, ids: &[u32]) -> Vec<Vec<f32>> {
     let mut out = Vec::with_capacity(seq);
     for t in 0..seq {
         let mut hn = vec![0f32; h];
-        tensor::rms_norm(&hs[t], &w.final_norm_g, 1e-6, &mut hn);
+        tensor::rms_norm(&hs[t], &w.final_norm_g, w.rms_eps, &mut hn);
         let mut logits = vec![0f32; w.vocab];
         for v in 0..w.vocab {
             logits[v] = dot_naive(&w.lm[v * h..(v + 1) * h], &hn);
@@ -1102,6 +1175,82 @@ mod tests {
         let model = GlmModel::open(&path).unwrap();
         let out = model.generate(&[1, 2], 4, &Sampling::Greedy, 0).unwrap();
         assert_eq!(out.len(), 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn glm_chatglm3_semantics_differential() {
+        // ChatGLM3-семантика против эталона: GQA-блоки (head/(heads/kv)),
+        // qkv-bias, послойный масштаб внимания, eps=1e-5. Движок обязан
+        // воспроизводить эталон побитово-близко на всех этих модификациях.
+        let path = std::env::temp_dir().join(format!(
+            "poler-glm-cglm3-{}.pqw",
+            std::process::id()
+        ));
+        // Int8 (как в эталонном дифференциале): изолируем именно
+        // семантику ChatGLM3, а не шум Int4-квантования.
+        let (builder, fp32) = synth_glm(101, 2, 32, 4, 2, 48, 64, 24, Quant::Int8, 0, 0);
+        builder
+            .with_qk_layer_scaling()
+            .with_rms_eps(1e-5)
+            .write_to(&path)
+            .unwrap();
+        let mut fp32 = fp32;
+        fp32.qk_layer_scaling = true;
+        fp32.rms_eps = 1e-5;
+        let model = GlmModel::open(&path).unwrap();
+        assert!(
+            model.view().header().qk_layer_scaling(),
+            "флаг qk_layer_scaling не прочитан"
+        );
+        assert!(
+            (model.view().header().rms_eps - 1e-5).abs() < 1e-12,
+            "eps не прочитан из заголовка"
+        );
+        let ids: Vec<u32> = vec![1, 5, 2, 9, 3];
+        let full = model.full_logits(&ids).unwrap();
+        let reference = reference_glm_logits(&fp32, &ids);
+        let cos = |a: &[f32], b: &[f32]| {
+            let ip = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+            let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+            ip / (na * nb)
+        };
+        for t in 0..ids.len() {
+            let c = cos(&full[t], &reference[t]);
+            assert!(c > 0.999, "t={t}: косинус ChatGLM3-семантики = {c}");
+        }
+        // GQA-блоки реально влияют на выход: с чередованием (старый баг)
+        // косинус с эталоном был бы < 1 при kv_heads=2 < heads.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn glm_legacy_files_default_semantics() {
+        // Старые .pqw (без новых флагов): eps=1e-6, без послойного
+        // масштабирования — обратная совместимость формата.
+        let path = std::env::temp_dir().join(format!(
+            "poler-glm-legacy-{}.pqw",
+            std::process::id()
+        ));
+        let (builder, fp32) = synth_glm(33, 1, 16, 2, 1, 24, 32, 16, Quant::Int8, 0, 0);
+        builder.write_to(&path).unwrap();
+        let model = GlmModel::open(&path).unwrap();
+        assert!(!model.view().header().qk_layer_scaling());
+        assert!((model.view().header().rms_eps - 1e-6).abs() < 1e-12);
+        let ids: Vec<u32> = vec![3, 1, 4];
+        let full = model.full_logits(&ids).unwrap();
+        let reference = reference_glm_logits(&fp32, &ids);
+        let cos = |a: &[f32], b: &[f32]| {
+            let ip = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+            let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+            ip / (na * nb)
+        };
+        for t in 0..ids.len() {
+            let c = cos(&full[t], &reference[t]);
+            assert!(c > 0.999, "t={t}: косинус legacy-семантики = {c}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

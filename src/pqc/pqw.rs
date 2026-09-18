@@ -162,6 +162,8 @@ pub struct PqwHeader {
     pub experts: usize,
     pub top_k: usize,
     pub kv_heads: usize,
+    /// eps RMSNorm (заголовок, смещение 60; 0 → 1e-6).
+    pub rms_eps: f32,
     pub table_offset: u64,
     pub table_len: u64,
     pub payload_len: u64,
@@ -186,6 +188,11 @@ impl PqwHeader {
     /// без абсолютных позиций, eps 1e-7). Для model_type Gliner.
     pub fn is_deberta(&self) -> bool {
         self.flags & 8 != 0
+    }
+    /// Флаг: послойное масштабирование внимания (ChatGLM-класс:
+    /// scores/(layer_number·√hd), нумерация слоёв с 1).
+    pub fn qk_layer_scaling(&self) -> bool {
+        self.flags & 16 != 0
     }
 }
 
@@ -218,6 +225,11 @@ pub struct PqwBuilder {
     pub experts: usize,
     pub top_k: usize,
     pub kv_heads: usize,
+    /// Послойное масштабирование внимания (ChatGLM-класс: деление
+    /// скоров на layer_number·√head_dim, нумерация слоёв с 1).
+    pub qk_layer_scaling: bool,
+    /// eps RMSNorm (ChatGLM3 = 1e-5; 0/устаревшие файлы → 1e-6).
+    pub rms_eps: f32,
     tensors: Vec<BuilderTensor>,
 }
 
@@ -247,6 +259,8 @@ impl PqwBuilder {
             experts: 0,
             top_k: 0,
             kv_heads: 1,
+            qk_layer_scaling: false,
+            rms_eps: 1e-6,
             tensors: Vec::new(),
         }
     }
@@ -261,6 +275,19 @@ impl PqwBuilder {
     /// Число KV-голов внимания (1 = MQA; heads = MHA; 2..heads = GQA).
     pub fn with_kv_heads(mut self, kv_heads: usize) -> Self {
         self.kv_heads = kv_heads;
+        self
+    }
+
+    /// Послойное масштабирование внимания (ChatGLM-класс,
+    /// apply_query_key_layer_scaling=true).
+    pub fn with_qk_layer_scaling(mut self) -> Self {
+        self.qk_layer_scaling = true;
+        self
+    }
+
+    /// eps RMSNorm (ChatGLM3: layernorm_epsilon = 1e-5).
+    pub fn with_rms_eps(mut self, eps: f32) -> Self {
+        self.rms_eps = eps;
         self
     }
 
@@ -384,6 +411,9 @@ impl PqwBuilder {
         if self.experts > 0 {
             flags |= 4;
         }
+        if self.qk_layer_scaling {
+            flags |= 16;
+        }
         buf[18..20].copy_from_slice(&flags.to_le_bytes());
         buf[20..24].copy_from_slice(&(self.layers as u32).to_le_bytes());
         buf[24..28].copy_from_slice(&(self.hidden as u32).to_le_bytes());
@@ -396,7 +426,9 @@ impl PqwBuilder {
         buf[48..52].copy_from_slice(&(self.experts as u32).to_le_bytes());
         buf[52..56].copy_from_slice(&(self.top_k as u32).to_le_bytes());
         buf[56..60].copy_from_slice(&(self.kv_heads as u32).to_le_bytes());
-        buf[60..64].copy_from_slice(&0u32.to_le_bytes());
+        // Ранее зарезервированное поле: eps RMSNorm (0.0 → старые файлы,
+        // интерпретируется как 1e-6 в QuantizedWeightsView::open).
+        buf[60..64].copy_from_slice(&self.rms_eps.to_le_bytes());
         buf[64..72].copy_from_slice(&(table_offset as u64).to_le_bytes());
         buf[72..80].copy_from_slice(&(table_len as u64).to_le_bytes());
         buf[80..88].copy_from_slice(&(table_offset as u64 - PAGE as u64).to_le_bytes());
@@ -580,6 +612,16 @@ impl QuantizedWeightsView {
             experts: u32_at(48) as usize,
             top_k: u32_at(52) as usize,
             kv_heads: u32_at(56) as usize,
+            // eps RMSNorm из ранее зарезервированного поля;
+            // нулевые биты старых файлов → стандартные 1e-6.
+            rms_eps: {
+                let e = f32::from_bits(u32_at(60));
+                if e > 0.0 {
+                    e
+                } else {
+                    1e-6
+                }
+            },
             table_offset: table_offset as u64,
             table_len: table_len as u64,
             payload_len: u64_at(80),
