@@ -191,6 +191,10 @@ pub struct McpServer {
     /// состояние сети, веса, медиаторы и тон живут между вызовами
     /// poler_ssn_step/inject/status (агент ведёт мозг непрерывно).
     warm_ssn: Mutex<SsnSessions>,
+    /// S2/v0.36.0: резидентные Триединства (муха + вихрь + кристалл) —
+    /// говорящие сессии: мозг, пульс мухи и контекст речи живут между
+    /// вызовами poler_triune_speak/state.
+    warm_triune: Mutex<TriuneSessions>,
 }
 
 impl McpServer {
@@ -211,6 +215,7 @@ impl McpServer {
             warm_fly: Mutex::new(None),
             warm_psi: Mutex::new(PsiSessions::default()),
             warm_ssn: Mutex::new(SsnSessions::default()),
+            warm_triune: Mutex::new(TriuneSessions::default()),
         }
     }
 
@@ -392,6 +397,16 @@ fn is_ssn_tool(msg: &Value) -> bool {
         )
 }
 
+/// S2/v0.36.0: инструменты poler_triune_* держат резидентные говорящие
+/// Триединства (муха + вихрь + кристалл) — последовательный исполнитель.
+fn is_triune_tool(msg: &Value) -> bool {
+    msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(|v| v.as_str()),
+            Some("poler_triune_speak" | "poler_triune_state")
+        )
+}
+
 /// Резидентная «живая муха»: коннектом FLYCSR1 + таблица root_id + CSC
 /// (входящие рёбра) в RAM. CSC строится лениво один раз — первый
 /// impact/центральность запрос платит ~43 мс, остальные — ноль.
@@ -555,6 +570,62 @@ impl SsnSessions {
     }
 }
 
+/// S2/v0.36.0: одна резидентная говорящая сессия Триединства.
+struct TriuneSession {
+    core: crate::triune::TriuneCore,
+    /// Последняя сказанная фраза (для poler_triune_state).
+    last_text: String,
+    last_tokens: usize,
+}
+
+/// S2/v0.36.0: резидентные Триединства — LRU-очередь + карта.
+/// Лимит 4: каждая сессия = мозг (~150 КБ) + пульс мухи (КБ) + кристалл
+/// (~30 КБ) — говорящие организмы тяжеловаты, но их мало и надо.
+#[derive(Default)]
+struct TriuneSessions {
+    map: std::collections::HashMap<String, Arc<Mutex<TriuneSession>>>,
+    order: std::collections::VecDeque<String>,
+    counter: u64,
+}
+
+impl TriuneSessions {
+    const CAP: usize = 4;
+
+    fn insert(&mut self, core: crate::triune::TriuneCore) -> (String, Arc<Mutex<TriuneSession>>) {
+        self.counter += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let id = format!(
+            "triune-{:x}-{:x}",
+            self.counter,
+            crate::literary::qualia::fnv1a64(&nanos.to_le_bytes()) & 0xffff
+        );
+        let arc = Arc::new(Mutex::new(TriuneSession {
+            core,
+            last_text: String::new(),
+            last_tokens: 0,
+        }));
+        self.order.push_back(id.clone());
+        self.map.insert(id.clone(), arc.clone());
+        while self.map.len() > Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        (id, arc)
+    }
+
+    fn get(&self, id: &str) -> Option<Arc<Mutex<TriuneSession>>> {
+        self.map.get(id).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 /// Загрузка таблицы root_id с проверкой соответствия коннектому.
 fn fly_load_nodes(path: &str, con: &Connectome) -> Result<ConnectomeNodes, String> {
     let tbl = ConnectomeNodes::load(std::path::Path::new(path))?;
@@ -633,7 +704,7 @@ pub fn run(
             }
         };
         #[cfg(feature = "pnd-ffi")]
-        if is_exec_tool(&msg) || is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) {
+        if is_exec_tool(&msg) || is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) || is_triune_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -643,7 +714,7 @@ pub fn run(
             continue;
         }
         #[cfg(not(feature = "pnd-ffi"))]
-        if is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) {
+        if is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) || is_triune_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -771,6 +842,8 @@ impl McpServer {
             "poler_ssn_inject" => self.tool_ssn_inject(&args),
             "poler_ssn_status" => self.tool_ssn_status(&args),
             "poler_ssn_eject" => self.tool_ssn_eject(&args),
+            "poler_triune_speak" => self.tool_triune_speak(&args),
+            "poler_triune_state" => self.tool_triune_state(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -2294,6 +2367,157 @@ impl McpServer {
         Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
     }
 
+    /// S2/v0.36.0: poler_triune_speak — Триединство говорит от промпта.
+    /// Без session — создаёт новую сессию (seed/gamma/tokens); с session —
+    /// продолжает ту же (мозг, муха и контекст речи живут между вызовами).
+    fn tool_triune_speak(&self, args: &Value) -> Result<String, String> {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("укажите text — сенсорный вход (о чём говорить)")?;
+        let tokens = args
+            .get("tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(24)
+            .clamp(1, 256) as usize;
+        let session_id = args.get("session").and_then(|v| v.as_str());
+
+        let (id, arc) = match session_id {
+            Some(id) => {
+                let arc = self
+                    .warm_triune
+                    .lock()
+                    .expect("poler-mcp: отравленный triune-лок")
+                    .get(id)
+                    .ok_or_else(|| {
+                        format!("Триединство «{id}» не найдено (создайте: poler_triune_speak без session)")
+                    })?;
+                (id.to_string(), arc)
+            }
+            None => {
+                let seed = args.get("seed").and_then(|v| v.as_u64()).unwrap_or(777);
+                let gamma = args.get("gamma").and_then(|v| v.as_f64()).unwrap_or(0.8).clamp(0.0, 4.0);
+                let crystal = crate::triune::Crystal::embedded()
+                    .map_err(|e| format!("зашитый кристалл повреждён: {e}"))?;
+                let fly = crate::triune::FlyPulse::synthetic(seed, gamma);
+                let core = crate::triune::TriuneCore::new(
+                    crystal,
+                    crate::triune::TriuneConfig::default(),
+                    fly,
+                    seed,
+                );
+                let mut guard = self
+                    .warm_triune
+                    .lock()
+                    .expect("poler-mcp: отравленный triune-лок");
+                let (id, arc) = guard.insert(core);
+                let _ = guard.len();
+                (id, arc)
+            }
+        };
+
+        let mut sess = arc
+            .lock()
+            .map_err(|_| "poler-mcp: Триединство отравлено".to_string())?;
+        let u = sess.core.speak(text, tokens);
+        sess.last_text = u.text.clone();
+        sess.last_tokens = u.trace.len();
+
+        // Провенанс: голова трейса (агенту хватает 5 токенов для вкуса).
+        let r4 = |x: f64| (x * 1e4).round() / 1e4;
+        let trace_head: Vec<Value> = u
+            .trace
+            .iter()
+            .take(5)
+            .map(|t| {
+                json!({
+                    "token": t.token, "sem": r4(t.sem), "gate": r4(t.gate),
+                    "syn": t.syn, "fly": r4(t.fly), "score": r4(t.score), "tau": r4(t.tau),
+                })
+            })
+            .collect();
+        let intents: Vec<Value> = u
+            .intents
+            .iter()
+            .map(|i| {
+                json!({
+                    "verb": i.verb, "op": i.op.as_str(), "object": i.object,
+                    "proposal": i.proposal, "allowed": i.allowed,
+                })
+            })
+            .collect();
+        let t = &u.telemetry;
+        let fly = match &u.fly_origin {
+            crate::triune::PulseOrigin::Connectome { members, top_rotor } => json!({
+                "kind": "connectome", "members": members, "top_rotor": top_rotor
+            }),
+            crate::triune::PulseOrigin::Synthetic { seed } => {
+                json!({"kind": "synthetic", "seed": seed})
+            }
+        };
+        let report = json!({
+            "session": id,
+            "prompt": text,
+            "speech": u.text,
+            "tokens": u.trace.len(),
+            "crystal_vocab": u.crystal_vocab,
+            "fly": fly,
+            "brain": {
+                "activity": ssn_round(t.activity), "synchrony": ssn_round(t.synchrony),
+                "criticality": ssn_round(t.criticality), "ei": ssn_round(t.ei),
+                "da": ssn_round(t.da), "ht_5": ssn_round(t.ht), "ne": ssn_round(t.ne),
+            },
+            "trace_head": trace_head,
+            "motor_intents": intents,
+            "note": "муха крутит, вихрь дышит, кристалл говорит; интенты — только \
+предложения, исполнение остаётся за агентом (poler_exec)",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// S2/v0.36.0: poler_triune_state — снимок говорящего Триединства.
+    fn tool_triune_state(&self, args: &Value) -> Result<String, String> {
+        let id = args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .ok_or("укажите session (id говорящего Триединства)")?;
+        // Лок берём ОДИН раз: повторный lock внутри замыкания — дедлок.
+        let (found, live) = {
+            let guard = self
+                .warm_triune
+                .lock()
+                .expect("poler-mcp: отравленный triune-лок");
+            (guard.get(id), guard.len())
+        };
+        let arc = found.ok_or_else(|| {
+            format!(
+                "Триединство «{id}» не найдено (живых: {live}; создайте: poler_triune_speak без session)"
+            )
+        })?;
+        let sess = arc
+            .lock()
+            .map_err(|_| "poler-mcp: Триединство отравлено".to_string())?;
+        let (inj, spoken, ctx) = sess.core.state_summary();
+        let t = sess.core.telemetry();
+        let report = json!({
+            "session": id,
+            "injections": inj,
+            "tokens_spoken": spoken,
+            "ctx_window": ctx,
+            "last_speech": sess.last_text,
+            "last_tokens": sess.last_tokens,
+            "brain": {
+                "step": t.step, "activity": ssn_round(t.activity),
+                "synchrony": ssn_round(t.synchrony), "criticality": ssn_round(t.criticality),
+                "ei": ssn_round(t.ei), "da": ssn_round(t.da),
+                "ht_5": ssn_round(t.ht), "ne": ssn_round(t.ne),
+                "w_min": ssn_round(t.w_min), "w_max": ssn_round(t.w_max),
+            },
+            "note": "снимок без шага: мозг спит между фразами, но помнит всё",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
     /// Имя режима Ψ для JSON.
     fn psi_mode_name(m: PsiMode) -> &'static str {
         match m {
@@ -3319,6 +3543,44 @@ DA/5HT/NE, веса) + readout топ-K активных нейронов + чи
         }
     }));
 
+    tools.push(json!({
+        "name": "poler_triune_speak",
+        "description": "ТРИЕДИНАЯ АРХИТЕКТУРА (S2/v0.36.0): муха + синусоидный вихрь + \
+троичный кристалл → ЖИВАЯ РЕЧЬ. Без session — рождает новое Триединство (seed/gamma); \
+с session — продолжает разговор (мозг, пульс мухи и контекст живут между вызовами). \
+Промпт воспринимается CSE-сенсорикой (золотая фаза), вихрь дышит между токенами \
+(медиаторы DA/5HT/NE задают температуру речи), ротор мухи разводит лексику по 12 \
+архетипам (γ=0 — речь зацикливается), кристалл (.t5c, Trit5: 5 тритов/байт, \
+No-Mul SIMD) даёт семантику и синтаксис, NMDA-гейт пропускает совпадающие смыслы. \
+Возврат: speech + трейс провенанса (sem/gate/syn/fly/tau) + моторные интенты \
+(ТОЛЬКО предложения poler_exec — исполнение остаётся за агентом).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "сенсорный вход — о чём говорить"},
+                "session": {"type": "string", "description": "id Триединства (продолжить разговор)"},
+                "seed": {"type": "integer", "default": 777},
+                "gamma": {"type": "number", "default": 0.8, "minimum": 0, "maximum": 4, "description": "усиление ротора мухи"},
+                "tokens": {"type": "integer", "default": 24, "minimum": 1, "maximum": 256, "description": "длина речи"}
+            },
+            "required": ["text"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_triune_state",
+        "description": "СНИМОК говорящего Триединства без шага: последняя фраза, \
+число сенсорных инъекций и произнесённых токенов, телеметрия живого мозга \
+(активность ~5%, синхронность, критичность, медиаторы, веса).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "id Триединства"}
+            },
+            "required": ["session"]
+        }
+    }));
+
     tools
 }
 
@@ -4274,6 +4536,84 @@ mod psi_family_tests {
             "method": "tools/call",
             "params": {"name": "poler_literary_step", "arguments": {}}
         })));
+    }
+
+    #[test]
+    fn manifest_contains_triune_family() {
+        let m = tools_manifest();
+        let names: Vec<&str> =
+            m.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
+        for expected in ["poler_triune_speak", "poler_triune_state"] {
+            assert!(names.contains(&expected), "нет {expected}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn is_triune_tool_routes_family_only() {
+        for name in ["poler_triune_speak", "poler_triune_state"] {
+            assert!(is_triune_tool(&json!({
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}}
+            })));
+        }
+        assert!(!is_triune_tool(&json!({"method": "tools/list"})));
+        assert!(!is_triune_tool(&json!({
+            "method": "tools/call",
+            "params": {"name": "poler_ssn_step", "arguments": {}}
+        })));
+    }
+
+    #[test]
+    fn triune_tools_smoke_via_dispatch() {
+        // полный цикл: родить Триединство → речь → снимок → продолжить разговор
+        let db = std::env::temp_dir().join("poler_mcp_triune_smoke.db");
+        let srv = McpServer::new(0, 0, db);
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "poler_triune_speak",
+                           "arguments": {"text": "живой мозг говорит", "tokens": 8, "seed": 42}}
+            }))
+            .expect("речь");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let v: Value = serde_json::from_str(text).expect("речь — валидный JSON");
+        let id = v.get("session").and_then(|s| s.as_str()).expect("session id").to_string();
+        let speech = v.get("speech").and_then(|s| s.as_str()).unwrap_or("");
+        assert!(!speech.is_empty(), "Триединство должно говорить: {text}");
+        let activity = v.pointer("/brain/activity").and_then(|x| x.as_f64()).unwrap_or(1.0);
+        assert!(activity < 0.5, "активность {activity} — эпилепсия в smoke-тесте");
+        assert!(v.get("trace_head").is_some(), "провенанс токенов обязателен");
+
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "poler_triune_state", "arguments": {"session": id}}
+            }))
+            .expect("снимок");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let st: Value = serde_json::from_str(text).expect("снимок — валидный JSON");
+        assert_eq!(
+            st.get("last_speech").and_then(|s| s.as_str()).unwrap_or(""),
+            speech,
+            "снимок помнит последнюю фразу"
+        );
+        assert!(st.get("tokens_spoken").and_then(|t| t.as_u64()).unwrap_or(0) >= 8);
+
+        // Продолжение того же разговора: мозг и муха живы между вызовами.
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "poler_triune_speak",
+                           "arguments": {"session": id, "text": "продолжай мысль", "tokens": 6}}
+            }))
+            .expect("продолжение");
+        assert!(serde_json::to_string(&r).unwrap().contains("speech"));
     }
 
     #[test]

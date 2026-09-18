@@ -63,6 +63,7 @@ pub mod graph;
 pub mod license;
 pub mod literary;
 pub mod ssn;
+pub mod triune;
 pub mod llm;
 pub mod mcp;
 pub mod mcp_http;

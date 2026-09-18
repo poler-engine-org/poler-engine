@@ -896,6 +896,77 @@ struct Cli {
     #[arg(long = "ssn-json", default_value_t = false)]
     ssn_json: bool,
 
+    // ── S2/v0.36.0: Триединая Архитектура (муха + вихрь + кристалл) ──
+
+    /// Витрина Триединства: муха + вихрь + кристалл → живая речь +
+    /// моторные интенты + телеметрия всех трёх опор.
+    #[arg(long = "triune-demo", default_value_t = false)]
+    triune_demo: bool,
+
+    /// Попросить Триединство говорить от промпта.
+    #[arg(long = "triune-speak", value_name = "TEXT")]
+    triune_speak: Option<String>,
+
+    /// Токенов речи [default: 24].
+    #[arg(long = "triune-tokens", value_name = "N", default_value_t = 24)]
+    triune_tokens: usize,
+
+    /// Seed Триединства [default: 777].
+    #[arg(long = "triune-seed", value_name = "N", default_value_t = 777)]
+    triune_seed: u64,
+
+    /// Усиление ротора мухи γ (0 = муха спит) [default: 0.8].
+    #[arg(long = "triune-gamma", value_name = "F", default_value_t = 0.8)]
+    triune_gamma: f64,
+
+    /// Настоящий мозг мухи: артефакт коннектома FLYCSR1 (.csr.zst).
+    #[arg(long = "triune-connectome", value_name = "CSR_ZST")]
+    triune_connectome: Option<PathBuf>,
+
+    /// Семена касты для --triune-connectome (CSV индексов) [default: 1000,5000,9000].
+    #[arg(long = "triune-seeds", value_name = "CSV", default_value = "1000,5000,9000")]
+    triune_seeds: String,
+
+    /// Внешний кристалл .t5c (по умолчанию — зашитый в бинарник).
+    #[arg(long = "triune-crystal", value_name = "T5C")]
+    triune_crystal: Option<PathBuf>,
+
+    /// JSON-вывод режима --triune-* (для агентов).
+    #[arg(long = "triune-json", default_value_t = false)]
+    triune_json: bool,
+
+    /// Собрать кристалл знаний .t5c из корпуса.
+    #[arg(long = "crystal-build", value_name = "CORPUS_TXT")]
+    crystal_build: Option<PathBuf>,
+
+    /// Словарь кристалла для --crystal-build [default: 384].
+    #[arg(long = "crystal-vocab", value_name = "N", default_value_t = 384)]
+    crystal_vocab: usize,
+
+    /// Выходной путь .t5c для --crystal-build [default: <корпус>.t5c].
+    #[arg(long = "crystal-out", value_name = "T5C")]
+    crystal_out: Option<PathBuf>,
+
+    /// Потоковое квантование весов на лету: сырец → .t5q (70B на диске 4 ГБ).
+    #[arg(long = "stream-quant", value_name = "FILE|-")]
+    stream_quant: Option<PathBuf>,
+
+    /// Выходной путь .t5q [default: <вход>.t5q].
+    #[arg(long = "stream-quant-out", value_name = "T5Q")]
+    stream_quant_out: Option<PathBuf>,
+
+    /// Значений на блок [default: 512].
+    #[arg(long = "stream-quant-block", value_name = "N", default_value_t = 512)]
+    stream_quant_block: usize,
+
+    /// Доля топ-|w| тритов на блок (вакуум при <1) [default: 1.0].
+    #[arg(long = "stream-quant-keep", value_name = "F", default_value_t = 1.0)]
+    stream_quant_keep: f64,
+
+    /// Вход — f16-LE (иначе f32-LE).
+    #[arg(long = "stream-quant-f16", default_value_t = false)]
+    stream_quant_f16: bool,
+
     /// Watcher-режим: инкрементальный рескан по mtime/size.
     #[arg(long)]
     watch: bool,
@@ -1315,6 +1386,17 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- S1/v0.35.0: Синаптический Вихрь SSN ----------
     if cli.ssn_demo || cli.ssn_encode.is_some() || cli.ssn_inject.is_some() {
         return ExitCode::from(run_ssn(&cli) as u8);
+    }
+
+    // ---------- S2/v0.36.0: Триединая Архитектура ----------
+    if cli.triune_demo || cli.triune_speak.is_some() {
+        return ExitCode::from(run_triune(&cli) as u8);
+    }
+    if cli.crystal_build.is_some() {
+        return ExitCode::from(run_crystal_build(&cli) as u8);
+    }
+    if cli.stream_quant.is_some() {
+        return ExitCode::from(run_stream_quant(&cli) as u8);
     }
 
     // ---------- v0.20.0: Native Retrieval — grep-режим (слой 0) ----------
@@ -4580,6 +4662,304 @@ fn run_ssn(cli: &Cli) -> i32 {
         }
         println!("время: {} мс ({:.0} шагов/с)", elapsed.as_millis(), sps);
     }
+    0
+}
+
+// ---------- S2/v0.36.0: Триединая Архитектура (муха + вихрь + кристалл) ----------
+
+/// Загрузка кристалла: внешний .t5c или зашитый в бинарник.
+fn triune_load_crystal(cli: &Cli) -> Result<poler_engine::triune::Crystal, String> {
+    match &cli.triune_crystal {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("чтение {path:?}: {e}"))?;
+            poler_engine::triune::Crystal::load(&bytes, poler_engine::triune::crystal::DEFAULT_DIMS)
+        }
+        None => poler_engine::triune::Crystal::embedded(),
+    }
+}
+
+/// Пульс мухи: настоящая каста из коннектома или виртуальная (seed).
+fn triune_load_fly(cli: &Cli) -> Result<poler_engine::triune::FlyPulse, String> {
+    match &cli.triune_connectome {
+        Some(csr) => {
+            let con = poler_engine::graph::connectome::Connectome::load(csr)
+                .map_err(|e| format!("коннектом {csr:?}: {e}"))?;
+            let seeds: Vec<usize> = cli
+                .triune_seeds
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if seeds.is_empty() {
+                return Err("--triune-seeds: укажите CSV индексов нейронов".into());
+            }
+            let cast = poler_engine::triune::flypulse::cast_from_connectome(&con, &seeds, 2)?;
+            Ok(poler_engine::triune::FlyPulse::from_cast(&cast, cli.triune_gamma))
+        }
+        None => Ok(poler_engine::triune::FlyPulse::synthetic(cli.triune_seed, cli.triune_gamma)),
+    }
+}
+
+/// Телеметрия вихря → JSON (общая для run_triune и MCP).
+fn triune_telemetry_json(t: &poler_engine::ssn::VortexTelemetry) -> serde_json::Value {
+    let r = |x: f64| (x * 1e6).round() / 1e6;
+    serde_json::json!({
+        "step": t.step, "activity": r(t.activity), "f_sys": r(t.f_sys),
+        "b_tone": r(t.b_tone), "synchrony": r(t.synchrony),
+        "criticality": r(t.criticality), "ei": r(t.ei),
+        "gaba": r(t.gaba), "glut": r(t.glut),
+        "da": r(t.da), "ht_5": r(t.ht), "ne": r(t.ne),
+        "w_min": r(t.w_min), "w_max": r(t.w_max), "w_at_clip": r(t.w_at_clip),
+        "active_count": t.active_count,
+    })
+}
+
+/// Высказывание → JSON (агентам: полный провенанс каждого токена).
+fn triune_utterance_json(u: &poler_engine::triune::Utterance) -> serde_json::Value {
+    use poler_engine::triune::PulseOrigin;
+    let r = |x: f64| (x * 1e4).round() / 1e4;
+    let trace: Vec<serde_json::Value> = u
+        .trace
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "token": t.token, "idx": t.idx,
+                "sem": r(t.sem), "gate": r(t.gate), "syn": t.syn,
+                "fly": r(t.fly), "rep": r(t.rep), "score": r(t.score),
+                "tau": r(t.tau), "activity": r(t.activity),
+            })
+        })
+        .collect();
+    let intents: Vec<serde_json::Value> = u
+        .intents
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "verb": i.verb, "op": i.op.as_str(), "object": i.object,
+                "proposal": i.proposal, "allowed": i.allowed, "reason": i.reason,
+            })
+        })
+        .collect();
+    let fly = match &u.fly_origin {
+        PulseOrigin::Connectome { members, top_rotor } => serde_json::json!({
+            "kind": "connectome", "members": members, "top_rotor": top_rotor
+        }),
+        PulseOrigin::Synthetic { seed } => serde_json::json!({
+            "kind": "synthetic", "seed": seed
+        }),
+    };
+    serde_json::json!({
+        "text": u.text,
+        "tokens": u.trace.len(),
+        "crystal_vocab": u.crystal_vocab,
+        "fly": fly,
+        "fly_drift": u.fly_drift.iter().map(|v| r(*v as f64)).collect::<Vec<_>>(),
+        "telemetry": triune_telemetry_json(&u.telemetry),
+        "trace": trace,
+        "motor_intents": intents,
+    })
+}
+
+fn run_triune(cli: &Cli) -> i32 {
+    use poler_engine::triune::{TriuneConfig, TriuneCore};
+    use serde_json::json;
+
+    let t0 = std::time::Instant::now();
+    let crystal = match triune_load_crystal(cli) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("triune: {e}");
+            return 2;
+        }
+    };
+    let fly = match triune_load_fly(cli) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("triune: {e}");
+            return 2;
+        }
+    };
+    let cfg = TriuneConfig::default();
+    let mut core = TriuneCore::new(crystal, cfg, fly, cli.triune_seed);
+
+    let prompts: Vec<String> = if cli.triune_demo {
+        vec![
+            "живой мозг говорит".into(),
+            "система слушает сенсорный вход".into(),
+            "открой терминал и покажи статус".into(),
+        ]
+    } else {
+        vec![cli.triune_speak.clone().unwrap_or_default()]
+    };
+
+    let mut utterances = Vec::new();
+    for prompt in &prompts {
+        let u = core.speak(prompt, cli.triune_tokens);
+        utterances.push((prompt.clone(), u));
+    }
+
+    if cli.triune_json {
+        let arr: Vec<serde_json::Value> = utterances
+            .iter()
+            .map(|(p, u)| {
+                json!({"prompt": p, "seed": cli.triune_seed, "gamma": cli.triune_gamma,
+                       "utterance": triune_utterance_json(u)})
+            })
+            .collect();
+        println!("{}", json!({"mode": "triune", "elapsed_ms": t0.elapsed().as_millis(), "speech": arr}));
+        return 0;
+    }
+
+    // Человекочитаемая витрина.
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║   ТРИЕДИНАЯ АРХИТЕКТУРА: муха + вихрь + кристалл → речь    ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    let fly_desc = match utterances.first().map(|(_, u)| &u.fly_origin) {
+        Some(poler_engine::triune::PulseOrigin::Connectome { members, top_rotor }) => {
+            format!("настоящая каста FLYCSR1: {members} нейронов, топ-ротор {top_rotor}")
+        }
+        Some(poler_engine::triune::PulseOrigin::Synthetic { seed }) => {
+            format!("виртуальная муха (seed {seed}; подключи --triune-connectome для настоящей)")
+        }
+        None => "—".into(),
+    };
+    println!("муха:    {fly_desc}");
+    println!("вихрь:   SSN v0.35.0, гомеостаз 5%, критичность на краю хаоса");
+    println!("кристалл: {} токенов, Trit5 (5 тритов/байт), зашит в бинарник",
+        utterances.first().map(|(_, u)| u.crystal_vocab).unwrap_or(0));
+    for (prompt, u) in &utterances {
+        println!("\n─ промпт: «{prompt}» ─────────────────────────────────");
+        println!("речь: {text}", text = u.text);
+        let t = &u.telemetry;
+        println!("мозг: активность {:.1}%, S={:.2}, C={:.2}, DA={:.2} 5HT={:.2} NE={:.2}",
+            t.activity * 100.0, t.synchrony, t.criticality, t.da, t.ht, t.ne);
+        if let Some(first) = u.trace.first() {
+            println!("первый токен: sem={:+.3} gate={:.3} syn={:+} fly={:+.3} τ={:.2}",
+                first.sem, first.gate, first.syn, first.fly, first.tau);
+        }
+        if !u.intents.is_empty() {
+            println!("моторный слой (S2):");
+            for i in &u.intents {
+                if i.allowed {
+                    println!("  [допущено] {} → {}", i.verb, i.proposal);
+                } else {
+                    println!("  [отклонено] {} — {}", i.verb, i.reason);
+                }
+            }
+        }
+    }
+    let (inj, spoken, _) = core.state_summary();
+    println!("\nитог: {} фраз, {} токенов, {} сенсорных инъекций, {} мс",
+        utterances.len(), spoken, inj, t0.elapsed().as_millis());
+    0
+}
+
+fn run_crystal_build(cli: &Cli) -> i32 {
+    use poler_engine::triune::Crystal;
+    let corpus_path = cli.crystal_build.as_ref().unwrap();
+    let corpus = match std::fs::read_to_string(corpus_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("crystal-build: чтение {corpus_path:?}: {e}");
+            return 2;
+        }
+    };
+    let crystal = match Crystal::build(
+        &corpus,
+        cli.crystal_vocab,
+        poler_engine::triune::crystal::DEFAULT_DIMS,
+        poler_engine::triune::crystal::DEFAULT_THETA_HI,
+        poler_engine::triune::crystal::DEFAULT_THETA_LO,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crystal-build: {e}");
+            return 2;
+        }
+    };
+    let out = cli.crystal_out.clone().unwrap_or_else(|| {
+        let mut p = corpus_path.clone();
+        p.set_extension("t5c");
+        p
+    });
+    let bytes = crystal.to_bytes();
+    if let Err(e) = crystal.save(&out) {
+        eprintln!("crystal-build: {e}");
+        return 2;
+    }
+    println!("кристалл собран: {}", out.display());
+    println!("  словарь: {} токенов (порог включения θ_hi={})",
+        crystal.vocab(), crystal.theta_hi());
+    println!("  корпус: {} слов, {} символов", crystal.corpus_words, crystal.corpus_chars);
+    println!("  биграммы: {} ненулевых тритов (Trit5, 5 тритов/байт)", crystal.bigram_nonzeros);
+    println!("  файл: {} байт, sha256 защищён", bytes.len());
+    0
+}
+
+fn run_stream_quant(cli: &Cli) -> i32 {
+    use poler_engine::triune::{stream_quantize, verify_t5q, StreamQuantConfig};
+    let input = cli.stream_quant.as_ref().unwrap();
+    let out_path = cli.stream_quant_out.clone().unwrap_or_else(|| {
+        let mut p = input.clone();
+        p.set_extension("t5q");
+        p
+    });
+    let cfg = StreamQuantConfig {
+        block: cli.stream_quant_block,
+        theta: 0.05,
+        keep: cli.stream_quant_keep as f32,
+        f16: cli.stream_quant_f16,
+    };
+    let t0 = std::time::Instant::now();
+    let stats = {
+        let reader: Box<dyn std::io::Read> = if input.as_os_str() == "-" {
+            Box::new(std::io::stdin().lock())
+        } else {
+            let f = match std::fs::File::open(input) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("stream-quant: открытие {input:?}: {e}");
+                    return 2;
+                }
+            };
+            Box::new(f)
+        };
+        let mut out = match std::fs::File::create(&out_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("stream-quant: создание {out_path:?}: {e}");
+                return 2;
+            }
+        };
+        match stream_quantize(reader, &mut out, &cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("stream-quant: {e}");
+                return 2;
+            }
+        }
+    };
+    // Верификация записанного (честность формата).
+    let written = std::fs::read(&out_path).unwrap_or_default();
+    let ok = verify_t5q(&written).is_ok();
+    println!("потоковое квантование: {} → {}", input.display(), out_path.display());
+    println!("  значений: {} ({} блоков по {}), вход {} байт",
+        stats.values, stats.blocks, cfg.block, stats.in_bytes);
+    println!("  выход: {} байт = {:.3} бита/вес, сжатие {:.1}×",
+        stats.out_bytes, stats.bits_per_value(),
+        stats.in_bytes as f64 / stats.out_bytes.max(1) as f64);
+    println!("  вакуум: {:.1}% нулевых тритов (keep = {})",
+        stats.vacuum_frac() * 100.0, cfg.keep);
+    println!("  пик RAM: {} байт (сырец на диск НЕ писался)", stats.peak_buffer);
+    println!("  sha256: {} | время {} мс",
+        if ok { "сходится" } else { "ОШИБКА" }, t0.elapsed().as_millis());
+    if !ok {
+        return 3;
+    }
+    // Математика масштабирования (честная): 70B FP16 = 140 ГБ →
+    // 70e9 весов × bpv бит / 8 = N ГБ (1 ГБ = 1e9 Б).
+    let bpv = stats.bits_per_value();
+    let gb_70b = 70.0e9 * bpv / 8.0 / 1e9;
+    println!("  масштаб 70B: 140 ГБ FP16 → {:.1} ГБ в этом режиме", gb_70b);
     0
 }
 
