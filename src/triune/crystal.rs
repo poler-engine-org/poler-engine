@@ -104,8 +104,12 @@ pub struct Crystal {
     pub tokens: Vec<String>,
     /// Обратный индекс: токен → id.
     index: HashMap<String, u32>,
-    /// Биграммы, Trit5-упакованные: строка prev, ceil(V/5) байт.
+    /// Биграммы, Trit5-упакованные: строка prev, stride байт на строку.
+    /// stride ≥ ceil(V/5): запас под динамическое расширение словаря
+    /// (expand_vocab) без перезапаковки всей матрицы на каждое слово.
     bigram: Vec<u8>,
+    /// Выделено байт на строку биграмм (может быть больше ceil(V/5)).
+    stride: usize,
     /// Статистика корпуса.
     pub corpus_words: u64,
     pub corpus_chars: u64,
@@ -150,6 +154,7 @@ impl Crystal {
         }
         let mut ranked: Vec<(&str, u64)> = counts.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        ranked.retain(|(w, _)| w.len() <= u8::MAX as usize); // u8-длина в .t5c
         let vocab = vocab.clamp(32, ranked.len());
         let tokens: Vec<String> = ranked[..vocab].iter().map(|(w, _)| w.to_string()).collect();
         let index: HashMap<String, u32> =
@@ -229,6 +234,7 @@ impl Crystal {
             tokens,
             index,
             bigram,
+            stride: cols_packed,
             corpus_words: words.len() as u64,
             corpus_chars: corpus.chars().count() as u64,
             bigram_nonzeros,
@@ -267,8 +273,7 @@ impl Crystal {
         if (prev as usize) >= v || (next as usize) >= v {
             return 0;
         }
-        let cols = (v + 4) / 5;
-        let byte = self.bigram[prev as usize * cols + next as usize / 5];
+        let byte = self.bigram[prev as usize * self.stride + next as usize / 5];
         Trit5Codec::unpack_5(byte)[next as usize % 5]
     }
 
@@ -374,6 +379,7 @@ impl Crystal {
             tokens,
             index,
             bigram,
+            stride: cols,
             corpus_words,
             corpus_chars,
             bigram_nonzeros,
@@ -388,8 +394,12 @@ impl Crystal {
     }
 
     /// Сериализация в байты .t5c.
+    /// Строки биграмм обрезаются до ceil(V/5) — запас stride не утекает
+    /// в артефакт: тот же словарь + та же топология → те же байты,
+    /// независимо от ёмкости в памяти.
     pub fn to_bytes(&self) -> Vec<u8> {
         let vocab = self.tokens.len();
+        let cols = (vocab + 4) / 5;
         let token_off = HEADER;
         let mut token_table = Vec::new();
         for t in &self.tokens {
@@ -397,7 +407,7 @@ impl Crystal {
             token_table.extend_from_slice(t.as_bytes());
         }
         let bigram_off = token_off + token_table.len();
-        let mut out = Vec::with_capacity(bigram_off + self.bigram.len());
+        let mut out = Vec::with_capacity(bigram_off + vocab * cols);
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(vocab as u32).to_le_bytes());
@@ -408,15 +418,21 @@ impl Crystal {
         out.extend_from_slice(&self.corpus_chars.to_le_bytes());
         out.extend_from_slice(&self.theta_hi_milli.to_le_bytes());
         let digest = {
-            let mut body = Vec::with_capacity(token_table.len() + self.bigram.len());
+            let mut body = Vec::with_capacity(token_table.len() + vocab * cols);
             body.extend_from_slice(&token_table);
-            body.extend_from_slice(&self.bigram);
+            for row in 0..vocab {
+                let from = row * self.stride;
+                body.extend_from_slice(&self.bigram[from..from + cols]);
+            }
             sha256(&body)
         };
         out.extend_from_slice(&digest);
         debug_assert_eq!(out.len(), HEADER, "заголовок .t5c ровно 0x50 байт");
         out.extend_from_slice(&token_table);
-        out.extend_from_slice(&self.bigram);
+        for row in 0..vocab {
+            let from = row * self.stride;
+            out.extend_from_slice(&self.bigram[from..from + cols]);
+        }
         out
     }
 
@@ -433,6 +449,139 @@ impl Crystal {
     /// θ_hi сборки (восстановление из милли-долей).
     pub fn theta_hi(&self) -> f64 {
         self.theta_hi_milli as f64 / 1000.0
+    }
+
+    /// Динамическое расширение словаря (Dynamic Vocab Expansion):
+    /// новое слово мгновенно получает id, CSE-вложение и якорь архетипа —
+    /// и становится полноценным участником речи Триединства.
+    ///
+    /// Матрица биграмм растёт с запасом stride (+64 столбца за рост),
+    /// поэтому амортизированная стоимость добавления — O(1), а не
+    /// O(V·cols) перезапаковка на каждое слово.
+    pub fn expand_vocab(&mut self, word: &str) -> Option<u32> {
+        if let Some(&id) = self.index.get(word) {
+            return Some(id);
+        }
+        if word.is_empty() || word.len() > u8::MAX as usize {
+            return None; // u8-длина в .t5c не вместит это слово
+        }
+        if self.tokens.len() >= u32::MAX as usize {
+            return None;
+        }
+        let id = self.tokens.len() as u32;
+        // Вакуум-байт Trit5: pack_5([0,0,0,0,0]) = 121 (не 0x00 — тот
+        // декодируется как пять тритов −1!).
+        let vacuum = Trit5Codec::pack_5(&[0i8; 5]).unwrap_or(121);
+        // 1. Ёмкость матрицы: нужна строка для нового prev + столбец next.
+        let need_cols = ((self.tokens.len() + 1) + 4) / 5;
+        if need_cols > self.stride {
+            let new_stride = need_cols + 64;
+            let mut grown = vec![vacuum; self.tokens.len() * new_stride];
+            for row in 0..self.tokens.len() {
+                let (from, to) = (row * self.stride, row * new_stride);
+                grown[to..to + self.stride]
+                    .copy_from_slice(&self.bigram[from..from + self.stride]);
+            }
+            self.bigram = grown;
+            self.stride = new_stride;
+        }
+        self.bigram.extend(std::iter::repeat(vacuum).take(self.stride));
+        // 2. Словарь + индекс.
+        self.tokens.push(word.to_string());
+        self.index.insert(word.to_string(), id);
+        // 3. Вложения только для нового слова (не пересобираем весь V×dims).
+        let v = cse::encode(word, self.dims);
+        let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+        let t = quantize(&v32, 0.05);
+        let q = t.dequantize();
+        self.embeds_trit.push(t);
+        self.embeds_f64.push(q.iter().map(|&x| x as f64).collect());
+        self.anchors
+            .push((fnv1a64(word.as_bytes()) % ARCHETYPES as u64) as u8);
+        Some(id)
+    }
+
+    /// Subword-фолбек: жадное разложение слова на известные подтокены
+    /// (длиннейший префикс слева). Пустой вектор = слово не разложимо.
+    /// Предел глубины 6 кусков защищает от бессмысленного дробления.
+    pub fn subword_ids(&self, word: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let bytes = word.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() && out.len() < 6 {
+            let mut best: Option<(usize, u32)> = None;
+            // длиннейший префикс word[pos..], присутствующий в словаре
+            for end in (pos + 1..=bytes.len()).rev() {
+                if !word.is_char_boundary(end) {
+                    continue;
+                }
+                if let Some(&id) = self.index.get(&word[pos..end]) {
+                    best = Some((end, id));
+                    break;
+                }
+            }
+            match best {
+                Some((end, id)) => {
+                    out.push(id);
+                    pos = end;
+                }
+                None => return Vec::new(), // тупик: слово не разложимо
+            }
+        }
+        if pos < bytes.len() {
+            return Vec::new(); // не доели слово за лимит кусков
+        }
+        out
+    }
+
+    /// Сборка кристалла из готовых компонентов (путь потокового
+    /// инжектора [`crate::triune::ingest`]): словарь + уже
+    /// квантованная Trit5-матрица биграмм + статистика корпуса.
+    pub fn from_parts(
+        tokens: Vec<String>,
+        bigram: Vec<u8>,
+        corpus_words: u64,
+        corpus_chars: u64,
+        bigram_nonzeros: u64,
+        theta_hi: f64,
+        theta_lo: f64,
+        dims: usize,
+    ) -> Result<Crystal, String> {
+        if !(0.5..=8.0).contains(&theta_hi) || !(0.05..=0.95).contains(&theta_lo) {
+            return Err(format!("пороги вне диапазона: θ_hi={theta_hi}, θ_lo={theta_lo}"));
+        }
+        if theta_hi <= theta_lo {
+            return Err("θ_hi должен быть больше θ_lo".into());
+        }
+        let vocab = tokens.len();
+        if vocab == 0 || vocab > 1_000_000 {
+            return Err(format!("странный словарь: {vocab}"));
+        }
+        let stride = (vocab + 4) / 5;
+        if bigram.len() != vocab * stride {
+            return Err(format!(
+                "матрица биграмм {vocab}×{stride} ожидается, байт: {}",
+                bigram.len()
+            ));
+        }
+        let index: HashMap<String, u32> =
+            tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let mut crystal = Crystal {
+            tokens,
+            index,
+            bigram,
+            stride,
+            corpus_words,
+            corpus_chars,
+            bigram_nonzeros,
+            theta_hi_milli: (theta_hi * 1000.0).round() as u32,
+            embeds_trit: Vec::new(),
+            embeds_f64: Vec::new(),
+            anchors: Vec::new(),
+            dims: dims.clamp(16, 512),
+        };
+        crystal.derive_embeddings();
+        Ok(crystal)
     }
 }
 
@@ -529,5 +678,111 @@ mod tests {
     fn tokenizer_lowercases_and_splits() {
         let ts = tokenize("Открой Терминал, и — покажи: статус!");
         assert_eq!(ts, vec!["открой", "терминал", "и", "покажи", "статус"]);
+    }
+
+    #[test]
+    fn expand_vocab_gives_new_word_full_life() {
+        let mut c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
+        let v0 = c.vocab();
+        assert!(c.id_of("квантигон").is_none(), "слова нет в корпусе");
+        let id = c.expand_vocab("квантигон").expect("слово должно добавиться");
+        assert_eq!(c.vocab(), v0 + 1);
+        assert_eq!(c.id_of("квантигон"), Some(id));
+        // Вложения и якорь на месте.
+        assert_eq!(c.embed_trit(id).dims, 64);
+        assert!(c.embed_trit(id).nonzeros > 0, "вложение нового слова не вакуум");
+        assert!(!c.embed_f64(id).is_empty());
+        assert!(c.anchor(id) < ARCHETYPES);
+        // Повторное добавление — идемпотентно.
+        assert_eq!(c.expand_vocab("квантигон"), Some(id));
+        assert_eq!(c.vocab(), v0 + 1);
+        // Пустое и сверхдлинное слова отклоняются.
+        assert!(c.expand_vocab("").is_none());
+        let long = "а".repeat(256);
+        assert!(c.expand_vocab(&long).is_none());
+    }
+
+    #[test]
+    fn expand_vocab_preserves_bigrams_and_serializes_clean() {
+        let mut c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
+        let (a, b) = (c.id_of("через").unwrap(), c.id_of("кодировщик").unwrap());
+        let before = c.bigram_trit(a, b);
+        assert_eq!(before, 1, "пару ожидает притяжение");
+        // 30 расширений — матрица растёт со stride-запасом.
+        for i in 0..30 {
+            c.expand_vocab(&format!("неологизм{i}")).unwrap();
+        }
+        assert_eq!(c.bigram_trit(a, b), 1, "старые биграммы целы после роста");
+        // Новая строка — вакуум (слово никогда не встречалось в парах).
+        let new_id = c.id_of("неологизм0").unwrap();
+        for next in 0..c.vocab() as u32 {
+            assert_eq!(c.bigram_trit(new_id, next), 0);
+        }
+        // Сериализация: stride-запас не утекает, roundtrip бит-в-бит.
+        let bytes = c.to_bytes();
+        let back = Crystal::load(&bytes, 64).unwrap();
+        assert_eq!(back.vocab(), c.vocab());
+        for prev in 0..c.vocab() as u32 {
+            for next in 0..c.vocab() as u32 {
+                assert_eq!(c.bigram_trit(prev, next), back.bigram_trit(prev, next));
+            }
+        }
+        // Файл ровно V×ceil(V/5) байт биграмм: никаких скрытых запасов.
+        let v = c.vocab();
+        let tail = &bytes[0x50..];
+        let mut pos = 0usize;
+        for _ in 0..v {
+            pos += 1 + tail[pos] as usize;
+        }
+        assert_eq!(bytes.len(), 0x50 + pos + v * ((v + 4) / 5), "хвост — ровно матрица");
+    }
+
+    #[test]
+    fn subword_fallback_decomposes_unknown_words() {
+        let mut c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
+        // «мозговой» не в корпусе, но «мозг» есть… проверяем общий механизм
+        // на гарантированно разложимом случае: склейке двух словарных слов.
+        let w1 = c.tokens[0].clone();
+        let w2 = c.tokens[1].clone();
+        let glued = format!("{w1}{w2}");
+        let ids = c.subword_ids(&glued);
+        assert_eq!(ids.len(), 2, "склейка двух слов режется на 2 куска");
+        assert_eq!(ids[0], c.id_of(&w1).unwrap());
+        assert_eq!(ids[1], c.id_of(&w2).unwrap());
+        // Словарное слово = само себя одним куском.
+        assert_eq!(c.subword_ids(&w1), vec![c.id_of(&w1).unwrap()]);
+        // Неразложимый мусор → пусто.
+        assert!(c.subword_ids("ъъъъъ").is_empty() || {
+            // «ъ» может не быть в словаре — тогда пусто; иначе один кусок
+            c.subword_ids("ъъъъъ").len() <= 1
+        });
+    }
+
+    #[test]
+    fn from_parts_rejects_bad_input() {
+        let c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
+        let v = c.vocab();
+        let stride = (v + 4) / 5;
+        // Матрица не того размера.
+        assert!(Crystal::from_parts(
+            c.tokens.clone(),
+            vec![0u8; v * stride + 1],
+            c.corpus_words, c.corpus_chars, c.bigram_nonzeros, 1.7, 0.5, 64
+        )
+        .is_err());
+        // Пороги вне диапазона.
+        assert!(Crystal::from_parts(
+            c.tokens.clone(),
+            vec![0u8; v * stride],
+            c.corpus_words, c.corpus_chars, c.bigram_nonzeros, 9.9, 0.5, 64
+        )
+        .is_err());
+        // Корректный вход — работает.
+        let parts = Crystal::from_parts(
+            c.tokens.clone(),
+            vec![121u8; v * stride],
+            c.corpus_words, c.corpus_chars, 0, 1.7, 0.5, 64,
+        );
+        assert!(parts.is_ok());
     }
 }
