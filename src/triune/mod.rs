@@ -30,12 +30,17 @@
 //! - потоковое квантование инвариантно к размеру чанков;
 //! - .t5c/.t5q защищены sha256.
 
+pub mod compiler;
 pub mod crystal;
 pub mod flypulse;
 pub mod motor;
 pub mod stream_quant;
 pub mod triune;
 
+pub use compiler::{
+    CommitStats, MutationImpulse, PlasticityCompiler, PlasticityConfig, T5qMmapView, TritDirection,
+    TritMutator,
+};
 pub use crystal::Crystal;
 pub use flypulse::{FlyPulse, PulseOrigin};
 pub use motor::{MotorIntent, MotorOp};
