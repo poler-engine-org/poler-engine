@@ -421,6 +421,12 @@ struct Cli {
     #[arg(long = "t5q-compile", value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
     t5q_compile: Option<String>,
 
+    /// JIT-контур: обученные веса → машинный код x86_64 (ваги вшиты в
+    /// інструкції як immediate) → виконання → Hebb-пластичність →
+    /// перекомпіляція. Без аргумента — синтетический слой 32×32.
+    #[arg(long = "jit-loop", value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
+    jit_loop: Option<String>,
+
     // ---------- Суверенный Гиппокамп: библиотека POLER → нативный индекс (v0.29) ----------
 
     /// ИНЖЕСТ БИБЛИОТЕКИ ЗНАНИЙ: PATH = корень POLER_ALL_GENERATED_DOCS
@@ -1218,6 +1224,9 @@ fn run(cli: Cli) -> ExitCode {
     }
     if let Some(target) = &cli.t5q_compile {
         return ExitCode::from(run_t5q_compile(target) as u8);
+    }
+    if let Some(target) = &cli.jit_loop {
+        return ExitCode::from(run_jit_loop(target) as u8);
     }
     if let Some(mode) = cli.semantic.as_deref() {
         return ExitCode::from(run_semantic_native(mode, &cli) as u8);
@@ -4300,6 +4309,136 @@ fn run_quantum_llm(cli: &Cli) -> i32 {
             2
         }
     }
+}
+
+/// `--jit-loop [FILE]`: замкнутий контур «ваги → машинний код →
+/// виконання → пластичність → перекомпіляція».
+///
+/// Кожен вага шару вшивається в машинний код x86_64 як immediate
+/// (`mov eax, <біти f32>`), код виконується прямо з R|X-сторінки,
+/// після чого Hebb-правило переписує трити в .t5q і шар
+/// перекомпілюється — модель навчается, залишаючись стисненою.
+fn run_jit_loop(target: &str) -> i32 {
+    use poler_engine::triune::compiler::PlasticityConfig;
+    use poler_engine::triune::jit_loop::JitLoop;
+    use poler_engine::triune::stream_quant::{stream_quantize, StreamQuantConfig};
+
+    let path: std::path::PathBuf = if target.is_empty() {
+        // Синтетичний шар: 4096 LCG-значень → .t5q у тимчасовій папці.
+        let mut s = 0x91F100Du64;
+        let mut data = Vec::with_capacity(4096 * 4);
+        for _ in 0..4096 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = ((s >> 33) as i32 as f64 / i32::MAX as f64) as f32;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        if let Err(e) = stream_quantize(&data[..], &mut out, &StreamQuantConfig::default()) {
+            eprintln!("poler-engine: синтетичний шар: {e}");
+            return 2;
+        }
+        let dir = std::env::temp_dir().join("poler_jit_loop_demo");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("layer.t5q");
+        if let Err(e) = std::fs::write(&p, &out) {
+            eprintln!("poler-engine: тимчасовий файл: {e}");
+            return 2;
+        }
+        p
+    } else {
+        target.into()
+    };
+
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║  JIT LOOP · ВЕСЫ = МАШИННЫЙ КОД · ЗАМКНУТЫЙ КОНТУР       ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!("файл: {}", path.display());
+
+    let mut lp = match JitLoop::open(&path, PlasticityConfig::default(), 0, 32, 32) {
+        Ok(lp) => lp,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    println!(
+        "слой: {}×{} · машинный код: {} Б · инструкций: {} · плотность: {:.1} Б/вес",
+        lp.rows(),
+        lp.cols(),
+        lp.code_len(),
+        lp.instruction_count(),
+        lp.code_len() as f32 / (lp.rows() * lp.cols()) as f32
+    );
+    println!(
+        "блоков в .t5q: {} · значений: {}",
+        lp.view().block_count(),
+        lp.view().values()
+    );
+
+    // Фрагмент листинга — ваги видно прямо в інструкціях.
+    println!("\nлистинг (первые строки — ваги як immediate у потоці коду):");
+    for line in lp.asm_listing().lines().take(14) {
+        println!("  {line}");
+    }
+
+    // Три цикли контуру з різними фазами входу.
+    for cycle in 1..=3u32 {
+        let phase = cycle as f32 * 0.35;
+        let x: Vec<f32> = (0..32)
+            .map(|j| {
+                let v = (j as f32 * 0.21 + phase).sin() * 0.9 + 0.05 * ((j % 3) as f32 - 1.0);
+                v.clamp(-1.0, 1.0)
+            })
+            .collect();
+        let rep = match lp.cycle(&x) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("poler-engine: цикл {cycle}: {e}");
+                return 2;
+            }
+        };
+        let y_norm = rep.y_before.iter().map(|v| v * v).sum::<f32>().sqrt();
+        println!(
+            "\n─ цикл {cycle} ─ вход ||x||≈{:.2}",
+            x.iter().map(|v| v * v).sum::<f32>().sqrt()
+        );
+        println!(
+            "  forward машинним кодом: ||y|| = {y_norm:.4} ({} выходов)",
+            rep.y_before.len()
+        );
+        println!(
+            "  Hebb: {} импульсов · in-place переписано тритов: {}",
+            rep.impulses, rep.flips
+        );
+        println!(
+            "  commit: вакуум {} → {} · {} мс · sha256 пересчитан",
+            rep.zeros_before, rep.zeros_after, rep.commit_ms
+        );
+        println!(
+            "  перекомпіляція: {} Б нового машинного кода ({} инструкций)",
+            rep.code_bytes, lp.instruction_count()
+        );
+        println!(
+            "  следующий forward на новых весах: ||Δy|| = {:.4} — сигнал обучения",
+            rep.y_delta_norm()
+        );
+    }
+
+    // Цілісність файлу після трьох циклів мутацій.
+    match lp.view().verify() {
+        Ok(()) => println!("\nsha256: OK — файл валиден после 3 циклов самомодификации"),
+        Err(e) => {
+            eprintln!("poler-engine: verify: {e}");
+            return 2;
+        }
+    }
+    if target.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        println!("(демо-файл удалён; для работы с реальными весами: --jit-loop layer.t5q)");
+    }
+    0
 }
 
 /// `--t5q-compile [FILE]`: обратный In-Place компилятор — модель
