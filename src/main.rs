@@ -951,9 +951,17 @@ struct Cli {
     #[arg(long = "crystal-build", value_name = "CORPUS_TXT")]
     crystal_build: Option<PathBuf>,
 
-    /// Потоковая ингестия директории с текстами/кодом в кристалл .t5c.
+    /// Потокова інгестия директорії з текстами/кодом в кристалл .t5c.
     #[arg(long = "crystal-ingest-dir", value_name = "DIR")]
     crystal_ingest_dir: Option<PathBuf>,
+
+    /// Автогенерація розгорнутого x86_64 асемблерного алгоритму матриці архетипів (50 000+ рядків).
+    #[arg(long = "gen-archetype-asm", value_name = "OUT_ASM_PATH")]
+    gen_archetype_asm: Option<PathBuf>,
+
+    /// Мінімальна кількість рядків асемблера для --gen-archetype-asm [default: 50000].
+    #[arg(long = "gen-archetype-lines", value_name = "N", default_value_t = 50000)]
+    gen_archetype_lines: usize,
 
     /// Словарь кристалла для --crystal-build / --crystal-ingest-dir [default: 384].
     #[arg(long = "crystal-vocab", value_name = "N", default_value_t = 384)]
@@ -1419,6 +1427,9 @@ fn run(cli: Cli) -> ExitCode {
     }
     if cli.crystal_ingest_dir.is_some() {
         return ExitCode::from(run_crystal_ingest_dir(&cli) as u8);
+    }
+    if cli.gen_archetype_asm.is_some() {
+        return ExitCode::from(run_gen_archetype_asm(&cli) as u8);
     }
     if cli.stream_quant.is_some() {
         return ExitCode::from(run_stream_quant(&cli) as u8);
@@ -5171,11 +5182,13 @@ fn run_crystal_build(cli: &Cli) -> i32 {
 }
 
 fn run_crystal_ingest_dir(cli: &Cli) -> i32 {
-    use poler_engine::triune::CrystalIngestor;
+    use poler_engine::triune::{IngestConfig, StreamCrystalBuilder};
     let dir = cli.crystal_ingest_dir.as_ref().unwrap();
-    let mut ingestor = CrystalIngestor::new(cli.crystal_vocab);
+    let mut cfg = IngestConfig::default();
+    cfg.vocab = cli.crystal_vocab;
+    let mut builder = StreamCrystalBuilder::new(cfg);
     println!("потоковая ингестия текстов из: {}", dir.display());
-    match ingestor.feed_dir(dir) {
+    match builder.feed_dir(dir) {
         Ok(count) => {
             println!("  прочитано файлов: {count}");
         }
@@ -5184,10 +5197,10 @@ fn run_crystal_ingest_dir(cli: &Cli) -> i32 {
             return 2;
         }
     }
-    let (crystal, stats) = match ingestor.compile() {
+    let (crystal, stats) = match builder.finalize() {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("crystal-ingest-dir: ошибка компиляции: {e}");
+            eprintln!("crystal-ingest-dir: ошибка финализации: {e}");
             return 2;
         }
     };
@@ -5207,6 +5220,31 @@ fn run_crystal_ingest_dir(cli: &Cli) -> i32 {
     println!("  sha256: {}", stats.sha256_hex);
     0
 }
+
+fn run_gen_archetype_asm(cli: &Cli) -> i32 {
+    use poler_engine::universal_archetype_asm::ArchetypeAsmGenerator;
+    let out_path = cli.gen_archetype_asm.as_ref().unwrap();
+    let min_lines = cli.gen_archetype_lines;
+    println!("генерація розгорнутого x86_64 асемблерного алгоритму матриці архетипів...");
+    println!("  цільовий файл: {}", out_path.display());
+    println!("  мінімальна кількість рядків: {min_lines}");
+
+    let gen = ArchetypeAsmGenerator::new();
+    let t0 = std::time::Instant::now();
+    match gen.write_unrolled_asm_to_file(out_path, min_lines) {
+        Ok(count) => {
+            let elapsed = t0.elapsed();
+            println!("  успішно згенеровано рядків: {count}");
+            println!("  час генерації: {:.2?}", elapsed);
+            0
+        }
+        Err(e) => {
+            eprintln!("gen-archetype-asm: помилка запису файлу: {e}");
+            2
+        }
+    }
+}
+
 
 
 fn run_stream_quant(cli: &Cli) -> i32 {
