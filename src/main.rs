@@ -415,6 +415,12 @@ struct Cli {
     #[arg(long = "pqw-selftest")]
     pqw_selftest: bool,
 
+    /// Обратный In-Place компилятор: живая демонстрация переписывания
+    /// тритов в .t5q без декомпрессии (STDP + фазовый ротор + commit).
+    /// Без аргумента — синтетический поток; с путём — ваш .t5q-файл.
+    #[arg(long = "t5q-compile", value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
+    t5q_compile: Option<String>,
+
     // ---------- Суверенный Гиппокамп: библиотека POLER → нативный индекс (v0.29) ----------
 
     /// ИНЖЕСТ БИБЛИОТЕКИ ЗНАНИЙ: PATH = корень POLER_ALL_GENERATED_DOCS
@@ -1209,6 +1215,9 @@ fn run(cli: Cli) -> ExitCode {
     // считаются нативными SIMD-кернелами внутри этого бинарника.
     if cli.pqw_selftest {
         return ExitCode::from(poler_engine::pqc::selftest::run_selftest() as u8);
+    }
+    if let Some(target) = &cli.t5q_compile {
+        return ExitCode::from(run_t5q_compile(target) as u8);
     }
     if let Some(mode) = cli.semantic.as_deref() {
         return ExitCode::from(run_semantic_native(mode, &cli) as u8);
@@ -4291,6 +4300,126 @@ fn run_quantum_llm(cli: &Cli) -> i32 {
             2
         }
     }
+}
+
+/// `--t5q-compile [FILE]`: обратный In-Place компилятор — модель
+/// переписывает собственные триты в .t5q без декомпрессии.
+/// Без FILE — синтетическая демонстрация полного цикла.
+fn run_t5q_compile(target: &str) -> i32 {
+    use poler_engine::triune::compiler::{PlasticityCompiler, PlasticityConfig};
+    use poler_engine::triune::stream_quant::{stream_quantize, StreamQuantConfig};
+
+    let mut demo_path: Option<std::path::PathBuf> = None;
+    let path: std::path::PathBuf = if target.is_empty() {
+        // Синтетический поток: 4096 значений LCG → .t5q во временной папке.
+        let mut s = 0xC0FFEEu64;
+        let mut data = Vec::with_capacity(4096 * 4);
+        for _ in 0..4096 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = ((s >> 33) as i32 as f64 / i32::MAX as f64) as f32;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        if let Err(e) = stream_quantize(&data[..], &mut out, &StreamQuantConfig::default()) {
+            eprintln!("poler-engine: синтетический поток: {e}");
+            return 2;
+        }
+        let dir = std::env::temp_dir().join("poler_t5q_compile_demo");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("demo.t5q");
+        if let Err(e) = std::fs::write(&p, &out) {
+            eprintln!("poler-engine: временный файл: {e}");
+            return 2;
+        }
+        demo_path = Some(p.clone());
+        p
+    } else {
+        target.into()
+    };
+
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║   INVERSE IN-PLACE COMPILER · триты переписывают себя    ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!("файл: {}", path.display());
+
+    let mut compiler = match PlasticityCompiler::open(&path, PlasticityConfig::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("poler-engine: {e}");
+            return 2;
+        }
+    };
+    let blocks = compiler.view().block_count();
+    let values = compiler.view().values();
+    println!("блоков: {blocks} · значений: {values} · вакуум: пересчитывается при commit");
+
+    // 1. Хеббовские импульсы: пара активаций пре/пост.
+    let pre = vec![0.9f32, -0.2, 0.05, 0.0, 0.7, 0.0, -0.6, 0.1];
+    let post = vec![0.8f32, 0.0, -0.9, 0.05, 0.0, 0.6, 0.0, -0.05];
+    let hebb = match compiler.hebbian_impulses(0, 8, 8, &pre, &post) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("poler-engine: хебб: {e}");
+            return 2;
+        }
+    };
+    let mut impulses = hebb;
+
+    // 2. Фазовый ротор J = A − Aᵀ: доминирующий поток ↔ встречный канал.
+    let mut a = vec![0.0f32; 64];
+    a[1 * 8 + 0] = 0.9;
+    a[0 * 8 + 1] = -0.4;
+    match compiler.phase_rotor_impulses(0, &a, 8) {
+        Ok(mut v) => impulses.append(&mut v),
+        Err(e) => {
+            eprintln!("poler-engine: фазовый ротор: {e}");
+            return 2;
+        }
+    }
+    println!("импульсов мутаций: {} (STDP + фазовый ротор)", impulses.len());
+
+    // 3. In-place применение (без распаковки в FP16).
+    match compiler.apply(&impulses) {
+        Ok(changed) => println!("тритов переписано: {changed}"),
+        Err(e) => {
+            eprintln!("poler-engine: apply: {e}");
+            return 2;
+        }
+    }
+
+    // 4. Адаптация масштаба первого блока (STDP-пластичность масштаба).
+    let _ = compiler.adapt_scale(0, 1.1);
+
+    // 5. Атомарная фиксация: пересчёт вакуума + sha256 + msync.
+    match compiler.commit() {
+        Ok(stats) => {
+            println!(
+                "commit: {} флипов · {} масштабов · вакуум {} → {} · {} мс",
+                stats.flips, stats.scale_updates, stats.zeros_before, stats.zeros_after, stats.ms
+            );
+        }
+        Err(e) => {
+            eprintln!("poler-engine: commit: {e}");
+            return 2;
+        }
+    }
+
+    // 6. Финальная валидация.
+    if let Err(e) = compiler.view().verify() {
+        eprintln!("poler-engine: файл невалиден после commit: {e}");
+        return 2;
+    }
+    println!("sha256: OK — файл валиден, мутации зафиксированы на диске");
+
+    if let Some(p) = demo_path {
+        let dir = p.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir(&dir);
+        println!("(демо-файл удалён; для работы с реальными весами: --t5q-compile model.t5q)");
+    }
+    0
 }
 
 /// `--llm local --model X.pqw -q "…"`: нативный GLM-декодер (RoPE + MQA +
