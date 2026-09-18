@@ -211,7 +211,7 @@ fn quantize_block(values: &[f32], theta: f32, keep: f32, block: usize) -> (f32, 
     let cut = if keep < 1.0 {
         let keep_n = ((values.len() as f32) * keep.clamp(0.01, 1.0)).ceil() as usize;
         let mut mags: Vec<f32> = values.iter().map(|v| v.abs()).collect();
-        mags.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        mags.sort_by(|a, b| b.total_cmp(a));
         mags[keep_n.min(mags.len()).saturating_sub(1)]
     } else {
         0.0
