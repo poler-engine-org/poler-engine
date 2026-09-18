@@ -152,17 +152,33 @@ impl GraphMachineCompiler {
                 let src_offset = (edge.src_node * 4) as i32;
                 match edge.weight {
                     WeightKind::F32(w) => {
-                        // movss xmm1, [rdi + src_offset]
-                        // mulss xmm1, [rel const_w]
-                        // addss xmm0, xmm1
+                        // ВЕС ВШИТ В МАШИННЫЙ КОД как immediate (mov eax, биты f32):
+                        //   movss xmm1, [rdi + src_offset]  — загрузка входа x[j]
+                        //   mov  eax, <w_bits>              — обученный вес literal
+                        //   movd xmm2, eax
+                        //   mulss xmm1, xmm2                — x[j] * w
+                        //   addss xmm0, xmm1                — аккумуляция
                         asm.push_str(&format!("    movss   xmm1, dword [rdi + {}]\n", src_offset));
-                        asm.push_str(&format!("    ; weight f32 = {}\n", w));
-                        asm.push_str("    addss   xmm0, xmm1\n"); // у спрощеному JIT
+                        asm.push_str(&format!(
+                            "    mov     eax, 0x{:08X}        ; вес f32 = {:.6}\n",
+                            w.to_bits(),
+                            w
+                        ));
+                        asm.push_str("    movd    xmm2, eax\n");
+                        asm.push_str("    mulss   xmm1, xmm2\n");
+                        asm.push_str("    addss   xmm0, xmm1\n");
 
                         emit_movss_load_rdi(&mut bytes, src_offset);
+                        // mov eax, imm32(w bits) -> 0xB8 + 4 байта
+                        bytes.push(0xB8);
+                        bytes.extend_from_slice(&w.to_bits().to_le_bytes());
+                        // movd xmm2, eax -> 0x66 0x0F 0x6E 0xD0
+                        bytes.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xD0]);
+                        // mulss xmm1, xmm2 -> 0xF3 0x0F 0x59 0xCA
+                        bytes.extend_from_slice(&[0xF3, 0x0F, 0x59, 0xCA]);
                         // addss xmm0, xmm1 -> 0xF3 0x0F 0x58 0xC1
                         bytes.extend_from_slice(&[0xF3, 0x0F, 0x58, 0xC1]);
-                        inst_count += 2;
+                        inst_count += 5;
                     }
                     WeightKind::Trit { val, scale: _ } => {
                         match val {
