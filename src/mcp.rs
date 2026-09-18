@@ -187,6 +187,10 @@ pub struct McpServer {
     /// — латентное состояние p_t, эхо и мушиная калибровка живут между
     /// вызовами poler_literary_step (агент ведёт нарратив шаг за шагом).
     warm_psi: Mutex<PsiSessions>,
+    /// S1/v0.35.0: резидентные живые мозги SSN (Синаптический Вихрь) —
+    /// состояние сети, веса, медиаторы и тон живут между вызовами
+    /// poler_ssn_step/inject/status (агент ведёт мозг непрерывно).
+    warm_ssn: Mutex<SsnSessions>,
 }
 
 impl McpServer {
@@ -206,6 +210,7 @@ impl McpServer {
             exec_tasks: Arc::new(crate::exec::TaskRegistry::default()),
             warm_fly: Mutex::new(None),
             warm_psi: Mutex::new(PsiSessions::default()),
+            warm_ssn: Mutex::new(SsnSessions::default()),
         }
     }
 
@@ -371,6 +376,22 @@ fn is_psi_tool(msg: &Value) -> bool {
         )
 }
 
+/// S1/v0.35.0: инструменты poler_ssn_* держат резидентные мозги SSN
+/// (общее мутабельное состояние сессий) — как psi-семейство, маршрутизируются
+/// на последовательный исполнитель, а не в параллельный пул.
+fn is_ssn_tool(msg: &Value) -> bool {
+    msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(|v| v.as_str()),
+            Some(
+                "poler_ssn_step"
+                    | "poler_ssn_inject"
+                    | "poler_ssn_status"
+                    | "poler_ssn_eject"
+            )
+        )
+}
+
 /// Резидентная «живая муха»: коннектом FLYCSR1 + таблица root_id + CSC
 /// (входящие рёбра) в RAM. CSC строится лениво один раз — первый
 /// impact/центральность запрос платит ~43 мс, остальные — ноль.
@@ -403,6 +424,11 @@ impl WarmFly {
 /// аналогичный round6 — локальное замыкание).
 fn psi_round(x: f32) -> f64 {
     ((x as f64) * 1e6).round() / 1e6
+}
+
+/// S1/v0.35.0: округление f64 до 6 знаков (SSN-телеметрия — двойная точность).
+fn ssn_round(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
 }
 
 /// Резидентные сессии POLER[Ψ]: LRU-очередь + карта двигателей.
@@ -455,6 +481,64 @@ impl PsiSessions {
     }
 
     /// Выгрузить сессию (или все — id = "all"). Возвращает число выгруженных.
+    fn eject(&mut self, id: &str) -> usize {
+        if id == "all" || id == "все" {
+            let n = self.map.len();
+            self.map.clear();
+            self.order.clear();
+            return n;
+        }
+        if self.map.remove(id).is_some() {
+            self.order.retain(|x| x != id);
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// S1/v0.35.0: резидентные живые мозги SSN — LRU-очередь + карта.
+/// Лимит 8: каждый мозг = N×F весов + фазы (600×16×2×8 Б ≈ 150 КБ).
+#[derive(Default)]
+struct SsnSessions {
+    map: std::collections::HashMap<String, Arc<Mutex<crate::ssn::SsnEngine>>>,
+    order: std::collections::VecDeque<String>,
+    counter: u64,
+}
+
+impl SsnSessions {
+    const CAP: usize = 8;
+
+    fn insert(&mut self, eng: crate::ssn::SsnEngine) -> (String, Arc<Mutex<crate::ssn::SsnEngine>>) {
+        self.counter += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let id = format!(
+            "ssn-{:x}-{:x}",
+            self.counter,
+            crate::literary::qualia::fnv1a64(&nanos.to_le_bytes()) & 0xffff
+        );
+        let arc = Arc::new(Mutex::new(eng));
+        self.order.push_back(id.clone());
+        self.map.insert(id.clone(), arc.clone());
+        while self.map.len() > Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        (id, arc)
+    }
+
+    fn get(&self, id: &str) -> Option<Arc<Mutex<crate::ssn::SsnEngine>>> {
+        self.map.get(id).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
     fn eject(&mut self, id: &str) -> usize {
         if id == "all" || id == "все" {
             let n = self.map.len();
@@ -549,7 +633,7 @@ pub fn run(
             }
         };
         #[cfg(feature = "pnd-ffi")]
-        if is_exec_tool(&msg) || is_fly_tool(&msg) || is_psi_tool(&msg) {
+        if is_exec_tool(&msg) || is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -559,7 +643,7 @@ pub fn run(
             continue;
         }
         #[cfg(not(feature = "pnd-ffi"))]
-        if is_fly_tool(&msg) || is_psi_tool(&msg) {
+        if is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -683,6 +767,10 @@ impl McpServer {
             "poler_literary_step" => self.tool_literary_step(&args),
             "poler_literary_generate" => self.tool_literary_generate(&args),
             "poler_literary_eject" => self.tool_literary_eject(&args),
+            "poler_ssn_step" => self.tool_ssn_step(&args),
+            "poler_ssn_inject" => self.tool_ssn_inject(&args),
+            "poler_ssn_status" => self.tool_ssn_status(&args),
+            "poler_ssn_eject" => self.tool_ssn_eject(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -2012,6 +2100,200 @@ impl McpServer {
         Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
     }
 
+    // ── S1/v0.35.0: Синаптический Вихрь SSN ───────────────────────
+
+    /// Телеметрия вихря → JSON (общая для step/inject/status).
+    fn ssn_telemetry_json(id: &str, t: &crate::ssn::VortexTelemetry) -> Value {
+        json!({
+            "session": id,
+            "step": t.step,
+            "activity": ssn_round(t.activity),
+            "f_sys": ssn_round(t.f_sys),
+            "b_tone": ssn_round(t.b_tone),
+            "synchrony": ssn_round(t.synchrony),
+            "criticality": ssn_round(t.criticality),
+            "ei": ssn_round(t.ei),
+            "gaba": t.gaba,
+            "glut": t.glut,
+            "da": t.da,
+            "ht_5ht": t.ht,
+            "ne": t.ne,
+            "w_min": ssn_round(t.w_min),
+            "w_max": ssn_round(t.w_max),
+            "w_at_clip": ssn_round(t.w_at_clip),
+            "active_count": t.active_count,
+        })
+    }
+
+    /// poler_ssn_step: создать живой мозг (без text — новые параметры)
+    /// или шагнуть существующий на N шагов. Параметры создания: seed,
+    /// n, fields, dims. Возвращает телеметрию + readout топ-K.
+    fn tool_ssn_step(&self, args: &Value) -> Result<String, String> {
+        let session_id = args.get("session").and_then(|v| v.as_str());
+        let steps = args
+            .get("steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1000)
+            .clamp(1, 100_000) as usize;
+        let readout_k = args
+            .get("readout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 100) as usize;
+
+        let (id, arc) = match session_id {
+            Some(id) => {
+                let arc = self
+                    .warm_ssn
+                    .lock()
+                    .expect("poler-mcp: отравленный ssn-лок")
+                    .get(id)
+                    .ok_or_else(|| {
+                        format!("мозг «{id}» не найден (создайте: poler_ssn_step без session, или poler_ssn_eject all)")
+                    })?;
+                (id.to_string(), arc)
+            }
+            None => {
+                let cfg = crate::ssn::VortexConfig {
+                    n: args.get("n").and_then(|v| v.as_u64()).unwrap_or(600).clamp(8, 1_000_000) as usize,
+                    fields: args.get("fields").and_then(|v| v.as_u64()).unwrap_or(16).clamp(1, 64) as usize,
+                    topology_seed: args.get("seed").and_then(|v| v.as_u64()).unwrap_or(777),
+                    ..Default::default()
+                };
+                let seed = args.get("seed").and_then(|v| v.as_u64()).unwrap_or(777);
+                let dims = args.get("dims").and_then(|v| v.as_u64()).unwrap_or(128).clamp(8, 4096) as usize;
+                let eng = crate::ssn::SsnEngine::new(cfg, seed, dims);
+                let mut guard = self
+                    .warm_ssn
+                    .lock()
+                    .expect("poler-mcp: отравленный ssn-лок");
+                let (id, arc) = guard.insert(eng);
+                let _ = guard.len();
+                (id, arc)
+            }
+        };
+
+        let mut eng = arc
+            .lock()
+            .map_err(|_| "poler-mcp: мозг ssn отравлен".to_string())?;
+        for _ in 0..steps {
+            eng.step();
+        }
+        let t = eng.telemetry();
+        let readout: Vec<Value> = eng
+            .readout(readout_k)
+            .iter()
+            .map(|(i, v)| json!({"neuron": i, "activation": ssn_round(*v)}))
+            .collect();
+        let report = json!({
+            "telemetry": Self::ssn_telemetry_json(&id, &t),
+            "readout": readout,
+            "steps_done": steps,
+            "note": "живой мозг шагнул: гомеостаз-интегратор держит ~5%, лавины = критичность",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_ssn_inject: сенсорная инъекция текста в живой мозг
+    /// (CSE: золотая фаза → вектор → активации) + опциональные шаги.
+    fn tool_ssn_inject(&self, args: &Value) -> Result<String, String> {
+        let id = args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .ok_or("укажите session (id живого мозга, создан poler_ssn_step)")?;
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("укажите text — сенсорный вход (что мозг должен воспринять)")?;
+        let steps = args
+            .get("steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500)
+            .clamp(0, 100_000) as usize;
+        let arc = self
+            .warm_ssn
+            .lock()
+            .expect("poler-mcp: отравленный ssn-лок")
+            .get(id)
+            .ok_or_else(|| format!("мозг «{id}» не найден (создайте: poler_ssn_step без session)"))?;
+        let mut eng = arc
+            .lock()
+            .map_err(|_| "poler-mcp: мозг ssn отравлен".to_string())?;
+        let (chars, touched) = eng.inject_text(text);
+        for _ in 0..steps {
+            eng.step();
+        }
+        let t = eng.telemetry();
+        let report = json!({
+            "telemetry": Self::ssn_telemetry_json(id, &t),
+            "injected": {"chars": chars, "neurons_touched": touched, "text": text},
+            "steps_done": steps,
+            "note": "текст воспринят: CSE-вектор (золотая фаза) влился в активации",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_ssn_status: телеметрия + readout живого мозга (без шага).
+    fn tool_ssn_status(&self, args: &Value) -> Result<String, String> {
+        let id = args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .ok_or("укажите session (id живого мозга)")?;
+        let readout_k = args
+            .get("readout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 100) as usize;
+        let live = self
+            .warm_ssn
+            .lock()
+            .expect("poler-mcp: отравленный ssn-лок")
+            .len();
+        let arc = self
+            .warm_ssn
+            .lock()
+            .expect("poler-mcp: отравленный ssn-лок")
+            .get(id)
+            .ok_or_else(|| {
+                format!("мозг «{id}» не найден (живых мозгов: {live}; создайте: poler_ssn_step без session)")
+            })?;
+        let eng = arc
+            .lock()
+            .map_err(|_| "poler-mcp: мозг ssn отравлен".to_string())?;
+        let t = eng.telemetry();
+        let readout: Vec<Value> = eng
+            .readout(readout_k)
+            .iter()
+            .map(|(i, v)| json!({"neuron": i, "activation": ssn_round(*v)}))
+            .collect();
+        let report = json!({
+            "telemetry": Self::ssn_telemetry_json(id, &t),
+            "readout": readout,
+            "live_sessions": live,
+            "note": "мозг спокоен (шага не было): снимок состояния",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// poler_ssn_eject: выгрузить живые мозги из RAM (session=id | all).
+    fn tool_ssn_eject(&self, args: &Value) -> Result<String, String> {
+        let id = args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all");
+        let n = self
+            .warm_ssn
+            .lock()
+            .expect("poler-mcp: отравленный ssn-лок")
+            .eject(id);
+        let report = json!({
+            "ejected": n,
+            "requested": id,
+            "note": "живые мозги выгружены из RAM",
+        });
+        Ok(serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()))
+    }
+
     /// Имя режима Ψ для JSON.
     fn psi_mode_name(m: PsiMode) -> &'static str {
         match m {
@@ -2970,6 +3252,73 @@ poler_literary_step с text создаст сессию заново.",
         }
     }));
 
+    tools.push(json!({
+        "name": "poler_ssn_step",
+        "description": "ЖИВОЙ МОЗГ SSN (Синаптический Вихрь, доказанный стек): создать мозг \
+(без session — параметры seed/n/fields/dims) или шагнуть существующий на steps шагов. \
+Полный стек: виртуальная топология (tgt = (i·39293+f·29101+seed·73471) mod N — ноль RAM \
+на граф), фазовые синапсы cos(), латеральное торможение, STDP+DA, гомеостаз-интегратор \
+(f_sys), ретикулярный тон (анти-windup), E/I-контроллер, нейромодуляторы DA/5HT/NE, \
+ритмы θ/γ. Инварианты (доказаны 67 проверок + 10 seed × 10k шагов): активность ~5%, \
+S < 0.8, веса в клипах. Телеметрия + readout топ-K активных нейронов.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "id живого мозга (продолжить)"},
+                "seed": {"type": "integer", "default": 777},
+                "n": {"type": "integer", "default": 600, "minimum": 8, "maximum": 1000000, "description": "нейронов"},
+                "fields": {"type": "integer", "default": 16, "minimum": 1, "maximum": 64, "description": "виртуальных синаптических полей"},
+                "dims": {"type": "integer", "default": 128, "description": "размерность CSE-сенсорики"},
+                "steps": {"type": "integer", "default": 1000, "maximum": 100000},
+                "readout": {"type": "integer", "default": 10, "description": "топ-K нейронов в readout"}
+            }
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_ssn_inject",
+        "description": "СЕНСОРНАЯ ИНЪЕКЦИЯ в живой мозг SSN: текст → CSE-вектор \
+(золотая фаза: c·φ mod 2π — разделимость 1.35) → активации нейронов. Затем \
+steps шагов динамики. Мозг воспринимает текст как сенсорный сигнал: инварианты \
+сохраняются (проверено inject_keeps_invariants).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "id живого мозга"},
+                "text": {"type": "string", "description": "сенсорный вход — что мозг воспринимает"},
+                "steps": {"type": "integer", "default": 500, "maximum": 100000, "description": "шагов после инъекции (0 — только восприять)"}
+            },
+            "required": ["session", "text"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_ssn_status",
+        "description": "СНИМОК ЖИВОГО МОЗГА SSN без шага: телеметрия (активность, \
+f_sys, ретикулярный тон, синхронность S, критичность C, E/I, GABA/глутамат, \
+DA/5HT/NE, веса) + readout топ-K активных нейронов + число живых сессий.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string"},
+                "readout": {"type": "integer", "default": 10}
+            },
+            "required": ["session"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "poler_ssn_eject",
+        "description": "Выгрузить живые мозги SSN из RAM: конкретный (session=id) \
+или все (all — умолчание). Состояния сетей, веса и медиаторы освобождаются.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "id мозга либо all (умолчание)"}
+            }
+        }
+    }));
+
     tools
 }
 
@@ -3893,6 +4242,93 @@ mod psi_family_tests {
         ] {
             assert!(names.contains(&expected), "нет {expected}: {names:?}");
         }
+    }
+
+    #[test]
+    fn manifest_contains_ssn_family() {
+        let m = tools_manifest();
+        let names: Vec<&str> =
+            m.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
+        for expected in [
+            "poler_ssn_step",
+            "poler_ssn_inject",
+            "poler_ssn_status",
+            "poler_ssn_eject",
+        ] {
+            assert!(names.contains(&expected), "нет {expected}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn is_ssn_tool_routes_family_only() {
+        for name in ["poler_ssn_step", "poler_ssn_inject", "poler_ssn_status", "poler_ssn_eject"] {
+            assert!(is_ssn_tool(&json!({
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}}
+            })));
+        }
+        assert!(!is_ssn_tool(&json!({
+            "method": "tools/list"
+        })));
+        assert!(!is_ssn_tool(&json!({
+            "method": "tools/call",
+            "params": {"name": "poler_literary_step", "arguments": {}}
+        })));
+    }
+
+    #[test]
+    fn ssn_tools_smoke_via_dispatch() {
+        // полный цикл: создать мозг → шагнуть → статус → выгрузить
+        let db = std::env::temp_dir().join("poler_mcp_ssn_smoke.db");
+        let srv = McpServer::new(0, 0, db);
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "poler_ssn_step", "arguments": {"steps": 1500, "seed": 42, "n": 300}}
+            }))
+            .expect("создание мозга");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let t_val: Value = serde_json::from_str(text).expect("телеметрия — валидный JSON");
+        let id = t_val
+            .pointer("/telemetry/session")
+            .and_then(|s| s.as_str())
+            .expect("session id в ответе")
+            .to_string();
+        let activity = t_val.pointer("/telemetry/activity").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        assert!(activity < 0.5, "активность {activity} — эпилепсия в smoke-тесте");
+
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "poler_ssn_inject", "arguments": {"session": id, "text": "проверка связи", "steps": 200}}
+            }))
+            .expect("инъекция");
+        assert!(serde_json::to_string(&r).unwrap().contains("neurons_touched"));
+
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "poler_ssn_status", "arguments": {"session": id}}
+            }))
+            .expect("статус");
+        assert!(serde_json::to_string(&r).unwrap().contains("criticality"));
+
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "poler_ssn_eject", "arguments": {}}
+            }))
+            .expect("выгрузка");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ev: Value = serde_json::from_str(text).expect("eject — валидный JSON");
+        let ejected = ev.get("ejected").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(ejected, 1, "должен выгрузиться один мозг: {text}");
     }
 
     #[test]

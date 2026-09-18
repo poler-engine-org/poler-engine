@@ -850,6 +850,52 @@ struct Cli {
     #[arg(long = "literary-json", default_value_t = false)]
     literary_json: bool,
 
+    // ── S1/v0.35.0: Синаптический Вихрь SSN ────────────────────────
+
+    /// Прогон живого мозга: полный доказанный стек вихря, телеметрия.
+    #[arg(long = "ssn-demo", default_value_t = false)]
+    ssn_demo: bool,
+
+    /// CSE-кодирование текста (с --ssn-encode-b — сходство пары).
+    #[arg(long = "ssn-encode", value_name = "TEXT")]
+    ssn_encode: Option<String>,
+
+    /// Второй текст для сравнения с --ssn-encode.
+    #[arg(long = "ssn-encode-b", value_name = "TEXT", requires = "ssn_encode")]
+    ssn_encode_b: Option<String>,
+
+    /// Сенсорная инъекция текста в живой мозг + прогон --ssn-steps.
+    #[arg(long = "ssn-inject", value_name = "TEXT")]
+    ssn_inject: Option<String>,
+
+    /// Нейронов в мозге [default: 600].
+    #[arg(long = "ssn-n", value_name = "N", default_value_t = 600)]
+    ssn_n: usize,
+
+    /// Виртуальных синаптических полей на нейрон [default: 16].
+    #[arg(long = "ssn-fields", value_name = "N", default_value_t = 16)]
+    ssn_fields: usize,
+
+    /// Seed траектории мозга [default: 777].
+    #[arg(long = "ssn-seed", value_name = "N", default_value_t = 777)]
+    ssn_seed: u64,
+
+    /// Размерность CSE-вектора сенсорики [default: 128].
+    #[arg(long = "ssn-dims", value_name = "N", default_value_t = 128)]
+    ssn_dims: usize,
+
+    /// Шагов для --ssn-demo/--ssn-inject [default: 10000].
+    #[arg(long = "ssn-steps", value_name = "N", default_value_t = 10_000)]
+    ssn_steps: usize,
+
+    /// Readout: топ-K активных нейронов [default: 10].
+    #[arg(long = "ssn-readout", value_name = "K", default_value_t = 10)]
+    ssn_readout: usize,
+
+    /// JSON-вывод режима --ssn-* (для агентов).
+    #[arg(long = "ssn-json", default_value_t = false)]
+    ssn_json: bool,
+
     /// Watcher-режим: инкрементальный рескан по mtime/size.
     #[arg(long)]
     watch: bool,
@@ -1264,6 +1310,11 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- L1/v0.34.0: Литературный Двигатель POLER[Ψ] ----------
     if cli.literary_field.is_some() || cli.literary_generate.is_some() {
         return ExitCode::from(run_literary(&cli) as u8);
+    }
+
+    // ---------- S1/v0.35.0: Синаптический Вихрь SSN ----------
+    if cli.ssn_demo || cli.ssn_encode.is_some() || cli.ssn_inject.is_some() {
+        return ExitCode::from(run_ssn(&cli) as u8);
     }
 
     // ---------- v0.20.0: Native Retrieval — grep-режим (слой 0) ----------
@@ -4377,6 +4428,161 @@ fn run_ner(what: &str, cli: &Cli) -> i32 {
 // ══════════════════════════════════════════════════════════════════
 
 /// Режим CLI Литературного Двигателя.
+// S1/v0.35.0: Синаптический Вихрь SSN — доказанное до реализации ядро
+// (65→67 проверок Python-сьюта, 10 seed × 10k шагов Rust full-fidelity).
+fn run_ssn(cli: &Cli) -> i32 {
+    use poler_engine::ssn;
+    use serde_json::json;
+
+    let cfg = ssn::VortexConfig {
+        n: cli.ssn_n,
+        fields: cli.ssn_fields,
+        ..Default::default()
+    };
+
+    // ── Режим 1: --ssn-encode [+ --ssn-encode-b] — сенсорная мера CSE ──
+    if let Some(text) = cli.ssn_encode.clone() {
+        let v = ssn::cse::encode(&text, cli.ssn_dims);
+        match cli.ssn_encode_b.clone() {
+            Some(other) => {
+                let w = ssn::cse::encode(&other, cli.ssn_dims);
+                let cos = ssn::cse::cos_sim(&v, &w);
+                let sin = ssn::cse::sin_corrected(&v, &w);
+                if cli.ssn_json {
+                    println!(
+                        "{}",
+                        json!({
+                            "mode": "ssn-encode-pair",
+                            "a": text, "b": other, "dims": cli.ssn_dims,
+                            "cos": (cos * 1e4).round() / 1e4,
+                            "sin_corrected": (sin * 1e4).round() / 1e4,
+                            "verdict": if cos > 0.5 { "похожи" } else if cos < 0.0 { "непохожи" } else { "нейтральны" },
+                        })
+                    );
+                } else {
+                    println!("CSE-сходство (D={}): cos = {:+.4}, sin-коррекция = {:+.4}", cli.ssn_dims, cos, sin);
+                    println!("вердикт: {}", if cos > 0.5 { "похожи" } else if cos < 0.0 { "непохожи" } else { "нейтральны" });
+                }
+            }
+            None => {
+                if cli.ssn_json {
+                    let head: Vec<f64> = v.iter().take(8).map(|x| (x * 1e4).round() / 1e4).collect();
+                    println!(
+                        "{}",
+                        json!({
+                            "mode": "ssn-encode", "dims": cli.ssn_dims,
+                            "chars": text.chars().count(),
+                            "norm": ssn::cse::norm(&v),
+                            "head": head,
+                        })
+                    );
+                } else {
+                    println!("CSE-вектор (D={}, {} символов, норма {:.6}):", cli.ssn_dims, text.chars().count(), ssn::cse::norm(&v));
+                    for (i, x) in v.iter().take(8).enumerate() {
+                        println!("  v[{i:3}] = {x:+.6}");
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    // ── Режим 2: --ssn-demo / --ssn-inject — живой мозг ──
+    let t0 = std::time::Instant::now();
+    let mut eng = ssn::SsnEngine::new(cfg, cli.ssn_seed, cli.ssn_dims);
+
+    let injected = cli.ssn_inject.clone().map(|text| {
+        let (chars, touched) = eng.inject_text(&text);
+        (text, chars, touched)
+    });
+
+    let steps = cli.ssn_steps.max(1);
+    let checkpoint = (steps / 10).max(1);
+    let mut traj: Vec<(usize, f64)> = Vec::new();
+    if !cli.ssn_json {
+        println!(
+            "Синаптический Вихрь SSN: N={} нейронов × {} полей = {} синапсов (виртуальная топология, 0 RAM на граф)",
+            cli.ssn_n,
+            cli.ssn_fields,
+            cli.ssn_n * cli.ssn_fields
+        );
+        if let Some((text, chars, touched)) = &injected {
+            println!("сенсорная инъекция: «{text}» — {chars} символов → {touched} нейронов");
+        }
+        println!("прогон {steps} шагов (доказанный режим: цель 5%, порог спайка 0.1):");
+        println!("  шаг    акт  f_sys  b_тон    S     C   E/I  GABA  DA   5HT   NE");
+    }
+    for i in 0..steps {
+        let act = eng.step();
+        let done = i + 1;
+        if done % checkpoint == 0 || done == steps {
+            traj.push((done, act));
+            if !cli.ssn_json {
+                let t = eng.telemetry();
+                println!(
+                    "{:>6} {:>6.4} {:>6.4} {:>6.3} {:>5.2} {:>5.2} {:>5.2} {:>5.2} {:>4.2} {:>5.2} {:>5.2}",
+                    done, t.activity, t.f_sys, t.b_tone, t.synchrony, t.criticality, t.ei, t.gaba, t.da, t.ht, t.ne
+                );
+            }
+        }
+    }
+
+    let t = eng.telemetry();
+    let readout = eng.readout(cli.ssn_readout);
+    let elapsed = t0.elapsed();
+    let sps = steps as f64 / elapsed.as_secs_f64();
+
+    if cli.ssn_json {
+        let traj_json: Vec<serde_json::Value> = traj
+            .iter()
+            .map(|(s, a)| json!({"step": s, "activity": (a * 1e4).round() / 1e4}))
+            .collect();
+        let readout_json: Vec<serde_json::Value> = readout
+            .iter()
+            .map(|(i, v)| json!({"neuron": i, "activation": (v * 1e4).round() / 1e4}))
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "mode": if injected.is_some() { "ssn-inject" } else { "ssn-demo" },
+                "n": cli.ssn_n, "fields": cli.ssn_fields, "seed": cli.ssn_seed,
+                "steps": steps,
+                "injected_text": injected.as_ref().map(|(t, _, _)| t.clone()),
+                "telemetry": {
+                    "activity": (t.activity * 1e4).round() / 1e4,
+                    "f_sys": (t.f_sys * 1e4).round() / 1e4,
+                    "b_tone": (t.b_tone * 1e4).round() / 1e4,
+                    "synchrony": (t.synchrony * 1e4).round() / 1e4,
+                    "criticality": (t.criticality * 1e4).round() / 1e4,
+                    "ei": (t.ei * 1e2).round() / 1e2,
+                    "gaba": t.gaba, "glut": t.glut, "da": t.da, "ht_5ht": t.ht, "ne": t.ne,
+                    "w_min": (t.w_min * 1e3).round() / 1e3, "w_max": (t.w_max * 1e3).round() / 1e3,
+                    "w_at_clip": (t.w_at_clip * 1e4).round() / 1e4,
+                    "active_count": t.active_count,
+                },
+                "readout": readout_json,
+                "trajectory": traj_json,
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "steps_per_sec": sps as u64,
+            })
+        );
+    } else {
+        println!("\nздоровье мозга: активность {:.1}% (цель 5%), S={:.2} (эпилепсия <0.8), C={:.2} (критичность), E/I={:.1} (норма ~4)",
+            t.activity * 100.0, t.synchrony, t.criticality, t.ei);
+        println!("веса: [{:+.3}, {:+.3}], у клипа {:.1}% | тон={:.3} | DA={:.2} 5HT={:.2} NE={:.2} | GABA={:.2} глут={:.2}",
+            t.w_min, t.w_max, t.w_at_clip * 100.0, t.b_tone, t.da, t.ht, t.ne, t.gaba, t.glut);
+        if !readout.is_empty() {
+            print!("readout (топ-{}): ", readout.len());
+            for (i, v) in &readout {
+                print!("[{i}] {v:.3}  ");
+            }
+            println!();
+        }
+        println!("время: {} мс ({:.0} шагов/с)", elapsed.as_millis(), sps);
+    }
+    0
+}
+
 fn run_literary(cli: &Cli) -> i32 {
     use poler_engine::literary as lit;
 
