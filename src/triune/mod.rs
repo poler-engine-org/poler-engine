@@ -16,6 +16,9 @@
 //! - [`stream_quant`] — потоковое квантование весов на лету (.t5q):
 //!   путь «70B на диске 4 ГБ» — сырец не касается диска, RAM-пик —
 //!   килобайты, результат не зависит от чанков чтения.
+//! - [`ingest`] — потоковый интернет-инжектор памяти: папки/веб-краул →
+//!   .t5c без удержания корпуса в RAM (RAM-дисциплина: слово ≤ 256 Б,
+//!   счётчики под капами с детерминированной эвакуацией);
 //! - [`motor`] — S2 моторный слой: речь → интенты poler_exec
 //!   (только предложения; исполнение остаётся за агентом).
 //!
@@ -45,7 +48,7 @@ pub use compiler::{
 };
 pub use crystal::Crystal;
 pub use flypulse::{FlyPulse, PulseOrigin};
-pub use ingest::{CrystalIngestor, IngestStats};
+pub use ingest::{IngestConfig, IngestStats, IngestingFetcher, StreamCrystalBuilder};
 pub use jit_loop::{CycleReport, ExecutableKernel, JitLoop, WeightsInCode};
 pub use motor::{MotorIntent, MotorOp};
 pub use stream_quant::{stream_quantize, verify_t5q, StreamQuantConfig, StreamQuantStats};
