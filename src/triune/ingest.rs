@@ -376,6 +376,7 @@ impl StreamCrystalBuilder {
             self.push_chunk(&buf[..n]);
         }
         self.finish();
+        self.sources += 1;
         Ok(true)
     }
 
@@ -383,10 +384,7 @@ impl StreamCrystalBuilder {
     /// Возвращает число прочитанных файлов.
     pub fn feed_dir<P: AsRef<Path>>(&mut self, dir: P) -> std::io::Result<usize> {
         let mut count = 0usize;
-        let entries = match std::fs::read_dir(dir.as_ref()) {
-            Ok(e) => e,
-            Err(e) => return Err(e),
-        };
+        let entries = std::fs::read_dir(dir.as_ref())?;
         let mut paths: Vec<std::path::PathBuf> =
             entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
         // детерминизм обхода: сортировка имён (платформо-независимая)
@@ -465,7 +463,7 @@ impl StreamCrystalBuilder {
         pairs.sort_by_key(|&(p, n)| (p, n));
 
         // ── Квантизация PMI в Trit5 (формулы — паритет Crystal::build) ──
-        let cols_packed = (vocab + 4) / 5;
+        let cols_packed = vocab.div_ceil(5);
         let zero_byte = Trit5Codec::pack_5(&[0i8; 5]).unwrap_or(121);
         let mut bigram = vec![zero_byte; vocab * cols_packed];
         let mut bigram_nonzeros: u64 = 0;
@@ -674,7 +672,7 @@ mod tests {
         let (ca, sa) = a.finalize().unwrap();
         let mut b = StreamCrystalBuilder::new(mk(48));
         b.push_str(&text);
-        let (cb, sb) = b.finalize().unwrap();
+        let (cb, _) = b.finalize().unwrap();
         assert_eq!(ca.to_bytes(), cb.to_bytes(), "эвакуация детерминирована");
         assert!(sa.words_evicted > 0, "эвакуация обязана была сработать");
         assert!(sa.peak_text_buffer <= 256 + 3, "RAM-дисциплина текста");

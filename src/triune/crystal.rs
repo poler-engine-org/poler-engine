@@ -473,7 +473,7 @@ impl Crystal {
         // декодируется как пять тритов −1!).
         let vacuum = Trit5Codec::pack_5(&[0i8; 5]).unwrap_or(121);
         // 1. Ёмкость матрицы: нужна строка для нового prev + столбец next.
-        let need_cols = ((self.tokens.len() + 1) + 4) / 5;
+        let need_cols = (self.tokens.len() + 1).div_ceil(5);
         if need_cols > self.stride {
             let new_stride = need_cols + 64;
             let mut grown = vec![vacuum; self.tokens.len() * new_stride];

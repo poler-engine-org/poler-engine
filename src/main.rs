@@ -963,11 +963,51 @@ struct Cli {
     #[arg(long = "gen-archetype-lines", value_name = "N", default_value_t = 50000)]
     gen_archetype_lines: usize,
 
-    /// Словарь кристалла для --crystal-build / --crystal-ingest-dir [default: 384].
+    /// АВТОНОМНЫЙ ИНТЕРНЕТ-ИНЖЕКТОР ПАМЯТИ: краулить URL (глубина и
+    /// лимиты наследуются из --crawl-*) и потоково выучить кристалл .t5c.
+    #[arg(
+        long = "learn-web",
+        value_name = "URL",
+        conflicts_with_all = [
+            "crawl", "web_search", "web_stats", "browser_index", "learn_dir",
+            "mcp", "mcp_http", "shell", "tui", "impact", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir",
+        ]
+    )]
+    learn_web: Option<String>,
+
+    /// Автономный инжектор памяти: рекурсивно выучить кристалл из папки
+    /// (текстовые расширения, бинарники пропускаются).
+    #[arg(
+        long = "learn-dir",
+        value_name = "DIR",
+        conflicts_with_all = [
+            "crawl", "web_search", "web_stats", "browser_index", "learn_web",
+            "mcp", "mcp_http", "shell", "tui", "impact", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir",
+        ]
+    )]
+    learn_dir: Option<PathBuf>,
+
+    /// Размер чанка потокового чтения при обучении, байт [default: 65536].
+    #[arg(long = "learn-chunk", value_name = "BYTES", default_value_t = 65_536)]
+    learn_chunk: usize,
+
+    /// Лимит уникальных слов в RAM при обучении (защита от OOM) [default: 262144].
+    #[arg(long = "learn-word-cap", value_name = "N", default_value_t = 262_144)]
+    learn_word_cap: usize,
+
+    /// Лимит биграммных пар в RAM при обучении [default: 2097152].
+    #[arg(long = "learn-bigram-cap", value_name = "N", default_value_t = 2_097_152)]
+    learn_bigram_cap: usize,
+
+    /// Словарь кристалла для --crystal-build / --crystal-ingest-dir /
+    /// --learn-web / --learn-dir [default: 384; для обучения рекомендуем
+    /// 4096..65536 — при 384 режимы learn автоматически поднимают до 4096].
     #[arg(long = "crystal-vocab", value_name = "N", default_value_t = 384)]
     crystal_vocab: usize,
 
-    /// Выходной путь .t5c для --crystal-build [default: <корпус>.t5c].
+    /// Выходной путь .t5c для --crystal-build / --learn-* [default: <корпус>.t5c / memory.t5c].
     #[arg(long = "crystal-out", value_name = "T5C")]
     crystal_out: Option<PathBuf>,
 
@@ -1430,6 +1470,9 @@ fn run(cli: Cli) -> ExitCode {
     }
     if cli.gen_archetype_asm.is_some() {
         return ExitCode::from(run_gen_archetype_asm(&cli) as u8);
+    }
+    if cli.learn_web.is_some() || cli.learn_dir.is_some() {
+        return ExitCode::from(run_learn(&cli) as u8);
     }
     if cli.stream_quant.is_some() {
         return ExitCode::from(run_stream_quant(&cli) as u8);
@@ -5245,7 +5288,149 @@ fn run_gen_archetype_asm(cli: &Cli) -> i32 {
     }
 }
 
+/// `--learn-web <URL>` / `--learn-dir <DIR>`: автономный инжектор памяти —
+/// потоковое обучение Кристалла Знаний без удержания корпуса в RAM.
+///
+/// Веб-режим повторяет конвейер `--crawl` (robots, politeness, дедупликация
+/// в SQLite-индекс), но каждая викачанная страница параллельно льётся в
+/// [`StreamCrystalBuilder`] через декоратор [`IngestingFetcher`].
+fn run_learn(cli: &Cli) -> i32 {
+    use poler_engine::triune::{IngestConfig, IngestingFetcher, StreamCrystalBuilder};
+    let t0 = std::time::Instant::now();
 
+    // Словарь: 384 (дефолт флага) для обучения мал — поднимаем до 4096.
+    let mut vocab = cli.crystal_vocab;
+    if vocab == 384 {
+        vocab = 4096;
+        eprintln!(
+            "learn: --crystal-vocab не задан, поднят 384 → 4096 \
+             (для больших дампов укажите до 65536)"
+        );
+    }
+    let vocab = vocab.clamp(32, 65_536);
+    if vocab > 16_384 {
+        let dense_mb = vocab as f64 * ((vocab as f64 + 4.0) / 5.0) / 1e6;
+        eprintln!(
+            "learn: ВНИМАНИЕ: плотная биграммная матрица {vocab}×{} ≈ {dense_mb:.0} МБ",
+            (vocab + 4) / 5
+        );
+    }
+    let cfg = IngestConfig {
+        vocab,
+        dims: poler_engine::triune::crystal::DEFAULT_DIMS,
+        theta_hi: poler_engine::triune::crystal::DEFAULT_THETA_HI,
+        theta_lo: poler_engine::triune::crystal::DEFAULT_THETA_LO,
+        chunk_bytes: cli.learn_chunk.max(1024),
+        word_cap: cli.learn_word_cap.max(1024),
+        bigram_cap: cli.learn_bigram_cap.max(1024),
+    };
+    let mut builder = StreamCrystalBuilder::new(cfg);
+
+    // ── Источник 1: локальная папка ──
+    if let Some(dir) = &cli.learn_dir {
+        eprintln!("learn-dir: потоковое чтение {}", dir.display());
+        match builder.feed_dir(dir) {
+            Ok(n) => eprintln!("learn-dir: прочитано файлов: {n}"),
+            Err(e) => {
+                eprintln!("learn-dir: {e}");
+                return 2;
+            }
+        }
+    }
+
+    // ── Источник 2: веб-краул (страницы → кристалл на лету) ──
+    if let Some(seed) = &cli.learn_web {
+        if !seed.starts_with("http://") && !seed.starts_with("https://") {
+            eprintln!("learn-web: ожидается URL (http(s)://...), получено: {seed}");
+            return 2;
+        }
+        let db = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let mut ix = match poler_engine::web::WebIndex::open(&db) {
+            Ok(ix) => ix,
+            Err(e) => {
+                eprintln!("learn-web: веб-индекс {db:?}: {e}");
+                return 2;
+            }
+        };
+        let fetcher = match poler_engine::web::cdp_fetcher_with_timeout(
+            cli.cdp_port,
+            cli.web_wait_ms,
+            cli.crawl_page_timeout_ms,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("learn-web: Chromium CDP (порт {}): {e}", cli.cdp_port);
+                eprintln!("  автозапуск не удался: установите POLER_CHROME_BIN или запустите вручную:");
+                eprintln!("  chrome --headless --remote-debugging-port={} --no-sandbox", cli.cdp_port);
+                return 2;
+            }
+        };
+        let crawl_cfg = poler_engine::web::CrawlConfig {
+            max_pages: cli.crawl_max.max(1),
+            max_depth: cli.crawl_depth,
+            delay_ms: cli.crawl_delay_ms,
+            cross_site: cli.cross_site,
+            wait_ms: cli.web_wait_ms,
+            page_timeout_ms: cli.crawl_page_timeout_ms,
+            respect_robots: true,
+        };
+        eprintln!(
+            "learn-web: seed {seed}, глубина ≤ {}, до {} страниц, база {db:?}",
+            crawl_cfg.max_depth, crawl_cfg.max_pages
+        );
+        let mut ing = IngestingFetcher::new(Box::new(fetcher), &mut builder);
+        match poler_engine::web::crawl::crawl(&mut ix, &mut ing, seed, &crawl_cfg, cli.verbose) {
+            Ok(s) => {
+                eprintln!(
+                    "learn-web: {} загружено, {} проиндексировано, {} без изменений, \
+                     {} дубликатов, {} robots-запретов, {} ошибок",
+                    s.fetched, s.indexed, s.unchanged, s.duplicates, s.skipped_robots, s.errors
+                );
+                eprintln!("learn-web: {} страниц скормлено в кристалл", ing.pages);
+            }
+            Err(e) => {
+                eprintln!("learn-web: {e}");
+                return 2;
+            }
+        }
+    }
+
+    // ── Сборка кристалла ──
+    let (crystal, stats) = match builder.finalize() {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("learn: {e}");
+            return 2;
+        }
+    };
+    let out = cli
+        .crystal_out
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("memory.t5c"));
+    if let Err(e) = crystal.save(&out) {
+        eprintln!("learn: {e}");
+        return 2;
+    }
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║   АВТОНОМНЫЙ ИНТЕРНЕТ-ИНЖЕКТОР ПАМЯТИ: кристалл готов       ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    println!("артефакт:  {}", out.display());
+    println!("словарь:   {} токенов (Trit5, 5 тритов/байт)", stats.crystal_vocab);
+    println!("корпус:    {} слов, {} символов, {} источников", stats.total_words, stats.total_chars, stats.total_sources);
+    println!("топология: {} ненулевых биграмм, sha256 {}", stats.bigram_nonzeros, &stats.sha256_hex[..16.min(64)]);
+    println!(
+        "RAM:       пик текстового буфера {} Б (лимит {} + 3), эвакуаций: {} слов / {} биграмм",
+        stats.peak_text_buffer, cli.learn_chunk, stats.words_evicted, stats.bigrams_evicted
+    );
+    if stats.files_skipped_binary > 0 {
+        println!("фильтр:    {} бинарных файлов пропущено", stats.files_skipped_binary);
+    }
+    println!("время:     {} мс", t0.elapsed().as_millis());
+    println!();
+    println!("говорить выученными словами:");
+    println!("  poler-engine --triune-speak \"живой мозг\" --triune-crystal {}", out.display());
+    0
+}
 
 fn run_stream_quant(cli: &Cli) -> i32 {
     use poler_engine::triune::{stream_quantize, verify_t5q, StreamQuantConfig};

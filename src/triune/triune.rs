@@ -72,6 +72,12 @@ pub struct TriuneConfig {
     pub ctx_window: usize,
     /// Громкость эха собственной речи (инъекция в мозг, 0..1).
     pub echo_scale: f64,
+    /// Динамическое расширение словаря: неизвестное слово промпта
+    /// мгновенно получает CSE-вложение и входит в активную лексику
+    /// (Dynamic Vocab Expansion, v0.37.0).
+    pub dynamic_vocab: bool,
+    /// Предел динамических слов за сессию (сверх — subword-фолбек).
+    pub dynamic_vocab_cap: usize,
 }
 
 impl Default for TriuneConfig {
@@ -88,6 +94,8 @@ impl Default for TriuneConfig {
             tau_base: 0.9,
             ctx_window: 2,
             echo_scale: 0.25,
+            dynamic_vocab: true,
+            dynamic_vocab_cap: 2048,
         }
     }
 }
@@ -144,6 +152,8 @@ pub struct TriuneCore {
     usage: HashMap<u32, u32>,
     /// Последние токены (контекст).
     ctx: Vec<u32>,
+    /// Сколько новых слов добавлено динамически за сессию.
+    dynamic_added: usize,
     /// Сенсорных инъекций сделано.
     pub injections: usize,
     /// Всего токенов произнесено.
@@ -162,9 +172,28 @@ impl TriuneCore {
             cfg,
             usage: HashMap::new(),
             ctx: Vec::new(),
+            dynamic_added: 0,
             injections: 0,
             tokens_spoken: 0,
         }
+    }
+
+    /// Резолюция слова промпта: словарь → динамическое расширение →
+    /// subword-фолбек. Возвращает id последнего куска (контекст),
+    /// None — слово неразложимо и лимит исчерпан.
+    fn resolve_prompt_token(&mut self, word: &str) -> Option<u32> {
+        if let Some(id) = self.crystal.id_of(word) {
+            return Some(id);
+        }
+        if self.cfg.dynamic_vocab && self.dynamic_added < self.cfg.dynamic_vocab_cap {
+            if let Some(id) = self.crystal.expand_vocab(word) {
+                self.dynamic_added += 1;
+                return Some(id);
+            }
+            return None;
+        }
+        // Лимит исчерпан (или выключен): жадное разложение на куски.
+        self.crystal.subword_ids(word).last().copied()
     }
 
     /// Температура речи из медиаторов (вихрь дышит — τ плывёт).
@@ -187,10 +216,12 @@ impl TriuneCore {
             self.vortex.inject(&pattern);
             self.injections += 1;
         }
-        // Контекст речи: последние слова промпта в словаре кристалла.
+        // Контекст речи: слова промпта — каждое либо находится в словаре,
+        // либо ДОБАВЛЯЕТСЯ на лету (Dynamic Vocab Expansion), либо
+        // раскладывается на словарные куски (subword-фолбек).
         let prompt_ids: Vec<u32> = crate::triune::crystal::tokenize(prompt)
             .iter()
-            .filter_map(|w| self.crystal.id_of(w))
+            .filter_map(|w| self.resolve_prompt_token(w))
             .collect();
         self.ctx = prompt_ids.iter().rev().take(self.cfg.ctx_window).cloned().rev().collect();
         let prompt_tail: String = prompt_ids
@@ -518,5 +549,43 @@ mod tests {
             assert!(!i.proposal.contains(";"), "инъекция команд запрещена");
             assert!(!i.proposal.contains("&&"), "конкатенация команд запрещена");
         }
+    }
+
+    /// Dynamic Vocab Expansion: неизвестное слово промпта входит в
+    /// активную лексику и звучит в речи.
+    #[test]
+    fn speak_learns_unknown_words_on_the_fly() {
+        let word = "квантизаторнейронность"; // заведомо вне словаря корпуса
+        let mut core = TriuneCore::new(
+            test_crystal(),
+            TriuneConfig::default(),
+            FlyPulse::synthetic(31, 0.8),
+            5,
+        );
+        assert!(core.crystal.id_of(word).is_none(), "слово вне словаря");
+        let v0 = core.crystal.vocab();
+        let _ = core.speak(&format!("живой {word}"), 16);
+        assert!(core.crystal.id_of(word).is_some(), "слово выучено на лету");
+        assert_eq!(core.crystal.vocab(), v0 + 1);
+    }
+
+    /// Subword-фолбек при выключенном динамическом словаре: склейка
+    /// словарных слов резолвится через последний кусок.
+    #[test]
+    fn subword_fallback_when_dynamic_disabled() {
+        let mut cfg = TriuneConfig::default();
+        cfg.dynamic_vocab = false;
+        let mut core =
+            TriuneCore::new(test_crystal(), cfg, FlyPulse::synthetic(41, 0.8), 6);
+        let w1 = core.crystal.tokens[0].clone();
+        let w2 = core.crystal.tokens[1].clone();
+        let glued = format!("{w1}{w2}");
+        let v0 = core.crystal.vocab();
+        let _ = core.speak(&format!("и {glued}"), 12);
+        assert_eq!(
+            core.crystal.vocab(),
+            v0,
+            "при выключенном dynamic_vocab словарь не растёт"
+        );
     }
 }
