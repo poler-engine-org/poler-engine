@@ -33,6 +33,7 @@
 pub mod compiler;
 pub mod crystal;
 pub mod flypulse;
+pub mod ingest;
 pub mod jit_loop;
 pub mod motor;
 pub mod stream_quant;
@@ -44,7 +45,9 @@ pub use compiler::{
 };
 pub use crystal::Crystal;
 pub use flypulse::{FlyPulse, PulseOrigin};
+pub use ingest::{CrystalIngestor, IngestStats};
 pub use jit_loop::{CycleReport, ExecutableKernel, JitLoop, WeightsInCode};
 pub use motor::{MotorIntent, MotorOp};
 pub use stream_quant::{stream_quantize, verify_t5q, StreamQuantConfig, StreamQuantStats};
 pub use triune::{TokenTrace, TriuneConfig, TriuneCore, Utterance};
+

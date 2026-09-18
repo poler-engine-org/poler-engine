@@ -951,7 +951,11 @@ struct Cli {
     #[arg(long = "crystal-build", value_name = "CORPUS_TXT")]
     crystal_build: Option<PathBuf>,
 
-    /// Словарь кристалла для --crystal-build [default: 384].
+    /// Потоковая ингестия директории с текстами/кодом в кристалл .t5c.
+    #[arg(long = "crystal-ingest-dir", value_name = "DIR")]
+    crystal_ingest_dir: Option<PathBuf>,
+
+    /// Словарь кристалла для --crystal-build / --crystal-ingest-dir [default: 384].
     #[arg(long = "crystal-vocab", value_name = "N", default_value_t = 384)]
     crystal_vocab: usize,
 
@@ -1412,6 +1416,9 @@ fn run(cli: Cli) -> ExitCode {
     }
     if cli.crystal_build.is_some() {
         return ExitCode::from(run_crystal_build(&cli) as u8);
+    }
+    if cli.crystal_ingest_dir.is_some() {
+        return ExitCode::from(run_crystal_ingest_dir(&cli) as u8);
     }
     if cli.stream_quant.is_some() {
         return ExitCode::from(run_stream_quant(&cli) as u8);
@@ -5162,6 +5169,45 @@ fn run_crystal_build(cli: &Cli) -> i32 {
     println!("  файл: {} байт, sha256 защищён", bytes.len());
     0
 }
+
+fn run_crystal_ingest_dir(cli: &Cli) -> i32 {
+    use poler_engine::triune::CrystalIngestor;
+    let dir = cli.crystal_ingest_dir.as_ref().unwrap();
+    let mut ingestor = CrystalIngestor::new(cli.crystal_vocab);
+    println!("потоковая ингестия текстов из: {}", dir.display());
+    match ingestor.feed_dir(dir) {
+        Ok(count) => {
+            println!("  прочитано файлов: {count}");
+        }
+        Err(e) => {
+            eprintln!("crystal-ingest-dir: ошибка чтения директории {dir:?}: {e}");
+            return 2;
+        }
+    }
+    let (crystal, stats) = match ingestor.compile() {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("crystal-ingest-dir: ошибка компиляции: {e}");
+            return 2;
+        }
+    };
+    let out = cli.crystal_out.clone().unwrap_or_else(|| {
+        let mut p = dir.clone();
+        p.set_extension("t5c");
+        p
+    });
+    if let Err(e) = crystal.save(&out) {
+        eprintln!("crystal-ingest-dir: {e}");
+        return 2;
+    }
+    println!("кристалл успешно скомпилирован: {}", out.display());
+    println!("  словарь: {} токенов", stats.crystal_vocab);
+    println!("  корпус: {} слов, {} символов", stats.total_words, stats.total_chars);
+    println!("  размер: {} байт (Trit5, 5 тритов/байт, No-Mul)", stats.crystal_bytes);
+    println!("  sha256: {}", stats.sha256_hex);
+    0
+}
+
 
 fn run_stream_quant(cli: &Cli) -> i32 {
     use poler_engine::triune::{stream_quantize, verify_t5q, StreamQuantConfig};
