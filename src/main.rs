@@ -967,6 +967,26 @@ struct Cli {
     #[arg(long = "triune-json", default_value_t = false)]
     triune_json: bool,
 
+    // ── S2→E2/v0.38.1: моторный мост (MotorIntent → исполнение) ──
+
+    /// ИСПОЛНЯТЬ моторные интенты речи: R1 (чтение/статус) — авто,
+    /// M2 (сборка/пуш/GUI) — подтверждение [y/N] или --motor-yes.
+    #[arg(long = "motor-act", default_value_t = false)]
+    motor_act: bool,
+
+    /// Авто-подтверждение мутаций M2 без вопросов (для неинтерактивных
+    /// прогонов; ответственность на операторе — красный баннер при старте).
+    #[arg(long = "motor-yes", default_value_t = false)]
+    motor_yes: bool,
+
+    /// Таймаут моторной команды, мс [default: 30000].
+    #[arg(long = "motor-timeout-ms", value_name = "N", default_value_t = 30_000)]
+    motor_timeout_ms: u64,
+
+    /// Лимит вывода моторной команды, байт (голова+хвост) [default: 65536].
+    #[arg(long = "motor-max-out", value_name = "N", default_value_t = 65_536)]
+    motor_max_out: usize,
+
     /// Собрать кристалл знаний .t5c из корпуса.
     #[arg(long = "crystal-build", value_name = "CORPUS_TXT")]
     crystal_build: Option<PathBuf>,
@@ -5152,6 +5172,28 @@ fn run_triune(cli: &Cli) -> i32 {
     }
     let mut core = TriuneCore::new(crystal, cfg, fly, cli.triune_seed);
 
+    // S2→E2/v0.38.1: моторный мост — двухуровневый контур исполнения.
+    let bridge = poler_engine::triune::motor_bridge::BridgeConfig {
+        act: cli.motor_act,
+        yes: cli.motor_yes,
+        timeout_ms: cli.motor_timeout_ms,
+        max_out: cli.motor_max_out,
+    };
+    if bridge.act {
+        // Баннер в stderr: stdout остаётся чистым для --triune-json.
+        eprintln!("┌─ МОТОРНЫЙ МОСТ АКТИВЕН (S2→E2) ────────────────────────────");
+        eprintln!("│ R1 ReadOnly: авто-исполнение (статус, логи, чтение файлов)");
+        if bridge.yes {
+            eprintln!("│ M2 Mutating: АВТО (--motor-yes; ответственность на операторе!)");
+        } else {
+            eprintln!("│ M2 Mutating: подтверждение [y/N] (нет tty → отказ; --motor-yes для авто)");
+        }
+        eprintln!("│ таймаут {} мс (SIGTERM→2с→SIGKILL), вывод ≤ {} байт (head+tail)",
+            bridge.timeout_ms, bridge.max_out);
+        eprintln!("└────────────────────────────────────────────────────────────");
+    }
+    let mut motor_log: Vec<(String, serde_json::Value)> = Vec::new();
+
     let mut utterances = Vec::new();
 
     if let Some(evolve_secs) = cli.triune_auto_evolve {
@@ -5219,13 +5261,41 @@ fn run_triune(cli: &Cli) -> i32 {
             println!("[Цикл {:03} | лишилось {:02}хв {:02}с] синапсів: {} | DA={:.2} C={:.2}{} | «{}»",
                 cycle, rem / 60, rem % 60, core.crystal.bigram_nonzeros, b.da, b.criticality, loop_marker, speech_text);
 
+            // S2→E2: исполнение моторных интентов цикла (двухуровневый контур).
+            // Сканируем и ПРОМПТ (директива пользователя), и речь кристалла:
+            // команда может прийти извне или родиться внутри речи.
+            if bridge.act {
+                let mut all_intents = poler_engine::triune::motor::scan(&cur_prompt);
+                all_intents.extend(u.intents.iter().cloned());
+                let events = poler_engine::triune::motor_bridge::act_on_intents(&all_intents, &bridge);
+                if !cli.triune_json {
+                    for ev in &events {
+                        eprintln!("  ⚙ мотор [{}] {} → {}: {}",
+                            ev["level"].as_str().unwrap_or("-"),
+                            ev["verb"].as_str().unwrap_or("?"),
+                            ev["program"].as_str().unwrap_or("—"),
+                            ev["status"].as_str().unwrap_or("?"));
+                    }
+                }
+                for ev in events {
+                    motor_log.push((format!("цикл-{cycle}"), ev));
+                }
+            }
+
             utterances.push((format!("цикл-{cycle}"), u));
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
 
         // Автозбереження навченого стану в постійну пам'ять
-        let save_path = std::path::PathBuf::from("/home/vitalij/.poler/permanent_memory.t5c");
-        let _ = core.crystal.save(&save_path);
+        // v0.38.1: глобальний шлях — через $HOME (портабельно; на машині
+        // розробника це той самий /home/vitalij/.poler/), а не хардкод.
+        if let Some(home) = std::env::var_os("HOME") {
+            let global = std::path::Path::new(&home).join(".poler").join("permanent_memory.t5c");
+            if let Some(dir) = global.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = core.crystal.save(&global);
+        }
         let _ = core.crystal.save(std::path::Path::new("permanent_memory.t5c"));
     } else {
         let prompts: Vec<String> = if cli.triune_demo {
@@ -5240,6 +5310,26 @@ fn run_triune(cli: &Cli) -> i32 {
 
         for prompt in &prompts {
             let u = core.speak(prompt, cli.triune_tokens);
+            // S2→E2: исполнение моторных интентов. Промпт — директивный канал
+            // пользователя («покажи статус»), речь — канал кристалла (если
+            // он сам скажет «запусти сборку» — тоже исполнится по правилам).
+            if bridge.act {
+                let mut all_intents = poler_engine::triune::motor::scan(prompt);
+                all_intents.extend(u.intents.iter().cloned());
+                let events = poler_engine::triune::motor_bridge::act_on_intents(&all_intents, &bridge);
+                if !cli.triune_json {
+                    for ev in &events {
+                        eprintln!("⚙ мотор [{}] {} → {}: {}",
+                            ev["level"].as_str().unwrap_or("-"),
+                            ev["verb"].as_str().unwrap_or("?"),
+                            ev["program"].as_str().unwrap_or("—"),
+                            ev["status"].as_str().unwrap_or("?"));
+                    }
+                }
+                for ev in events {
+                    motor_log.push((prompt.clone(), ev));
+                }
+            }
             utterances.push((prompt.clone(), u));
         }
     }
@@ -5252,7 +5342,13 @@ fn run_triune(cli: &Cli) -> i32 {
                        "utterance": triune_utterance_json(u)})
             })
             .collect();
-        println!("{}", json!({"mode": "triune", "elapsed_ms": t0.elapsed().as_millis(), "speech": arr}));
+        let mut payload = json!({"mode": "triune", "elapsed_ms": t0.elapsed().as_millis(), "speech": arr});
+        if bridge.act {
+            payload["motor_exec"] = json!(motor_log.iter()
+                .map(|(src, ev)| json!({"source": src, "event": ev}))
+                .collect::<Vec<_>>());
+        }
+        println!("{payload}");
         return 0;
     }
 
@@ -5302,6 +5398,12 @@ fn run_triune(cli: &Cli) -> i32 {
     let (inj, spoken, _) = core.state_summary();
     println!("\nитог: {} фраз, {} токенов, {} сенсорных инъекций, {} мс",
         utterances.len(), spoken, inj, t0.elapsed().as_millis());
+    if bridge.act {
+        let count = |st: &str| motor_log.iter().filter(|(_, e)| e["status"] == st).count();
+        println!("мост S2→E2: {} моторных событий (ok={}, refused={}, unresolved={}, error/timeout={})",
+            motor_log.len(), count("ok"), count("refused"), count("unresolved"),
+            motor_log.len() - count("ok") - count("refused") - count("unresolved"));
+    }
     // v0.38.0: сохранение синапсов, обученных в сессии (непрерывное обучение).
     if !cli.triune_no_learn {
         let save_target = if let Some(out) = &cli.triune_out {
