@@ -695,6 +695,31 @@ void EditorView::mousePressEvent(QMouseEvent *e)
     setCursor(Pos{line, col}, e->modifiers() & Qt::ShiftModifier);
 }
 
+void EditorView::mouseMoveEvent(QMouseEvent *e)
+{
+    if (e->buttons() & Qt::LeftButton) {
+        const int lh = lineHeight();
+        const int cw = charWidth();
+        const int gw = gutterWidth();
+        const qlonglong line = topLine() + e->pos().y() / lh;
+        const qlonglong col = qMax<qlonglong>(0, (e->pos().x() - gw + horizontalScrollBar()->value() * cw) / cw);
+        // keepAnchor = true для непрерывного выделения фрагментов мышью
+        setCursor(Pos{line, col}, true);
+    } else {
+        QAbstractScrollArea::mouseMoveEvent(e);
+    }
+}
+
+void EditorView::mouseReleaseEvent(QMouseEvent *e)
+{
+    if (e->button() == Qt::LeftButton) {
+        // Завершение выделения мышью
+        viewport()->update();
+    } else {
+        QAbstractScrollArea::mouseReleaseEvent(e);
+    }
+}
+
 void EditorView::mouseDoubleClickEvent(QMouseEvent *e)
 {
     // v1: двойной клик выделяет слово (по пробелам/знакам)
