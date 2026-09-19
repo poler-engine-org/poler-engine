@@ -38,9 +38,8 @@ kcoreaddons_add_plugin(
         polerpanel.cpp
         enginebridge.cpp
         polercommands.cpp
-    JSON
-        polerplugin.json
 )
+
 
 target_compile_definitions(polerengineplugin PRIVATE TRANSLATION_DOMAIN="polerengineplugin")
 
