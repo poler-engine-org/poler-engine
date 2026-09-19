@@ -68,6 +68,25 @@ enum KnowledgeEmbedderArg {
     Pqw,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum HarvestFormatArg {
+    /// Markdown: секции с номерами строк (для человека/агента).
+    Markdown,
+    /// JSONL: meta → file-записи → summary (стримится построчно).
+    Json,
+    /// Чистый текст-корпус для обучения кристалла (alias: t5c).
+    #[value(alias = "t5c")]
+    Corpus,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum HarvestModeArg {
+    /// Секции: ±context строк вокруг совпадений, слияние перекрытий.
+    Sections,
+    /// Файлы целиком (стриминг, ≤ max-file-bytes).
+    Files,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "poler-engine",
@@ -232,6 +251,75 @@ struct Cli {
     /// вхождений, статистика (для ИИ-агента).
     #[arg(long = "grep-json", requires = "grep")]
     grep_json: bool,
+
+    // ---------- poler_disk_harvester: суб-секундный сбор диска ----------
+
+    /// HARVEST: корни обхода (1+; каталоги, репозитории или файлы).
+    /// Параллельный ripgrep-обход + mmap + Aho-Corasick → один документ.
+    #[arg(
+        long = "harvest-disk",
+        value_name = "ROOT_PATH",
+        requires = "harvest_query",
+        conflicts_with_all = [
+            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "benchmark", "semantic_expand"
+        ]
+    )]
+    harvest_disk: Vec<PathBuf>,
+
+    /// Термы через пробел/запятую (OR; кириллица — вариантами регистра)
+    /// или единый regex при --harvest-regex.
+    #[arg(long = "harvest-query", value_name = "PATTERN")]
+    harvest_query: Option<String>,
+
+    /// Куда писать результат [default: stdout; "-" = stdout].
+    #[arg(long = "harvest-out", value_name = "OUT_FILE")]
+    harvest_out: Option<PathBuf>,
+
+    /// Формат: markdown | json | corpus (t5c-корпус для обучения).
+    #[arg(long = "harvest-format", value_enum, default_value = "markdown")]
+    harvest_format: HarvestFormatArg,
+
+    /// Гранулярность: sections (±context строк) | files (целиком).
+    #[arg(long = "harvest-mode", value_enum, default_value = "sections")]
+    harvest_mode: HarvestModeArg,
+
+    /// Строк контекста вокруг совпадения (sections).
+    #[arg(long = "harvest-context", default_value_t = 6)]
+    harvest_context: usize,
+
+    /// Кап файлов в выдаче (ранжирование по числу совпадений).
+    #[arg(long = "harvest-max-files", default_value_t = 20_000)]
+    harvest_max_files: usize,
+
+    /// Минимум совпадений на файл для попадания в выдачу.
+    #[arg(long = "harvest-min-matches", default_value_t = 1)]
+    harvest_min_matches: usize,
+
+    /// Скан первых N байт файла (гиганты — частично).
+    #[arg(long = "harvest-max-file-bytes", default_value_t = 8 * 1024 * 1024)]
+    harvest_max_file_bytes: u64,
+
+    /// Кап размера выходного документа.
+    #[arg(long = "harvest-max-out-bytes", default_value_t = 4294967296_u64)]
+    harvest_max_out_bytes: u64,
+
+    /// Число воркеров (0 = все ядра).
+    #[arg(long = "harvest-threads", default_value_t = 0)]
+    harvest_threads: usize,
+
+    /// Включить скрытые файлы/каталоги (по умолчанию как ripgrep — нет).
+    #[arg(long = "harvest-hidden")]
+    harvest_hidden: bool,
+
+    /// Игнорировать .gitignore (собрать ВСЁ, включая игнорируемое).
+    #[arg(long = "harvest-no-ignore")]
+    harvest_no_ignore: bool,
+
+    /// Трактовать --harvest-query как regex (regex::bytes).
+    #[arg(long = "harvest-regex")]
+    harvest_regex: bool,
 
     // ---------- v0.28.1: Архивы без распаковки ----------
 
@@ -1761,6 +1849,61 @@ fn run(cli: Cli) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+
+    // ---------- poler_disk_harvester: суб-секундный сбор диска ----------
+    if !cli.harvest_disk.is_empty() {
+        use poler_engine::search::disk_harvester as dh;
+        let Some(query) = cli.harvest_query.clone() else {
+            eprintln!("poler-engine: --harvest-disk требует --harvest-query <PATTERN>");
+            return ExitCode::from(2);
+        };
+        let cfg = dh::HarvestConfig {
+            roots: cli.harvest_disk.clone(),
+            query,
+            regex_mode: cli.harvest_regex,
+            out_path: cli
+                .harvest_out
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("-")),
+            format: match cli.harvest_format {
+                HarvestFormatArg::Markdown => dh::HarvestFormat::Markdown,
+                HarvestFormatArg::Json => dh::HarvestFormat::Json,
+                HarvestFormatArg::Corpus => dh::HarvestFormat::Corpus,
+            },
+            mode: match cli.harvest_mode {
+                HarvestModeArg::Sections => dh::HarvestMode::Sections,
+                HarvestModeArg::Files => dh::HarvestMode::Files,
+            },
+            context_lines: cli.harvest_context,
+            max_files: cli.harvest_max_files,
+            min_matches: cli.harvest_min_matches,
+            max_file_bytes: cli.harvest_max_file_bytes,
+            max_out_bytes: cli.harvest_max_out_bytes,
+            threads: cli.harvest_threads,
+            include_hidden: cli.harvest_hidden,
+            no_ignore: cli.harvest_no_ignore,
+            chunk_bytes: dh::DEFAULT_CHUNK,
+        };
+        match dh::run_harvest(&cfg) {
+            Ok(stats) => {
+                eprintln!("{}", stats.summary_line());
+                if stats.read_errors > 0 {
+                    eprintln!(
+                        "poler_disk_harvester: ошибок чтения: {}",
+                        stats.read_errors
+                    );
+                }
+                if stats.files_selected == 0 {
+                    return ExitCode::from(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        return ExitCode::SUCCESS;
     }
 
     // ---------- Semantic Bridge: диагностика расширения запроса ----------
