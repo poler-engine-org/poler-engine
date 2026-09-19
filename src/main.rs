@@ -5014,11 +5014,18 @@ fn triune_load_crystal(cli: &Cli) -> Result<poler_engine::triune::Crystal, Strin
         let bytes = std::fs::read(path).map_err(|e| format!("чтение {path:?}: {e}"))?;
         return poler_engine::triune::Crystal::load(&bytes, poler_engine::triune::crystal::DEFAULT_DIMS);
     }
-    // Автоматический поиск постоянной обученной памяти
-    for default_path in &["mega_corpus.t5c", "permanent_memory.t5c"] {
-        let p = std::path::Path::new(default_path);
+    // Автоматический поиск постоянной обученной памяти в глобальных и локальных путях
+    let mut search_paths = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        search_paths.push(std::path::PathBuf::from(home).join(".poler").join("permanent_memory.t5c"));
+    }
+    search_paths.push(std::path::PathBuf::from("permanent_memory.t5c"));
+    search_paths.push(std::path::PathBuf::from("mega_corpus.t5c"));
+    search_paths.push(std::path::PathBuf::from("/home/vitalij/Стільниця/poler-engine/mega_corpus.t5c"));
+
+    for p in search_paths {
         if p.exists() {
-            if let Ok(bytes) = std::fs::read(p) {
+            if let Ok(bytes) = std::fs::read(&p) {
                 if let Ok(c) = poler_engine::triune::Crystal::load(&bytes, poler_engine::triune::crystal::DEFAULT_DIMS) {
                     return Ok(c);
                 }
@@ -5146,28 +5153,69 @@ fn run_triune(cli: &Cli) -> i32 {
         let mut cycle = 0;
         let mut cur_prompt = cli.triune_speak.clone().unwrap_or_else(|| "квантовий ротор пам'яті".into());
         let deadline = t0 + std::time::Duration::from_secs(evolve_secs);
+        let mut recent_tokens_history: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(30);
+
+        let exploration_seeds = [
+            "квантова редукція фази",
+            "топологічний інваріант поля",
+            "синаптична пластичність і пам'ять",
+            "ентропійний градієнт вихору",
+            "динаміка збудження та гальмування",
+            "фрактальний атрактор свідомості",
+            "нейромедіаторний баланс дофаміну",
+            "когерентний синтез інформації",
+        ];
 
         while std::time::Instant::now() < deadline {
             cycle += 1;
             let u = core.speak(&cur_prompt, cli.triune_tokens.min(24));
             let speech_text = u.text.clone();
-            
-            // Вибираємо 2-3 слова з кінця відповіді для наступного промпта ланцюжка думок
-            let next_words: Vec<&str> = speech_text.split_whitespace().rev().take(3).collect();
-            cur_prompt = if !next_words.is_empty() {
-                next_words.into_iter().rev().collect::<Vec<_>>().join(" ")
+            let words: Vec<&str> = speech_text.split_whitespace().collect();
+
+            // Перевірка на цифрову епілепсію / граничний цикл (Limit-Cycle Attractor Trap)
+            let mut repeat_count = 0;
+            for w in &words {
+                if recent_tokens_history.iter().any(|past| past == *w) {
+                    repeat_count += 1;
+                }
+            }
+            let is_epileptic_loop = words.is_empty() || (words.len() > 3 && repeat_count * 100 / words.len() > 50);
+
+            for w in &words {
+                if recent_tokens_history.len() >= 30 {
+                    recent_tokens_history.pop_front();
+                }
+                recent_tokens_history.push_back((*w).to_string());
+            }
+
+            if is_epileptic_loop {
+                // Анти-епілептичний зрив резонансу: введення свіжого семантичного імпульсу
+                let seed_idx = (cycle + (u.telemetry.step as usize)) % exploration_seeds.len();
+                cur_prompt = exploration_seeds[seed_idx].to_string();
             } else {
-                "синтез структури системи".into()
-            };
+                // Вільний потік асоціативного ланцюжка
+                let next_words: Vec<&str> = speech_text.split_whitespace().rev().take(3).collect();
+                cur_prompt = if !next_words.is_empty() {
+                    next_words.into_iter().rev().collect::<Vec<_>>().join(" ")
+                } else {
+                    "синтез структури системи".into()
+                };
+            }
 
             let rem = deadline.saturating_duration_since(std::time::Instant::now()).as_secs();
             let b = &u.telemetry;
-            println!("[Цикл {:03} | лишилось {:02}хв {:02}с] синапсів: {} | DA={:.2} C={:.2} | «{}»",
-                cycle, rem / 60, rem % 60, core.crystal.bigram_nonzeros, b.da, b.criticality, speech_text);
+            let loop_marker = if is_epileptic_loop { " [⚡зрив петлі]" } else { "" };
+            println!("[Цикл {:03} | лишилось {:02}хв {:02}с] синапсів: {} | DA={:.2} C={:.2}{} | «{}»",
+                cycle, rem / 60, rem % 60, core.crystal.bigram_nonzeros, b.da, b.criticality, loop_marker, speech_text);
 
             utterances.push((format!("цикл-{cycle}"), u));
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(400));
         }
+
+        // Автозбереження навченого стану в постійну пам'ять
+        let save_path = std::path::PathBuf::from("/home/vitalij/.poler/permanent_memory.t5c");
+        let _ = core.crystal.save(&save_path);
+        let _ = core.crystal.save(std::path::Path::new("permanent_memory.t5c"));
     } else {
         let prompts: Vec<String> = if cli.triune_demo {
             vec![
