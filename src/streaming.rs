@@ -33,6 +33,12 @@ use crate::{with_text, EngineConfig, PiiCleaner, ResonanceMode};
 /// Порог «гигантского» файла: обрабатывается строго последовательно.
 pub const GIANT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Полуширина окна (в токенах) proximity-AND поиска: если точная фраза
+/// не найдена, многословный запрос ищется как «все токены в одном окне».
+/// 128 токенов ≈ типичная функция/абзац — покрывает агентский кейс
+/// «найди функцию, где встречаются оба термина».
+pub const PROXIMITY_WINDOW: usize = 128;
+
 // ---------------------------------------------------------------------------
 // Zero-copy токены файла
 // ---------------------------------------------------------------------------
@@ -123,6 +129,15 @@ impl<'a> FileTokens<'a> {
     }
 
     /// Позиции (индексы токенов) вхождений фразы запроса.
+    ///
+    /// Семантика (agent-friendly):
+    /// • 1 токен — все вхождения токена;
+    /// • ≥2 токена — сначала ТОЧНАЯ ФРАЗА (подряд, в порядке запроса);
+    ///   если фразы нет — proximity-AND: вхождения самого редкого токена,
+    ///   в окне ±[`PROXIMITY_WINDOW`] токенов которого встречаются ВСЕ
+    ///   токены запроса (в любом порядке). Раньше многословный запрос
+    ///   без точной фразы давал 0 хитов, даже если все токены жили в
+    ///   одной функции — главный агентский кейс («isatty confirm_mutating»).
     pub fn find_phrase(&self, query: &[String]) -> Vec<u32> {
         if query.is_empty() {
             return Vec::new();
@@ -148,6 +163,75 @@ impl<'a> FileTokens<'a> {
                 }
                 out.push(i as u32);
             }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+        self.find_proximity(query, PROXIMITY_WINDOW)
+    }
+
+    /// Proximity-AND: вхождения самого редкого токена запроса, в окне
+    /// ±window токенов которого есть все остальные токены запроса.
+    /// Позиции каждого уникального токена собираются одним проходом
+    /// (отсортированы по построению), попадание в окно проверяется
+    /// бинарным поиском — O(якоря × токены × log n).
+    fn find_proximity(&self, query: &[String], window: usize) -> Vec<u32> {
+        if self.raw.is_empty() || query.len() < 2 {
+            return Vec::new();
+        }
+        // Уникальные токены запроса (повторы не проверяем дважды).
+        let mut uniq: Vec<&str> = Vec::with_capacity(query.len());
+        for t in query {
+            if !uniq.contains(&t.as_str()) {
+                uniq.push(t.as_str());
+            }
+        }
+        if uniq.len() < 2 {
+            // Все токены запроса одинаковы → семантика одиночного токена.
+            let t = uniq[0];
+            return (0..self.raw.len())
+                .filter(|i| self.tok(*i) == t)
+                .map(|i| i as u32)
+                .collect();
+        }
+        // Один проход: позиции каждого уникального токена.
+        let mut positions: Vec<Vec<u32>> = vec![Vec::new(); uniq.len()];
+        for i in 0..self.raw.len() {
+            let t = self.tok(i);
+            for (ui, u) in uniq.iter().enumerate() {
+                if t == *u {
+                    positions[ui].push(i as u32);
+                }
+            }
+        }
+        // Хотя бы один токен в файле отсутствует — кандидатов нет.
+        if positions.iter().any(|p| p.is_empty()) {
+            return Vec::new();
+        }
+        // Якорь — самый редкий токен запроса (меньше проверок окна).
+        let anchor = positions
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.len())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let hi_bound = self.raw.len() - 1;
+        let mut out = Vec::new();
+        'anchors: for &a in &positions[anchor] {
+            let au = a as usize;
+            let lo = au.saturating_sub(window);
+            let hi = (au + window).min(hi_bound);
+            for (ui, ps) in positions.iter().enumerate() {
+                if ui == anchor {
+                    continue;
+                }
+                // ps отсортирован: первый элемент >= lo.
+                let first = ps.partition_point(|p| (*p as usize) < lo);
+                if ps.get(first).map_or(true, |p| *p as usize > hi) {
+                    continue 'anchors; // токен ui не попал в окно якоря
+                }
+            }
+            out.push(a);
         }
         out
     }
@@ -1192,6 +1276,60 @@ mod tests {
         assert!(literal_present("только ALPHA тут", &both, &pre));
         assert!(literal_present("только omega тут", &both, &pre));
         assert!(!literal_present("ни одного литерала", &both, &pre));
+    }
+
+    #[test]
+    fn find_phrase_exact_phrase_wins_over_proximity() {
+        // Точная фраза найдена → proximity не должен подмешивать лишние якоря.
+        let ft = FileTokens::build("alpha beta gamma alpha delta beta");
+        let hits = ft.find_phrase(&q(&["alpha", "beta"]));
+        assert_eq!(hits, vec![0]);
+    }
+
+    #[test]
+    fn find_phrase_proximity_fallback() {
+        // Реальный кейс из багрепорта: оба токена в одной функции,
+        // но не подряд. Раньше — 0 хитов.
+        let ft = FileTokens::build(
+            "pub fn confirm_mutating ( action : & ResolvedAction ) -> bool { \
+             let stdin_fd = std io stdin ( ) ; let is_stdin_tty = unsafe { \
+             libc :: isatty ( stdin_fd ) == 1 } ; }",
+        );
+        let hits = ft.find_phrase(&q(&["isatty", "confirm_mutating"]));
+        assert!(!hits.is_empty(), "proximity-AND должен найти функцию");
+        // Якорь — позиция одного из токенов запроса.
+        for h in &hits {
+            let t = ft.tok(*h as usize);
+            assert!(
+                t == "isatty" || t == "confirm_mutating",
+                "якорь должен быть токеном запроса, got {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_phrase_proximity_respects_window() {
+        // 300 разделителей > окно 128 → совпадения быть не должно.
+        let mut text = String::from("anchor");
+        for i in 0..300 {
+            text.push_str(&format!(" filler{i}"));
+        }
+        text.push_str(" needle");
+        let ft = FileTokens::build(&text);
+        assert!(ft.find_phrase(&q(&["anchor", "needle"])).is_empty());
+    }
+
+    #[test]
+    fn find_phrase_proximity_missing_token_empty() {
+        let ft = FileTokens::build("alpha beta gamma");
+        assert!(ft.find_phrase(&q(&["alpha", "zzz"])).is_empty());
+    }
+
+    #[test]
+    fn find_phrase_duplicated_token_single_semantics() {
+        let ft = FileTokens::build("alpha beta alpha gamma");
+        let hits = ft.find_phrase(&q(&["alpha", "alpha"]));
+        assert_eq!(hits, vec![0, 2]);
     }
 
     #[test]
