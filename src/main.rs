@@ -321,6 +321,18 @@ struct Cli {
     #[arg(long = "harvest-regex")]
     harvest_regex: bool,
 
+    // ---------- v0.38.0: POLER Sovereign Browser ----------
+
+    /// СУВЕРЕННЫЙ БРАУЗЕР POLER: загрузить страницу, отфильтровать рекламу
+    /// по квантовой ε-плотности и извлечь чистый семантический DOM/текст.
+    #[arg(long = "browser-url", value_name = "URL")]
+    browser_url: Option<String>,
+
+    /// Сохранить чистый текст и структуру веб-страницы в файл.
+    #[arg(long = "browser-out", value_name = "OUT_FILE", requires = "browser_url")]
+    browser_out: Option<PathBuf>,
+
+
     // ---------- v0.28.1: Архивы без распаковки ----------
 
     /// Скан архивов без распаковки (с --grep): записи zip/tar/tar.gz/
@@ -1361,15 +1373,83 @@ fn print_web_hits(
     let _ = std::io::stdout().flush();
 }
 
+/// v0.38.0: Автономный запуск браузерного ядра POLER
+fn run_browser_url(url: &str, out_file: Option<&std::path::Path>) -> i32 {
+    use poler_engine::browser::{BrowserConfig, BrowserWindow};
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    println!("poler-browser: загрузка {}", url);
+
+    let html_content = if url.starts_with("http://") || url.starts_with("https://") {
+        match poler_engine::web::cdp_fetcher_with_timeout(9222, 500, 10000) {
+            Ok(mut fetcher) => {
+                use poler_engine::web::PageFetcher;
+                match fetcher.fetch_raw(url) {
+                    Ok((_code, body)) => body,
+                    Err(_) => match fetcher.fetch(url) {
+                        Ok(page) => page.text,
+                        Err(e) => {
+                            eprintln!("poler-browser: ошибка CDP fetch: {e}");
+                            return 2;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("poler-browser: не удалось подключиться к веб-рантайму: {e}");
+                return 2;
+            }
+        }
+    } else if std::path::Path::new(url).exists() {
+        match std::fs::read_to_string(url) {
+            Ok(body) => body,
+            Err(e) => {
+                eprintln!("poler-browser: ошибка чтения локального файла: {e}");
+                return 2;
+            }
+        }
+    } else {
+        eprintln!("poler-browser: неподдерживаемый протокол или путь: {url}");
+        return 2;
+    };
+
+
+    let mut window = BrowserWindow::new(BrowserConfig::default());
+    window.open_tab(url);
+    window.load_html(&html_content);
+
+    let active_text = window.get_active_text();
+    let title = &window.tabs[window.active_tab_idx].title;
+
+    println!("poler-browser: [Заголовок] {}", title);
+    println!("poler-browser: [Чистый текст] {} символов (обработано за {} мс)", active_text.len(), t0.elapsed().as_millis());
+
+    if let Some(out) = out_file {
+        if let Err(e) = std::fs::write(out, active_text) {
+            eprintln!("poler-browser: ошибка сохранения: {e}");
+            return 2;
+        }
+        println!("poler-browser: сохранено в {}", out.display());
+    } else {
+        println!("\n--- Содержимое (ε-очищенное) ---\n{}", active_text.lines().take(30).collect::<Vec<_>>().join("\n"));
+        if active_text.lines().count() > 30 {
+            println!("\n... [остальной текст скрыт, используй --browser-out для сохранения]");
+        }
+    }
+
+    0
+}
+
 /// v0.18.0 → v2.0: человекочитаемый статус лицензии (`--license`).
-/// Формат живёт в license::status_text() — единый источник
-/// для CLI и команды `license` в Terminal Gateway.
 fn print_license_status() -> ExitCode {
     print!("{}", poler_engine::license::status_text());
     ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
+
+
     // v0.24.0: hidden-вход PATH-shim медиации агентов — перехват ДО clap:
     // shim-обёртки (~/.poler-engine/shim/bash) вызывают именно его.
     // `poler-engine __gateway-shim <shell> [args…]` → судит payload тем же
@@ -1417,8 +1497,14 @@ fn run(cli: Cli) -> ExitCode {
     if let Some(what) = cli.ner.as_deref() {
         return ExitCode::from(run_ner(what, &cli) as u8);
     }
+    // ---------- v0.38.0: POLER Sovereign Browser ----------
+    if let Some(url) = &cli.browser_url {
+        return ExitCode::from(run_browser_url(url, cli.browser_out.as_deref()) as u8);
+    }
+
 
     // ---------- Суверенный Гиппокамп: библиотека знаний POLER (v0.29) ----------
+
     if cli.knowledge_stats {
         return ExitCode::from(run_knowledge_stats(&cli) as u8);
     }
