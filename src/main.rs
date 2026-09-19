@@ -955,6 +955,14 @@ struct Cli {
     #[arg(long = "triune-auto-evolve", value_name = "SECONDS")]
     triune_auto_evolve: Option<u64>,
 
+    /// Інспекція кристала пам'яті: статистика, токени, активні синапси.
+    #[arg(long = "triune-crystal-info")]
+    triune_crystal_info: bool,
+
+    /// Інспекція синаптичних зв'язків конкретного слова в пам'яті (+1 / -1).
+    #[arg(long = "triune-crystal-inspect", value_name = "WORD")]
+    triune_crystal_inspect: Option<String>,
+
     /// JSON-вывод режима --triune-* (для агентов).
     #[arg(long = "triune-json", default_value_t = false)]
     triune_json: bool,
@@ -1471,6 +1479,9 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     // ---------- S2/v0.36.0: Триединая Архитектура ----------
+    if cli.triune_crystal_info || cli.triune_crystal_inspect.is_some() {
+        return ExitCode::from(run_triune_crystal_inspect(&cli) as u8);
+    }
     if cli.triune_auto_evolve.is_some() || cli.triune_demo || cli.triune_speak.is_some() {
         return ExitCode::from(run_triune(&cli) as u8);
     }
@@ -5312,6 +5323,81 @@ fn run_triune(cli: &Cli) -> i32 {
                 Err(e) => eprintln!("triune auto-save: {e}"),
             }
         }
+    }
+    0
+}
+
+fn run_triune_crystal_inspect(cli: &Cli) -> i32 {
+    let crystal = match triune_load_crystal(cli) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("помилка завантаження кристала: {e}");
+            return 2;
+        }
+    };
+
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║         ІНСПЕКЦІЯ ТРІЙКОВОГО КРИСТАЛА ПАМ'ЯТІ (Trit5)       ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    println!("• Розмірність словника: {} унікальних токенів", crystal.vocab());
+    println!("• Активних ненульових синапсів: {} зв'язків", crystal.bigram_nonzeros);
+    println!("• Опрацьовано корпусу: {} слів ({} символів)", crystal.corpus_words, crystal.corpus_chars);
+    println!("• Поріг зв'язку θ_hi: {:.3}", crystal.theta_hi());
+
+    if let Some(target_word) = &cli.triune_crystal_inspect {
+        let query = target_word.to_lowercase();
+        let target_id = crystal.id_of(&query);
+
+        println!("\n── ДЕТАЛЬНИЙ АНАЛІЗ ТОКЕНА «{}» ────────────────────────", target_word);
+        match target_id {
+            Some(tid) => {
+                println!("• Внутрішній ID: {}", tid);
+                let mut exc_synapses = Vec::new();
+                let mut inh_synapses = Vec::new();
+
+                for other_id in 0..(crystal.vocab() as u32) {
+                    if other_id == tid {
+                        continue;
+                    }
+                    let trit = crystal.bigram_trit(tid, other_id);
+                    if trit > 0 {
+                        exc_synapses.push(crystal.tokens[other_id as usize].clone());
+                    } else if trit < 0 {
+                        inh_synapses.push(crystal.tokens[other_id as usize].clone());
+                    }
+                }
+
+                println!("• Збуджувальні синапси (+1, притягує): {} токенів", exc_synapses.len());
+                if !exc_synapses.is_empty() {
+                    println!("  → Топ ланцюжок: {}", exc_synapses.iter().take(20).cloned().collect::<Vec<_>>().join(", "));
+                }
+
+                println!("• Гальмівні синапси (-1, відштовхує): {} токенів", inh_synapses.len());
+                if !inh_synapses.is_empty() {
+                    println!("  → Топ гальмування: {}", inh_synapses.iter().take(20).cloned().collect::<Vec<_>>().join(", "));
+                }
+            }
+            None => {
+                println!("⚠ Токен «{}» відсутній у поточному словнику кристала.", target_word);
+                let similar: Vec<&str> = crystal.tokens.iter()
+                    .filter(|t| t.contains(&query) || query.contains(t.as_str()))
+                    .take(8)
+                    .map(|s| s.as_str())
+                    .collect();
+                if !similar.is_empty() {
+                    println!("  Можливо, ви мали на увазі: {}", similar.join(", "));
+                }
+            }
+        }
+    } else {
+        println!("\n── ТОП-32 НАЙБІЛЬШ ВЖИВАНИХ ТОКЕНІВ ПАМ'ЯТІ ─────────────");
+        for (i, t) in crystal.tokens.iter().take(32).enumerate() {
+            print!("{:<16}", format!("{}. {}", i + 1, t));
+            if (i + 1) % 4 == 0 {
+                println!();
+            }
+        }
+        println!("\n\n💡 Для аналізу конкретного слова запустіть:\n  poler-engine --triune-crystal-inspect \"<СЛОВО>\"");
     }
     0
 }
