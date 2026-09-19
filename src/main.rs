@@ -5004,15 +5004,24 @@ fn run_ssn(cli: &Cli) -> i32 {
 
 // ---------- S2/v0.36.0: Триединая Архитектура (муха + вихрь + кристалл) ----------
 
-/// Загрузка кристалла: внешний .t5c или зашитый в бинарник.
+/// Загрузка кристалла: внешний .t5c, постоянная память или зашитый в бинарник.
 fn triune_load_crystal(cli: &Cli) -> Result<poler_engine::triune::Crystal, String> {
-    match &cli.triune_crystal {
-        Some(path) => {
-            let bytes = std::fs::read(path).map_err(|e| format!("чтение {path:?}: {e}"))?;
-            poler_engine::triune::Crystal::load(&bytes, poler_engine::triune::crystal::DEFAULT_DIMS)
-        }
-        None => poler_engine::triune::Crystal::embedded(),
+    if let Some(path) = &cli.triune_crystal {
+        let bytes = std::fs::read(path).map_err(|e| format!("чтение {path:?}: {e}"))?;
+        return poler_engine::triune::Crystal::load(&bytes, poler_engine::triune::crystal::DEFAULT_DIMS);
     }
+    // Автоматический поиск постоянной обученной памяти
+    for default_path in &["mega_corpus.t5c", "permanent_memory.t5c"] {
+        let p = std::path::Path::new(default_path);
+        if p.exists() {
+            if let Ok(bytes) = std::fs::read(p) {
+                if let Ok(c) = poler_engine::triune::Crystal::load(&bytes, poler_engine::triune::crystal::DEFAULT_DIMS) {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+    poler_engine::triune::Crystal::embedded()
 }
 
 /// Пульс мухи: настоящая каста из коннектома или виртуальная (seed).
@@ -5195,14 +5204,25 @@ fn run_triune(cli: &Cli) -> i32 {
     let (inj, spoken, _) = core.state_summary();
     println!("\nитог: {} фраз, {} токенов, {} сенсорных инъекций, {} мс",
         utterances.len(), spoken, inj, t0.elapsed().as_millis());
-    // v0.38.0: сохранение синапсов, обученных в сессии.
-    if let Some(out) = &cli.triune_out {
-        match core.crystal.save(out) {
-            Ok(()) => println!("кристалл сохранён: {} ({} токенов, {} синапсов)",
-                out.display(), core.crystal.vocab(), core.crystal.bigram_nonzeros),
-            Err(e) => {
-                eprintln!("triune-out: {e}");
-                return 2;
+    // v0.38.0: сохранение синапсов, обученных в сессии (непрерывное обучение).
+    if !cli.triune_no_learn {
+        let save_target = if let Some(out) = &cli.triune_out {
+            Some(out.clone())
+        } else if let Some(c_path) = &cli.triune_crystal {
+            Some(c_path.clone())
+        } else if std::path::Path::new("mega_corpus.t5c").exists() {
+            Some(std::path::PathBuf::from("mega_corpus.t5c"))
+        } else if std::path::Path::new("permanent_memory.t5c").exists() {
+            Some(std::path::PathBuf::from("permanent_memory.t5c"))
+        } else {
+            None
+        };
+
+        if let Some(target) = save_target {
+            match core.crystal.save(&target) {
+                Ok(()) => println!("память обновлена (онлайн-обучение): {} ({} токенов, {} синапсов)",
+                    target.display(), core.crystal.vocab(), core.crystal.bigram_nonzeros),
+                Err(e) => eprintln!("triune auto-save: {e}"),
             }
         }
     }
