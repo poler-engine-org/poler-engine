@@ -332,6 +332,38 @@ struct Cli {
     #[arg(long = "browser-out", value_name = "OUT_FILE", requires = "browser_url")]
     browser_out: Option<PathBuf>,
 
+    // ---------- v0.38.0: poler-edit — суверенный редактор без лимитов ----------
+
+    /// EDITOR SERVER: JSON-протокол поверх stdio (LSP-стиль) для GUI-клиентов
+    /// (integrations/poler-edit-qt). Один процесс — много документов (вкладки),
+    /// события прогресса индексации/поиска, отмена длинных операций.
+    #[arg(
+        long = "edit-serve",
+        conflicts_with_all = [
+            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "benchmark", "semantic_expand", "harvest_disk", "edit_bench", "browser_url"
+        ]
+    )]
+    edit_serve: bool,
+
+    /// EDITOR BENCH: открыть FILE (любого размера — mmap zero-copy),
+    /// проиндексировать строки и выполнить поиск; печатает открытые цифры
+    /// (open ms, index GiB/s, search GiB/s, peak RSS) — см. docs/POLER_EDIT.md.
+    #[arg(
+        long = "edit-bench",
+        value_name = "FILE",
+        conflicts_with_all = [
+            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "benchmark", "semantic_expand", "harvest_disk", "edit_serve", "browser_url"
+        ]
+    )]
+    edit_bench: Option<PathBuf>,
+
+    /// Искать эту подстроку в --edit-bench [default: e].
+    #[arg(long = "edit-bench-query", default_value = "e")]
+    edit_bench_query: String,
 
     // ---------- v0.28.1: Архивы без распаковки ----------
 
@@ -1474,6 +1506,17 @@ fn run(cli: Cli) -> ExitCode {
             eprintln!("poler-engine: не удалось настроить пул потоков: {e}");
             return ExitCode::from(2);
         }
+    }
+
+    // ---------- v0.38.0 poler-edit: сервер редактора и бенчмарк ядра ----------
+    if cli.edit_serve {
+        return ExitCode::from(poler_engine::editor::protocol::run_edit_server() as u8);
+    }
+    if let Some(file) = &cli.edit_bench {
+        return ExitCode::from(poler_engine::editor::bench::run_edit_bench(
+            file,
+            &cli.edit_bench_query,
+        ) as u8);
     }
 
     // ---------- v2.0 Part E/F: суверенный ML-инференс через pqc ----------
