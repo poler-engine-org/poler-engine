@@ -5,6 +5,7 @@
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QGuiApplication>
+#include <QJsonArray>
 #include <QKeyEvent>
 #include <QPainter>
 #include <QScrollBar>
@@ -30,7 +31,7 @@ EditorView::EditorView(EngineBridge *bridge, const QString &path, QWidget *paren
     setFont(m_font);
 
     setFocusPolicy(Qt::StrongFocus);
-    setCursor(Qt::IBeamCursor);
+    viewport()->setCursor(Qt::IBeamCursor);
     setFrameShape(QFrame::NoFrame);
     viewport()->setAttribute(Qt::WA_OpaquePaintEvent);
 
