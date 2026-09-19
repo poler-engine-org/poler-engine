@@ -951,6 +951,10 @@ struct Cli {
     #[arg(long = "triune-no-learn", default_value_t = false)]
     triune_no_learn: bool,
 
+    /// Автономне безперервне навчання та еволюція пам'яті (секунди, наприклад: 300 = 5 хв).
+    #[arg(long = "triune-auto-evolve", value_name = "SECONDS")]
+    triune_auto_evolve: Option<u64>,
+
     /// JSON-вывод режима --triune-* (для агентов).
     #[arg(long = "triune-json", default_value_t = false)]
     triune_json: bool,
@@ -1467,7 +1471,7 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     // ---------- S2/v0.36.0: Триединая Архитектура ----------
-    if cli.triune_demo || cli.triune_speak.is_some() {
+    if cli.triune_auto_evolve.is_some() || cli.triune_demo || cli.triune_speak.is_some() {
         return ExitCode::from(run_triune(&cli) as u8);
     }
     if cli.crystal_build.is_some() {
@@ -5130,20 +5134,55 @@ fn run_triune(cli: &Cli) -> i32 {
     }
     let mut core = TriuneCore::new(crystal, cfg, fly, cli.triune_seed);
 
-    let prompts: Vec<String> = if cli.triune_demo {
-        vec![
-            "живой мозг говорит".into(),
-            "система слушает сенсорный вход".into(),
-            "открой терминал и покажи статус".into(),
-        ]
-    } else {
-        vec![cli.triune_speak.clone().unwrap_or_default()]
-    };
-
     let mut utterances = Vec::new();
-    for prompt in &prompts {
-        let u = core.speak(prompt, cli.triune_tokens);
-        utterances.push((prompt.clone(), u));
+
+    if let Some(evolve_secs) = cli.triune_auto_evolve {
+        println!("╔════════════════════════════════════════════════════════════╗");
+        println!("║  АВТОНОМНА ЕВОЛЮЦІЯ ТА НЕПРЕРВНЕ НАВЧАННЯ ТРИЄДНОСТІ ({} с) ║", evolve_secs);
+        println!("╚════════════════════════════════════════════════════════════╝");
+        println!("тривалість: {} секунд | кристалл: {} токенів | STDP: активний\n",
+            evolve_secs, core.crystal.vocab());
+
+        let mut cycle = 0;
+        let mut cur_prompt = cli.triune_speak.clone().unwrap_or_else(|| "квантовий ротор пам'яті".into());
+        let deadline = t0 + std::time::Duration::from_secs(evolve_secs);
+
+        while std::time::Instant::now() < deadline {
+            cycle += 1;
+            let u = core.speak(&cur_prompt, cli.triune_tokens.min(24));
+            let speech_text = u.text.clone();
+            
+            // Вибираємо 2-3 слова з кінця відповіді для наступного промпта ланцюжка думок
+            let next_words: Vec<&str> = speech_text.split_whitespace().rev().take(3).collect();
+            cur_prompt = if !next_words.is_empty() {
+                next_words.into_iter().rev().collect::<Vec<_>>().join(" ")
+            } else {
+                "синтез структури системи".into()
+            };
+
+            let rem = deadline.saturating_duration_since(std::time::Instant::now()).as_secs();
+            let b = &u.telemetry;
+            println!("[Цикл {:03} | лишилось {:02}хв {:02}с] синапсів: {} | DA={:.2} C={:.2} | «{}»",
+                cycle, rem / 60, rem % 60, core.crystal.bigram_nonzeros, b.da, b.criticality, speech_text);
+
+            utterances.push((format!("цикл-{cycle}"), u));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    } else {
+        let prompts: Vec<String> = if cli.triune_demo {
+            vec![
+                "живой мозг говорит".into(),
+                "система слушает сенсорный вход".into(),
+                "открой терминал и покажи статус".into(),
+            ]
+        } else {
+            vec![cli.triune_speak.clone().unwrap_or_default()]
+        };
+
+        for prompt in &prompts {
+            let u = core.speak(prompt, cli.triune_tokens);
+            utterances.push((prompt.clone(), u));
+        }
     }
 
     if cli.triune_json {
