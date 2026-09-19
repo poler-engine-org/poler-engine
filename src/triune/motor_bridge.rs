@@ -196,21 +196,46 @@ fn resolve_case_insensitive(path: &str) -> std::path::PathBuf {
 /// Интерактивное подтверждение мутации (UX Open Interpreter: `[y/N]`).
 /// Не-tty stdin → отказ (безопасный дефолт для пайпов/агентов).
 pub fn confirm_mutating(action: &ResolvedAction) -> bool {
-    use std::io::Write;
-    let mut tty = match std::fs::File::open("/dev/tty") {
-        Ok(f) => f,
-        Err(_) => return false, // нет терминала → отказ
-    };
-    let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "⚡ МОТОР M2 [{}] {} {:}? [y/N] ", action.level.as_str(), action.program, action.args.join(" "));
-    let _ = stdout.flush();
-    let mut buf = [0u8; 8];
-    let Ok(n) = tty.read(&mut buf) else { return false };
-    let ans = String::from_utf8_lossy(&buf[..n]);
-    let c = ans.trim().chars().next().unwrap_or('n');
-    let c = c.to_lowercase().next().unwrap_or(c);
-    // y/yes (EN), д/да (RU), т/так (UA)
-    matches!(c, 'y' | 'д' | 'т')
+    // В тестах не ждём ввод пользователя — считаем отсутствие подтверждения
+    #[cfg(test)]
+    {
+        let _ = action;
+        return false;
+    }
+
+    #[cfg(not(test))]
+    {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        // Проверяем, что stdin процесса является интерактивным терминалом
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        let is_stdin_tty = unsafe { libc::isatty(stdin_fd) == 1 };
+        if !is_stdin_tty {
+            return false;
+        }
+
+        let mut tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            Ok(f) => {
+                let is_atty = unsafe { libc::isatty(f.as_raw_fd()) == 1 };
+                if !is_atty {
+                    return false;
+                }
+                f
+            }
+            Err(_) => return false,
+        };
+
+        let _ = write!(tty, "⚡ МОТОР M2 [{}] {} {:}? [y/N] ", action.level.as_str(), action.program, action.args.join(" "));
+        let _ = tty.flush();
+        let mut buf = [0u8; 8];
+        let Ok(n) = tty.read(&mut buf) else { return false };
+        let ans = String::from_utf8_lossy(&buf[..n]);
+        let c = ans.trim().chars().next().unwrap_or('n');
+        let c = c.to_lowercase().next().unwrap_or(c);
+        // y/yes (EN), д/да (RU), т/так (UA)
+        matches!(c, 'y' | 'д' | 'т')
+    }
 }
 
 /// Исполнение действия с гарантиями моста (таймаут-каскад + кольцевой буфер).
