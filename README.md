@@ -25,6 +25,40 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.42.0: winpe — Windows PE32+ нативно в коробке (Linux + Windows в одном контейнере)
+
+`poler-box` теперь исполняет **нативные Windows-бинарики (PE32+ AMD64)**
+внутри той же изолированной коробки — **без Wine и без виртуализации**:
+
+```
+poler-engine --poler-box windows.poler --box-entry rootfs/bin/7za.exe --box-arg i
+poler-engine --winexec 7za.exe            # прямой запуск с хоста
+```
+
+Архитектура `src/winpe/` (~3900 строк Rust, порт идей poler-os pe.zig/win32_crt.zig):
+
+- **runtime.rs** — отображение образа, DIR64-релокации, IAT → тunki
+  (`mov r10,id; mov rax,bridge; jmp rax`), asm-мост SysV↔Win64 (id через R10 —
+  volatile в обоих ABI), TEB/PEB через `arch_prctl(ARCH_SET_GS)`, стеки с
+  slack-зонами;
+- **pe.rs** — PE32+ парсер (секции, импорты, .pdata);
+- **crt.rs** — msvcrt: полный printf-формтер (varargs по регистрам + XMM-spill
+  + va_list-режим), `__getmainargs` (argc значением!), `_initterm` (пропуск
+  NULL), qsort с компаратором на текущем стеке;
+- **api.rs** — реентерабельный World (Gate: владелец=tid, без самодедлоков в
+  SEH) + kernel32 (~150 шимов: файлы, поиск с WIN32_FIND_DATAW cFileName@44,
+  критические секции на futex, потоки с собственными TEB);
+- **api_ext.rs** — CRT-IO, 64-битные мат-хелперы msvcrt, user32/advapi;
+- **seh.rs** — собственный walker x64 C++ исключений: .pdata/UNWIND_INFO
+  (слоты, а не коды!), FuncInfo в формате WINE x64 (nTryBlocks@+0x0C,
+  IP-to-state@+0x18), деструкторы → catch-продолжение (RAX), C-SEH
+  scope-таблицы, hop-механизм для обхода кадров Rust-слоя.
+
+Приёмка (e2e): **7-Zip 21.07 x64** — полный список форматов/кодеков/хешеров,
+exit 0; LZMA-бенчмарк: детекция Xeon A06D1, частота ~3.56 ГГц через
+QPC-шим, 4 потока; `tcc 0.9.27` (Linux) в той же коробке — регрессия
+зелёная. Демо-архивы: HF `VitalijKotok/poler-chromium-src/box-demos`.
+
 ## v0.41.0: poler-box — «замена Docker без ОС»: циклическая обёртка выполнения `.poler`
 
 Директива пользователя: исполнять тяжёлые payload (вплоть до сборки Chromium)

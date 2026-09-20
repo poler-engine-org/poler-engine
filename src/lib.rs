@@ -56,6 +56,7 @@ pub mod crypto;
 pub mod editor;
 pub mod engine;
 pub mod universal_archetype_asm;
+pub mod winpe;
 pub mod universal_letters;
 
 /// E1/v0.31.0: идеальный исполнитель команд — Zig-ядро

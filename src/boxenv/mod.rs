@@ -436,10 +436,46 @@ fn stage2_run() -> Result<i32, String> {
         }
     }
 
-    // --- запис entry у memfd: виконання прямо з архіву, без дубля на fs ---
+    // --- читання entry у пам'ять (стрім, zero-disk) ---
     let entry_file = reader
         .find_file(&entry)
         .ok_or_else(|| format!("запис '{entry}' зник з архіву"))?;
+    let mut entry_bytes: Vec<u8> = Vec::with_capacity(entry_file.raw_len.min(64 << 20) as usize);
+    stream_file_out(&reader, entry_file, &mut entry_bytes)
+        .map_err(|e| format!("читання entry: {e}"))?;
+
+    // --- v0.42.0 winpe: PE32+ → нативний Win64-субстрат БЕЗ exec ---
+    // (після pivot_root динамічний інтерпретатор самого engine зникає — тому
+    // Windows-шлях виконується напряму в D-процесі)
+    if crate::winpe::pe::is_pe32_plus(&entry_bytes) {
+        eprintln!(
+            "poler-box: entry={entry} — PE32+ AMD64, Win64-субстрат (без Wine/VM)"
+        );
+        let mut wargv = vec![
+            Path::new(&entry)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| entry.clone()),
+        ];
+        wargv.extend(args.iter().cloned());
+        let wenv: Vec<(String, String)> = vec![
+            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+            ("SystemDrive".into(), "C:".into()),
+            ("SystemRoot".into(), "C:\\Windows".into()),
+            ("TEMP".into(), "C:\\Temp".into()),
+            ("TMP".into(), "C:\\Temp".into()),
+            ("POLER_BOX".into(), "1".into()),
+        ];
+        match crate::winpe::winexec(&entry_bytes, wargv, wenv) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("poler-box D: winexec: {e}");
+                std::process::exit(126);
+            }
+        }
+    }
+
+    // --- запис entry у memfd: виконання прямо з пам'яті, без дубля на fs ---
     let memfd = unsafe { libc::memfd_create(b"poler-box-entry\0".as_ptr() as *const _, 0) };
     if memfd < 0 {
         return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
@@ -447,7 +483,8 @@ fn stage2_run() -> Result<i32, String> {
     {
         use std::os::unix::io::FromRawFd;
         let mut mf = unsafe { std::fs::File::from_raw_fd(memfd) };
-        stream_file_out(&reader, entry_file, &mut mf)
+        use std::io::Write;
+        mf.write_all(&entry_bytes)
             .map_err(|e| format!("memfd entry: {e}"))?;
         let _ = mf.flush();
         std::mem::forget(mf); // fd живе далі для execveat

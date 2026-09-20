@@ -1435,6 +1435,14 @@ struct Cli {
     )]
     poler_box: Option<PathBuf>,
 
+    /// v0.42.0 winpe: виконати Windows PE32+ (AMD64) бінарник нативно (без Wine/VM).
+    #[arg(long = "winexec", value_name = "FILE", conflicts_with_all = [
+        "stream_download", "stream_file", "stream_bench", "browser_crawl",
+        "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+        "poler_cat", "poler_patch", "poler_rollback", "poler_remux", "poler_box",
+    ])]
+    winexec: Option<PathBuf>,
+
     /// Запис архіву, що стає процесом коробки (для --poler-box).
     #[arg(long = "box-entry", value_name = "NAME")]
     box_entry: Option<String>,
@@ -2053,6 +2061,19 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     // ---------- v0.41.0 poler-box: циклічна обгортка виконання ----------
+    // v0.42.0 winpe: прямий запуск Windows PE32+ на хості
+    if let Some(pe_path) = cli.winexec.clone() {
+        let args = cli.box_arg.clone();
+        let code = match poler_engine::winpe::winexec_file(&pe_path, &args) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("winexec: {e}");
+                126
+            }
+        };
+        return ExitCode::from(code as u8);
+    }
+
     if let Some(arch) = cli.poler_box.clone() {
         return ExitCode::from(run_poler_box(&cli, &arch) as u8);
     }
