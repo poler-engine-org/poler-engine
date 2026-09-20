@@ -1422,6 +1422,47 @@ struct Cli {
     #[arg(long = "file", value_name = "NAME")]
     poler_file_name: Option<String>,
 
+    /// v0.41.0 poler-box: запуск запису .poler в ізольованій коробці без ОС
+    /// (userns/mntns/pidns/netns + pivot_root + seccomp + губернатор RSS/CPU).
+    #[arg(
+        long = "poler-box",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "poler_cat", "poler_patch", "poler_rollback", "poler_remux",
+        ]
+    )]
+    poler_box: Option<PathBuf>,
+
+    /// Запис архіву, що стає процесом коробки (для --poler-box).
+    #[arg(long = "box-entry", value_name = "NAME")]
+    box_entry: Option<String>,
+
+    /// Аргументи payload (повторюваний, для --poler-box).
+    #[arg(long = "box-arg", value_name = "ARG")]
+    box_arg: Vec<String>,
+
+    /// Мапа записів архіву в каталог коробки: PREFIX:DIR (повторюваний; за замовчуванням rootfs/:/).
+    #[arg(long = "box-map", value_name = "PREFIX:DIR")]
+    box_map: Vec<String>,
+
+    /// Ліміт RSS дерева процесів, МБ (губернатор) [default: 512].
+    #[arg(long = "box-rss-mb", value_name = "N", default_value_t = 512)]
+    box_rss_mb: u64,
+
+    /// Ліміт CPU-часу дерева, с (губернатор) [default: 60].
+    #[arg(long = "box-cpu-s", value_name = "N", default_value_t = 60)]
+    box_cpu_s: u64,
+
+    /// Розмір tmpfs rootfs коробки, МБ [default: 512].
+    #[arg(long = "box-tmpfs-mb", value_name = "N", default_value_t = 512)]
+    box_tmpfs_mb: u64,
+
+    /// Debug: без просторів імен/seccomp — лише губернатор.
+    #[arg(long = "box-no-isolate")]
+    box_no_isolate: bool,
+
     /// JSON-манифест для --poler-patch: {"replace":[{name,data|file}],
     /// "add":[...], "delete":[{name}]}.
     #[arg(long = "manifest", value_name = "JSON")]
@@ -1733,6 +1774,11 @@ fn print_license_status() -> ExitCode {
 
 fn main() -> ExitCode {
 
+    // v0.41.0 poler-box: stage2-вхід — викликається exec-хелпером
+    // /usr/bin/unshare -Ur -- <self>. МАЄ стояти до будь-якого парсингу argv.
+    if std::env::var_os("POLER_BOX_STAGE2").is_some() {
+        return ExitCode::from(poler_engine::boxenv::stage2_main() as u8);
+    }
 
     // v0.24.0: hidden-вход PATH-shim медиации агентов — перехват ДО clap:
     // shim-обёртки (~/.poler-engine/shim/bash) вызывают именно его.
@@ -2004,6 +2050,11 @@ fn run(cli: Cli) -> ExitCode {
     }
     if let Some(arch) = cli.poler_cat.clone() {
         return ExitCode::from(run_poler_cat(&cli, &arch) as u8);
+    }
+
+    // ---------- v0.41.0 poler-box: циклічна обгортка виконання ----------
+    if let Some(arch) = cli.poler_box.clone() {
+        return ExitCode::from(run_poler_box(&cli, &arch) as u8);
     }
     if let Some(arch) = cli.poler_patch.clone() {
         return ExitCode::from(run_poler_patch(&cli, &arch) as u8);
@@ -6739,6 +6790,54 @@ fn run_poler_cat(cli: &Cli, arch: &std::path::Path) -> i32 {
         }
         Err(e) => {
             eprintln!("poler-cat: {e}");
+            2
+        }
+    }
+}
+
+/// `--poler-box <POLER> --box-entry <NAME>`: нативна «заміна Docker без ОС».
+/// Див. poler_engine::boxenv — архітектуру трипроцесного ланцюжка.
+fn run_poler_box(cli: &Cli, arch: &std::path::Path) -> i32 {
+    use poler_engine::boxenv::{run_box, BoxSpec};
+    let Some(entry) = &cli.box_entry else {
+        eprintln!("poler-box: потрібен --box-entry <ім'я запису> (див. --poler-list)");
+        return 2;
+    };
+    let mut maps: Vec<(String, String)> = Vec::new();
+    for m in &cli.box_map {
+        match m.split_once(':') {
+            // порожній префікс (":/ ") = увесь архів; інакше PREFIX:DIR
+            Some((p, d)) if !d.is_empty() => {
+                maps.push((p.to_string(), d.to_string()));
+            }
+            _ => {
+                eprintln!("poler-box: --box-map очікує PREFIX:DIR, отримано '{m}'");
+                return 2;
+            }
+        }
+    }
+    if maps.is_empty() {
+        maps.push(("rootfs/".to_string(), "/".to_string()));
+    }
+    let spec = BoxSpec {
+        archive: arch.to_path_buf(),
+        entry: entry.clone(),
+        args: cli.box_arg.clone(),
+        maps,
+        rss_mb: cli.box_rss_mb,
+        cpu_s: cli.box_cpu_s,
+        tmpfs_mb: cli.box_tmpfs_mb,
+        isolate: !cli.box_no_isolate,
+    };
+    match run_box(&spec) {
+        Ok(report) => {
+            let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+            eprintln!("--- poler-box report ---
+{json}");
+            report.exit_code.unwrap_or(137)
+        }
+        Err(e) => {
+            eprintln!("poler-box: {e}");
             2
         }
     }

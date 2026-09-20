@@ -49,6 +49,7 @@
 pub mod aidde;
 pub mod archive;
 pub mod bench;
+pub mod boxenv;
 pub mod browser;
 pub mod compression;
 pub mod crypto;

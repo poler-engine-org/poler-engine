@@ -25,6 +25,78 @@ poler-engine ~/book -q "нокс" --format ai-json | jq '.anchors[0].k_hop_relat
 
 ---
 
+## v0.41.0: poler-box — «замена Docker без ОС»: циклическая обёртка выполнения `.poler`
+
+Директива пользователя: исполнять тяжёлые payload (вплоть до сборки Chromium)
+**изнутри архиватора**, с остановкой пожирателей ресурсов, без распаковки на
+диск; «коробка без ОС», непробиваемая изнутри; железо и память — нативные
+хостовые, но недостижимые. Это не криптография и не виртуализация — это
+циклическая обёртка среды выполнения на примитивах ядра.
+
+### Модель изоляции (три процесса)
+
+```text
+P  poler-engine (CLI)          — fork/exec, губернатор (RSS/CPU дерева), отчёт JSON
+C1 └─ /usr/bin/unshare -Ur —   — привилегированный хелпер: userns + мапа 0↔uid
+    └─ poler-engine (stage2)   — unshare(mnt/pid/net/ipc/uts), tmpfs rootfs,
+                                 стрим записей из .poler, pivot_root, rlimits
+        └─ D = payload (pid 1) — execveat(memfd записи архива) + seccomp
+```
+
+* **пути**: pivot_root на tmpfs (RAM) — ФС хоста исчезает из виду;
+* **сисколы**: seccomp — белый список ~150 + KILL_PROCESS для 40 смертельных;
+  `socket(AF_INET/INET6/NETLINK/PACKET)` → EPERM (сетевой выход запрещён);
+* **процессы**: pidns (payload = pid 1, хостовых pid не существует);
+* **память/CPU**: губернатор поллит дерево VmRSS/utime каждые 50 мс,
+  SIGKILL при превышении (--box-rss-mb/--box-cpu-s) + rlimits-кордоны;
+* **zero-disk**: rootfs коробки = tmpfs, куда стримятся записи `.poler`;
+  сам payload исполняется из memfd (execveat AT_EMPTY_PATH).
+
+Почему exec `/usr/bin/unshare`: кастомное ядро песочницы (kangaroo) отклоняет
+запись `uid_map` от неизвестных его политике бинарников (свежескомпилированные
+— EPERM, util-linux — проходит). Поэтому userns устанавливает доверенный
+unshare — стандартный паттерн rootless-контейнеров (аналог newuidmap).
+
+### Цикличность
+
+poler-box запускает **poler-engine как запись архива** внутри коробки, который
+открывает другие архивы (переданные в rootfs): обёртка внутри обёртки,
+без конца. E2E: engine из `engine.poler` верифицирует `mini.poler` внутри
+коробки → `all_ok: true`.
+
+### Использование
+
+```bash
+# изоляция + отчёт
+poler-engine --poler-box tools.poler --box-entry rootfs/bin/hello
+
+# бюджета ресурсів + аргументы payload (=-синтаксис против clap)
+poler-engine --poler-box tools.poler --box-entry rootfs/bin/hog --box-rss-mb 150
+poler-engine --poler-box tcc.poler --box-entry bin/tcc --box-map=:/ \
+    --box-arg=-run --box-arg=/src/hello.c
+
+# мапа записей: префикс архива → каталог коробки (rootfs/:/ по умолчанию,
+# ":/" — весь архив; tmpfs-бюджет --box-tmpfs-mb)
+```
+
+### Приёмка в песочнице (2 vCPU, cgroup 4 ГБ, ядро kangaroo 5.10)
+
+| Тест | Результат |
+|---|---|
+| hello (изоляция) | pid=1, uid=0-in-userns, `/etc/passwd` ENOENT, AF_INET EPERM, `/proc` замаскирован |
+| escape (смертельные) | mount() → SIGKILL от seccomp, вывод оборван |
+| hog @ 150 МБ | kill_reason=rss_limit, peak 231 МБ, wall 0.13 с |
+| spin @ 3 с CPU | kill_reason=cpu_limit, cpu 3.05 с |
+| tcc -run | компиляция **внутри архива**: peak RSS 2.4 МБ |
+| cyclic | engine из архива → verify мини-архива → all_ok: true |
+
+Найденные и исправленные баги по пути: `read_status_field` не пропускал TAB
+после двоеточия (губернатор был слеп к VmRSS); опции mount передавались без
+NUL-терминатора (EINVAL в зависимости от кучи); режим `ld-linux` не был
+исполняемым (EACCES на интерпретаторе динамических payload).
+
+---
+
 ## v0.40.0: In-Place CoW-патчер `.poler` — редактирование гигабайтных архивов без распаковки
 
 Директива пользователя: править исходники Chromium внутри суверенного архива
