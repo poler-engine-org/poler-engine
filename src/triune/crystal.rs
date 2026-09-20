@@ -156,7 +156,13 @@ impl Crystal {
         let mut ranked: Vec<(&str, u64)> = counts.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         ranked.retain(|(w, _)| w.len() <= u8::MAX as usize); // u8-длина в .t5c
-        let vocab = vocab.clamp(32, ranked.len());
+        // clamp(32, n) паникует при n < 32 — короткий корпус получает
+        // свой фактический словарь (паритет с потоковым ingest::finalize)
+        let vocab = if ranked.len() < 32 {
+            ranked.len()
+        } else {
+            vocab.clamp(32, ranked.len())
+        };
         let tokens: Vec<String> = ranked[..vocab].iter().map(|(w, _)| w.to_string()).collect();
         let index: HashMap<String, u32> =
             tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();

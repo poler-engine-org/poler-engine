@@ -7,6 +7,12 @@
 //! как виртуальная файловая система, а запись — как виртуальный файл
 //! с адресом `архив::запись`.
 //!
+//! v0.39.0: сюда же встал суверенный архиватор `.poler`
+//! (директива DIRECTIVE_STREAMING_INGESTION_PIPELINE):
+//! [`dedup`] — FastCDC + BLAKE3, [`stream_writer`] — потоковая запись
+//! сети/файлов в сжатые чанки без сырой выгрузки, [`reader`] —
+//! zero-copy mmap-чтение с O(log n) доступом к любому байту.
+//!
 //! ## Почему без распаковки
 //!
 //! 1. **Суверенность диска** — распаковка чужого архива означает запись
@@ -56,7 +62,21 @@
 //! * `--grep --archives` — записи сканируются слоем 0 (grep) с
 //!   виртуальными путями `архив::запись` (см. `retrieval::grep`);
 //! * `--chunk "архив::запись"` — RAG-чанки конкретной записи (слой B);
-//! * `--archive-list` — листинг контейнера для агента.
+//! * `--archive-list` — листинг контейнера для агента;
+//! * `--stream-download/--stream-file → .poler` — потоковая запись
+//!   гигабайтных потоков без сырой выгрузки (v0.39.0);
+//! * `--poler-list/--poler-verify/--poler-extract` — инспекция
+//!   `.poler`-контейнеров.
+
+pub mod dedup;
+pub mod reader;
+pub mod stream_writer;
+
+pub use reader::{ExtractReport, PolerFile, PolerInfo, PolerReader, VerifyReport};
+pub use stream_writer::{
+    fmt_bytes, peak_rss_kb, write_stream, CompressTier, StreamWriteConfig, StreamWriteStats,
+    StreamWriter, SyntheticStream,
+};
 
 use std::fs::File;
 use std::io::Read;

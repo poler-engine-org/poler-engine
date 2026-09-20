@@ -37,6 +37,40 @@ enum Format {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum StreamTierArg {
+    /// Только zstd-3: максимум скорости записи.
+    Fast,
+    /// Только zstd-15: максимум плотности (медленнее).
+    Deep,
+    /// Авто: zstd-3, глубокий ярус для хорошо сжимаемых чанков
+    /// (дефолт директивы).
+    Auto,
+}
+
+/// Парсер размеров с суффиксами: "100M", "4GiB", "2T", "512K".
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let (num, mult) = if let Some(v) = t.strip_suffix("GiB").or_else(|| t.strip_suffix("G")) {
+        (v, 1024u64.pow(3))
+    } else if let Some(v) = t.strip_suffix("MiB").or_else(|| t.strip_suffix("M")) {
+        (v, 1024u64.pow(2))
+    } else if let Some(v) = t.strip_suffix("KiB").or_else(|| t.strip_suffix("K")) {
+        (v, 1024u64)
+    } else if let Some(v) = t.strip_suffix("TiB").or_else(|| t.strip_suffix("T")) {
+        (v, 1024u64.pow(4))
+    } else if let Some(v) = t.strip_suffix("B") {
+        (v, 1)
+    } else {
+        (t, 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("не число: {s:?}"))?;
+    n.checked_mul(mult).ok_or_else(|| format!("переполнение: {s:?}"))
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum PiiArg {
     /// PII-маскирование выключено.
     Off,
@@ -1183,6 +1217,163 @@ struct Cli {
     #[arg(long = "crystal-out", value_name = "T5C")]
     crystal_out: Option<PathBuf>,
 
+    // ---------- v0.39.0: Zero-Disk Streaming Ingestion Pipeline ----------
+
+    /// Потоковое скачивание URL (HTTP/HTTPS) → сжатый .poler БЕЗ сырой
+    /// выгрузки на диск (директива DIRECTIVE_STREAMING_INGESTION_PIPELINE).
+    #[arg(
+        long = "stream-download",
+        value_name = "URL",
+        conflicts_with_all = [
+            "stream_file", "stream_bench", "browser_crawl", "archive_to_crystal",
+            "poler_list", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    stream_download: Option<String>,
+
+    /// Потоковое чтение локального файла (или '-' = stdin) → .poler.
+    /// Тот же конвейер, что и --stream-download, без сети.
+    #[arg(
+        long = "stream-file",
+        value_name = "FILE|-",
+        conflicts_with_all = [
+            "stream_download", "stream_bench", "browser_crawl", "archive_to_crystal",
+            "poler_list", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    stream_file: Option<String>,
+
+    /// Внутренний синтетический поток N байт (суффиксы K/M/G/T) → .poler:
+    /// бенчмарк приёмочных критериев без занятия диска сырьём.
+    #[arg(
+        long = "stream-bench",
+        value_name = "BYTES",
+        value_parser = parse_byte_size,
+        conflicts_with_all = [
+            "stream_download", "stream_file", "browser_crawl", "archive_to_crystal",
+            "poler_list", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    stream_bench: Option<u64>,
+
+    /// Выходной .poler-архив для --stream-download/--stream-file/
+    /// --stream-bench/--browser-crawl.
+    #[arg(long = "output-archive", value_name = "POLER")]
+    output_archive: Option<PathBuf>,
+
+    /// Отключить BLAKE3-дедупликацию чанков (по умолчанию включена).
+    #[arg(long = "no-dedup", default_value_t = false)]
+    no_dedup: bool,
+
+    /// Ярус сжатия чанков: fast (zstd-3) / deep (zstd-15) / auto [default: auto].
+    #[arg(long = "stream-tier", value_enum, default_value_t = StreamTierArg::Auto)]
+    stream_tier: StreamTierArg,
+
+    /// HTTP/HTTPS-краул БЕЗ Chromium: страницы → ε-фильтр → кристалл .t5c
+    /// (--ingest-to-crystal) и/или .poler (--output-archive).
+    /// Глубина/лимиты наследуются из --crawl-* флагов.
+    #[arg(
+        long = "browser-crawl",
+        value_name = "URL",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "archive_to_crystal",
+            "poler_list", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    browser_crawl: Option<String>,
+
+    /// Кристалл .t5c для --browser-crawl (потоковое обучение на лету).
+    #[arg(long = "ingest-to-crystal", value_name = "T5C")]
+    ingest_to_crystal: Option<PathBuf>,
+
+    /// .poler → потоковое обучение кристалла .t5c без распаковки.
+    #[arg(
+        long = "archive-to-crystal",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "poler_list", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    archive_to_crystal: Option<PathBuf>,
+
+    /// Выходной .t5c для --archive-to-crystal [default: memory.t5c].
+    #[arg(long = "crystal", value_name = "T5C")]
+    crystal: Option<PathBuf>,
+
+    /// Листинг .poler-контейнера (JSON: чанки/файлы/компрессия).
+    #[arg(
+        long = "poler-list",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    poler_list: Option<PathBuf>,
+
+    /// Верификация .poler: SHA256 потока + каждой записи.
+    #[arg(
+        long = "poler-verify",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    poler_verify: Option<PathBuf>,
+
+    /// Распаковка .poler в каталог (--extract-dir) с sha256-контролем.
+    #[arg(
+        long = "poler-extract",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    poler_extract: Option<PathBuf>,
+
+    /// Каталог распаковки для --poler-extract [default: poler-extracted].
+    #[arg(long = "extract-dir", value_name = "DIR", default_value = "poler-extracted")]
+    extract_dir: PathBuf,
+
+    /// Порог ε для --browser-crawl: ниже — больше шума [default: 1.0].
+    #[arg(long = "min-epsilon", value_name = "F", default_value_t = 1.0)]
+    min_epsilon: f32,
+
     /// Потоковое квантование весов на лету: сырец → .t5q (70B на диске 4 ГБ).
     #[arg(long = "stream-quant", value_name = "FILE|-")]
     stream_quant: Option<PathBuf>,
@@ -1733,6 +1924,22 @@ fn run(cli: Cli) -> ExitCode {
     }
     if cli.learn_web.is_some() || cli.learn_dir.is_some() {
         return ExitCode::from(run_learn(&cli) as u8);
+    }
+    // ---------- v0.39.0: Zero-Disk Streaming Ingestion Pipeline ----------
+    if cli.stream_download.is_some()
+        || cli.stream_file.is_some()
+        || cli.stream_bench.is_some()
+    {
+        return ExitCode::from(run_stream_ingest(&cli) as u8);
+    }
+    if cli.browser_crawl.is_some() {
+        return ExitCode::from(run_browser_crawl(&cli) as u8);
+    }
+    if cli.archive_to_crystal.is_some() {
+        return ExitCode::from(run_archive_to_crystal(&cli) as u8);
+    }
+    if cli.poler_list.is_some() || cli.poler_verify.is_some() || cli.poler_extract.is_some() {
+        return ExitCode::from(run_poler_ops(&cli) as u8);
     }
     if cli.stream_quant.is_some() {
         return ExitCode::from(run_stream_quant(&cli) as u8);
@@ -6023,6 +6230,458 @@ fn run_learn(cli: &Cli) -> i32 {
     println!();
     println!("говорить выученными словами:");
     println!("  poler-engine --triune-speak \"живой мозг\" --triune-crystal {}", out.display());
+    0
+}
+
+// ─────────── v0.39.0: Zero-Disk Streaming Ingestion Pipeline ───────────
+
+/// Общая конфигурация StreamWriter из CLI-флагов.
+fn stream_write_cfg(cli: &Cli) -> poler_engine::archive::StreamWriteConfig {
+    poler_engine::archive::StreamWriteConfig {
+        dedup: !cli.no_dedup,
+        tier: match cli.stream_tier {
+            StreamTierArg::Fast => poler_engine::archive::CompressTier::Fast,
+            StreamTierArg::Deep => poler_engine::archive::CompressTier::Deep,
+            StreamTierArg::Auto => poler_engine::archive::CompressTier::Auto,
+        },
+        ..Default::default()
+    }
+}
+
+/// Имя файла из URL (для одиночной записи не-tar потока).
+fn url_hint(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("stream")
+        .split('?')
+        .next()
+        .unwrap_or("stream")
+        .to_string()
+}
+
+/// --stream-download / --stream-file / --stream-bench → .poler.
+fn run_stream_ingest(cli: &Cli) -> i32 {
+    use poler_engine::archive::{write_stream, SyntheticStream};
+    let cfg = stream_write_cfg(cli);
+    let out = match cli.output_archive.clone() {
+        Some(p) => p,
+        None => {
+            eprintln!("stream: укажите --output-archive <out.poler>");
+            return 2;
+        }
+    };
+    let stats = if let Some(url) = &cli.stream_download {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            eprintln!("stream-download: ожидается http(s) URL: {url}");
+            return 2;
+        }
+        eprintln!("stream-download: {url} → {}", out.display());
+        let agent = ureq::AgentBuilder::new()
+            .user_agent("poler-engine/0.39 (zero-disk streaming)")
+            .build();
+        let resp = match agent.get(url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => {
+                eprintln!("stream-download: HTTP {code}");
+                return 2;
+            }
+            Err(e) => {
+                eprintln!("stream-download: {e}");
+                return 2;
+            }
+        };
+        match write_stream(resp.into_reader(), &out, cfg, &url_hint(url)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("stream-download: {e}");
+                return 2;
+            }
+        }
+    } else if let Some(path) = &cli.stream_file {
+        if path == "-" {
+            eprintln!("stream-file: stdin → {}", out.display());
+            match write_stream(std::io::stdin(), &out, cfg, "stdin") {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("stream-file: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            let p = std::path::Path::new(path);
+            match std::fs::File::open(p) {
+                Ok(f) => {
+                    eprintln!("stream-file: {} → {}", p.display(), out.display());
+                    match write_stream(f, &out, cfg, &p.display().to_string()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("stream-file: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("stream-file: {path}: {e}");
+                    return 2;
+                }
+            }
+        }
+    } else {
+        let total = cli.stream_bench.unwrap_or(1024 * 1024 * 1024);
+        eprintln!("stream-bench: {} синтетики → {}", poler_engine::archive::fmt_bytes(total), out.display());
+        match write_stream(SyntheticStream::new(total, 0x504F_4C45), &out, cfg, "synthetic.bin") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("stream-bench: {e}");
+                return 2;
+            }
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+    if stats.peak_rss_kb > 48 * 1024 {
+        eprintln!(
+            "stream: ВНИМАНИЕ: пик RSS {} КиБ превысил бюджет 48 МиБ",
+            stats.peak_rss_kb
+        );
+    }
+    0
+}
+
+/// --browser-crawl: HTTP-краул без Chromium → ε-фильтр → кристалл/.poler.
+fn run_browser_crawl(cli: &Cli) -> i32 {
+    use poler_engine::browser::StreamingFetcher;
+    use poler_engine::triune::{IngestConfig, StreamCrystalBuilder};
+    use poler_engine::web::crawl::CrawlConfig;
+
+    let seed = cli.browser_crawl.as_ref().unwrap().clone();
+    if !seed.starts_with("http://") && !seed.starts_with("https://") {
+        eprintln!("browser-crawl: ожидается http(s) URL: {seed}");
+        return 2;
+    }
+    let crystal_path = cli.ingest_to_crystal.clone();
+    let archive_path = cli.output_archive.clone();
+    if crystal_path.is_none() && archive_path.is_none() {
+        eprintln!("browser-crawl: не задан ни --ingest-to-crystal, ни --output-archive — нечего делать");
+        return 2;
+    }
+
+    let crawl_cfg = CrawlConfig {
+        max_pages: cli.crawl_max.max(1),
+        max_depth: cli.crawl_depth,
+        delay_ms: cli.crawl_delay_ms,
+        cross_site: cli.cross_site,
+        wait_ms: 0, // нет JS-рендера — пауза не нужна
+        page_timeout_ms: cli.crawl_page_timeout_ms,
+        respect_robots: true,
+    };
+    eprintln!(
+        "browser-crawl: seed {seed}, глубина ≤ {}, до {} страниц, ε ≥ {}",
+        crawl_cfg.max_depth, crawl_cfg.max_pages, cli.min_epsilon
+    );
+
+    // индекс в памяти: обход без дисковых side-эффектов (zero-disk)
+    let mut ix = match poler_engine::web::WebIndex::open_memory() {
+        Ok(ix) => ix,
+        Err(e) => {
+            eprintln!("browser-crawl: индекс в памяти: {e}");
+            return 2;
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    let mut builder = StreamCrystalBuilder::new(IngestConfig {
+        vocab: {
+            let v = if cli.crystal_vocab == 384 { 4096 } else { cli.crystal_vocab };
+            v.clamp(32, 65_536)
+        },
+        dims: poler_engine::triune::crystal::DEFAULT_DIMS,
+        theta_hi: poler_engine::triune::crystal::DEFAULT_THETA_HI,
+        theta_lo: poler_engine::triune::crystal::DEFAULT_THETA_LO,
+        chunk_bytes: cli.learn_chunk.max(1024),
+        word_cap: cli.learn_word_cap.max(1024),
+        bigram_cap: cli.learn_bigram_cap.max(1024),
+    });
+    let mut archive_writer = match &archive_path {
+        Some(p) => match poler_engine::archive::StreamWriter::open(p, stream_write_cfg(cli)) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("browser-crawl: {p:?}: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+
+    // одна обёртка — два стока: каждая страница течёт и в кристалл,
+    // и в .poler (ε-очищенная семантика; сырой HTML не храним)
+    struct CrawlSink<'a> {
+        inner: StreamingFetcher,
+        builder: &'a mut StreamCrystalBuilder,
+        writer: Option<&'a mut poler_engine::archive::StreamWriter>,
+        pages: usize,
+    }
+    impl poler_engine::web::crawl::PageFetcher for CrawlSink<'_> {
+        fn fetch(
+            &mut self,
+            url: &str,
+        ) -> Result<poler_engine::web::crawl::FetchedPage, String> {
+            let page = self.inner.fetch(url)?;
+            let mut text = String::with_capacity(page.text.len() + page.title.len() + 2);
+            if !page.title.is_empty() {
+                text.push_str(&page.title);
+                text.push('\n');
+            }
+            text.push_str(&page.text);
+            if let Some(w) = self.writer.as_mut() {
+                if let Err(e) = w.push_bytes(text.as_bytes()) {
+                    return Err(format!("архив: {e}"));
+                }
+            }
+            self.builder.push_str(&text);
+            self.pages += 1;
+            Ok(page)
+        }
+        fn fetch_raw(&mut self, url: &str) -> Result<(u16, String), String> {
+            self.inner.fetch_raw(url)
+        }
+    }
+
+    let fetcher = StreamingFetcher::new(cli.crawl_page_timeout_ms, cli.min_epsilon);
+    let mut sink = CrawlSink {
+        inner: fetcher,
+        builder: &mut builder,
+        writer: archive_writer.as_mut(),
+        pages: 0,
+    };
+    let stats =
+        match poler_engine::web::crawl::crawl(&mut ix, &mut sink, &seed, &crawl_cfg, cli.verbose) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("browser-crawl: {e}");
+                return 2;
+            }
+        };
+    let pages = sink.pages;
+
+    // финализация .poler ДО потребления билдера
+    let mut archive_stats = None;
+    if let Some(w) = archive_writer {
+        match w.finish("crawl-pages.txt") {
+            Ok(s) => archive_stats = Some(s),
+            Err(e) => {
+                eprintln!("browser-crawl: архив: {e}");
+                return 2;
+            }
+        }
+    }
+
+    eprintln!(
+        "browser-crawl: {} страниц, {} robots-запретов, {} ошибок, {} в кристалл, за {} мс",
+        stats.fetched, stats.skipped_robots, stats.errors, pages,
+        t0.elapsed().as_millis()
+    );
+
+    match crystal_path {
+        Some(path) => {
+            let (crystal, cstats) = match builder.finalize() {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("browser-crawl: кристалл: {e}");
+                    return 2;
+                }
+            };
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = crystal.save(&path) {
+                eprintln!("browser-crawl: сохранение {}: {e}", path.display());
+                return 2;
+            }
+            eprintln!(
+                "browser-crawl: кристалл {} (словарь {}, {} слов корпуса)",
+                path.display(), cstats.crystal_vocab, cstats.total_words
+            );
+        }
+        None => {
+            // архив без кристалла: билдер больше не нужен
+            let _ = builder.finalize();
+        }
+    }
+    if let Some(s) = archive_stats {
+        println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
+    }
+    0
+}
+
+/// RAM-дисциплина директивы (пик ≤ 48 МиБ): капы билдера выше этих
+/// значений не сэкономить — карты слов/биграмм доминируют в RSS
+/// (запас: vocab 4096 требует лишь ≥4096 живых слов, 131K капа
+/// оставляет 32× запас на статистику Ципфа).
+const DIRECTIVE_BIGRAM_CAP: usize = 131_072;
+const DIRECTIVE_WORD_CAP: usize = 131_072;
+
+/// --archive-to-crystal: .poler → потоковое обучение .t5c без распаковки.
+fn run_archive_to_crystal(cli: &Cli) -> i32 {
+    use poler_engine::archive::reader::PolerReader;
+    use poler_engine::triune::{IngestConfig, StreamCrystalBuilder};
+    let poler_path = cli.archive_to_crystal.as_ref().unwrap();
+    let reader = match PolerReader::open(poler_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("archive-to-crystal: {e}");
+            return 2;
+        }
+    };
+    let out = cli.crystal.clone().unwrap_or_else(|| std::path::PathBuf::from("memory.t5c"));
+    let t0 = std::time::Instant::now();
+    let vocab = {
+        let v = if cli.crystal_vocab == 384 { 4096 } else { cli.crystal_vocab };
+        v.clamp(32, 65_536)
+    };
+    let (word_cap, bigram_cap) = if cli.learn_word_cap > DIRECTIVE_WORD_CAP
+        || cli.learn_bigram_cap > DIRECTIVE_BIGRAM_CAP
+    {
+        eprintln!(
+            "archive-to-crystal: RAM-дисциплина 48 МиБ: word_cap {} → {}, bigram_cap {} → {} \
+             (явные --learn-word-cap/--learn-bigram-cap ниже порога не трогаются)",
+            cli.learn_word_cap,
+            cli.learn_word_cap.min(DIRECTIVE_WORD_CAP),
+            cli.learn_bigram_cap,
+            cli.learn_bigram_cap.min(DIRECTIVE_BIGRAM_CAP)
+        );
+        (
+            cli.learn_word_cap.min(DIRECTIVE_WORD_CAP),
+            cli.learn_bigram_cap.min(DIRECTIVE_BIGRAM_CAP),
+        )
+    } else {
+        (cli.learn_word_cap, cli.learn_bigram_cap)
+    };
+    let mut builder = StreamCrystalBuilder::new(IngestConfig {
+        vocab,
+        dims: poler_engine::triune::crystal::DEFAULT_DIMS,
+        theta_hi: poler_engine::triune::crystal::DEFAULT_THETA_HI,
+        theta_lo: poler_engine::triune::crystal::DEFAULT_THETA_LO,
+        chunk_bytes: cli.learn_chunk.max(1024),
+        word_cap: word_cap.max(1024),
+        bigram_cap: bigram_cap.max(1024),
+    });
+    let info = reader.info().clone();
+    eprintln!(
+        "archive-to-crystal: {} ({} сырых, {} записей, дедуп {}) → {}",
+        poler_path.display(),
+        poler_engine::archive::fmt_bytes(info.total_raw),
+        info.files,
+        info.logical_chunks - info.physical_chunks,
+        out.display()
+    );
+    let fed = match builder.feed_poler(&reader) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("archive-to-crystal: {e}");
+            return 2;
+        }
+    };
+    drop(reader);
+    // вернуть освобождённые арены аллокатора до финализации: пик RSS
+    // не должен накладывать карты инжеста на матрицу кристалла
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    let (crystal, stats) = match builder.finalize() {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("archive-to-crystal: {e}");
+            return 2;
+        }
+    };
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = crystal.save(&out) {
+        eprintln!("archive-to-crystal: {e}", );
+        return 2;
+    }
+    let throughput = if t0.elapsed().as_millis() > 0 {
+        info.total_raw as f64 / 1024.0 / 1024.0 / (t0.elapsed().as_millis() as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "archive": poler_path.display().to_string(),
+            "crystal": out.display().to_string(),
+            "entries_fed": fed,
+            "entries_total": info.files,
+            "total_words": stats.total_words,
+            "crystal_vocab": stats.crystal_vocab,
+            "skipped_binary": stats.files_skipped_binary,
+            "crystal_bytes": stats.crystal_bytes,
+            "sha256": stats.sha256_hex,
+            "elapsed_ms": t0.elapsed().as_millis(),
+            "throughput_mbs": throughput,
+            "peak_rss_kb": poler_engine::archive::peak_rss_kb(),
+        })
+    );
+    0
+}
+
+/// --poler-list / --poler-verify / --poler-extract.
+fn run_poler_ops(cli: &Cli) -> i32 {
+    use poler_engine::archive::reader::PolerReader;
+    if let Some(path) = &cli.poler_list {
+        let r = match PolerReader::open(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("poler-list: {e}");
+                return 2;
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&r.list_json()).unwrap_or_default());
+    }
+    if let Some(path) = &cli.poler_verify {
+        let r = match PolerReader::open(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("poler-verify: {e}");
+                return 2;
+            }
+        };
+        let report = match r.verify() {
+            Ok(rep) => rep,
+            Err(e) => {
+                eprintln!("poler-verify: {e}");
+                return 2;
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        if !report.all_ok {
+            return 1;
+        }
+    }
+    if let Some(path) = &cli.poler_extract {
+        let r = match PolerReader::open(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("poler-extract: {e}");
+                return 2;
+            }
+        };
+        let dir = &cli.extract_dir;
+        let report = match r.extract_all(dir) {
+            Ok(rep) => rep,
+            Err(e) => {
+                eprintln!("poler-extract: {e}");
+                return 2;
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        if !report.files_bad.is_empty() {
+            return 1;
+        }
+    }
     0
 }
 

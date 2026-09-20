@@ -131,6 +131,12 @@ lz4_flex = "0.11"
 # ленивое обучение на первых страницах, обратная совместимость старых БД).
 zstd = "0.13"
 
+# v0.39.0 Streaming Ingestion Pipeline (docs/DIRECTIVE_STREAMING_INGESTION_PIPELINE.md):
+# blake3 — криптографический хеш чанков для FastCDC-дедупликации .poler
+# (референсная реализация, SIMD, чистый Rust без C-зависимостей; sha256
+# для верификации потоков остаётся суверенным crate::pqc::sha256).
+blake3 = "1.5"
+
 # v0.28.1 Archives (Native Retrieval: скан архивов без распаковки):
 # чтение записей zip/tar/tar.gz/tar.zst/gz/zst прямо из контейнера,
 # виртуальные пути «архив::запись», распаковка на диск запрещена by design.

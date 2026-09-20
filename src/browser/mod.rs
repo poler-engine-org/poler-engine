@@ -9,10 +9,15 @@
 pub mod dom_tree;
 pub mod filter;
 pub mod session;
+pub mod stream_ingest;
 
 pub use dom_tree::{DomDocument, DomNode, NodeType};
 pub use filter::{ContentFilter, FilterStats};
 pub use session::{BrowserConfig, BrowserWindow, TabSession};
+pub use stream_ingest::{
+    BlockHints, EpsilonStreamFilter, StreamPage, StreamPageBuilder, StreamPageStats,
+    StreamingFetcher, DEFAULT_MIN_EPSILON, DEFAULT_PAGE_MAX_BYTES,
+};
 
 #[cfg(test)]
 mod tests;

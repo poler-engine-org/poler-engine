@@ -86,6 +86,53 @@ const TEXT_EXTS: &[&str] = &[
     "java", "cfg", "ini", "conf", "tex", "srt", "vtt", "rss", "atom",
 ];
 
+// ─────────── FxHash: детерминированный быстрый хеш ключей ───────────
+// SipHash (дефолт HashMap) на каждом слове съедал ~40% пропускной
+// способности инжеста. FxHash — мультипликативный хеш из rustc-hash
+// (Public Domain), 20 строк, БЕЗ криптографии — от коллизий карту
+// всё равно защищает сравнение ключей. Порядок обхода хэш-таблицы
+// нигде не влияет на результат: эвакуация и finalize сортируют
+// канонично (тесты детерминизма и паритета — регрессионная сеть).
+
+#[derive(Default, Clone)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(c);
+            self.add(u64::from_le_bytes(b));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut b = [0u8; 8];
+            b[..rem.len()].copy_from_slice(rem);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+}
+
+type Fx = std::hash::BuildHasherDefault<FxHasher>;
+
+fn fx_map<K, V>() -> HashMap<K, V, Fx> {
+    HashMap::with_hasher(Fx::default())
+}
+
 /// Конфигурация потокового обучения.
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
@@ -153,13 +200,13 @@ pub struct IngestStats {
 pub struct StreamCrystalBuilder {
     cfg: IngestConfig,
     /// слово → динамический id (растёт по мере встречи новых слов).
-    id_of: HashMap<String, u32>,
+    id_of: HashMap<String, u32, Fx>,
     /// id → слово (после эвакуации строка освобождается).
     words: Vec<String>,
     /// id → частота (параллельно words).
     counts: Vec<u64>,
     /// Биграммы смежных слов потока (динамические id).
-    bigram: HashMap<(u32, u32), u64>,
+    bigram: HashMap<(u32, u32), u64, Fx>,
     /// Слово в обработке (между двумя не-alphanumeric символами).
     word_buf: String,
     /// Слово превысило 255 байт — в словарь не попадёт (u8-длина .t5c).
@@ -176,6 +223,9 @@ pub struct StreamCrystalBuilder {
     bigrams_evicted: u64,
     peak_text_buffer: usize,
     files_skipped_binary: usize,
+    /// Переиспользуемые скретчи эвакуации биграмм (RAM-дисциплина).
+    evict_scratch_bigr: Vec<(u64, u64)>,
+    evict_scratch_keys: Vec<u64>,
 }
 
 impl StreamCrystalBuilder {
@@ -183,10 +233,10 @@ impl StreamCrystalBuilder {
     pub fn new(cfg: IngestConfig) -> StreamCrystalBuilder {
         StreamCrystalBuilder {
             cfg,
-            id_of: HashMap::new(),
+            id_of: fx_map(),
             words: Vec::new(),
             counts: Vec::new(),
-            bigram: HashMap::new(),
+            bigram: fx_map(),
             word_buf: String::new(),
             word_overflow: false,
             utf8_tail: Vec::new(),
@@ -198,6 +248,8 @@ impl StreamCrystalBuilder {
             bigrams_evicted: 0,
             peak_text_buffer: 0,
             files_skipped_binary: 0,
+            evict_scratch_bigr: Vec::new(),
+            evict_scratch_keys: Vec::new(),
         }
     }
 
@@ -211,36 +263,45 @@ impl StreamCrystalBuilder {
     /// границей чанка, переносится в следующий (хвост ≤ 3 байт).
     /// Безнадёжно битые последовательности замещаются U+FFFD и
     /// пропускаются — хвост не может расти бесконечно.
+    ///
+    /// v0.39.0 (квадратичный drain): раньше каждый битый символ делал
+    /// `buf.drain(..n)` — memmove всего хвоста буфера. На потоках с
+    /// мусорными байтами (случайные блоки датасетов) в 700КиБ срезах
+    /// .poler-читателя это давало гигабайты memmove на мегабайт входа
+    /// (20 МиБ инжестились 15 с). Теперь курсор ходит по буферу
+    /// без перемещения данных, компакция — одна за вызов.
     pub fn push_chunk(&mut self, bytes: &[u8]) {
         let mut buf = std::mem::take(&mut self.utf8_tail);
         buf.extend_from_slice(bytes);
+        let mut cursor = 0usize;
         loop {
-            match std::str::from_utf8(&buf) {
+            match std::str::from_utf8(&buf[cursor..]) {
                 Ok(s) => {
                     self.consume(s);
-                    buf.clear();
+                    cursor = buf.len();
                     break;
                 }
                 Err(e) => {
                     let valid = e.valid_up_to();
                     if valid > 0 {
                         // безопасно: префикс валиден по определению valid_up_to
-                        let s = unsafe { std::str::from_utf8_unchecked(&buf[..valid]) };
+                        let s =
+                            unsafe { std::str::from_utf8_unchecked(&buf[cursor..cursor + valid]) };
                         self.consume(s);
-                        buf.drain(..valid);
+                        cursor += valid;
                     }
                     match e.error_len() {
                         Some(bad) => {
                             // битая последовательность: замена + пропуск
                             self.consume("\u{FFFD}");
-                            let skip = bad.max(1).min(buf.len());
-                            buf.drain(..skip);
+                            cursor += bad.max(1).min(buf.len() - cursor);
                         }
                         None => break, // незавершённый символ: ждём продолжения
                     }
                 }
             }
         }
+        buf.drain(..cursor); // единственная компакция за вызов
         self.utf8_tail = buf;
         self.note_buffer_peak();
     }
@@ -259,10 +320,28 @@ impl StreamCrystalBuilder {
 
     /// Символ-за-символом: слово накапливаем, разделитель — сбрасывает
     /// предложение, прочие не-буквы просто разделяют слова.
+    ///
+    /// v0.39.0: ASCII-быстрый путь — `to_lowercase()`-итератор на
+    /// каждом символе съедал половину пропускной способности
+    /// (Unicode-таблицы ради 26 латинских букв). Кириллица и прочие
+    /// письменности идут полным путём без изменения семантики.
     fn consume(&mut self, text: &str) {
         for ch in text.chars() {
             self.corpus_chars += 1;
-            if ch.is_alphanumeric() {
+            if ch.is_ascii() {
+                if ch.is_ascii_alphanumeric() {
+                    if self.word_buf.len() < 256 {
+                        self.word_buf.push(ch.to_ascii_lowercase());
+                    } else {
+                        self.word_overflow = true;
+                    }
+                } else {
+                    self.emit_word();
+                    if is_sentence_delim(ch) {
+                        self.prev = None;
+                    }
+                }
+            } else if ch.is_alphanumeric() {
                 for lc in ch.to_lowercase() {
                     if self.word_buf.len() < 256 {
                         self.word_buf.push(lc);
@@ -321,6 +400,14 @@ impl StreamCrystalBuilder {
     /// Детерминированная эвакуация: остаются топ-половина ёмкости по
     /// (частота ↓, id ↑). Правило не зависит от порядка обхода хэш-таблиц,
     /// одинаковый вход → одинаковое выживание (тест детерминизма).
+    ///
+    /// v0.39.0 (компакция id-пространства): раньше `words`/`counts`
+    /// росли с каждым КОГДА-ЛИБО встреченным словом — мёртвые id
+    /// оставались пустыми слотами навсегда. На потоках с мусорными
+    /// токенами (случайные блоки датасетов) это раздувало RSS до
+    /// сотен МиБ при капе 196K. Теперь выжившие перенумеровываются
+    /// в плотный диапазон, биграммы ремапятся (пары с мёртвыми id
+    /// выбрасываются — в finalize они фильтровались и так).
     fn maybe_evict(&mut self) {
         if self.id_of.len() > self.cfg.word_cap {
             let target = (self.cfg.word_cap / 2).max(1);
@@ -329,30 +416,69 @@ impl StreamCrystalBuilder {
                 .map(|id| (self.counts[id as usize], id))
                 .collect();
             alive.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            let survivors: std::collections::HashSet<u32> =
-                alive[..target.min(alive.len())].iter().map(|&(_, id)| id).collect();
-            let dead: Vec<u32> = (0..self.words.len() as u32)
-                .filter(|&id| self.counts[id as usize] > 0 && !survivors.contains(&id))
-                .collect();
-            self.words_evicted += dead.len() as u64;
-            for id in dead {
-                let w = std::mem::take(&mut self.words[id as usize]);
-                if !w.is_empty() {
-                    self.id_of.remove(&w);
+            let keep = target.min(alive.len());
+            self.words_evicted += alive.len() as u64 - keep as u64;
+
+            // старый id → новый плотный id (u32::MAX = мёртв)
+            let mut remap = vec![u32::MAX; self.words.len()];
+            let mut new_words: Vec<String> = Vec::with_capacity(keep);
+            let mut new_counts: Vec<u64> = Vec::with_capacity(keep);
+            let mut new_id_of: HashMap<String, u32, Fx> = HashMap::with_capacity_and_hasher(keep, Fx::default());
+            for (new_id, &(_, old_id)) in alive[..keep].iter().enumerate() {
+                remap[old_id as usize] = new_id as u32;
+                let w = std::mem::take(&mut self.words[old_id as usize]);
+                new_counts.push(self.counts[old_id as usize]);
+                new_id_of.insert(w.clone(), new_id as u32);
+                new_words.push(w);
+            }
+            self.words = new_words;
+            self.counts = new_counts;
+            self.id_of = new_id_of;
+
+            // биграммы: ремап ключей; пары с мёртвыми сторонами бесполезны
+            // (finalize их фильтрует) — выбрасываем сразу
+            let mut new_bigram: HashMap<(u32, u32), u64, Fx> =
+                HashMap::with_capacity_and_hasher(self.bigram.len(), Fx::default());
+            for (&(a, b), &c) in self.bigram.iter() {
+                let (ra, rb) = (remap[a as usize], remap[b as usize]);
+                if ra != u32::MAX && rb != u32::MAX {
+                    *new_bigram.entry((ra, rb)).or_insert(0) += c;
                 }
-                self.counts[id as usize] = 0;
+            }
+            self.bigram = new_bigram;
+
+            // текущее слово-предшественник могло умереть
+            if let Some(p) = self.prev {
+                self.prev = match remap[p as usize] {
+                    v if v != u32::MAX => Some(v),
+                    _ => None,
+                };
             }
         }
         if self.bigram.len() > self.cfg.bigram_cap {
             let target = (self.cfg.bigram_cap / 2).max(1);
-            let mut alive: Vec<(u64, (u32, u32))> =
-                self.bigram.iter().map(|(&k, &c)| (c, k)).collect();
-            alive.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            let survivors: std::collections::HashSet<(u32, u32)> =
-                alive[..target.min(alive.len())].iter().map(|&(_, k)| k).collect();
+            // ключ (u32,u32) пакуется в u64: 16 Б/запись вместо 24,
+            // выжившие — отсортированный Vec + бинарный поиск вместо HashSet
+            let pack = |k: (u32, u32)| ((k.0 as u64) << 32) | k.1 as u64;
+            let mut alive = std::mem::take(&mut self.evict_scratch_bigr);
+            alive.clear();
+            alive.extend(self.bigram.iter().map(|(&k, &c)| (c, pack(k))));
+            alive.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            alive.truncate(target.min(alive.len()));
+            let mut survivors = std::mem::take(&mut self.evict_scratch_keys);
+            survivors.clear();
+            survivors.extend(alive.iter().map(|&(_, k)| k));
+            // binary_search требует порядка по ключу (набор выживших
+            // уже детерминирован truncate по (count↓, key↑))
+            survivors.sort_unstable();
             let before = self.bigram.len() as u64;
-            self.bigram.retain(|k, _| survivors.contains(k));
+            self.bigram
+                .retain(|&k, _| survivors.binary_search(&pack(k)).is_ok());
             self.bigrams_evicted += before - self.bigram.len() as u64;
+            alive.clear();
+            survivors.clear();
+            self.evict_scratch_bigr = alive;
+            self.evict_scratch_keys = survivors;
         }
     }
 
@@ -401,6 +527,82 @@ impl StreamCrystalBuilder {
             }
         }
         Ok(count)
+    }
+
+    /// Ингестировать `.poler`-контейнер потоково (v0.39.0, директива
+    /// DIRECTIVE_STREAMING_INGESTION_PIPELINE §3): записи таблицы
+    /// файлов налагаются на последовательность разжатых чанков,
+    /// текстовые (NUL-снифф первых 4 КиБ) льются в кристалл —
+    /// БЕЗ распаковки архива на диск. Каждая запись — отдельный
+    /// источник (`sources`), бинарники пропускаются честно.
+    /// Возвращает число скормленных записей.
+    pub fn feed_poler(
+        &mut self,
+        reader: &crate::archive::reader::PolerReader,
+    ) -> std::io::Result<usize> {
+        // (start, end) записей: файловая таблица отсортирована по raw_off
+        let ranges: Vec<(u64, u64)> = reader
+            .files()
+            .iter()
+            .map(|f| (f.raw_off, f.raw_off + f.raw_len))
+            .collect();
+        // состояние по записям: [probed, is_text]
+        let mut states: Vec<(bool, bool)> = ranges.iter().map(|_| (false, false)).collect();
+        let mut fed: usize = 0;
+        let mut cursor: usize = 0; // первая возможно-живая запись
+        let builder = self;
+        reader
+            .for_each_chunk(|raw_off, data| {
+                let chunk_start = raw_off;
+                let chunk_end = raw_off + data.len() as u64;
+                // записи, начинающиеся до конца чанка
+                let mut fi = cursor;
+                while fi < ranges.len() && ranges[fi].0 < chunk_end {
+                    let (fstart, fend) = ranges[fi];
+                    if fend <= chunk_start {
+                        // запись целиком раньше чанка (пустые/нулевые) —
+                        // закрываем её штатно
+                        if !states[fi].0 {
+                            states[fi] = (true, false); // пустое не кормим
+                        }
+                        if fi == cursor {
+                            cursor += 1;
+                        }
+                        fi += 1;
+                        continue;
+                    }
+                    let a = fstart.saturating_sub(chunk_start) as usize;
+                    let b = ((fend - chunk_start) as usize).min(data.len());
+                    if a < b {
+                        let slice = &data[a..b];
+                        if !states[fi].0 {
+                            // NUL-снифф первого куска записи (≤ 4 КиБ)
+                            let probe = &slice[..slice.len().min(4096)];
+                            let is_text = !probe.contains(&0);
+                            states[fi] = (true, is_text);
+                            if !is_text {
+                                builder.files_skipped_binary += 1;
+                            }
+                        }
+                        if states[fi].1 {
+                            builder.push_chunk(slice);
+                        }
+                    }
+                    if fend <= chunk_end && fi == cursor && states[fi].0 {
+                        // запись закончилась внутри чанка
+                        if states[fi].1 {
+                            builder.finish();
+                            builder.sources += 1;
+                            fed += 1;
+                        }
+                        cursor += 1;
+                    }
+                    fi += 1;
+                }
+                Ok(())
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(fed)
     }
 
     /// Финальная сборка: ранжирование → квантизация PMI → .t5c.
@@ -728,6 +930,51 @@ mod tests {
         assert!(c.id_of("кристалл").is_some());
         assert!(c.id_of("мозг").is_some());
         assert!(c.id_of("трит").is_some());
+    }
+
+    #[test]
+    fn feed_poler_streams_text_and_skips_binary() {
+        use crate::archive::reader::PolerReader;
+        use crate::archive::stream_writer::{write_stream, StreamWriteConfig};
+        // tar с двумя текстовыми файлами, одним бинарником и длинным именем
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut put = |name: &str, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, name, data).unwrap();
+            };
+            put(
+                "docs/a.txt",
+                b"mozg muhi derzhit ritm mysli zhivogo vikhrya smysla cherez reshetku tritov\n",
+            );
+            put(
+                "src/very/long/path/that/exceeds/one/hundred/characters/in/total/for/sure/b.rs",
+                b"fn main() { let crystal = trit; println!(\"{}\", crystal); }\n",
+            );
+            put("blob.bin", b"\x00\x01\x02\xffbinary");
+            b.finish().unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("poler-feed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let poler = dir.join("corpus.poler");
+        let sw_cfg = StreamWriteConfig { progress_bytes: 0, ..Default::default() };
+        write_stream(&tar_bytes[..], &poler, sw_cfg, "corpus.tar").unwrap();
+
+        let reader = PolerReader::open(&poler).unwrap();
+        assert!(reader.info().tar_mode, "tar распознан");
+        assert_eq!(reader.files().len(), 3);
+        let mut b = StreamCrystalBuilder::new(cfg(4096));
+        let fed = b.feed_poler(&reader).unwrap();
+        assert_eq!(fed, 2, "текстовые записи скормлены, бинарник пропущен");
+        let (c, stats) = b.finalize().unwrap();
+        assert!(stats.files_skipped_binary >= 1);
+        assert!(c.id_of("vikhrya").is_some() || c.id_of("ritm").is_some(), "русский текст выучен");
+        assert!(c.id_of("crystal").is_some(), "код выучен");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Мок-источник страниц для проверки Crawl → Ingestion пайплайна.
