@@ -1370,6 +1370,67 @@ struct Cli {
     #[arg(long = "extract-dir", value_name = "DIR", default_value = "poler-extracted")]
     extract_dir: PathBuf,
 
+    /// Запись .poler в stdout (байты) — для пайпов в grep/sed.
+    #[arg(
+        long = "poler-cat",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "poler_patch", "poler_rollback", "poler_remux",
+        ]
+    )]
+    poler_cat: Option<PathBuf>,
+
+    /// In-place CoW-патч .poler по JSON-манифесту (--manifest).
+    #[arg(
+        long = "poler-patch",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "poler_cat", "poler_rollback", "poler_remux",
+        ]
+    )]
+    poler_patch: Option<PathBuf>,
+
+    /// Откат последнего --poler-patch по .polerbak.
+    #[arg(
+        long = "poler-rollback",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "poler_cat", "poler_patch", "poler_remux",
+        ]
+    )]
+    poler_rollback: Option<PathBuf>,
+
+    /// Ремукс .poler (tar.gz-блоб) в .poler с файловой таблицей (--output-archive).
+    #[arg(
+        long = "poler-remux",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "poler_cat", "poler_patch", "poler_rollback",
+        ]
+    )]
+    poler_remux: Option<PathBuf>,
+
+    /// Имя записи для --poler-cat.
+    #[arg(long = "file", value_name = "NAME")]
+    poler_file_name: Option<String>,
+
+    /// JSON-манифест для --poler-patch: {"replace":[{name,data|file}],
+    /// "add":[...], "delete":[{name}]}.
+    #[arg(long = "manifest", value_name = "JSON")]
+    poler_manifest: Option<PathBuf>,
+
+    /// Перезаписать существующий .polerbak при --poler-patch.
+    #[arg(long = "force-bak")]
+    force_bak: bool,
+
     /// Порог ε для --browser-crawl: ниже — больше шума [default: 1.0].
     #[arg(long = "min-epsilon", value_name = "F", default_value_t = 1.0)]
     min_epsilon: f32,
@@ -1940,6 +2001,30 @@ fn run(cli: Cli) -> ExitCode {
     }
     if cli.poler_list.is_some() || cli.poler_verify.is_some() || cli.poler_extract.is_some() {
         return ExitCode::from(run_poler_ops(&cli) as u8);
+    }
+    if let Some(arch) = cli.poler_cat.clone() {
+        return ExitCode::from(run_poler_cat(&cli, &arch) as u8);
+    }
+    if let Some(arch) = cli.poler_patch.clone() {
+        return ExitCode::from(run_poler_patch(&cli, &arch) as u8);
+    }
+    if let Some(arch) = cli.poler_rollback.clone() {
+        return match poler_engine::archive::patcher::rollback_archive(&arch) {
+            Ok(rep) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).unwrap_or_default()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("poler-rollback: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if let Some(arch) = cli.poler_remux.clone() {
+        return ExitCode::from(run_poler_remux(&cli, &arch) as u8);
     }
     if cli.stream_quant.is_some() {
         return ExitCode::from(run_stream_quant(&cli) as u8);
@@ -6628,7 +6713,148 @@ fn run_archive_to_crystal(cli: &Cli) -> i32 {
     0
 }
 
-/// --poler-list / --poler-verify / --poler-extract.
+/// `--poler-cat <POLER> --file <NAME>`: байты записи в stdout (для
+/// пайпов `| grep`, `| sed`, `| wc -c` — движок вместо bash-распаковки).
+fn run_poler_cat(cli: &Cli, arch: &std::path::Path) -> i32 {
+    use poler_engine::archive::patcher::cat_file;
+    let Some(name) = &cli.poler_file_name else {
+        eprintln!("poler-cat: требуется --file <NAME> (имя записи; см. --poler-list)");
+        return 2;
+    };
+    let mut buf = Vec::new();
+    match cat_file(arch, name, &mut buf) {
+        Ok(n) => {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            if out.write_all(&buf).is_err() {
+                eprintln!("poler-cat: stdout закрыт (пайп?)");
+                return 2;
+            }
+            let _ = out.flush();
+            if n != buf.len() as u64 {
+                eprintln!("poler-cat: прочитано {} из {}", buf.len(), n);
+                return 2;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-cat: {e}");
+            2
+        }
+    }
+}
+
+/// `--poler-patch <POLER> --manifest <JSON>`: in-place CoW-патч.
+/// Манифест: {"replace":[{"name":..,"data":..|"file":..}],
+/// "add":[..], "delete":[{"name":..}]}.
+fn run_poler_patch(cli: &Cli, arch: &std::path::Path) -> i32 {
+    use poler_engine::archive::patcher::{patch_archive, PatchOp, PatchOptions};
+    let Some(manifest) = &cli.poler_manifest else {
+        eprintln!("poler-patch: требуется --manifest <JSON>");
+        return 2;
+    };
+    let text = match std::fs::read_to_string(manifest) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("poler-patch: {} {e}", manifest.display());
+            return 2;
+        }
+    };
+    let root: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("poler-patch: JSON: {e}");
+            return 2;
+        }
+    };
+    let mut ops: Vec<PatchOp> = Vec::new();
+    let mut parse = |section: &str,
+                     make: &dyn Fn(String, Vec<u8>) -> PatchOp|
+     -> Result<(), String> {
+        let Some(arr) = root.get(section) else {
+            return Ok(());
+        };
+        let serde_json::Value::Array(arr) = arr else {
+            return Err(format!("манифест: {section} не массив"));
+        };
+        for (i, item) in arr.iter().enumerate() {
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("{section}[{i}]: нет поля name"))?
+                .to_string();
+            let data = if let Some(f) = item.get("file").and_then(|v| v.as_str()) {
+                std::fs::read(f).map_err(|e| format!("{section}[{i}] file {f}: {e}"))?
+            } else if let Some(d) = item.get("data").and_then(|v| v.as_str()) {
+                d.as_bytes().to_vec()
+            } else {
+                return Err(format!("{section}[{i}]: нужно поле data или file"));
+            };
+            ops.push(make(name, data));
+        }
+        Ok(())
+    };
+    if let Err(e) = parse("replace", &PatchOp::replace) {
+        eprintln!("poler-patch: {e}");
+        return 2;
+    }
+    if let Err(e) = parse("add", &PatchOp::add) {
+        eprintln!("poler-patch: {e}");
+        return 2;
+    }
+    // delete: без данных
+    if let Some(arr) = root.get("delete").and_then(|v| v.as_array()) {
+        for (i, item) in arr.iter().enumerate() {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                eprintln!("poler-patch: delete[{i}]: нет поля name");
+                return 2;
+            };
+            ops.push(PatchOp::delete(name));
+        }
+    }
+    let opts = PatchOptions { force_bak: cli.force_bak, ..Default::default() };
+    match patch_archive(arch, &ops, &opts) {
+        Ok(rep) => {
+            println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-patch: {e}");
+            2
+        }
+    }
+}
+
+/// `--poler-remux <POLER> --output-archive <OUT>`: tar.gz-блоб →
+/// файловая таблица (zero-disk стриминг через gzip-декодер).
+fn run_poler_remux(cli: &Cli, arch: &std::path::Path) -> i32 {
+    use poler_engine::archive::patcher::remux_archive;
+    use poler_engine::archive::stream_writer::StreamWriteConfig;
+    let Some(out) = &cli.output_archive else {
+        eprintln!("poler-remux: требуется --output-archive <POLER>");
+        return 2;
+    };
+    let cfg = StreamWriteConfig {
+        tier: match cli.stream_tier {
+            StreamTierArg::Fast => poler_engine::archive::CompressTier::Fast,
+            StreamTierArg::Deep => poler_engine::archive::CompressTier::Deep,
+            StreamTierArg::Auto => poler_engine::archive::CompressTier::Auto,
+        },
+        dedup: !cli.no_dedup,
+        ..Default::default()
+    };
+    match remux_archive(arch, out, cfg) {
+        Ok(stats) => {
+            println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+            0
+        }
+        Err(e) => {
+            eprintln!("poler-remux: {e}");
+            2
+        }
+    }
+}
+
 fn run_poler_ops(cli: &Cli) -> i32 {
     use poler_engine::archive::reader::PolerReader;
     if let Some(path) = &cli.poler_list {

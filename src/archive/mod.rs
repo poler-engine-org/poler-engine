@@ -69,6 +69,7 @@
 //!   `.poler`-контейнеров.
 
 pub mod dedup;
+pub mod patcher;
 pub mod reader;
 pub mod stream_writer;
 

@@ -72,6 +72,21 @@ struct IndexEntry {
     raw_len: u32,
 }
 
+/// Геометрия контейнера для in-place патчера.
+#[derive(Debug, Clone, Copy)]
+pub struct PolerLayout {
+    pub file_len: u64,
+    pub index_off: u64,
+    pub index_len: u64,
+    pub files_off: u64,
+    pub files_len: u64,
+    pub logical_chunks: u64,
+    pub physical_chunks: u64,
+    pub total_raw: u64,
+    pub dedup: bool,
+    pub tar_mode: bool,
+}
+
 /// Развёрнутый mmap-читатель `.poler`.
 pub struct PolerReader {
     mmap: Mmap,
@@ -79,6 +94,10 @@ pub struct PolerReader {
     files: Vec<PolerFile>,
     info: PolerInfo,
     stream_sha256: [u8; 32],
+    index_off: u64,
+    index_len: u64,
+    files_off: u64,
+    files_len: u64,
 }
 
 impl PolerReader {
@@ -186,6 +205,10 @@ impl PolerReader {
             mmap,
             index,
             stream_sha256,
+            index_off,
+            index_len,
+            files_off,
+            files_len,
             info: PolerInfo {
                 version,
                 dedup: flags & 1 != 0,
@@ -216,6 +239,55 @@ impl PolerReader {
 
     pub fn find_file(&self, name: &str) -> Option<&PolerFile> {
         self.files.iter().find(|f| f.name == name)
+    }
+
+    /// Снимок логического индекса: (raw_off, stored_off, raw_len) всех
+    /// чанков в порядке сырого потока. Для CoW-патчера, который
+    /// переливает индекс в хвост контейнера.
+    pub fn logical_entries(&self) -> Vec<(u64, u64, u32)> {
+        self.index
+            .iter()
+            .map(|e| (e.raw_off, e.stored_off, e.raw_len))
+            .collect()
+    }
+
+    /// blake3-хеш физического чанка по stored_off (первые 32 Б заголовка).
+    /// Дедуп-реестр патчера строится по этим хешам без декомпрессии.
+    pub fn physical_blake3(&self, stored_off: u64) -> Option<[u8; 32]> {
+        let off = stored_off as usize;
+        if off + 32 > self.mmap.len() {
+            return None;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&self.mmap[off..off + 32]);
+        Some(h)
+    }
+
+    /// Сырой срез mmap-отображения [off, off+len) — для потокового
+    /// копирования метаданных (индекс, файловая таблица) без RAM-копий.
+    pub fn raw_region(&self, off: u64, len: u64) -> Option<&[u8]> {
+        let start = off as usize;
+        let end = start.checked_add(len as usize)?;
+        if end > self.mmap.len() {
+            return None;
+        }
+        Some(&self.mmap[start..end])
+    }
+
+    /// Геометрия контейнера для in-place патчера.
+    pub fn layout(&self) -> PolerLayout {
+        PolerLayout {
+            file_len: self.mmap.len() as u64,
+            index_off: self.index_off,
+            index_len: self.index_len,
+            files_off: self.files_off,
+            files_len: self.files_len,
+            logical_chunks: self.info.logical_chunks,
+            physical_chunks: self.info.physical_chunks,
+            total_raw: self.info.total_raw,
+            dedup: self.info.dedup,
+            tar_mode: self.info.tar_mode,
+        }
     }
 
     /// Физический чанк по stored_off: (method, raw_len, payload).
