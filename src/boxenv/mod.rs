@@ -670,21 +670,26 @@ fn set_rlimits(rss_mb: u64, cpu_s: u64) {
 
 fn safe_join(staging: &Path, box_dir: &str, rest: &str) -> Result<PathBuf, String> {
     let rel = box_dir.trim_start_matches('/');
-    let mut p = staging.to_path_buf();
-    if !rel.is_empty() {
-        p.push(rel);
-    }
-    // захист від ../ в іменах записів
+    let base = if rel.is_empty() {
+        staging.to_path_buf()
+    } else {
+        staging.join(rel)
+    };
+    let mut p = base.clone();
+    // захист від ../ в іменах записів: шлях не може виходити за межі base
     for seg in rest.split('/') {
         match seg {
             "" | "." => {}
             ".." => {
-                if !p.pop() {
+                if p == base || !p.pop() {
                     return Err(format!("небезпечний шлях у записі: {rest}"));
                 }
             }
             s => p.push(s),
         }
+    }
+    if !p.starts_with(staging) {
+        return Err(format!("небезпечний шлях у записі: {rest}"));
     }
     Ok(p)
 }

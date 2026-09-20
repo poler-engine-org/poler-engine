@@ -344,22 +344,23 @@ mod tests {
             libc::SYS_exit_group as u32,
             libc::SYS_futex as u32,
         ] {
+            let jeq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
             assert!(
-                f.iter().any(|i| i.code == (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) && i.k == must),
+                f.iter().any(|i| i.code == jeq && i.k == must),
                 "білий список без syscall {must}"
             );
         }
 
         // стрибки в межах програми
+        let jeq_code = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
         for (idx, i) in f.iter().enumerate() {
-            if i.code == (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) {
+            if i.code == jeq_code {
                 assert!(idx + 1 + i.jt as usize <= f.len(), "jt за межами при {idx}");
                 assert!(idx + 1 + i.jf as usize <= f.len(), "jf за межами при {idx}");
             }
         }
 
         // семантика: за білим списком слідує RET ALLOW
-        let jeq_code = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
         for (idx, i) in f.iter().enumerate() {
             if i.code == jeq_code && i.jt == 0 && i.jf == 1 {
                 assert_eq!(f[idx + 1].code, RET, "пара JEQ/RET порушена при {idx}");
