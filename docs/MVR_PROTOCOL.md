@@ -50,6 +50,8 @@
 | `python3 + numpy` | чисельна валідація, MC | LOADED (2.1.3) | `python3 tools/verifiers/<v>.py` |
 | `python3 + sympy` | CAS: похідні, Z-перетворення | LOADED (1.14.0) | — // — |
 | `python3 + z3-solver` | SMT: бієктивність, FP IEEE-754 | LOADED (5.1.0) | — // — |
+| `python3 + scipy` | RK45-еталон для O(η)-збіжності дискретних схем | LOADED (1.14.1) | — // — |
+| `python3 + qiskit` | квантов субстрат: DensityMatrix/expectation_value кросс-чек | LOADED (2.5.2) | — // — |
 | `cargo test` | тести Rust-сторони | LOADED (rustc ≥1.87) | `cargo test -p <crate>` |
 | `cargo bench` / criterion | бенчмарки | STANDBY | `cargo bench --workspace` |
 | `cargo asm` / `objdump` | дизасемблювання | STANDBY | `cargo install cargo-asm` |
@@ -101,6 +103,7 @@ theorem_id (том.номер)
 | C | III | III.1 (arcsin-MLE), III.2 (стиснення) | `verify_rabitq_arcsin.py` | див. том |
 | A | V | V.1/V.2 (PND: GF(2⁸), ARX) | `verify_pnd_gf.py` | див. том |
 | E | IV | IV.1 (IIR ⟺ Volterra/експ. слід) | `verify_iir_z.py` | див. том |
+| F | VII | VII.F.1–F.10 (єдене дискретне рівняння УДЕ) | `verify_unified_discrete.py` | AXIOM CONFIRMED (10/10) |
 
 Новий цикл = новий рядок + паспорт у томі. Жодна теорема не отримує
 `AXIOM CONFIRMED` без виконаного скрипта з числами.
