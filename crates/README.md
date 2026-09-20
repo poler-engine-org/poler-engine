@@ -31,3 +31,19 @@ Kotokvit).
 Дальнейшая эволюция структуры — M3: виртуальный манифест, движок переезжает
 в `crates/poler-engine` (docs/MERGE_PLAN.md §3,
 docs/MONOREPO_CONSOLIDATION_PLAN.md).
+
+## v1.4.0 — POLER Quantum PC (Том VIII, цикл G)
+
+Крейт `pqc` получил Circuit-слой идеального кубитного субстрата:
+
+- **`src/qpc.rs`** — QCASM-lite (`pqc qc file.qc`), пер-shot коллапс,
+  Born-гистограммы, энтропия и ландауэров пол в каждом отчёте;
+- **`src/algorithms.rs`** — QFT/IQFT, Grover с точным оракулом
+  (`flipstate` — привилегия владельца вектора состояния), BV, DJ, GHZ;
+- **`src/exact.rs`** — точное кольцо ℤ[1/√2, i]: амплитуды Clifford+T
+  без единого округления (`--exact`), бит-в-бит против SymPy;
+- **`src/substrate.rs`** — P-поток УДЕ §2.2 с γ-прецессией (Thm G.1:
+  роторная работа ровно 0 при F=H) и SCF-режимом.
+
+Верификация: `tools/verifiers/verify_quantum_pc.py` — 19/19
+(паспорт `scratch/passports/cycle_G.json`), qiskit-паритет 2.2e-16.

@@ -16,6 +16,16 @@ pub enum PqcError {
     BadQubit { q: usize, n_qubits: usize },
     /// Контроль и цель двухкубитного гейта совпадают.
     SameQubit { control: usize, target: usize },
+    /// Коллизия индексов Тоффоли (ccx): два из трёх кубитов совпали.
+    BadCcxCollision,
+    /// Ошибка разбора QCASM-текста (строка и причина).
+    QcParse { line: usize, what: String },
+    /// Гейт вне точного кольца ℤ[1/√2, i] (режим --exact).
+    NotExactGate { gate: String },
+    /// Переполнение i128 в точной арифметике — схема слишком глубока.
+    ExactOverflow,
+    /// Некорректный аргумент алгоритма/субстрата (CLI и library).
+    BadArgument { what: String },
     /// Фаза вне [−1, 1] или NaN.
     BadPhase(f64),
     /// Born-правило определено только для нормированного состояния.
@@ -46,6 +56,21 @@ impl fmt::Display for PqcError {
             PqcError::SameQubit { control, target } => {
                 write!(f, "control and target coincide: {control} == {target}")
             }
+            PqcError::BadCcxCollision => {
+                write!(f, "ccx qubit indices must be pairwise distinct")
+            }
+            PqcError::QcParse { line, what } => {
+                write!(f, "circuit parse error at line {line}: {what}")
+            }
+            PqcError::NotExactGate { gate } => write!(
+                f,
+                "gate {gate} is outside the exact ring Z[1/sqrt(2), i] (Clifford+T)"
+            ),
+            PqcError::ExactOverflow => write!(
+                f,
+                "exact ring overflow (i128): circuit too deep for bit-exact mode"
+            ),
+            PqcError::BadArgument { what } => write!(f, "bad argument: {what}"),
             PqcError::BadPhase(p) => write!(f, "phase out of [-1, 1] or NaN: {p}"),
             PqcError::NotNormalized { norm } => {
                 write!(

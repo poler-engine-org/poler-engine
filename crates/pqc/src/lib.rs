@@ -85,6 +85,7 @@
 //! ```
 
 pub mod ansatz;
+pub mod algorithms;
 pub mod archetype;
 pub mod archetype_lattice;
 pub mod bloch_stream;
@@ -94,6 +95,7 @@ pub mod complex;
 pub mod crypto;
 pub mod entangle;
 pub mod error;
+pub mod exact;
 pub mod gates;
 pub mod generate;
 pub mod gyro;
@@ -108,10 +110,12 @@ pub mod netfetch;
 pub mod parallel;
 pub mod parity;
 pub mod qcurriculum;
+pub mod qpc;
 pub mod rng;
 pub mod statevector;
 pub mod stream;
 pub mod stream_engine;
+pub mod substrate;
 pub mod tls13;
 pub mod tlsprim;
 pub mod trite;
@@ -124,6 +128,18 @@ pub use archetype::{precess_to_fixpoint, PrecessReport, TracePoint};
 pub use born::BornSampler;
 pub use coherence::{binary_entropy, coherence, CoherenceReport};
 pub use complex::Cx;
+// qpc — POLER Quantum PC (идеальные кубиты: точный режим + субстрат УДЕ).
+pub use algorithms::{
+    bell, bernstein_vazirani, deutsch_jozsa, ghz, grover, qft,
+};
+pub use exact::{run_exact, ExactCx, ExactDyadic, ExactReport, ExactStatevector};
+pub use qpc::{
+    run as run_circuit, Circuit, Op, QpcReport, K_B, LANDAUER_T,
+};
+pub use substrate::{
+    mcweeney, run_flow, run_random, CMat, SubstrateConfig, SubstratePoint,
+    SubstrateReport,
+};
 pub use crypto::{
     cipher_distance, decrypt, encrypt, CipherKey, DecryptReport, EncryptReport, MAX_MODES,
 };

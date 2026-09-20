@@ -223,6 +223,86 @@ impl Statevector {
         Ok(())
     }
 
+    /// S = diag(1, i).
+    pub fn apply_s(&mut self, q: usize) -> Result<()> {
+        self.apply_diag(q, Cx::ONE, Cx::I)
+    }
+
+    /// S† = diag(1, −i).
+    pub fn apply_sdg(&mut self, q: usize) -> Result<()> {
+        self.apply_diag(q, Cx::ONE, -Cx::I)
+    }
+
+    /// T = diag(1, e^{iπ/4}).
+    pub fn apply_t(&mut self, q: usize) -> Result<()> {
+        self.apply_diag(q, Cx::ONE, Cx::cis(core::f64::consts::FRAC_PI_4))
+    }
+
+    /// T† = diag(1, e^{−iπ/4}).
+    pub fn apply_tdg(&mut self, q: usize) -> Result<()> {
+        self.apply_diag(q, Cx::ONE, Cx::cis(-core::f64::consts::FRAC_PI_4))
+    }
+
+    /// SWAP(a, b): перестановка амплитуд с разными битами a/b.
+    pub fn apply_swap(&mut self, a: usize, b: usize) -> Result<()> {
+        self.check_qubit(a)?;
+        self.check_qubit(b)?;
+        if a == b {
+            return Err(PqcError::SameQubit { control: a, target: b });
+        }
+        let (ba, bb) = (1usize << a, 1usize << b);
+        let block = 1usize << (a.max(b) + 1);
+        par_blocks_mut(&mut self.amps, block, move |slice| {
+            for i in 0..slice.len() {
+                // Стреляем с бита a = 1, b = 0: пара (i, i^ba^bb) встречается один раз.
+                if i & ba != 0 && i & bb == 0 {
+                    slice.swap(i, i ^ ba ^ bb);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// CCX (Тоффоли): X на target при обоих контрольных битах 1.
+    pub fn apply_ccx(&mut self, c1: usize, c2: usize, target: usize) -> Result<()> {
+        self.check_qubit(c1)?;
+        self.check_qubit(c2)?;
+        self.check_qubit(target)?;
+        if c1 == c2 || c1 == target || c2 == target {
+            return Err(PqcError::BadCcxCollision);
+        }
+        let (b1, b2, bt) = (1usize << c1, 1usize << c2, 1usize << target);
+        let block = 1usize << (c1.max(c2).max(target) + 1);
+        par_blocks_mut(&mut self.amps, block, move |slice| {
+            for i in 0..slice.len() {
+                if i & b1 != 0 && i & b2 != 0 && i & bt == 0 {
+                    slice.swap(i, i | bt);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// CP(θ) = diag(1, 1, 1, e^{iθ}) — контролируемая фаза.
+    pub fn apply_cp(&mut self, control: usize, target: usize, theta: f64) -> Result<()> {
+        self.check_qubit(control)?;
+        self.check_qubit(target)?;
+        if control == target {
+            return Err(PqcError::SameQubit { control, target });
+        }
+        let phase = Cx::cis(theta);
+        let (bc, bt) = (1usize << control, 1usize << target);
+        let block = 1usize << (control.max(target) + 1);
+        par_blocks_mut(&mut self.amps, block, move |slice| {
+            for i in 0..slice.len() {
+                if i & bc != 0 && i & bt != 0 {
+                    slice[i] *= phase;
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Диспетчер именованных гейтов.
     pub fn apply(&mut self, gate: Gate) -> Result<()> {
         match gate {
@@ -235,6 +315,17 @@ impl Statevector {
             Gate::Z { q } => self.apply_z(q),
             Gate::Cx { control, target } => self.apply_cnot(control, target),
             Gate::Cz { control, target } => self.apply_cz(control, target),
+            Gate::S { q } => self.apply_s(q),
+            Gate::T { q } => self.apply_t(q),
+            Gate::Sdg { q } => self.apply_sdg(q),
+            Gate::Tdg { q } => self.apply_tdg(q),
+            Gate::Swap { a, b } => self.apply_swap(a, b),
+            Gate::Ccx { c1, c2, target } => self.apply_ccx(c1, c2, target),
+            Gate::Cp {
+                control,
+                target,
+                theta,
+            } => self.apply_cp(control, target, theta),
             Gate::U2 { q, ref m } => self.apply_gate2(q, *m),
         }
     }

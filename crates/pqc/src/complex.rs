@@ -56,6 +56,15 @@ impl Cx {
             im: self.im * k,
         }
     }
+
+    /// e^{iθ} = cos θ + i·sin θ (фазовые гейты S/T/CP).
+    #[inline]
+    pub fn cis(theta: f64) -> Cx {
+        Cx {
+            re: theta.cos(),
+            im: theta.sin(),
+        }
+    }
 }
 
 impl Add for Cx {

@@ -54,6 +54,39 @@ USAGE:
                                                               RQ22: --docs URL — документации/markdown через HTTPS
     pqc merge A.pqw B.pqw --out M.pqw [opts]                  RQ20: слияние мозгов ⊗_ε → v4
                                                               RQ21: --settle — консолидация волной
+    pqc qc <file.qc> [opts]                                  v0.44: Quantum PC — идеальные кубиты
+                                                              (QCASM-схемы; --exact — кольцо
+                                                              Z[1/sqrt(2), i], бит-в-бит)
+    pqc algo <bell|ghz|qft|iqft|grover|bv|dj> [opts]         v0.44: алгоритмы на идеальных кубитах
+    pqc substrate [opts]                                     v0.44: субстрат УДЕ — P-поток Ауфбау,
+                                                              γ-прецессия, SCF-режим
+
+QC OPTIONS (v0.44: POLER Quantum PC):
+    --shots <N>               число выстрелов Борна (default 1024)
+    --seed <S>                семя xoshiro256++ (default 42)
+    --top <K>                 топ-K исходов в отчёте (default 20)
+    --exact                   точный режим: амплитуды в Z[1/sqrt(2), i]
+                              без единого округления (Clifford+T)
+    --amplitudes              печатать амплитуды
+    --probs                   полная таблица вероятностей
+    --json                    машинно-читаемый отчёт (паритет с qiskit)
+
+ALGO OPTIONS:
+    --n <N>                   число кубитов (default 4)
+    --marks <a,b,..>          помеченные состояния (grover/dj)
+    --secret <S>              секрет BV (default 11 = 0b1011)
+
+SUBSTRATE OPTIONS (УДЕ §2.2, цикл G):
+    --dim <N>                 размерность гильбертова пространства (default 4)
+    --steps <N>               шаги потока (default 400)
+    --eta <H>                 дискретизация η (default 0.05)
+    --gamma <G>               роторная связь γ: прецессия занятого
+                              подпространства (default 0)
+    --mu <M>                  химический потенциал (default 1)
+    --fill <N>                число частиц (default 2)
+    --scf <U>                 самосогласованное поле U (default 0 = F = H)
+    --seed <S>                сид случайного H (default 42)
+    --trace <N>               каждые N шагов печатать точку (default 25)
 
 ENCRYPT/DECRYPT OPTIONS (RQ13: трит-схема GF(3) по умолчанию, файл 285;
                           --f32 — исследовательская схема RQ12):
@@ -309,6 +342,9 @@ fn main() {
         Some("archetype") => cmd_archetype(&args[1..]),
         Some("learn") => cmd_learn(&args[1..]),
         Some("merge") => cmd_merge(&args[1..]),
+        Some("qc") => cmd_qc(&args[1..]),
+        Some("algo") => cmd_algo(&args[1..]),
+        Some("substrate") => cmd_substrate(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -5981,5 +6017,528 @@ fn cmd_ask(args: &[String], chat_mode: bool) -> i32 {
             }
         }
     }
+    0
+}
+
+// ==========================================================================
+// qpc — POLER Quantum PC (идеальные кубиты, v0.44.0)
+// ==========================================================================
+
+fn arg_num<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Result<T, String> {
+    let mut it = args.iter().enumerate();
+    while let Some((i, a)) = it.next() {
+        if a == flag {
+            let v = args.get(i + 1).ok_or_else(|| format!("missing value for {flag}"))?;
+            return v
+                .parse::<T>()
+                .map_err(|_| format!("bad value for {flag}: {v}"));
+        }
+    }
+    Ok(default)
+}
+
+fn arg_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+fn bits_string(outcome: u64, n: usize) -> String {
+    let mut s = String::with_capacity(n + 2);
+    s.push('|');
+    for q in (0..n).rev() {
+        s.push(if outcome >> q & 1 == 1 { '1' } else { '0' });
+    }
+    s.push('⟩');
+    s
+}
+
+/// `pqc qc <file.qc> [--shots N] [--seed S] [--top K] [--amplitudes]
+///                 [--exact] [--json] [--probs]`
+fn cmd_qc(args: &[String]) -> i32 {
+    let path = match args.first() {
+        Some(p) if !p.starts_with("--") => p.clone(),
+        _ => {
+            eprintln!("pqc qc: circuit file required\n\n{USAGE}");
+            return 2;
+        }
+    };
+    let shots: u64 = match arg_num(args, "--shots", 1024u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qc: {e}");
+            return 2;
+        }
+    };
+    let seed: u64 = match arg_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qc: {e}");
+            return 2;
+        }
+    };
+    let top: usize = match arg_num(args, "--top", 20usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qc: {e}");
+            return 2;
+        }
+    };
+    let want_amplitudes = arg_flag(args, "--amplitudes");
+    let want_exact = arg_flag(args, "--exact");
+    let want_probs = arg_flag(args, "--probs");
+    let as_json = arg_flag(args, "--json");
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("pqc qc: cannot read {path}: {e}");
+            return 1;
+        }
+    };
+    let circuit = match pqc::qpc::Circuit::parse(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pqc qc: {e}");
+            return 1;
+        }
+    };
+
+    if want_exact {
+        match pqc::exact::run_exact(&circuit) {
+            Ok(rep) => {
+                if as_json {
+                    let mut obj: Vec<(String, pqc::Json)> = vec![
+                        ("engine".into(), pqc::Json::str("qpc-exact")),
+                        ("n_qubits".into(), pqc::Json::num(rep.n_qubits as f64)),
+                    ];
+                    obj.push(("probabilities".into(), pqc::Json::num_arr(rep.probs_f64.clone())));
+                    obj.push(("norm_residual".into(), pqc::Json::num(rep.norm_residual)));
+                    let comps: Vec<pqc::Json> = rep
+                        .exact_probs
+                        .iter()
+                        .map(|p| pqc::Json::Arr(vec![pqc::Json::num(p.a as f64), pqc::Json::num(p.b as f64), pqc::Json::num(p.k as f64)]))
+                        .collect();
+                    obj.push(("exact_probs".into(), pqc::Json::Arr(comps)));
+                    let amps: Vec<pqc::Json> = rep
+                        .amplitudes
+                        .iter()
+                        .map(|z| {
+                            pqc::Json::Arr(vec![
+                                pqc::Json::num(z.a as f64),
+                                pqc::Json::num(z.b as f64),
+                                pqc::Json::num(z.c as f64),
+                                pqc::Json::num(z.d as f64),
+                                pqc::Json::num(z.k as f64),
+                            ])
+                        })
+                        .collect();
+                    obj.push(("exact_amplitudes".into(), pqc::Json::Arr(amps)));
+                    let strs: Vec<pqc::Json> = rep.exact_probs.iter().map(|p| pqc::Json::str(format!("{p}"))).collect();
+                    obj.push(("exact_probs_pretty".into(), pqc::Json::Arr(strs)));
+                    println!("{}", pqc::Json::Obj(obj).to_string());
+                    return 0;
+                }
+                println!("POLER Quantum PC — EXACT RING Z[1/sqrt(2), i]");
+                println!("file: {path}");
+                println!("qubits: {}, norm residual: {:.2e}", rep.n_qubits, rep.norm_residual);
+                println!();
+                for (i, (p, ex)) in rep.probs_f64.iter().zip(rep.exact_probs.iter()).enumerate() {
+                    if *p > 0.0 || want_probs {
+                        println!("  {}  {:.6}   = {}", bits_string(i as u64, rep.n_qubits), p, ex);
+                    }
+                }
+                if want_amplitudes || rep.n_qubits <= 6 {
+                    println!("\namplitudes (exact):");
+                    for (i, z) in rep.amplitudes.iter().enumerate() {
+                        let (re, im) = z.to_f64();
+                        println!("  {}  ({:+.6} {:+.6}i)  = {}", bits_string(i as u64, rep.n_qubits), re, im, z.display());
+                    }
+                }
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("pqc qc --exact: {e}");
+                return 1;
+            }
+        }
+    }
+
+    match pqc::qpc::run(&circuit, shots, seed) {
+        Ok(rep) => {
+            if as_json {
+                let counts: Vec<pqc::Json> = rep
+                    .counts
+                    .iter()
+                    .map(|(o, c)| pqc::Json::Arr(vec![pqc::Json::num(*o as f64), pqc::Json::num(*c as f64)]))
+                    .collect();
+                let obj = pqc::Json::Obj(vec![
+                    ("engine".into(), pqc::Json::str("qpc")),
+                    ("n_qubits".into(), pqc::Json::num(rep.n_qubits as f64)),
+                    ("gate_count".into(), pqc::Json::num(rep.gate_count as f64)),
+                    ("per_shot".into(), pqc::Json::Bool(rep.per_shot)),
+                    ("shots".into(), pqc::Json::num(rep.shots as f64)),
+                    ("norm".into(), pqc::Json::num(rep.norm)),
+                    ("entropy_bits".into(), pqc::Json::num(rep.entropy_bits)),
+                    ("landauer_j".into(), pqc::Json::num(rep.landauer_j)),
+                    ("probabilities".into(), pqc::Json::num_arr(rep.probabilities.clone())),
+                    ("marginals".into(), pqc::Json::num_arr(rep.marginals.clone())),
+                    ("counts".into(), pqc::Json::Arr(counts)),
+                ]);
+                println!("{}", obj.to_string());
+                return 0;
+            }
+            println!("POLER Quantum PC — ideal qubit substrate");
+            println!("file: {path}");
+            println!(
+                "qubits: {}, gates: {}, shots: {}, mode: {}",
+                rep.n_qubits,
+                rep.gate_count,
+                rep.shots,
+                if rep.per_shot { "per-shot collapse" } else { "statevector" }
+            );
+            println!("norm: {:.16}", rep.norm);
+            println!(
+                "entropy: {:.4} bits | Landauer floor @300K: {:.3e} J",
+                rep.entropy_bits, rep.landauer_j
+            );
+            if !rep.counts.is_empty() {
+                println!("\ntop outcomes:");
+                for (o, c) in rep.counts.iter().take(top) {
+                    println!(
+                        "  {}  {:>8}  p̂ = {:.4}",
+                        bits_string(*o, rep.n_qubits),
+                        c,
+                        *c as f64 / rep.shots as f64
+                    );
+                }
+            }
+            if want_probs {
+                println!("\nBorn distribution |<x|psi>|^2:");
+                for (i, p) in rep.probabilities.iter().enumerate() {
+                    if *p > 1e-12 {
+                        println!("  {}  {:.6}", bits_string(i as u64, rep.n_qubits), p);
+                    }
+                }
+            }
+            if want_amplitudes && rep.n_qubits <= 20 {
+                println!("\namplitudes:");
+                for (i, a) in rep.final_state.amplitudes().iter().enumerate() {
+                    if a.norm_sq() > 1e-24 {
+                        println!("  {}  ({:+.6} {:+.6}i)", bits_string(i as u64, rep.n_qubits), a.re, a.im);
+                    }
+                }
+            }
+            println!("\nmarginals P(b_q = 1):");
+            for (q, m) in rep.marginals.iter().enumerate() {
+                println!("  q{q}: {m:.6}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("pqc qc: {e}");
+            1
+        }
+    }
+}
+
+/// `pqc algo <bell|ghz|qft|iqft|grover|bv|dj> [options]`
+fn cmd_algo(args: &[String]) -> i32 {
+    let name = match args.first() {
+        Some(n) if !n.starts_with("--") => n.as_str(),
+        _ => {
+            eprintln!("pqc algo: algorithm name required (bell|ghz|qft|iqft|grover|bv|dj)\n\n{USAGE}");
+            return 2;
+        }
+    };
+    let n: usize = match arg_num(args, "--n", 4usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
+    let shots: u64 = match arg_num(args, "--shots", 1024u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
+    let seed: u64 = match arg_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
+    let as_json = arg_flag(args, "--json");
+    let want_probs = arg_flag(args, "--probs");
+    let secret: u64 = match arg_num(args, "--secret", 0b1011u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
+    let marks_str: String = match arg_num(args, "--marks", "22".to_string()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
+    let marks: Vec<usize> = match marks_str
+        .split(',')
+        .map(|t| t.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("pqc algo: bad --marks \"{marks_str}\" (expected comma-separated integers)");
+            return 2;
+        }
+    };
+
+    use pqc::algorithms as alg;
+    let circuit_result = match name {
+        "bell" => alg::bell().map(|c| (c, 0usize)),
+        "ghz" => alg::ghz(n).map(|c| (c, 0usize)),
+        "qft" => alg::qft(n, false).map(|c| (c, 0usize)),
+        "iqft" => alg::qft(n, true).map(|c| (c, 0usize)),
+        "grover" => alg::grover(n, &marks),
+        "bv" => alg::bernstein_vazirani(n, secret).map(|c| (c, 0usize)),
+        "dj" => alg::deutsch_jozsa(n, &marks).map(|c| (c, 0usize)),
+        other => {
+            eprintln!("pqc algo: unknown algorithm `{other}` (bell|ghz|qft|iqft|grover|bv|dj)");
+            return 2;
+        }
+    };
+    let (circuit, iterations) = match circuit_result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 1;
+        }
+    };
+
+    match pqc::qpc::run(&circuit, shots, seed) {
+        Ok(rep) => {
+            if as_json {
+                let counts: Vec<pqc::Json> = rep
+                    .counts
+                    .iter()
+                    .map(|(o, c)| pqc::Json::Arr(vec![pqc::Json::num(*o as f64), pqc::Json::num(*c as f64)]))
+                    .collect();
+                let obj = pqc::Json::Obj(vec![
+                    ("engine".into(), pqc::Json::str("qpc-algo")),
+                    ("algorithm".into(), pqc::Json::str(name)),
+                    ("n_qubits".into(), pqc::Json::num(rep.n_qubits as f64)),
+                    ("gate_count".into(), pqc::Json::num(rep.gate_count as f64)),
+                    ("iterations".into(), pqc::Json::num(iterations as f64)),
+                    ("shots".into(), pqc::Json::num(rep.shots as f64)),
+                    ("norm".into(), pqc::Json::num(rep.norm)),
+                    ("entropy_bits".into(), pqc::Json::num(rep.entropy_bits)),
+                    ("landauer_j".into(), pqc::Json::num(rep.landauer_j)),
+                    ("probabilities".into(), pqc::Json::num_arr(rep.probabilities.clone())),
+                    ("marginals".into(), pqc::Json::num_arr(rep.marginals.clone())),
+                    ("counts".into(), pqc::Json::Arr(counts)),
+                ]);
+                println!("{}", obj.to_string());
+                return 0;
+            }
+            println!("POLER Quantum PC — algorithm: {}", name);
+            println!(
+                "qubits: {}, gates: {}, iterations: {}, shots: {}",
+                rep.n_qubits, rep.gate_count, iterations, rep.shots
+            );
+            println!("entropy: {:.4} bits", rep.entropy_bits);
+            if !rep.counts.is_empty() {
+                println!("\ntop outcomes:");
+                for (o, c) in rep.counts.iter().take(12) {
+                    println!(
+                        "  {}  {:>8}  p̂ = {:.4}",
+                        bits_string(*o, rep.n_qubits),
+                        c,
+                        *c as f64 / rep.shots as f64
+                    );
+                }
+            }
+            if want_probs {
+                println!("\nBorn distribution:");
+                for (i, p) in rep.probabilities.iter().enumerate() {
+                    if *p > 1e-9 {
+                        println!("  {}  {:.6}", bits_string(i as u64, rep.n_qubits), p);
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            1
+        }
+    }
+}
+
+/// `pqc substrate [--dim N] [--steps N] [--eta H] [--gamma G] [--mu M]
+///               [--fill N] [--scf U] [--seed S] [--trace N] [--json]`
+fn cmd_substrate(args: &[String]) -> i32 {
+    let dim: usize = match arg_num(args, "--dim", 4usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let steps: usize = match arg_num(args, "--steps", 400usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let eta: f64 = match arg_num(args, "--eta", 0.05f64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let gamma: f64 = match arg_num(args, "--gamma", 0.0f64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let mu: f64 = match arg_num(args, "--mu", 1.0f64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let fill: usize = match arg_num(args, "--fill", 2usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let scf_u: f64 = match arg_num(args, "--scf", 0.0f64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let seed: u64 = match arg_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let trace_every: usize = match arg_num(args, "--trace", 25usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 2;
+        }
+    };
+    let as_json = arg_flag(args, "--json");
+
+    let cfg = pqc::substrate::SubstrateConfig {
+        eta,
+        gamma,
+        mu,
+        particles: fill,
+        steps,
+        scf_u,
+    };
+    let rep = match pqc::substrate::run_random(dim, seed, cfg, trace_every) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc substrate: {e}");
+            return 1;
+        }
+    };
+
+    if as_json {
+        let mat_json = |m: &pqc::substrate::CMat| -> pqc::Json {
+            let rows: Vec<pqc::Json> = (0..m.n())
+                .map(|i| {
+                    let row: Vec<pqc::Json> = (0..m.n())
+                        .map(|j| {
+                            let v = m.at(i, j);
+                            pqc::Json::Arr(vec![pqc::Json::num(v.re), pqc::Json::num(v.im)])
+                        })
+                        .collect();
+                    pqc::Json::Arr(row)
+                })
+                .collect();
+            pqc::Json::Arr(rows)
+        };
+        let pts: Vec<pqc::Json> = rep
+            .points
+            .iter()
+            .map(|p| {
+                pqc::Json::Obj(vec![
+                    ("step".into(), pqc::Json::num(p.step as f64)),
+                    ("trace".into(), pqc::Json::num(p.trace)),
+                    ("purity".into(), pqc::Json::num(p.purity)),
+                    ("energy".into(), pqc::Json::num(p.energy)),
+                    ("lyapunov".into(), pqc::Json::num(p.lyapunov)),
+                    ("defect".into(), pqc::Json::num(p.defect)),
+                    ("rotor_work".into(), pqc::Json::num(p.rotor_work)),
+                    ("precession_speed".into(), pqc::Json::num(p.precession_speed)),
+                ])
+            })
+            .collect();
+        let obj = pqc::Json::Obj(vec![
+            ("engine".into(), pqc::Json::str("qpc-substrate")),
+            ("dim".into(), pqc::Json::num(rep.dim as f64)),
+            ("seed".into(), pqc::Json::num(seed as f64)),
+            ("config".into(), pqc::Json::Obj(vec![
+                ("eta".into(), pqc::Json::num(cfg.eta)),
+                ("gamma".into(), pqc::Json::num(cfg.gamma)),
+                ("mu".into(), pqc::Json::num(cfg.mu)),
+                ("particles".into(), pqc::Json::num(cfg.particles as f64)),
+                ("steps".into(), pqc::Json::num(cfg.steps as f64)),
+                ("scf_u".into(), pqc::Json::num(cfg.scf_u)),
+            ])),
+            ("hamiltonian".into(), mat_json(&rep.hamiltonian)),
+            ("p0".into(), mat_json(&rep.p0)),
+            ("points".into(), pqc::Json::Arr(pts)),
+            ("energy_violations".into(), pqc::Json::num(rep.energy_violations as f64)),
+            ("rotor_work_total".into(), pqc::Json::num(rep.rotor_work_total)),
+            ("max_trace_drift".into(), pqc::Json::num(rep.max_trace_drift)),
+            ("final_defect".into(), pqc::Json::num(rep.final_defect)),
+            ("final_commutator".into(), pqc::Json::num(rep.final_commutator)),
+            ("scf_residual".into(), pqc::Json::num(rep.scf_residual)),
+        ]);
+        println!("{}", obj.to_string());
+        return 0;
+    }
+
+    println!("POLER Quantum PC — UDE substrate flow (cycle G, Vol. VII §2.2)");
+    println!(
+        "dim: {}, particles: {}, steps: {}, eta: {}, gamma: {}, mu: {}, scf_u: {}",
+        rep.dim, cfg.particles, cfg.steps, cfg.eta, cfg.gamma, cfg.mu, cfg.scf_u
+    );
+    println!("\ntrajectory (every {trace_every} steps):");
+    println!("  {:>6}  {:>12}  {:>12}  {:>14}  {:>12}  {:>12}", "step", "Tr P", "Tr P^2", "E = Tr HP", "||[H,P]||^2", "||P^2-P||");
+    for p in &rep.points {
+        println!(
+            "  {:>6}  {:>12.6}  {:>12.6}  {:>14.8}  {:>12.3e}  {:>12.3e}",
+            p.step, p.trace, p.purity, p.energy, p.lyapunov, p.defect
+        );
+    }
+    println!("\nsummary:");
+    println!("  energy violations (>1e-12 up-steps): {}", rep.energy_violations);
+    println!("  rotor |work| total:            {:.3e}", rep.rotor_work_total);
+    println!("  max trace drift in flight:     {:.3e}", rep.max_trace_drift);
+    println!("  final idempotency defect:      {:.3e}", rep.final_defect);
+    println!("  final ||[F,P]||_HS:            {:.3e}", rep.final_commutator);
+    println!("  SCF residual ||F-F_prev||:     {:.3e}", rep.scf_residual);
     0
 }

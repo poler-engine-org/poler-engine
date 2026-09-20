@@ -64,6 +64,52 @@ pub enum Gate {
         /// Цель.
         target: usize,
     },
+    /// S = diag(1, i) — фазовый гейт π/2.
+    S {
+        /// Кубит.
+        q: usize,
+    },
+    /// T = diag(1, e^{iπ/4}) — фазовый гейт π/4 (неточность фазы — одна
+    /// из главных ошибок физических машин; здесь она равна нулю).
+    T {
+        /// Кубит.
+        q: usize,
+    },
+    /// S† = diag(1, −i).
+    Sdg {
+        /// Кубит.
+        q: usize,
+    },
+    /// T† = diag(1, e^{−iπ/4}).
+    Tdg {
+        /// Кубит.
+        q: usize,
+    },
+    /// SWAP двух кубитов.
+    Swap {
+        /// Первый кубит.
+        a: usize,
+        /// Второй кубит.
+        b: usize,
+    },
+    /// CCX (Тоффоли): два контроля, один target.
+    Ccx {
+        /// Контроль 1.
+        c1: usize,
+        /// Контроль 2.
+        c2: usize,
+        /// Цель.
+        target: usize,
+    },
+    /// Контролируемая фаза CP(θ) = diag(1, 1, 1, e^{iθ}).
+    Cp {
+        /// Контроль.
+        control: usize,
+        /// Цель.
+        target: usize,
+        /// Угол фазы.
+        theta: f64,
+    },
     /// Произвольная однокубитная 2×2; унитарность на совести вызывающего.
     U2 {
         /// Кубит.
@@ -118,6 +164,45 @@ impl Gate {
     pub fn cz(control: usize, target: usize) -> Gate {
         Gate::Cz { control, target }
     }
+
+    /// S на кубите `q`.
+    pub fn s(q: usize) -> Gate {
+        Gate::S { q }
+    }
+
+    /// T на кубите `q`.
+    pub fn t(q: usize) -> Gate {
+        Gate::T { q }
+    }
+
+    /// S† на кубите `q`.
+    pub fn sdg(q: usize) -> Gate {
+        Gate::Sdg { q }
+    }
+
+    /// T† на кубите `q`.
+    pub fn tdg(q: usize) -> Gate {
+        Gate::Tdg { q }
+    }
+
+    /// SWAP пары кубитов.
+    pub fn swap(a: usize, b: usize) -> Gate {
+        Gate::Swap { a, b }
+    }
+
+    /// CCX (Тоффоли).
+    pub fn ccx(c1: usize, c2: usize, target: usize) -> Gate {
+        Gate::Ccx { c1, c2, target }
+    }
+
+    /// Контролируемая фаза CP(θ).
+    pub fn cp(control: usize, target: usize, theta: f64) -> Gate {
+        Gate::Cp {
+            control,
+            target,
+            theta,
+        }
+    }
 }
 
 impl fmt::Display for Gate {
@@ -132,6 +217,19 @@ impl fmt::Display for Gate {
             Gate::Z { q } => write!(f, "Z(q{q})"),
             Gate::Cx { control, target } => write!(f, "CX(q{control} -> q{target})"),
             Gate::Cz { control, target } => write!(f, "CZ(q{control}, q{target})"),
+            Gate::S { q } => write!(f, "S(q{q})"),
+            Gate::T { q } => write!(f, "T(q{q})"),
+            Gate::Sdg { q } => write!(f, "Sdg(q{q})"),
+            Gate::Tdg { q } => write!(f, "Tdg(q{q})"),
+            Gate::Swap { a, b } => write!(f, "SWAP(q{a}, q{b})"),
+            Gate::Ccx { c1, c2, target } => {
+                write!(f, "CCX(q{c1}, q{c2} -> q{target})")
+            }
+            Gate::Cp {
+                control,
+                target,
+                theta,
+            } => write!(f, "CP(q{control}, q{target}, {theta:.4})"),
             Gate::U2 { q, .. } => write!(f, "U2(q{q})"),
         }
     }
