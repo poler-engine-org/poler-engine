@@ -6804,7 +6804,7 @@ fn run_archive_to_crystal(cli: &Cli) -> i32 {
     drop(reader);
     // вернуть освобождённые арены аллокатора до финализации: пик RSS
     // не должен накладывать карты инжеста на матрицу кристалла
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
     }

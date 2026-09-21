@@ -584,7 +584,8 @@ fn stage2_run() -> Result<i32, String> {
     cenv.push(std::ptr::null());
     let empty = std::ffi::CString::new("").unwrap();
     let _ = unsafe {
-        libc::execveat(
+        libc::syscall(
+            libc::SYS_execveat,
             memfd,
             empty.as_ptr(),
             cargv.as_ptr() as *const *mut std::os::raw::c_char,
