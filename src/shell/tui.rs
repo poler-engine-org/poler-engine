@@ -430,6 +430,39 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                     None => continue,
                 }
             }
+            Mode::Calc(cs) => {
+                // v0.48.0: Калькулятор Всего — ввод выражения с живым preview.
+                let mut next: Option<Mode> = None;
+                if let Event::Key(k) = ev {
+                    match (k.code, k.modifiers) {
+                        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            next = Some(Mode::Normal);
+                        }
+                        (KeyCode::Enter, _) => {
+                            let input = cs.buf.trim().to_string();
+                            if input.is_empty() {
+                                next = Some(Mode::Normal);
+                            } else {
+                                // вычисляем в контексте ShellState (ans, vars)
+                                let res = state.calc.eval_line(&input).unwrap_or_else(|e| format!("❌ {e}"));
+                                cs.push_result(&input, &res);
+                                cs.buf.clear();
+                                state.set_output(res.clone());
+                            }
+                        }
+                        (KeyCode::Backspace, _) => {
+                            cs.buf.pop();
+                        }
+                        (KeyCode::Up, _) => cs.recall_prev(),
+                        (KeyCode::Down, _) => cs.recall_next(),
+                        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                            cs.buf.push(ch);
+                        }
+                        _ => {}
+                    }
+                }
+                next.unwrap_or(Mode::Calc(std::mem::replace(cs, CalcUiState::new())))
+            }
             Mode::Normal => {
                 // Не меняем режим, переходим к обычной обработке событий
                 Mode::Normal
@@ -561,6 +594,65 @@ enum Mode {
     /// (F3; таблица poler_chat). `viewing == None` — лента пар;
     /// `Some(i)` — полный ответ записи `entries[i]` (Response View).
     Transcript(TranscriptState),
+    /// v0.48.0: Калькулятор Всего — оверлей с живым preview и историей
+    /// (открывается клавишей `=` в Normal-режиме).
+    Calc(CalcUiState),
+}
+
+/// Состояние виджета калькулятора (v0.48.0).
+#[derive(Debug)]
+struct CalcUiState {
+    /// Текущий ввод выражения.
+    buf: String,
+    /// История результатов (новые снизу), «❯ expr» / «= result».
+    lines: Vec<String>,
+    /// История ввода для Up/Down.
+    inputs: Vec<String>,
+    input_idx: Option<usize>,
+}
+
+impl CalcUiState {
+    fn new() -> Self {
+        CalcUiState { buf: String::new(), lines: Vec::new(), inputs: Vec::new(), input_idx: None }
+    }
+
+    fn push_result(&mut self, input: &str, result: &str) {
+        self.lines.push(format!("❯ {input}"));
+        self.lines.push(format!("= {result}"));
+        if self.lines.len() > 400 {
+            let drop = self.lines.len() - 400;
+            self.lines.drain(0..drop);
+        }
+        self.inputs.push(input.to_string());
+        self.input_idx = None;
+    }
+
+    fn recall_prev(&mut self) {
+        if self.inputs.is_empty() {
+            return;
+        }
+        let idx = match self.input_idx {
+            None => self.inputs.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.input_idx = Some(idx);
+        self.buf = self.inputs[idx].clone();
+    }
+
+    fn recall_next(&mut self) {
+        let idx = match self.input_idx {
+            None => return,
+            Some(i) if i + 1 >= self.inputs.len() => {
+                self.input_idx = None;
+                self.buf.clear();
+                return;
+            }
+            Some(i) => i + 1,
+        };
+        self.input_idx = Some(idx);
+        self.buf = self.inputs[idx].clone();
+    }
 }
 
 /// Состояние окна ленты чата: пары вопрос→ответ + просмотровый режим.
@@ -942,7 +1034,7 @@ fn render_ui(
 
     // Status bar
     let status_text = format!(
-        " poler-shell {}  │  db: {:?}  │  fmt: {:?}  │  top: {}  │  focus: {}  │  F3=лента чата  ?=palette  Ctrl+N=note",
+        " poler-shell {}  │  db: {:?}  │  fmt: {:?}  │  top: {}  │  focus: {}  │  ==calc  F3=лента  ?=palette  Ctrl+N=note",
         env!("CARGO_PKG_VERSION"),
         state.db_path(),
         state.format,
@@ -973,8 +1065,90 @@ fn render_ui(
         Mode::Transcript(ts) => {
             render_transcript_overlay(f, ts);
         }
+        Mode::Calc(cs) => {
+            render_calc_overlay(f, cs, state);
+        }
         Mode::Normal => {}
     }
+}
+
+/// v0.48.0: оверлей «Калькулятора Всего» — ввод + живой preview + история.
+fn render_calc_overlay(f: &mut ratatui::Frame, cs: &CalcUiState, state: &ShellState) {
+    let area = centered_rect(80, 80, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 🧮 Калькулятор Всего (v0.48.0) — Esc=закрыть, Enter=считать, ↑↓=история ")
+        .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+    let inner = {
+        let b = block.inner(area);
+        f.render_widget(&block, area);
+        b
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // ввод
+            Constraint::Length(2), // preview
+            Constraint::Min(3),    // история
+            Constraint::Length(2), // подсказки
+        ])
+        .split(inner);
+
+    // ввод
+    let input_line = Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(cs.buf.clone()),
+        Span::styled("▏", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(input_line), chunks[0]);
+
+    // живой preview (безопасный: не мутирует состояние)
+    let preview = if cs.buf.trim().is_empty() {
+        String::new()
+    } else {
+        state.calc.preview(cs.buf.trim())
+    };
+    let (p_style, p_text) = if preview.starts_with('⚠') {
+        (Style::default().fg(Color::Yellow), preview)
+    } else if preview.is_empty() {
+        (Style::default().fg(Color::DarkGray), String::new())
+    } else {
+        (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD), preview)
+    };
+    let preview_line = Paragraph::new(Line::from(Span::styled(p_text, p_style)));
+    f.render_widget(preview_line, chunks[1]);
+
+    // история (новые снизу)
+    let hist: Vec<Line> = cs
+        .lines
+        .iter()
+        .map(|l| {
+            if l.starts_with("❯") {
+                Line::from(Span::styled(l.clone(), Style::default().fg(Color::White)))
+            } else {
+                Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
+            }
+        })
+        .collect();
+    let hist_para = Paragraph::new(hist)
+        .wrap(Wrap { trim: false })
+        .scroll(if cs.lines.len() > chunks[2].height as usize {
+            ((cs.lines.len() - chunks[2].height as usize) as u16, 0)
+        } else {
+            (0, 0)
+        });
+    f.render_widget(hist_para, chunks[2]);
+
+    // подсказки
+    let hints = " примеры: 2^10 · 5 km to mi · solve x^2=4 · expm([0,-1;1,0]*psi) · moon_illum(2024,4,8,18.35) ";
+    let hint_line = Line::from(Span::styled(
+        hints,
+        Style::default().fg(Color::Black).bg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(hint_line).wrap(Wrap { trim: false }), chunks[3]);
 }
 /// v0.17.4: окно Transcript / Response View.
 ///
@@ -1308,6 +1482,10 @@ fn handle_key_event(
     selection: &mut SelectionRect,
 ) {
     match (k.code, k.modifiers) {
+        (KeyCode::Char('='), _) if input_buf.is_empty() => {
+            // v0.48.0: `=` открывает Калькулятор Всего (как префикс в REPL)
+            *mode = Mode::Calc(CalcUiState::new());
+        }
         (KeyCode::F(3), _) => {
             // Transcript — лента локальной истории вопросов (окно-оверлей).
             *mode = Mode::Transcript(TranscriptState::new(state));

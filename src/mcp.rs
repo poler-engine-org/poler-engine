@@ -195,6 +195,9 @@ pub struct McpServer {
     /// говорящие сессии: мозг, пульс мухи и контекст речи живут между
     /// вызовами poler_triune_speak/state.
     warm_triune: Mutex<TriuneSessions>,
+    /// v0.48.0: резидентный Калькулятор Всего — переменные/ans/история
+    /// живут между вызовами poler_calc (агент ведёт сквозные вычисления).
+    warm_calc: Mutex<crate::calc::CalcState>,
 }
 
 impl McpServer {
@@ -216,6 +219,7 @@ impl McpServer {
             warm_psi: Mutex::new(PsiSessions::default()),
             warm_ssn: Mutex::new(SsnSessions::default()),
             warm_triune: Mutex::new(TriuneSessions::default()),
+            warm_calc: Mutex::new(crate::calc::CalcState::new()),
         }
     }
 
@@ -394,6 +398,16 @@ fn is_ssn_tool(msg: &Value) -> bool {
                     | "poler_ssn_status"
                     | "poler_ssn_eject"
             )
+        )
+}
+
+/// v0.48.0: Калькулятор Всего — в пул воркеров (числовой solve может
+/// сканировать диапазон ±100; состояние за Mutex — параллельно безопасно).
+fn is_calc_tool(msg: &Value) -> bool {
+    msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(|v| v.as_str()),
+            Some("poler_calc" | "poler_hw")
         )
 }
 
@@ -704,7 +718,13 @@ pub fn run(
             }
         };
         #[cfg(feature = "pnd-ffi")]
-        if is_exec_tool(&msg) || is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) || is_triune_tool(&msg) {
+        if is_exec_tool(&msg)
+            || is_fly_tool(&msg)
+            || is_psi_tool(&msg)
+            || is_ssn_tool(&msg)
+            || is_triune_tool(&msg)
+            || is_calc_tool(&msg)
+        {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -714,7 +734,12 @@ pub fn run(
             continue;
         }
         #[cfg(not(feature = "pnd-ffi"))]
-        if is_fly_tool(&msg) || is_psi_tool(&msg) || is_ssn_tool(&msg) || is_triune_tool(&msg) {
+        if is_fly_tool(&msg)
+            || is_psi_tool(&msg)
+            || is_ssn_tool(&msg)
+            || is_triune_tool(&msg)
+            || is_calc_tool(&msg)
+        {
             let server = server.clone();
             let _ = tx.send(Box::new(move || {
                 if let Some(resp) = server.dispatch(&msg) {
@@ -844,6 +869,8 @@ impl McpServer {
             "poler_ssn_eject" => self.tool_ssn_eject(&args),
             "poler_triune_speak" => self.tool_triune_speak(&args),
             "poler_triune_state" => self.tool_triune_state(&args),
+            "poler_calc" => self.tool_calc(&args),
+            "poler_hw" => self.tool_hw(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -2519,6 +2546,28 @@ impl McpServer {
     }
 
     /// Имя режима Ψ для JSON.
+/// v0.48.0: poler_calc — Калькулятор Всего для агентов (Antigravity).
+    ///
+    /// Состояние (переменные, ans) — резидентное: сквозные вычисления
+    /// между вызовами. Возвращает структурированный JSON.
+    fn tool_calc(&self, args: &Value) -> Result<String, String> {
+        let expr = args
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент expression обязателен: {\"expression\": \"2^10\"}")?;
+        let mut calc = self
+            .warm_calc
+            .lock()
+            .map_err(|_| "calc: состояние занято".to_string())?;
+        Ok(calc.eval_structured(expr).to_string())
+    }
+
+    /// v0.48.0: poler_hw — зонд скрытых параметров ПК (JSON).
+    fn tool_hw(&self, _args: &Value) -> Result<String, String> {
+        let report = crate::calc::hardware::probe();
+        Ok(report.to_json())
+    }
+
     fn psi_mode_name(m: PsiMode) -> &'static str {
         match m {
             PsiMode::Attraction => "attraction",
@@ -3002,6 +3051,32 @@ K-hop связи сущностей. Работает и по веб-кэшу po
                     "json": {"type": "boolean", "default": false, "description": "Машинно-читаемый отчёт вместо текста"}
                 },
                 "required": ["pattern"]
+            }
+        }),
+        json!({
+            "name": "poler_calc",
+            "description": "Калькулятор Всего: арифметика, единицы (to), уравнения (solve), \
+матрицы expm/eigen/rot, триты POLER, астрономия (фазы Луны, планеты, восход), геодезия, \
+теория чисел, специальная математика (gamma/erf/zeta). Константы CODATA/IAU/СИ-2019 \
+встроены по именам (c, G, h, M_sun, R_earth, l_P…). Состояние резидентное: переменные \
+и ans сохраняются между вызовами. Примеры: 2^10; 5 km to mi; solve x^2-4=0; \
+expm([0,-1;1,0]*psi); moon_illum(2024,4,8,18.35); dist(50.45,30.52,49.84,24.03).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "Выражение калькулятора"}
+                },
+                "required": ["expression"]
+            }
+        }),
+        json!({
+            "name": "poler_hw",
+            "description": "Скрытые параметры ПК: кеши L1d/L1i/L2/L3, ISA-флаги (AVX/AVX-512/AES), \
+топология (сокеты/ядра/потоки/NUMA), bogomips, диски, GPU (nvidia-smi или PCI sysfs), \
+гипервизор. Возвращает JSON.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
             }
         }),
         json!({

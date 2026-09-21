@@ -74,6 +74,15 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         return CmdResult::Empty;
     }
 
+    // v0.48.0: Префикс `=` — быстрый путь калькулятора (= 2^10, = 5 km to mi)
+    if let Some(expr) = trimmed.strip_prefix('=') {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            return CmdResult::Done("= <выражение> — посчитать (= 2^10, = 5 km to mi, = solve x^2 = 4)".into());
+        }
+        return cmd_calc(state, expr);
+    }
+
     // v0.46.0: Прямой вызов системного шелла через `!` (например, `! agy ...` или `! ls -la`)
     if trimmed.starts_with('!') {
         let raw_sh = trimmed.trim_start_matches('!').trim();
@@ -103,7 +112,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
             }
         }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell v0.47.0 — sovereign stack: без Google/NotebookLM; Win+Linux словарь, среда агента: sysinfo/env/pty/--exec --json)",
+            "poler-engine {} (poler-shell v0.48.0 — Калькулятор Всего: calc/= , единицы, матрицы expm, триты, астро/гео, hw-зонд; среда агента: sysinfo/env/pty/--exec --json)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -148,6 +157,18 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "engine" => cmd_engine(args),
         // v0.47.0: POLER Reader — живой голос книги
         "read" | "reader" => cmd_read(args),
+        // v0.48.0: Калькулятор Всего — calc берёт RAW-аргументы (кавычки в
+        // выражениях типа trit_val("1TT") обязаны дожить до лексера)
+        "calc" => {
+            let raw = raw_args_of(line);
+            if raw.trim().is_empty() {
+                CmdResult::Done(calc_usage())
+            } else {
+                cmd_calc(state, &raw)
+            }
+        }
+        // v0.48.0: зонд скрытых параметров ПК
+        "hw" | "hardware" => cmd_hw(args),
         other => {
             // v0.47.0: echo с Windows-переменными %NAME% → ${NAME}
             if other == "echo" && args.iter().any(|a| contains_win_var(a)) {
@@ -165,6 +186,145 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// v0.48.0: Калькулятор Всего (calc / префикс =) и зонд железа (hw)
+// ---------------------------------------------------------------------------
+
+/// RAW-хвост строки после первого слова — БЕЗ разборки кавычек
+/// (токенизатор шелла съедает "…" , а лексеру калькулятора они нужны).
+pub fn raw_args_of(line: &str) -> String {
+    let trimmed = line.trim_start();
+    match trimmed.find(char::is_whitespace) {
+        Some(sp) => trimmed[sp..].trim().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Краткая справка по calc.
+fn calc_usage() -> String {
+    [
+        "calc <выражение>          — вычислить: calc (1538*485)/1024, calc 2^10",
+        "calc solve <уравнение>    — корни: calc solve x^2 - 4 = 0",
+        "calc x = 5                — переменная; ans — последний результат",
+        "calc 5 km + 300 m         — единицы: to mi / to m/s / to degF",
+        "calc expm([0,-1;1,0]*psi) — матрицы: det inv eigen trace rot2 so_gen",
+        "calc trits(5)             — триты POLER: trit_val(\"1TT\")",
+        "calc moon_illum(2024,4,8,18.35) — астрономия (затмения/фазы/планеты)",
+        "calc dist(50.45,30.52,49.84,24.03) — геодезия/навигация",
+        "calc constants | units | funcs | vars | hist | laws — каталоги",
+        "calc script <закон> [k=v] — генератор скриптов по законам физики",
+        "префикс: = 2^10          — то же самое, короче",
+        "help calc                 — полная справка с примерами",
+    ]
+    .join("\n")
+}
+
+/// Исполнить выражение калькулятора в контексте state.
+fn cmd_calc(state: &mut ShellState, expr: &str) -> CmdResult {
+    let src = expr.trim();
+
+    // симметричные кавычки вокруг выражения: calc "2 + 2"
+    let src = if src.len() >= 2
+        && src.starts_with('"')
+        && src.ends_with('"')
+        && !src[1..src.len() - 1].contains('"')
+    {
+        &src[1..src.len() - 1]
+    } else {
+        src
+    };
+
+    // подкоманды-каталоги: строго по первому слову (иначе units*2 примут
+    // за запрос каталога)
+    let mut words = src.split_whitespace();
+    let first = words.next().unwrap_or("").to_lowercase();
+    let rest: String = words.collect::<Vec<_>>().join(" ");
+    match first.as_str() {
+        "vars" | "переменные" => {
+            return CmdResult::Done(state.calc.vars_text().trim_end().to_string())
+        }
+        "hist" | "history" | "история" => {
+            return CmdResult::Done(state.calc.history_text(20).trim_end().to_string())
+        }
+        "constants" => {
+            return CmdResult::Done(
+                crate::calc::constants::list_all(&rest.to_lowercase()).trim_end().to_string(),
+            )
+        }
+        "units" => {
+            let names = crate::calc::units::all_names();
+            let filtered: Vec<&str> = names
+                .into_iter()
+                .filter(|n| rest.is_empty() || n.contains(&rest.to_lowercase()))
+                .collect();
+            return CmdResult::Done(format!("{} единиц: {}", filtered.len(), filtered.join(" ")));
+        }
+        "funcs" => {
+            return CmdResult::Done(
+                crate::calc::functions::catalog(&rest.to_lowercase()).trim_end().to_string(),
+            )
+        }
+        "laws" => {
+            return CmdResult::Done(crate::calc::scriptgen::list_laws().trim_end().to_string())
+        }
+        "script" => {
+            let (law_name, overrides) = parse_script_overrides(&rest);
+            return match crate::calc::scriptgen::find_law(&law_name) {
+                None => CmdResult::Done(format!(
+                    "закон «{law_name}» не найден; список: calc laws"
+                )),
+                Some(law) => match crate::calc::scriptgen::generate(law, &overrides) {
+                    Ok(text) => CmdResult::Done(text.trim_end().to_string()),
+                    Err(e) => CmdResult::Done(format!("❌ {e}")),
+                },
+            };
+        }
+        _ => {}
+    }
+
+    // обычное вычисление
+    match state.calc.eval_line(src) {
+        Ok(out) => CmdResult::Done(out),
+        Err(e) => CmdResult::Done(format!("❌ {e}")),
+    }
+}
+
+/// «kepler3 a=0.5 au M1=1.9885e30 kg» → («kepler3», [(a, «0.5 au»), …]).
+/// Значение жадно поглощает токены до следующего `k=` (юниты с пробелами!).
+fn parse_script_overrides(rest: &str) -> (String, Vec<(String, String)>) {
+    let mut it = rest.split_whitespace();
+    let law = it.next().unwrap_or("").to_string();
+    let mut overrides = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for tok in it {
+        if let Some((k, v)) = tok.split_once('=') {
+            if let Some(done) = current.take() {
+                overrides.push(done);
+            }
+            current = Some((k.to_string(), v.to_string()));
+        } else if let Some((_, v)) = current.as_mut() {
+            v.push(' ');
+            v.push_str(tok);
+        }
+    }
+    if let Some(done) = current.take() {
+        overrides.push(done);
+    }
+    (law, overrides)
+}
+
+/// Зонд скрытых параметров ПК: `hw`, `hw --json`.
+fn cmd_hw(args: &[String]) -> CmdResult {
+    let report = crate::calc::hardware::probe();
+    if args.iter().any(|a| a == "--json" || a == "-j") {
+        CmdResult::Done(report.to_json())
+    } else {
+        let mut out = String::from("🔍 Скрытые параметры ПК (v0.48.0)");
+        out.push_str(&report.to_text());
+        CmdResult::Done(out.trim_end().to_string())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // v0.46.0: Системный шелл, passthrough и запуск .poler-контейнеров
@@ -2205,6 +2365,126 @@ mod tests {
         let _ = std::fs::remove_file(&wav);
     }
 
+    // ================================================================
+    // v0.48.0: Калькулятор Всего — интеграционные тесты dispatch
+    // ================================================================
+    fn calc_out(line: &str) -> String {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-calc.db"));
+        match dispatch(&mut s, line) {
+            CmdResult::Done(out) => out,
+            other => panic!("ожидался Done, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_calc_basic() {
+        assert_eq!(calc_out("calc 2^10"), "1024.0");
+        assert_eq!(calc_out("calc (1538 * 485) / 1024"), "728.447265625");
+        assert_eq!(calc_out("calc 5!"), "120.0");
+        assert_eq!(calc_out("calc sin(pi/2)"), "1.0");
+        assert!(calc_out("calc 5 km to mi").starts_with("3.106"));
+    }
+
+    #[test]
+    fn cmd_calc_prefix_equals() {
+        assert_eq!(calc_out("= 2^10"), "1024.0");
+        assert_eq!(calc_out("=5 km + 300 m"), "5.3 km");
+        // пустой префикс — подсказка
+        match calc_out("=") {
+            out => assert!(out.contains("выражение"), "{out}"),
+        }
+    }
+
+    #[test]
+    fn cmd_calc_stateful() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-calc2.db"));
+        let _ = dispatch(&mut s, "calc a = 6");
+        match dispatch(&mut s, "calc a * 7") {
+            CmdResult::Done(out) => assert_eq!(out, "42.0"),
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&mut s, "calc ans / 6") {
+            CmdResult::Done(out) => assert_eq!(out, "7.0"),
+            other => panic!("{other:?}"),
+        }
+        // каталоги
+        match dispatch(&mut s, "calc vars") {
+            CmdResult::Done(out) => assert!(out.contains("a = 6"), "{out}"),
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&mut s, "calc hist") {
+            CmdResult::Done(out) => assert!(out.contains("a * 7"), "{out}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_calc_solve_and_catalogs() {
+        let out = calc_out("calc solve x^2 - 4 = 0");
+        assert!(out.contains("2.0") && out.contains("-2.0"), "{out}");
+        let out = calc_out("calc constants c");
+        assert!(out.contains("299792458") && out.contains("СИ-2019"), "{out}");
+        let out = calc_out("calc units bit");
+        assert!(out.contains("bit"), "{out}");
+        let out = calc_out("calc funcs астр");
+        assert!(out.contains("moon_illum"), "{out}");
+        let out = calc_out("calc laws");
+        assert!(out.contains("kepler3"), "{out}");
+        // scriptgen через шелл
+        let out = calc_out("calc script emc2");
+        assert!(out.contains("[[rule]]") && out.contains("emc2"), "{out}");
+        let out = calc_out("calc script kepler3 a=1 au");
+        assert!(out.contains("полином") || out.contains("1 au") || out.contains("calc 2*pi"), "{out}");
+        // неизвестный закон
+        let out = calc_out("calc script nosuchlaw");
+        assert!(out.contains("не найден"), "{out}");
+    }
+
+    #[test]
+    fn cmd_calc_quatum_and_astro() {
+        // ротор Ли с тритной фазой Ψ
+        let out = calc_out("calc det(expm([0,-1;1,0] * psi))");
+        assert!((out.parse::<f64>().unwrap() - 1.0).abs() < 1e-12, "{out}");
+        // триты
+        assert_eq!(calc_out("calc trits(5)"), "\"1TT\"");
+        // фаза Луны на солнечном затмении 08.04.2024
+        let out = calc_out("calc moon_illum(2024,4,8,18.35)");
+        assert!(out.parse::<f64>().unwrap() < 0.01, "{out}");
+        // гео: Киев—Львів
+        let out = calc_out("calc dist(50.45,30.52,49.84,24.03)");
+        let d: f64 = out.parse().unwrap();
+        assert!(d > 450.0 && d < 475.0, "{d}");
+    }
+
+    #[test]
+    fn cmd_calc_script_greedy_values() {
+        // юнит с пробелом не теряется: a=1 au
+        let out = calc_out("calc script kepler3 a=1 au");
+        assert!(out.contains("1 au"), "{out}");
+        assert!(out.contains("(1 au)^3") || out.contains("((1 au))^3"), "{out}");
+        // несколько оверрайдов с юнитами
+        let out = calc_out("calc script newton m1=70 kg m2=5.97e24 kg r=6371 km");
+        assert!(out.contains("70 kg") && out.contains("6371 km"), "{out}");
+    }
+
+    #[test]
+    fn cmd_calc_errors_are_messages() {
+        let out = calc_out("calc 2 +");
+        assert!(out.starts_with("❌"), "{out}");
+        let out = calc_out("calc unknown_var + 1");
+        assert!(out.starts_with("❌"), "{out}");
+        let out = calc_out("calc");
+        assert!(out.contains("calc <выражение>"), "{out}");
+    }
+
+    #[test]
+    fn cmd_hw_probe() {
+        let out = calc_out("hw");
+        assert!(!out.is_empty());
+        let out = calc_out("hw --json");
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok(), "{out}");
+    }
+
     #[test]
     fn cmd_quit_signals_exit() {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
@@ -2437,15 +2717,15 @@ mod tests {
 
     #[test]
     fn cmd_version_string_updated_for_v0171() {
-        // v0.47.0: sovereign stack + Win/Linux словарь + среда агента.
+        // v0.48.0: Калькулятор Всего + среда агента (наследие v0.47.0).
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("v0.47.0"));
+                assert!(out.contains("v0.48.0"));
                 assert!(out.contains("poler-shell"));
-                assert!(out.contains("sovereign"));
-                assert!(out.contains("sysinfo"), "v0.47.0: в бейдже упомянута среда агента");
+                assert!(out.contains("Калькулятор"), "v0.48.0: калькулятор в бейдже");
+                assert!(out.contains("sysinfo"), "среда агента упомянута");
                 assert!(!out.contains("Auth Companion"), "v2.0: Google-интеграция удалена");
             }
             _ => panic!(),
@@ -2459,7 +2739,7 @@ mod tests {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
-            CmdResult::Done(out) => assert!(out.contains("sovereign")),
+            CmdResult::Done(out) => assert!(out.contains("poler-shell")),
             _ => panic!(),
         }
     }

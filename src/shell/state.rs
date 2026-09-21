@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::calc::CalcState;
 use crate::web::WebIndex;
 use crate::notes;
 use crate::sources;
@@ -47,6 +48,8 @@ pub struct ShellState {
     pub top: usize,
     /// Последний ответ команды (для TUI: правая нижняя панель показывает это).
     pub last_output: String,
+    /// v0.48.0: состояние «Калькулятора Всего» — переменные + история.
+    pub calc: CalcState,
 }
 
 /// Формат вывода, как в CLI `--format`.
@@ -74,6 +77,7 @@ impl ShellState {
             format: OutputFormat::default(),
             top: 10,
             last_output: String::new(),
+            calc: CalcState::new(),
         }
     }
 
@@ -102,6 +106,8 @@ impl ShellState {
                 "sysinfo", "env", "agent", "pty", "win",
                 // v0.47.0: POLER Reader
                 "read", "reader",
+                // v0.48.0: Калькулятор Всего
+                "calc", "hw",
             ]
         })
     }
@@ -219,5 +225,7 @@ mod tests {
         assert!(cmds.contains(&"quit"));
         assert!(cmds.contains(&"exit"));
         assert!(!cmds.contains(&"nlm"), "v2.0: nlm удалён");
+        assert!(cmds.contains(&"calc"), "v0.48.0: калькулятор");
+        assert!(cmds.contains(&"hw"), "v0.48.0: зонд железа");
     }
 }

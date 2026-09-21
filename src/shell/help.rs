@@ -29,6 +29,8 @@ pub enum HelpGroup {
     System,
     Agent,
     Meta,
+    // v0.48.0
+    Calc,
 }
 
 impl HelpGroup {
@@ -47,6 +49,7 @@ impl HelpGroup {
             HelpGroup::System => "Система/Win+Linux (v0.47.0)",
             HelpGroup::Agent => "Середа агента (v0.47.0)",
             HelpGroup::Meta => "Мета",
+            HelpGroup::Calc => "Калькулятор Всего (v0.48.0)",
         }
     }
 }
@@ -114,6 +117,13 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::System, cmd: "dir | type | copy | del | md | ren | move", short: "Windows-словарь → ls/cat/cp/rm/mkdir/mv (деталі: `win`)" },
         HelpEntry { group: HelpGroup::System, cmd: "findstr | tasklist | taskkill | ipconfig | ping", short: "Windows-словарь → grep/ps/kill/ip addr (флаги переводяться)" },
         HelpEntry { group: HelpGroup::System, cmd: "win", short: "Повний каталог Windows-команд і їх трансляцій" },
+
+        // v0.48.0: Калькулятор Всего
+        HelpEntry { group: HelpGroup::Calc, cmd: "calc <expr> | = <expr>", short: "Вычислить всё: арифметика, единицы (to), матрицы expm/eigen, триты, законы" },
+        HelpEntry { group: HelpGroup::Calc, cmd: "calc solve <eq>", short: "Корни уравнения: полиномы (Дюран–Кернер) и трансцендентные (Ньютон+бисекция)" },
+        HelpEntry { group: HelpGroup::Calc, cmd: "calc constants|units|funcs|laws", short: "Каталоги: константы CODATA/IAU, единицы, функции, законы физики" },
+        HelpEntry { group: HelpGroup::Calc, cmd: "calc script <law> [k=v]", short: "Сгенерировать скрипт/.poler-правило по закону физики (Kepler, Циолковский…)" },
+        HelpEntry { group: HelpGroup::Calc, cmd: "hw [--json]", short: "Скрытые параметры ПК: кеши L1-L3, ISA-флаги, NUMA, GPU, топология" },
 
         // v0.47.0: середа для ІІ-агентів (Antigravity)
         HelpEntry { group: HelpGroup::Agent, cmd: "sysinfo | systeminfo", short: "Карта середовища: CPU/RAM/GPU/диск/тулчейни/локаль/TTY — звіт для агента" },
@@ -201,6 +211,7 @@ pub fn help_topic(name: &str) -> String {
     let parent_cmds = [
         "search", "web", "stats", "sync", "set", "crawl", "impact",
         "gh", "gl", "gt", "gix", "notes", "sources", "version", "quit", "help",
+        "calc", "hw",
     ];
     if parent_cmds.contains(&name_lower.as_str()) {
         let matching: Vec<&HelpEntry> = entries
@@ -229,6 +240,7 @@ pub fn help_topic(name: &str) -> String {
         HelpGroup::Notes,
         HelpGroup::Sources,
         HelpGroup::Meta,
+        HelpGroup::Calc,
     ] {
         if name_lower == g.as_str().to_lowercase()
             || name_lower
@@ -248,7 +260,92 @@ pub fn help_topic(name: &str) -> String {
             return format_entry_detail(e);
         }
     }
+    // 5) v0.48.0: развёрнутая тема калькулятора — полный каталог возможностей
+    if name_lower == "calc" || name_lower == "калькулятор" || name_lower == "=" {
+        return calc_help_topic();
+    }
+    if name_lower == "hw" || name_lower == "hardware" {
+        return format!(
+            "─── {} — hw [—json] ───\n\n{}\n\nСкрытые от глаз параметры ПК: кеши L1d/L1i/L2/L3 \
+по индексам sysfs, ISA-флаги (AVX/AVX2/AVX-512/AES…), топология сокетов/ядер/потоков, \
+NUMA-узлы, bogomips, размеры страниц, диски (HDD/SSD), GPU (nvidia-smi или PCI IDs sysfs), \
+гипервизор.\n\nПримеры:\n  poler> hw\n  poler> hw --json\n  poler-engine --exec \"hw --json\" --json\n",
+            HelpGroup::Calc.as_str(),
+            "Зонд железа: то, что не видно в htop"
+        );
+    }
     format!("тема не знайдена: {name} (введіть `help` для повного списку)")
+}
+
+/// v0.48.0: полная справка «Калькулятора Всего» с примерами.
+fn calc_help_topic() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "─── Калькулятор Всего (v0.48.0) ───");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Три входа: poler> calc <expr> · префикс = <expr> · --exec \"calc …\" --json");
+    let _ = writeln!(s, "В TUI: клавиша = в Normal-режиме открывает виджет с живым preview.");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Арифметика и алгебра ──");
+    let _ = writeln!(s, "  calc (1538 * 485) / 1024        = 728.447265625");
+    let _ = writeln!(s, "  calc 2^3^2                      = 512 (правоассоц.), -2^2 = -4, 5! = 120");
+    let _ = writeln!(s, "  calc 0.5!                       = 0.8862… (Γ(1.5) = √π/2)");
+    let _ = writeln!(s, "  calc x = 5; calc x^2 + 1        переменные; ans — последний результат");
+    let _ = writeln!(s, "  calc solve x^2 - 4 = 0          x ∈ 2.0, -2.0 (Дюран–Кернер)");
+    let _ = writeln!(s, "  calc solve x^2 + 1 = 0          комплексные: x ∈ i, -i");
+    let _ = writeln!(s, "  calc solve sin(x) = 0.5         численно: Ньютон + бисекция (±100)");
+    let _ = writeln!(s, "  calc gcd(1071, 462) | next_prime(1e6) | factorize(360) | fib(70)");
+    let _ = writeln!(s, "  calc binomial(52, 5)            = 2598960 (покерные руки)");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Единицы измерения (to) ──");
+    let _ = writeln!(s, "  calc 5 km + 300 m               = 5.3 km (размерности строго)");
+    let _ = writeln!(s, "  calc 100 km/h to m/s            = 27.777…");
+    let _ = writeln!(s, "  calc degC(100) to degF          = 212.0 (аффинные температуры)");
+    let _ = writeln!(s, "  calc asin(0.5) to deg           = 30.0 (радианы по умолчанию)");
+    let _ = writeln!(s, "  calc c to km/h                  = 1.079…e9 (c — и константа, и единица)");
+    let _ = writeln!(s, "  calc 1 TiB to byte              = 1099511627776.0 (IEC префиксы)");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Специальная математика ──");
+    let _ = writeln!(s, "  calc gamma(0.5)                 = 1.7724… (√π), Ланцрош g=7");
+    let _ = writeln!(s, "  calc erf(1)                     = 0.8427008 (A&S 7.1.26)");
+    let _ = writeln!(s, "  calc zeta(2)                    = 1.6449… (π²/6, Эйлер–Маклорен)");
+    let _ = writeln!(s, "  calc zeta(-1)                   = -0.08333… (−1/12)");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── POLER Matrix Calc (квант) ──");
+    let _ = writeln!(s, "  calc [1,2;3,4] * [5;6]          матрицы: det inv trace transpose");
+    let _ = writeln!(s, "  calc expm([0,-1;1,0] * psi)     вращение Ли: expm(J·Ψ), Паде [6/6]");
+    let _ = writeln!(s, "  calc eigen(rot2(pi/2))          = [i, -i] — чисто мнимые");
+    let _ = writeln!(s, "  calc charpoly([1,2;3,4])        = [1, -5, -2] (Фаддеев–Леврерье)");
+    let _ = writeln!(s, "  calc so_gen(3,0,2) * 1.0        генератор so(3); A^(-1) — обратная");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Триты POLER (сбалансированная троичная) ──");
+    let _ = writeln!(s, "  calc trits(5)                   = \"1TT\"; trit_val(\"1TT\") = 5");
+    let _ = writeln!(s, "  calc trit_and(\"1TT\", \"10T\")   вентили Клини: min/max/инверсия");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Астрономия (Шлhyter + NOAA; якоря — реальные затмения) ──");
+    let _ = writeln!(s, "  calc moon_illum(2024,4,8,18.35) ≈ 0 (солнечное затмение 08.04.2024)");
+    let _ = writeln!(s, "  calc moon_phase(2025,3,14,6.9)  ≈ 180 (полнолуние-затмение)");
+    let _ = writeln!(s, "  calc sun_lon(2024,3,20,3.1)     ≈ 0 (равноденствие)");
+    let _ = writeln!(s, "  calc planet_lon(\"mars\",2024,6,1)  геоцентрическая долгота");
+    let _ = writeln!(s, "  calc sunrise(50.45,30.52,2024,6,21)  восход в Киеве, часы UTC");
+    let _ = writeln!(s, "  calc moon_dist(2024,1,1,12)     расстояние до Луны, км");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Геодезия и навигация ──");
+    let _ = writeln!(s, "  calc dist(50.45,30.52,49.84,24.03)   Киев—Львов, км (большой круг)");
+    let _ = writeln!(s, "  calc bearing(50.45,30.52,49.84,24.03) азимут, град");
+    let _ = writeln!(s, "  calc dest(50.45,30.52,45,500)   точка в 500 км на северо-восток");
+    let _ = writeln!(s, "  calc earth_radius(55.75)        радиус кривизны WGS84, км");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Генератор скриптов по законам ──");
+    let _ = writeln!(s, "  calc laws                      19+ законов: Кеплер, Циолковский, Шварцшильд…");
+    let _ = writeln!(s, "  calc script kepler3             готовая команда calc + .poler-правило");
+    let _ = writeln!(s, "  calc script emc2 m=2 kg         со своими значениями");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Каталоги ──");
+    let _ = writeln!(s, "  calc constants [фильтр]         CODATA 2022 / IAU / СИ-2019 (с источниками)");
+    let _ = writeln!(s, "  calc units | calc funcs         единицы и функции");
+    let _ = writeln!(s, "  calc vars | calc hist           переменные и история");
+    let _ = writeln!(s, "  hw | hw --json                 скрытые параметры ПК");
+    s
 }
 
 fn format_entry_detail(e: &HelpEntry) -> String {

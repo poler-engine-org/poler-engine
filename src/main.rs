@@ -513,7 +513,9 @@ struct Cli {
 
     /// v0.47.0: одноразовое исполнение команды poler-shell без баннера
     /// и промптов — интерфейс для ИИ-агентов и скриптов.
-    /// Примеры: --exec 'search "квант" --top 3'; --exec 'dir'; --exec 'sysinfo'.
+    /// Примеры: --exec 'search "квант" --top 3'; --exec 'dir'; --exec 'sysinfo';
+    /// v0.48.0: --exec 'calc 2^10' --json; --exec '= 5 km to mi';
+    ///          --exec 'calc solve x^2 - 4 = 0'; --exec 'hw --json'.
     /// Поддерживает полный словарь: Linux-команды, Windows-команды (WinCompat),
     /// команды движка и пути к .poler-контейнерам.
     #[arg(long = "exec", value_name = "CMD", conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact"])]

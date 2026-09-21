@@ -51,6 +51,7 @@ pub mod archive;
 pub mod bench;
 pub mod boxenv;
 pub mod browser;
+pub mod calc;
 pub mod compression;
 pub mod crypto;
 pub mod editor;
