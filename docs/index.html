@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POLER Engine — AI-Native Topographical, Resonant and Physical Search Engine</title>
+    
+    <!-- SEO & Metadata -->
+    <meta name="description" content="POLER Engine: High-performance computational and AI-native search engine built on balanced ternary Trit5 logic, symplectic rotor dynamics J = A - A^T, and dimensional physical tensor analysis.">
+    <meta name="keywords" content="POLER, physics engine, Rust, search engine, continuous relaxation, ternary logic, Trit5, SIMD, Teddy search, RaBitQ, zero-copy, general relativity, quantum mechanics, open source">
+    <meta name="author" content="Vitalij Kotok (Kotokvit) & POLER Team">
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="https://poler-engine-org.github.io/poler-engine/">
+
+    <!-- OpenGraph / Social Media -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://poler-engine-org.github.io/poler-engine/">
+    <meta property="og:title" content="POLER Engine — AI-Native Physical and Topological Search Engine">
+    <meta property="og:description" content="High-performance computational engine on balanced ternary logic Trit5, symplectic rotor relaxation, and continuous physics validation.">
+    <meta property="og:site_name" content="POLER Engine">
+
+    <!-- JSON-LD Structured Data for Googlebot -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareSourceCode",
+      "name": "POLER Engine",
+      "codeRepository": "https://github.com/poler-engine-org/poler-engine",
+      "programmingLanguage": ["Rust", "Zig", "C", "Python", "Assembly"],
+      "license": "https://github.com/poler-engine-org/poler-engine/blob/main/LICENSE",
+      "author": {
+        "@type": "Person",
+        "name": "Vitalij Kotok"
+      },
+      "description": "AI-native topographical, resonant and graph search engine on balanced ternary Trit5, Teddy SIMD, and continuous relaxation dynamics."
+    }
+    </script>
+
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: #131b2e;
+            --accent-cyan: #06b6d4;
+            --accent-blue: #3b82f6;
+            --accent-purple: #8b5cf6;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --border-color: #1f293d;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            line-height: 1.6;
+            padding: 0 20px;
+        }
+        .container { max-width: 1100px; margin: 0 auto; padding: 40px 0; }
+        header { text-align: center; margin-bottom: 50px; }
+        h1 {
+            font-size: 2.8rem;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 12px;
+            font-weight: 800;
+        }
+        .subtitle { font-size: 1.25rem; color: var(--text-muted); max-width: 750px; margin: 0 auto 25px; }
+        .badges { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: 30px; }
+        .badge {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+        .cta-buttons { display: flex; justify-content: center; gap: 15px; margin-bottom: 50px; }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 12px 24px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+        .btn-primary { background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan)); color: #fff; }
+        .btn-primary:hover { opacity: 0.9; transform: translateY(-2px); }
+        .btn-secondary { background: var(--card-bg); color: var(--text-main); border: 1px solid var(--border-color); }
+        .btn-secondary:hover { border-color: var(--accent-cyan); transform: translateY(-2px); }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px; margin-bottom: 50px; }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 24px;
+            transition: border-color 0.2s;
+        }
+        .card:hover { border-color: var(--accent-blue); }
+        .card-icon { font-size: 1.8rem; margin-bottom: 12px; }
+        .card h3 { font-size: 1.25rem; margin-bottom: 10px; color: var(--accent-cyan); }
+        .card p { color: var(--text-muted); font-size: 0.95rem; }
+
+        .code-preview {
+            background: #060911;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 50px;
+            font-family: "JetBrains Mono", Consolas, Menlo, Monaco, monospace;
+            font-size: 0.9rem;
+            overflow-x: auto;
+        }
+        .code-title { color: var(--accent-purple); font-weight: bold; margin-bottom: 15px; }
+        .prompt { color: var(--accent-cyan); }
+        .output { color: #10b981; }
+
+        footer { text-align: center; color: var(--text-muted); padding: 30px 0; border-top: 1px solid var(--border-color); font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>POLER ENGINE</h1>
+            <p class="subtitle">AI-Native Topographical, Resonant and Physical Search Engine on Silicon</p>
+            <div class="badges">
+                <span class="badge">🦀 Rust Core</span>
+                <span class="badge">⚡ Trit5 Balanced Ternary</span>
+                <span class="badge">🌌 CODATA 2022 / SI-2019</span>
+                <span class="badge">🔍 Teddy SIMD 1.6 GB/s</span>
+                <span class="badge">📦 Zero-Copy .poler Archiver</span>
+            </div>
+            <div class="cta-buttons">
+                <a href="https://github.com/poler-engine-org/poler-engine" class="btn btn-primary">View on GitHub</a>
+                <a href="https://github.com/poler-engine-org" class="btn btn-secondary">Explore Organization</a>
+            </div>
+        </header>
+
+        <section class="grid">
+            <div class="card">
+                <div class="card-icon">📐</div>
+                <h3>Dimensional Physics Engine (calc)</h3>
+                <p>Strict dimensional analysis over CODATA/SI constants. Real-time tensor calculations: Schwarzschild radius, Lorentz factor, Rydberg frequency, and Lie group matrix exponentials (Padé [6/6]).</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">⚡</div>
+                <h3>Trit5 Balanced Ternary Logic</h3>
+                <p>5 trits packed per byte (-1, 0, +1). Replaces traditional floating-point multiplication with pure bitwise shifts, XOR, and POPCNT masks on AVX2 / AVX-512 registers.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">🔍</div>
+                <h3>Sub-Millisecond Search Data-Plane</h3>
+                <p>Teddy SIMD scanner (1.59 GB/s), RaBitQ 1-bit vector embeddings (24x compression), and BM25 + PageRank graph resonance for lightning-fast retrieval.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">🧠</div>
+                <h3>FlyWire Connectome Brain Scale</h3>
+                <p>Full-scale neural connectivity (139k neurons, 54.5M synapses) with Apache Arrow / Feather zero-copy mmap and Draco 3D mesh compression.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">📦</div>
+                <h3>.poler Zero-Copy Archiver</h3>
+                <p>FastCDC content-defined chunking with BLAKE3 deduplication and Zstd auto-leveling. Random byte-level access without full decompression.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">🛡️</div>
+                <h3>poler-box Hermetic Sandbox</h3>
+                <p>Kernel-level Landlock, seccomp BPF filters, and user namespaces for zero-disk execution and secure containerized computation.</p>
+            </div>
+        </section>
+
+        <section class="code-preview">
+            <div class="code-title">// POLER Physical Calculator Example (Real-time Dimensional Verification)</div>
+            <p><span class="prompt">poler&gt;</span> calc 2 * G * (5.972e24 kg) / c^2</p>
+            <p class="output">0.008869805825435334 m  # Earth Schwarzschild radius (~8.87 mm)</p>
+            <br>
+            <p><span class="prompt">poler&gt;</span> calc 1 / sqrt(1 - 0.9^2)</p>
+            <p class="output">2.294157338705618       # Lorentz factor γ at v = 0.9c</p>
+            <br>
+            <p><span class="prompt">poler&gt;</span> calc (1 kg) * c^2</p>
+            <p class="output">8.987551787368176e16 J  # Rest energy E = mc²</p>
+        </section>
+
+        <footer>
+            <p>© 2026 POLER Engine Project. Open Source Software under Apache 2.0 / MIT License.</p>
+            <p><a href="https://github.com/poler-engine-org/poler-engine" style="color: var(--accent-cyan); text-decoration: none;">GitHub Repository</a> • <a href="https://github.com/poler-engine-org" style="color: var(--accent-cyan); text-decoration: none;">Organization</a></p>
+        </footer>
+    </div>
+</body>
+</html>
