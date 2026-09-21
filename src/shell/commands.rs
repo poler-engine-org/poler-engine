@@ -66,6 +66,20 @@ pub fn tokenize(line: &str) -> Vec<String> {
 
 /// Исполнить одну строку ввода в контексте `state`.
 pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return CmdResult::Empty;
+    }
+
+    // v0.46.0: Прямой вызов системного шелла через `!` (например, `! agy ...` или `! ls -la`)
+    if trimmed.starts_with('!') {
+        let raw_sh = trimmed.trim_start_matches('!').trim();
+        if raw_sh.is_empty() {
+            return CmdResult::Done("! <command> — выполнить команду в системном шелле (например, `! ls -la`, `! agy ...`)".into());
+        }
+        return run_sh_command(raw_sh);
+    }
+
     let tokens = tokenize(line);
     if tokens.is_empty() {
         return CmdResult::Empty;
@@ -105,12 +119,108 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         // v0.17.0: Notes & Sources CRUD
         "notes" => cmd_notes(state, args),
         "sources" => cmd_sources(state, args),
-        other => CmdResult::Done(format!(
-            "неизвестная команда: {other} (введите `help` для списка)"
-        )),
+        // v0.46.0: Системный шелл и прямое исполнение
+        "sh" | "bash" | "exec" => {
+            if args.is_empty() {
+                CmdResult::Done("sh <command> — выполнить команду в шелле".into())
+            } else {
+                run_sh_command(&args.join(" "))
+            }
+        }
+        other => run_system_cmd(other, args),
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// v0.46.0: Системный шелл, passthrough и запуск .poler-контейнеров
+// ---------------------------------------------------------------------------
+
+fn run_sh_command(raw_cmd: &str) -> CmdResult {
+    let output = match std::process::Command::new("sh").arg("-c").arg(raw_cmd).output() {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Done(format!("❌ помилка виклику sh: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut res = String::new();
+    if !stdout.is_empty() {
+        res.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !res.is_empty() && !res.ends_with('\n') {
+            res.push('\n');
+        }
+        res.push_str(&stderr);
+    }
+    if res.is_empty() {
+        res = format!("✓ виконано (код: {})", output.status);
+    }
+    CmdResult::Done(res.trim_end_matches('\n').to_string())
+}
+
+fn run_system_cmd(cmd: &str, args: &[String]) -> CmdResult {
+    let expanded = if cmd.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            format!("{home}/{}", &cmd[2..])
+        } else {
+            cmd.to_string()
+        }
+    } else {
+        cmd.to_string()
+    };
+
+    // Прямой запуск .poler-контейнера через poler-box
+    if expanded.ends_with(".poler") || (cmd.ends_with(".poler") && std::path::Path::new(&expanded).exists()) {
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("poler-engine"));
+        let status = std::process::Command::new(current_exe)
+            .arg("--poler-box")
+            .arg(&expanded)
+            .args(args)
+            .status();
+
+        match status {
+            Ok(s) => return CmdResult::Done(format!("✓ [poler-box] завершено: {s}")),
+            Err(e) => return CmdResult::Done(format!("❌ poler-box error: {e}")),
+        }
+    }
+
+    // Проверка наличия бинарника в PATH или по прямому пути
+    let exists = if cmd.contains('/') {
+        std::path::Path::new(&expanded).is_file()
+    } else if let Ok(paths) = std::env::var("PATH") {
+        std::env::split_paths(&paths).any(|p| p.join(cmd).is_file())
+    } else {
+        false
+    };
+
+    if exists {
+        let output = match std::process::Command::new(&expanded).args(args).output() {
+            Ok(o) => o,
+            Err(e) => return CmdResult::Done(format!("❌ помилка запуску {cmd}: {e}")),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut res = String::new();
+        if !stdout.is_empty() {
+            res.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !res.is_empty() && !res.ends_with('\n') {
+                res.push('\n');
+            }
+            res.push_str(&stderr);
+        }
+        if res.is_empty() {
+            res = format!("✓ [{cmd}] виконано (код: {})", output.status);
+        }
+        CmdResult::Done(res.trim_end_matches('\n').to_string())
+    } else {
+        CmdResult::Done(format!(
+            "неизвестная команда: {cmd} (введите `help` для списка, `! <cmd>` для шелла, либо путь к .poler контейнеру)"
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // search / web — поиск по web-index.db
