@@ -52,8 +52,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     try stdout.print("\n=================================================================\n", .{});
-    try stdout.print("   POLER EVENT-DRIVEN & PREFETCH BENCHMARK: FLYWIRE v783 CORE    \n", .{});
-    try stdout.print("   CPU: Intel Core i7-3770 (Ivy Bridge, DDR3-1600, 1 Thread)     \n", .{});
+    try stdout.print("   POLER EVENT-DRIVEN & PREFETCH BENCHMARK: FLYWIRE-SCALE       \n", .{});
+    try stdout.print("   Референс оригінального запуску: i7-3770 / DDR3-1600, 1 Thread \n", .{});
+    try stdout.print("   Поточна машина: частота вимірюється нижче (див. [1])         \n", .{});
+    try stdout.print("   УВАГА: топологія СИНТЕТИЧНА (граф масштабу FlyWire), не       \n", .{});
+    try stdout.print("   реальний CSR коннектом — див. docs/flywire-connectome/.       \n", .{});
     try stdout.print("=================================================================\n\n", .{});
 
     // 1. Калібрування частоти
@@ -230,7 +233,10 @@ pub fn main() !void {
     const hz_event = 1000.0 / ms_event;
 
     try stdout.print("    - Час кроку : {d:.3} мс ({d:.1} Гц / {d:.2} кГц)\n", .{ ms_event, hz_event, hz_event / 1000.0 });
+    try stdout.print("    - Оброблено ребер/крок (фактично торкнуто): {d:.0} з {d} (розрідженість {d:.1}%)\n", .{ @as(f64, @floatFromInt(total_processed_edges)) / @as(f64, @floatFromInt(steps_event)), @as(f64, @floatFromInt(actual_edges)), 100.0 * @as(f64, @floatFromInt(total_processed_edges)) / (@as(f64, @floatFromInt(steps_event)) * @as(f64, @floatFromInt(actual_edges))) });
     try stdout.print("    - Прискорення проти базового Dense : {d:.2}x\n\n", .{ms_dense / ms_event});
+
+    std.mem.doNotOptimizeAway(total_processed_edges);
 
     // ----------------------------------------------------------------------
     // ПІДСУМКОВА ТАБЛИЦЯ
@@ -242,7 +248,12 @@ pub fn main() !void {
     try stdout.print(" 2. Dense + Software PREFETCH  | {d:6.3} мс | {d:6.1} Гц  |  {d:4.2}x      \n", .{ ms_pref, hz_pref, ms_dense / ms_pref });
     try stdout.print(" 3. EVENT-DRIVEN + Prefetch    | {d:6.3} мс | {d:6.1} кГц | {d:4.1}x      \n", .{ ms_event, hz_event / 1000.0, ms_dense / ms_event });
     try stdout.print("=================================================================\n", .{});
-    try stdout.print(" РЕАЛЬНІСТЬ: Мозок мухи на i7-3770 (2012 р.) працює на {d:.1} кГц!\n", .{hz_event / 1000.0});
-    try stdout.print(" Це в {d:.0}x швидше за живу біологічну муху (~200 Гц).\n", .{hz_event / 200.0});
+    try stdout.print(" РЕАЛЬНІСТЬ: мозок масштабу FlyWire на цьому CPU працює на {d:.1} кГц\n", .{hz_event / 1000.0});
+    try stdout.print(" (подієва симуляція при ~3.5% спайкової активності; синтетична топологія)\n", .{});
+    if (hz_event >= 200.0) {
+        try stdout.print(" Це у {d:.0}x швидше за живу біологічну муху (~200 Гц).\n", .{hz_event / 200.0});
+    } else {
+        try stdout.print(" Це складає {d:.0}% від швидкості живої мухи (~200 Гц).\n", .{hz_event / 200.0 * 100.0});
+    }
     try stdout.print("=================================================================\n\n", .{});
 }

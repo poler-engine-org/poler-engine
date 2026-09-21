@@ -44,8 +44,12 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     try stdout.print("\n=================================================================\n", .{});
-    try stdout.print("   FLYWIRE v783 REAL-SCALE BENCHMARK: ALU vs DDR3 MEMORY (ZIG)   \n", .{});
-    try stdout.print("   CPU: Intel Core i7-3770 (Ivy Bridge, L3=8MB, DDR3-1600)       \n", .{});
+    try stdout.print("   FLYWIRE v783 REAL-SCALE BENCHMARK: ALU vs MEMORY (ZIG)      \n", .{});
+    try stdout.print("   Референс оригінального запуску: i7-3770 / DDR3-1600 / L3=8МБ\n", .{});
+    try stdout.print("   Поточна машина: частота вимірюється нижче (див. [1])         \n", .{});
+    try stdout.print("   УВАГА: топологія СИНТЕТИЧНА (випадковий граф масштабу       \n", .{});
+    try stdout.print("   FlyWire: 138,639 нейронів / 2.7М ребер), не реальний CSR     \n", .{});
+    try stdout.print("   коннектом. Реальний граф — docs/flywire-connectome/.         \n", .{});
     try stdout.print("=================================================================\n\n", .{});
 
     // 1. Калібрування частоти
@@ -134,12 +138,12 @@ pub fn main() !void {
     try stdout.print("    🎯 Тактів на 1 синаптичне ребро  : {d:.2} тактів/ребро\n\n", .{cycles_per_edge_core});
 
     // -------------------------------------------------------------
-    // ТЕСТ 2: Вплив розсіювання пам'яті DDR3 (Gather vs Sequential)
+    // ТЕСТ 2: Кеш-ієрархія vs справжня DRAM-латентність (Gather)
     // -------------------------------------------------------------
-    try stdout.print("[4] ВИПРОБУВАННЯ 2: Аналіз DDR3 Stall vs L1 Cache...\n", .{});
+    try stdout.print("[4] ВИПРОБУВАННЯ 2: Кеш-ієрархія (L2/L3) vs DRAM (великий working set)...\n", .{});
     const bench_items: usize = 10_000_000;
 
-    // A. Послідовний доступ (Streaming - без L1/L3 промахів)
+    // A. Послідовний доступ по компактному масиву станів (277 КБ — L2/L3-resident + prefetch)
     const t_seq_0 = rdtscStart();
     var acc_seq: i64 = 0;
     for (0..bench_items) |idx| {
@@ -149,7 +153,7 @@ pub fn main() !void {
     const t_seq_1 = rdtscEnd();
     const cyc_seq = @as(f64, @floatFromInt(if (t_seq_1 > t_seq_0) t_seq_1 - t_seq_0 else 1)) / @as(f64, @floatFromInt(bench_items));
 
-    // B. Випадковий доступ (DDR3 Random Gather Latency)
+    // B. Випадковий доступ по КОМПАКТНОМУ масиву (277 КБ — працює з L2/L3, НЕ з DRAM)
     const t_rand_0 = rdtscStart();
     var acc_rand: i64 = 0;
     for (0..bench_items) |e_idx| {
@@ -159,20 +163,52 @@ pub fn main() !void {
     const t_rand_1 = rdtscEnd();
     const cyc_rand = @as(f64, @floatFromInt(if (t_rand_1 > t_rand_0) t_rand_1 - t_rand_0 else 1)) / @as(f64, @floatFromInt(bench_items));
 
+    // C. Справжня DRAM-латентність: ВЕЛИКИЙ working set (48 МБ > L3)
+    //    Масив станів масштабу повного графа + запас: 24М тритів i16 = 48 МБ.
+    const n_big: usize = 24_000_000;
+    const big_states = try allocator.alloc(i16, n_big);
+    defer allocator.free(big_states);
+    for (0..n_big) |i| {
+        big_states[i] = @intCast(@as(i32, @intCast(i % 7)) - 3);
+    }
+    var acc_big: i64 = 0;
+    var prng_big = std.Random.DefaultPrng.init(0xDDDD_0003);
+    const rand_big = prng_big.random();
+    // Передгенеруємо індекси, щоб RNG не забруднював вимір пам'яті
+    const big_idx = try allocator.alloc(u32, bench_items);
+    defer allocator.free(big_idx);
+    for (0..bench_items) |i| {
+        big_idx[i] = rand_big.intRangeAtMost(u32, 0, @as(u32, @intCast(n_big - 1)));
+    }
+    const t_big_1 = rdtscStart();
+    for (0..bench_items) |i| {
+        acc_big +%= big_states[big_idx[i]];
+    }
+    const t_big_2 = rdtscEnd();
+    const cyc_dram = @as(f64, @floatFromInt(if (t_big_2 > t_big_1) t_big_2 - t_big_1 else 1)) / @as(f64, @floatFromInt(bench_items));
+
     std.mem.doNotOptimizeAway(acc_seq);
     std.mem.doNotOptimizeAway(acc_rand);
+    std.mem.doNotOptimizeAway(acc_big);
 
-    try stdout.print("    - Послідовний доступ (L1/L2 Cache hit) : {d:.2} тактів/читання\n", .{cyc_seq});
-    try stdout.print("    - Випадковий вибір (DDR3 / L3 Stall)   : {d:.2} тактів/читання\n", .{cyc_rand});
-    try stdout.print("    - Коефіцієнт уповільнення від DDR3     : {d:.2}x\n\n", .{cyc_rand / cyc_seq});
+    try stdout.print("    - Послідовний доступ (277КБ, prefetch+L2/L3) : {d:.2} тактів/читання\n", .{cyc_seq});
+    try stdout.print("    - Випадковий вибір (277КБ — L2/L3-resident) : {d:.2} тактів/читання\n", .{cyc_rand});
+    try stdout.print("    - Випадковий вибір (48МБ > L3 — справжня DRAM): {d:.2} тактів/читання\n", .{cyc_dram});
+    try stdout.print("    - Коефіцієнт DRAM vs послідовний               : {d:.2}x\n", .{cyc_dram / cyc_seq});
+    try stdout.print("    - Коефіцієнт DRAM vs L2/L3-resident            : {d:.2}x\n\n", .{cyc_dram / cyc_rand});
 
     // -------------------------------------------------------------
     // ПІДСУМКОВИЙ ВЕРДИКТ
     // -------------------------------------------------------------
     try stdout.print("========================= ВЕРДИКТ ===============================\n", .{});
-    try stdout.print(" 1. Мозок мухи FlyWire (2.7M core) на 1 ядрі i7-3770 / DDR3:\n", .{});
-    try stdout.print("    Реальна швидкість: {d:.1} Гц (в {d:.1}x швидше за біологічну муху ~200 Гц!)\n", .{ hz_core, hz_core / 200.0 });
-    try stdout.print(" 2. Для розширення на повний мозок (15M рёбер) або мишу:\n", .{});
-    try stdout.print("    Головний боттлнек — не ALU (No-Mul працює за <1 такт), а випадковий доступ DDR3.\n", .{});
+    try stdout.print(" 1. Мозок мухи (синтетика масштабу FlyWire, 2.7М ребер) на 1 ядрі:\n", .{});
+    if (hz_core >= 200.0) {
+        try stdout.print("    Швидкість {d:.1} Гц — у {d:.1}x швидше за біологічну муху (~200 Гц)\n", .{ hz_core, hz_core / 200.0 });
+    } else {
+        try stdout.print("    Швидкість {d:.1} Гц — складає {d:.0}% від біологічної мухи (~200 Гц), тобто у {d:.1}x повільніше\n", .{ hz_core, hz_core / 200.0 * 100.0, 200.0 / hz_core });
+    }
+    try stdout.print(" 2. Боттлнек масштабування (15М ребер, миша):\n", .{});
+    try stdout.print("    НЕ ALU (No-Mul працює за <1 такт), а випадковий доступ до DRAM\n", .{});
+    try stdout.print("    (див. вимір 48МБ working set у ТЕСТІ 2C вище).\n", .{});
     try stdout.print("=================================================================\n\n", .{});
 }

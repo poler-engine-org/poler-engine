@@ -3,7 +3,8 @@
 Benchmark: POLER ε v7.0-LEM (з лематизацією) vs v7.0 canonical (без лематизації).
 
 Порівнює:
-  1. v7.0 canonical (baseline) — збігається з benchmark_poler_epsilon.py
+  1. v7.0-sw canonical — словоформи З фільтром стоп-слів (несумісно з
+     benchmark_poler_epsilon.py, де фільтра НЕМАЄ — виправлення аудиту)
   2. v7.0-LEM canonical_lemmatized — зводить словоформи до лем через dict_uk
      перед обчисленням рідкості
 
@@ -368,16 +369,36 @@ def analyze_manuscript(filepath, name, kappa=1.0):
 
 
 if __name__ == "__main__":
-    # Resolve repo root from script path
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Аудит 2026-09-21: (1) lemma_index і манускрипти litgraph-desktop тут відсутні —
+    # тепер graceful skip замість exit(1); (2) НОТА: v7.0-каноніка ЦЬОГО файлу
+    # фільтрує стоп-слова (STOP_WORDS), тому НЕ збігається з benchmark_poler_epsilon.py
+    # (там фільтра немає) — виправлено хибне твердження оригінального докстрингу.
+    import argparse
+    import tempfile
 
-    # Load lemma index (built by `cargo run --release -- build-lemmatizer`)
-    if load_lemma_index() is None:
-        print("ERROR: Cannot run v7.0-LEM benchmark without lemma index.")
-        print("       Run `cargo run --release -- build-lemmatizer` first.")
-        exit(1)
+    ap = argparse.ArgumentParser(description="POLER ε v7.0 (word forms) vs v7.0-LEM (lemmatized)")
+    ap.add_argument("files", nargs="*", help="манускрипти .txt/.md (за замовчуванням — демо)")
+    ap.add_argument("--kappa", type=float, default=1.0)
+    args = ap.parse_args()
 
-    sfera_path = os.path.join(repo_root, "litgraph-core/tests/sfera.md")
-    kasiopia_path = os.path.join(repo_root, "litgraph-core/tests/kasiopia.md")
-    analyze_manuscript(sfera_path, "Сфера Предела (Cyberpunk/Sci-Fi)", kappa=1.20)
-    analyze_manuscript(kasiopia_path, "Кассіопея (Ukrainian Fantasy/Sci-Fi)", kappa=1.00)
+    have_lemma = load_lemma_index() is not None
+    if not have_lemma:
+        print("WARNING: lemma index відсутній (resources/ua-linguistic/derivatives/) — "
+              "працює лише v7.0 (word forms); LEM-гілка автоматично ідентична їй.")
+
+    if args.files:
+        for fp in args.files:
+            analyze_manuscript(fp, os.path.basename(fp), kappa=args.kappa)
+    else:
+        demo = (
+            "Сектор Гамма-3 хмара этерии снова мигнула, и алгоритм буфера выдал ошибку.\n"
+            "Крик. Страх сковал её, кровь ударила в виски, паника, отчаяние, безумие.\n"
+            "Ну вот, опять пошёл этот дождь, да и ветер поднялся, совсем не погода.\n"
+            "Він прокручував план: спочатку карта, потім проникнути у сектор.\n"
+        ) * 12
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+        tmp.write(demo)
+        tmp.close()
+        print("Файли не вказані — вбудований демо-текст.")
+        analyze_manuscript(tmp.name, "DEMO (built-in)", kappa=args.kappa)
+        os.unlink(tmp.name)

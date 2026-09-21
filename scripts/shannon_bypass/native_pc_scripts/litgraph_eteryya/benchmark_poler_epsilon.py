@@ -160,5 +160,39 @@ def analyze_manuscript(filepath, name, kappa=1.0):
         print(f"#{i+1}: Epsilon={scores[idx]:.4f}")
         print(f"    Text: \"{raw_fragments[idx][:120]}...\"\n")
 
-analyze_manuscript("litgraph-core/tests/sfera.md", "Сфера Предела (Cyberpunk/Sci-Fi)", kappa=1.20)
-analyze_manuscript("litgraph-core/tests/kasiopia.md", "Кассіопея (Ukrainian Fantasy/Sci-Fi)", kappa=1.00)
+if __name__ == "__main__":
+    # Аудит 2026-09-21: оригинал имел ЗАХАРДКОЖЕННЫЕ пути litgraph-core/tests/*.md
+    # (другой проект) — здесь файлов нет, скрипт всегда падал. Теперь: CLI-аргументы
+    # + встроенный демо-текст, если файлов не передали.
+    import argparse
+    import tempfile
+
+    parser = argparse.ArgumentParser(
+        description="POLER ε-metric benchmark (порт из litgraph-desktop). "
+                    "Формула: ε = (κ·I_kw·Σrarity + E + C_canon + A_SVO)/√(|U|+δ).")
+    parser.add_argument("files", nargs="*", help="манускрипты .txt/.md (по умолчанию — демо-текст)")
+    parser.add_argument("--kappa", type=float, default=1.0)
+    args = parser.parse_args()
+
+    if args.files:
+        for fp in args.files:
+            analyze_manuscript(fp, f"{os.path.basename(fp)}", kappa=args.kappa)
+    else:
+        # Демо-фрагменты (синтетика с якорями/действиями/эмоциями и «шумом»)
+        demo = (
+            "Сектор Гамма-3 хмара этерии снова мигнула, и алгоритм буфера выдал ошибку.\n"
+            "Он взял карту, приказал группе двигаться к причалу и не оглядываться.\n"
+            "Ну вот, опять пошёл этот дождь, да и ветер поднялся, совсем не погода.\n"
+            "Крик. Страх сковал её, кровь ударила в виски, паника, отчаяние, безумие.\n"
+            "Кассіопея горіла у безодні, і ніхто не міг врятувати її від долі.\n"
+            "Система матрица узел код проект архив сигнал ток чип пластик.\n"
+            "Він прокручував план: спочатку карта, потім проникнути у сектор.\n"
+            "Она убить не смогла — предать значит умереть, спасти значит воскреснуть.\n"
+        ) * 12
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+        tmp.write(demo)
+        tmp.close()
+        print("Файлы не указаны — запускаю на встроенном демо-тексте "
+              "(8 фрагментов × 12 повторов с вариативным «шумом»).")
+        analyze_manuscript(tmp.name, "DEMO (built-in)", kappa=args.kappa)
+        os.unlink(tmp.name)

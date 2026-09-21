@@ -14,7 +14,9 @@ import struct
 import numpy as np
 import zstandard as zstd
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# scripts/shannon_bypass/native_pc_scripts/flywire/flywire_verify.py
+# → repo root: flywire/ → native_pc_scripts/ → shannon_bypass/ → scripts/ → poler-engine/
+REPO_ROOT = Path(__file__).resolve().parents[4]
 RAW = os.environ.get("FLYWIRE_RAW", str(REPO_ROOT / "docs" / "flywire-connectome" / "raw"))
 OUT = os.environ.get("FLYWIRE_OUT", str(REPO_ROOT / "docs" / "flywire-connectome"))
 NT = ["gaba", "ach", "glut", "oct", "ser", "da"]

@@ -61,3 +61,34 @@ LOADED: python3.12 + numpy 2.1.3 + sympy 1.14.0 + z3-solver 5.1.0; rustc/cargo
 (`cargo bench --workspace`).
 ПОДКЛЮЧЕНО (колись PENDING): poler-os @ fc3ffa8 — джерело golden-векторів
 (`tools/verifiers/golden/pnd_v8_golden_54626.txt` + `zig_probe/README.md`).
+
+## Рядок J — shannon_bypass (коміти d4b147f + 7375791, аудит 2026-09-21)
+
+Верифікаційний пакет `scripts/shannon_bypass/` (створений асистентом
+«Антигравіті», побітово перевірений і виправлений головним агентом —
+повний протокол: `scripts/shannon_bypass/AUDIT.md`):
+
+- **`04_shannon_bypass_math_verifier.py`** — переписаний у v2.0: виміряна
+  H(X)=4.9998 біт/симв. проти постульованої; побітове відновлення тексту з
+  64-бітного сиду xorshift64 (7 812×, чесна Kolmogorov-рамка); McWeeny
+  3P²−2P³: 0.564→7.1e-16 за 9 ітерацій, порядок сходимості 2.06, Tr/ермітовість/
+  спектр {0,1} перевірені; No-Mul/Ландауер: вичерпна бієкція тритного шару
+  (зсув+інверсія+своп) на всіх 3⁸=6561 станах + явний зворотний шар ⟹ ΔS=0.
+  Паспорт: `scratch/passports/shannon_bypass.json`.
+- **`flywire/flywire_verify.py`** — 9/9 перевірок реального CSR-коннектома
+  (138 639 нейронів / 15 091 983 ребер / 54 492 922 синапси / E:I 73.6:23.4).
+  Баг шляху parents[2]→parents[4] виправлений.
+- **`p3_engine/verify_pga_clifford.py`** — переписаний: vacuous-assert і ротор
+  на нуль-лезі e12 замінені коректною конвенцією clifford (null=e1, площина
+  e23, точка e234−x·e134+y·e124−z·e123); 6/6 перевірок, (1,0,0)→(0,1,0).
+- **`poler_quantum/`** — v2: metrics.py (purity/Uhlmann/von Neumann/trace
+  distance/mutual info; самотест 12/12 аналітики), run_benchmark.py
+  (деполяризація = аналітика до 2.2e-16, qiskit-арбітер 2.0e-8), tracking.py
+  (оригінальні трекінг-метрики, чесно відокремлені).
+- **`litgraph_eteryya/`** — CLI+демо-фолбек; ε-формула канонічна; LEM-гілка
+  graceful-skip без індекса; 02_p3_metric.py — без змін (коректний).
+- **`poler_toolkit/`** — реконструйований пакет (errors/paths/poler_v6-шим/
+  recipes/recipes_ext); smoke: 3 PNG + report.json + verdict.md.
+- **Zig-бенчмарки** — відтворені на цій машині: 0.714 такта/оп (4.48 GOPS),
+  event-driven 1.74 кГц при розрідженості 2.5%, справжня DRAM-латентність
+  20.01 такта (48 МБ working set, 6.2x проти L2/L3).
