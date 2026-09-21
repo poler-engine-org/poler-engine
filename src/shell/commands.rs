@@ -185,11 +185,28 @@ fn run_system_cmd(cmd: &str, args: &[String]) -> CmdResult {
         }
     }
 
-    // Проверка наличия бинарника в PATH или по прямому пути
+    // v0.46.1 (аудит): у PATH-скані тепер потрібен і біт виконуваності,
+    // а не лише is_file — інакше fallback тихо «запускав» довільні
+    // невиконувані файли (data-файли з іменами без розширення) і давав
+    // плутанину з правами.
+    let is_executable = |p: &std::path::Path| -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(p) {
+                Ok(m) => m.is_file() && (m.permissions().mode() & 0o111) != 0,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            p.is_file()
+        }
+    };
     let exists = if cmd.contains('/') {
-        std::path::Path::new(&expanded).is_file()
+        is_executable(std::path::Path::new(&expanded))
     } else if let Ok(paths) = std::env::var("PATH") {
-        std::env::split_paths(&paths).any(|p| p.join(cmd).is_file())
+        std::env::split_paths(&paths).any(|p| is_executable(&p.join(cmd)))
     } else {
         false
     };
@@ -1461,6 +1478,61 @@ mod tests {
             CmdResult::Done(out) => assert!(out.contains("неизвестная команда")),
             _ => panic!(),
         }
+    }
+
+    // ── v0.46.x (аудит 2026-09-21): системний прохід ────────────────────
+
+    #[test]
+    fn bang_empty_shows_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "!") {
+            CmdResult::Done(out) => assert!(out.contains("! <command>")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn bang_runs_shell_command() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "! echo poler_audit_ok") {
+            CmdResult::Done(out) => assert_eq!(out.trim(), "poler_audit_ok"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn sh_command_alias_runs() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "sh echo poler_sh_alias_ok") {
+            CmdResult::Done(out) => assert_eq!(out.trim(), "poler_sh_alias_ok"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn fallback_runs_path_executable_with_args() {
+        // `echo` є в PATH будь-якого POSIX-оточення тестів
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "echo --n poler_fallback_ok") {
+            CmdResult::Done(out) => assert!(out.contains("poler_fallback_ok")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn fallback_rejects_non_executable_file() {
+        // файл без біта виконуваності НЕ має запускатись (v0.46.1 аудит)
+        let dir = std::env::temp_dir().join("poler_sh_audit_nonexec");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("poler_nonexec_probe"); // без розширення, без chmod +x
+        std::fs::write(&f, b"not a program").unwrap();
+        let out_path = format!("{}", f.display());
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, &out_path) {
+            CmdResult::Done(out) => assert!(out.contains("неизвестная команда")),
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

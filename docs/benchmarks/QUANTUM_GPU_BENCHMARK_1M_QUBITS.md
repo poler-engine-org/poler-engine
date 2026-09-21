@@ -1,60 +1,65 @@
-# POLER Quantum & GPU Stress Benchmarks Report (1,048,576 Qubits)
-Date: 2026-09-21
-Platform: Linux x86_64, Intel Core i7-3770 (8T @ 3.4 GHz), NVIDIA GeForce GTX 1060 6GB (1280 CUDA Cores, 192 GB/s GDDR5)
+# POLER GPU / Quantum Benchmarks (v2 — аудит 2026-09-21)
+
+**Дата ревізії:** 2026-09-21 · **Статус:** переписано після побітового аудиту
+
+> **Знахідка аудиту.** Попередня редакція цього файла містила таблицю
+> «1 048 576 кубітів / 256 ГБ tableau / 100% DISENTANGLED» та «SMT-сертифікат
+> обходу межі Шеннона». Відтворення неможливе й твердження хибні:
+> (а) GPU-скрипт виконував побітове NOT над словами — це не квантова операція;
+> (б) chunk-цикл повторно обробляв той самий перший 1 ГБ (зсув не просувався),
+> тож «256 ГБ» ніколи не матеріалізовувались на 6 ГБ карті;
+> (в) «PASSED» друкувався без жодної перевірки коректності;
+> (г) SMT-сертифікат не мав скрипта/файлу для відтворення.
+> Оригінальні паспорти циклів B/D/H у `docs/passports/` — справжні прогони
+> на машині власника (numpy 2.5.3) і збережені без змін.
 
 ---
 
-## 1. 🚀 GPU Quantum Disentanglement Benchmark (1 Million Qubits)
-Direct CUDA Driver API (libcuda.so.1) PTX parallel stream execution across 1280 CUDA cores:
+## 1. GPU-зонд пропускної здатності tableau-пам'яті
 
-| Qubits ($N$) | Hilbert Space Dimension ($2^N$) | Equivalent Tableau Matrix | GPU Time (1280 CUDA @ 192 GB/s) | Status |
-|---|---|---|---|---|
-| **65,536** | $2^{65536}$ | 1.00 GB | **16.81 ms** | ✅ 100% DISENTANGLED |
-| **131,072** | $2^{131072}$ | 4.00 GB | **65.79 ms** | ✅ 100% DISENTANGLED |
-| **262,144** | $2^{262144}$ | 16.00 GB | **262.78 ms** | ✅ 100% DISENTANGLED |
-| **524,288** | $2^{524288}$ | 64.00 GB | **1069.49 ms** (1.06s) | ✅ 100% DISENTANGLED |
-| **1,048,576** 🏆 | $2^{1048576}$ | **256.00 GB** | **4262.34 ms** (4.26s) | ✅ **100% DISENTANGLED** |
+Скрипт: `scripts/quantum_benchmarks/gpu_quantum_disentangle_1m_qubits.py` (v2).
 
----
+Що він ДІЙСНО робить:
 
-## 2. 🔬 CPU Statevector vs Stabilizer Comparison (i7-3770)
+- стримить tableau-масштабний тіл (n рядків × 2n біт, як біт-пакетна
+  стабілізаторна таблиця Gottesman–Knill) чанками **з коректним зсувом**
+  через виділений VRAM-буфер;
+- вимірює ефективні ГБ/с — верхню межу трафіки, з якою GPU прокачує
+  tableau-подібні потоки;
+- **перевіряє коректність**: 1024 еталонних слів after рівно одного NOT-проходу
+  читаються назад і звіряються з NOT(оригінал) (кратні проходи дали б
+  тотожність — контроль кратності).
 
-### A. Exact Statevector ($2^N$ Complex128 Amplitudes in RAM)
-- 4 qubits (16 amps): 0.05 ms
-- 8 qubits (256 amps): 0.03 ms
-- 12 qubits (4,096 amps): 0.02 ms
-- 16 qubits (65,536 amps, 1 MB): 0.04 ms
-- 20 qubits (1,048,576 amps, 16 MB): 0.19 ms
-- 24 qubits (16,777,216 amps, 256 MB): 0.20 ms
-- Boundary limit: 26–27 qubits (67M–134M amps, bound by 16 GB Host RAM).
+Запуск: `python3 scripts/quantum_benchmarks/gpu_quantum_disentangle_1m_qubits.py`
+(без NVIDIA GPU — чесний exit 2 «skip»). Це зонд ПАМ'ЯТІ, не симуляція кубітів.
 
-### B. Stabilizer Substrate (Gottesman–Knill Bit-Packed GF(2) Algebra)
-- 64 qubits ($2^{64}$): 1 KB RAM, 0.13 ms
-- 256 qubits ($2^{256}$): 16 KB RAM, 0.49 ms
-- 1,024 qubits ($2^{1024}$): 256 KB RAM, 3.18 ms
-- 4,096 qubits ($2^{4096}$): 4 MB RAM, 17.44 ms
-- 16,384 qubits ($2^{16384}$): 64 MB RAM, 126.32 ms
-- 65,536 qubits ($2^{65536}$): 1 GB RAM, 1.89 s
-- 131,072 qubits ($2^{131072}$): 4 GB RAM, 6.86 s
+## 2. Реальні інструменти квантового стеку POLER (канонічні місця)
 
----
+| Задача | Інструмент | Статус |
+|---|---|---|
+| Стабілізаторний рушій Gottesman–Knill (GHZ-1024, 93 мс) | `crates/pqc/src/stabilizer.rs`, CLI `pqc stab` | 821/821 тестів, v0.45.0 |
+| Шумові моделі (MCWF, деполяризація, T1/T2, пресети IBM/Google) | `crates/pqc/src/noise.rs`, CLI `pqc noise --compare` | qiskit-зведірка 1.1e-18 |
+| Пошук періоду (QFT + Діріхле) | CLI `pqc algo period` | відновлення r∈{4..12} |
+| Квантові метрики (fidelity/vN/QMI) | `scripts/shannon_bypass/native_pc_scripts/poler_quantum/` | самотест 12/12 |
+| Statevector межі (26–27 кубітів на 16 ГБ RAM) | `pqc` density-шлях | — |
 
-## 3. 🧪 SMT Shannon Limit Bypass Formal Certificate
-- **Solver**: Z3 SMT Theorem Prover
-- **Theory**: Born Idempotent Projector ($P^2 = P$) + McWeeny Cubic Purification ($3P^2 - 2P^3 = P$)
-- **Perturbation Law**: $|\delta_{out}| \le 3\delta_{in}^2$
-- **SMT Verdict**: `UNSAT` on $\exists \delta \in (0, 1/3): 3\delta^2 \ge \delta$
-- **Mathematical Deduction**: $\lim_{k \to \infty} \delta_k = 0 \implies$ Noise vanishes strictly to zero $\implies$ Channel entropy $S = 0 \implies$ Channel capacity bypasses Shannon classical thermal limit.
+## 3. Bell-стан: заплутування/розплутування (демо)
 
----
+Скрипт: `scripts/quantum_benchmarks/two_qubit_disentangle_demo.py` —
+коректне демо: |00⟩ → H⊗I → CNOT → |Φ⁺⟩ (S(A)=1.0000 біт) →
+CNOT⁻¹ → H⁻¹ → |00⟩ (S(A)=0.0000). Запускається, перевіряється.
 
-## 4. 🧬 Step-by-Step 2-Qubit Entanglement & Disentanglement Test
-1. Initial State: $|00\rangle$, $S(A) = 0.0000$ bit.
-2. Hadamard + CNOT: $|\Phi^+\rangle = (|00\rangle + |11\rangle)/\sqrt{2}$, $S(A) = 1.0000$ bit (Maximal Entanglement).
-3. Inverse CNOT + Inverse Hadamard: $|00\rangle$, $S(A) = 0.0000$ bit (100% Coherently Disentangled).
+## 4. Щодо «обходу межі Шеннона»
 
----
+Чесна рамка (див. `scripts/shannon_bypass/AUDIT.md` та
+`scripts/shannon_bypass/04_shannon_bypass_math_verifier.py` v2.0):
 
-## 5. 🌀 Chaotic Logistic Map & Prime Resonance
-- **RDTSC Chaotic Logistic Map**: 1,000,000 nonlinear chaotic steps executed in 265.71 ms (265 ns/op).
-- **10,000 Prime Number Born Phase Interference**: Coherence index = 0.007028 (destructive quantum interference proves prime phase distribution acts as ideal quantum white noise).
+- **Семантичне стиснення**: передається ГЕНЕРАТОР (64-бітний сід), а не СЛІД.
+  Виміряно: H=4.9998 біт/симв., відновлення біт-в-біт, 7 812×. Це
+  Kolmogorov-рамка, а не порушення теореми кодування для джерела без моделі.
+- **McWeeny 3P²−2P³**: придушення шуму 0.564→7.1e-16 (9 ітерацій, порядок 2.06)
+  без контрольних бітів — активне очищення стану, не «канальна ємність».
+- **Ландауер**: No-Mul шар — бієкція на всіх 3⁸ станах (явний зворотний шар),
+  ΔS=0 — необхідна умова зворотності, не «обхід» межі Шеннона.
+
+Заяви про «bypass channel capacity» без цих застережень — містифікація.
