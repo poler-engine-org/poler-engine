@@ -192,11 +192,179 @@ pub fn deutsch_jozsa(n: usize, marks: &[usize]) -> Result<Circuit> {
     for q in 0..n {
         c.gate(Gate::H { q });
     }
+    // Оракул: фазовая инверсия помеченных состояний (f = индикатор marks).
     for &m in marks {
         c.push(Op::FlipIndex { idx: m });
     }
     for q in 0..n {
         c.gate(Gate::H { q });
+    }
+    c.push(Op::MeasureAll);
+    Ok(c)
+}
+
+/// Число зубьев гребёнки x ≡ offset (mod period) на регистре из N = 2^n
+/// состояний.
+pub fn comb_teeth(n: usize, period: usize, offset: usize) -> usize {
+    let dim = 1usize << n;
+    // количество x ∈ [0, dim): x ≡ offset (mod period)
+    if offset >= dim {
+        0
+    } else {
+        (dim - 1 - offset) / period + 1
+    }
+}
+
+/// Аналитика QFT-гребёнки (ядро поиска периода, Том VII §2.3):
+///
+/// |QFT|ψ⟩|²(k) = |Σ_{j=0}^{m−1} e^{2πi·k·r·j/N}|² / (m·N)
+///             = sin²(π·k·r·m/N) / (m·N·sin²(π·k·r/N)),
+///
+/// где m — число зубьев (сдвиг offset даёт только фазовый множитель
+/// e^{2πik·offset/N} и в вероятности не виден). Пики: k ≈ кратные N/r.
+pub fn comb_qft_prob(n: usize, period: usize, offset: usize, k: usize) -> f64 {
+    let dim = 1usize << n;
+    let m = comb_teeth(n, period, offset);
+    if m == 0 || k >= dim {
+        return 0.0;
+    }
+    let theta = core::f64::consts::PI * 2.0 * (k * period % dim) as f64 / dim as f64;
+    let num = (m as f64 * theta / 2.0).sin();
+    let den = (theta / 2.0).sin();
+    if den.abs() < 1e-15 {
+        // θ → 0 (mod π): все зубья в фазе, |Σ|² = m².
+        m as f64 / dim as f64
+    } else {
+        (num * num) / (m as f64 * dim as f64 * den * den)
+    }
+}
+
+/// Подходящие дроби (конвергенты) k/N в порядке роста знаменателя.
+///
+/// Теорема (Шор): если |k/N − l/r| < 1/(2r²), то l/r — конвергент k/N.
+pub fn convergents(mut num: usize, mut den: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (mut p_prev, mut q_prev) = (0usize, 1usize); // «−1-й» конвергент 0/1
+    let (mut p_curr, mut q_curr) = (1usize, 0usize); // «0-й» конвергент 1/0
+    while den > 0 {
+        let a = num / den;
+        let (p_next, q_next) = (a * p_curr + p_prev, a * q_curr + q_prev);
+        p_prev = p_curr;
+        q_prev = q_curr;
+        p_curr = p_next;
+        q_curr = q_next;
+        let rem = num % den;
+        num = den;
+        den = rem;
+        if q_curr > 0 {
+            out.push((p_curr, q_curr));
+        }
+        if q_curr > (1usize << 30) {
+            break; // защита от разрастания
+        }
+    }
+    out.retain(|(_, q)| *q > 0);
+    out
+}
+
+/// Кандидаты на период из измеренного пика k ≠ 0: знаменатели конвергентов
+/// k/N (кроме тривиального 1), ограниченные сверху размером регистра.
+/// ⚠ Среди них бывают ложные (5/29 для 11/64 — лучшее диофантово
+/// приближение, но не период): окончательный выбор — [`recover_period`].
+pub fn period_candidates(k: usize, n: usize) -> Vec<usize> {
+    let dim = 1usize << n;
+    if k == 0 || k >= dim {
+        return Vec::new();
+    }
+    convergents(k, dim)
+        .into_iter()
+        .map(|(_, q)| q)
+        .filter(|&q| q > 1 && q < dim)
+        .collect()
+}
+
+/// Восстановление периода по наблюдённым пикам (не включайте k = 0).
+/// Правило: r = min{ q ≥ 2 : каждый пик k даёт k·q/N близко к целому }.
+/// Пик k ≈ l·N/r измеряется с квантованием ±1/2 и шириной главного
+/// лепестка 1/(2m), m ≈ N/q ⇒ допуск |frac(k·q/N)| ≤ q/N + ε.
+/// Множители r проходят всегда (период любой кратности согласован) —
+/// поэтому минимум; делители/чужие q отбрасываются.
+/// Честная граница: правило доказуемо точно при 1.5·r² < N (квантование
+/// не может притянуть чужой q к целому); за пределами — эвристика Шора
+/// (стандартный совет n ≥ 2·log₂ r² остаётся в силе).
+pub fn recover_period(peaks: &[usize], n: usize) -> Option<usize> {
+    let dim = 1usize << n;
+    if peaks.is_empty() {
+        return None;
+    }
+    for q in 2..dim {
+        let tol = q as f64 / dim as f64 + 1e-12;
+        let ok = peaks.iter().all(|&k| {
+            let d = (k * q) % dim;
+            let dist = d.min(dim - d) as f64 / dim as f64;
+            dist <= tol
+        });
+        if ok {
+            return Some(q);
+        }
+    }
+    None
+}
+
+/// НОД (Евклид).
+pub fn gcd(a: usize, b: usize) -> usize {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// НОК (наименьшее общее кратное).
+pub fn lcm(a: usize, b: usize) -> usize {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    a / gcd(a, b) * b
+}
+
+/// Поиск периода (ядро Шора, теоретико-числовой субстрат УДЕ):
+///
+/// 1. Гребёнка |ψ⟩ = (1/√m) Σ_j |offset + j·r⟩ — состояние после оракула
+///    модульного возведения в степень (оракул — привилегия владельца
+///    вектора состояния, как у Гровера).
+/// 2. QFT с явным бит-реверсом (истинная конвенция |x⟩ → Σ ω^{xk}|k⟩/√N).
+/// 3. MeasureAll: пики на k ≈ l·N/r; период восстанавливается цепной
+///    дробью k/N (кандидаты из [`period_candidates`], затем lcm по
+///    нескольким выстрелам; сертификация a^r ≡ 1 (mod N) — вне машины,
+///    инструментами SMT, см. tools/verifiers/verify_number_theory_smt.py).
+pub fn period_finding(n: usize, period: usize, offset: usize) -> Result<Circuit> {
+    if n == 0 {
+        return Err(PqcError::EmptyState);
+    }
+    let dim = 1usize << n;
+    if period == 0 || period >= dim {
+        return Err(PqcError::BadArgument {
+            what: format!("period must be in [1, {dim})"),
+        });
+    }
+    if offset >= period {
+        return Err(PqcError::BadArgument {
+            what: format!("offset {offset} must be < period {period}"),
+        });
+    }
+    let mut c = Circuit::new(n)?;
+    c.push(Op::PrepComb { period, offset });
+    // QFT без бит-реверса…
+    let q = qft(n, false)?;
+    for op in q.ops() {
+        c.push(op.clone());
+    }
+    // …плюс явный бит-реверс: SWAP(i, n−1−i).
+    for i in 0..n / 2 {
+        c.gate(Gate::Swap { a: i, b: n - 1 - i });
     }
     c.push(Op::MeasureAll);
     Ok(c)
@@ -312,5 +480,107 @@ mod tests {
         let c1 = deutsch_jozsa(4, &marks).unwrap();
         let r1 = run(&c1, 0, 1).unwrap();
         assert!(r1.probabilities[0] < 1e-10, "balanced never gives |0>");
+    }
+
+    #[test]
+    fn period_finding_exact_divisor() {
+        // r = 4 делит N = 64: пики ровно на k ∈ {0, 16, 32, 48}, каждый 1/4.
+        let c = period_finding(6, 4, 0).unwrap();
+        let rep = run(&c, 0, 1).unwrap();
+        for (k, &p) in rep.probabilities.iter().enumerate() {
+            let want = if k % 16 == 0 { 0.25 } else { 0.0 };
+            assert!((p - want).abs() < TOL, "k={k}: {p} vs {want}");
+        }
+        // Сдвиг не влияет на |QFT|ψ⟩|² — только фазовый множитель.
+        let c2 = period_finding(6, 4, 3).unwrap();
+        let rep2 = run(&c2, 0, 1).unwrap();
+        for (a, b) in rep.probabilities.iter().zip(&rep2.probabilities) {
+            assert!((a - b).abs() < TOL);
+        }
+    }
+
+    #[test]
+    fn period_finding_dirichlet_parity() {
+        // r = 6 не делит N = 64: вся кривая |QFT|ψ⟩|² совпадает с
+        // аналитикой Дирихле comb_qft_prob по всем 64 точкам.
+        for &(n, r, o) in &[(6usize, 6usize, 0usize), (6, 6, 5), (5, 7, 2), (4, 3, 1)] {
+            let c = period_finding(n, r, o).unwrap();
+            let rep = run(&c, 0, 1).unwrap();
+            let mut max_dev = 0.0f64;
+            for (k, &p) in rep.probabilities.iter().enumerate() {
+                let want = comb_qft_prob(n, r, o, k);
+                max_dev = max_dev.max((p - want).abs());
+            }
+            assert!(max_dev < TOL, "n={n} r={r} o={o}: max dev {max_dev}");
+            // Сумма вероятностей аналитики = 1 (Parseval).
+            let s: f64 = (0..1usize << n).map(|k| comb_qft_prob(n, r, o, k)).sum();
+            assert!((s - 1.0).abs() < 1e-9, "n={n} r={r}: sum {s}");
+        }
+    }
+
+    #[test]
+    fn period_finding_recovers_period_by_lcm() {
+        // Выстрелы → главные лепестки (p̂ ≥ 0.3·max) → recover_period = r.
+        // r = 6: доказуемая зона (1.5·36 = 54 < 64); r = 12: за границей
+        // (1.5·144 = 216 > 64) — эвристика, восстановление эмпирически
+        // подтверждено (все 12 лепестков наблюдаются и согласованы).
+        for &(n, r) in &[(6usize, 6usize), (6, 4), (6, 12), (5, 5), (7, 7)] {
+            let c = period_finding(n, r, 0).unwrap();
+            let rep = run(&c, 1024, 42 + r as u64).unwrap();
+            let max_cnt = rep.counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+            let thr = ((max_cnt as f64) * 0.3) as u64;
+            let peaks: Vec<usize> = rep
+                .counts
+                .iter()
+                .filter(|&&(o, cnt)| o != 0 && cnt >= thr.max(6))
+                .map(|&(o, _)| o as usize)
+                .collect();
+            assert!(peaks.len() >= 2, "n={n} r={r}: peaks {peaks:?}");
+            let rec = recover_period(&peaks, n).expect("recovery");
+            assert_eq!(rec, r, "n={n} r={r}: recovered {rec}, peaks {peaks:?}");
+        }
+    }
+
+    #[test]
+    fn recover_period_rejects_divisors_and_strangers() {
+        // Пики r=6 (N=64): 5 не кратно 6 — отвергается; 3 — делитель: отвергается;
+        // 12 — кратное: проходит, но минимум — 6.
+        let peaks = [11usize, 21, 32, 43, 53];
+        assert_eq!(recover_period(&peaks, 6), Some(6));
+        // Один пик 11 (l=1, gcd=1): конвергент 1/6… но и 1/5, 5/29 рядом —
+        // правило целостности выбирает 6 (5: 55/64 = 0.859 — далеко от целого).
+        assert_eq!(recover_period(&[11], 6), Some(6));
+        // Пики r=4 (N=64): q=2 отвергается (16·2/64 = 0.5 — полупуть).
+        assert_eq!(recover_period(&[16, 32, 48], 6), Some(4));
+        // Пустой вход — None.
+        assert_eq!(recover_period(&[], 6), None);
+    }
+
+    #[test]
+    fn convergents_reference_values() {
+        // 11/64 → [0;5,1,4,2] → конвергенты 0/1, 1/5, 1/6, 5/29, 11/64.
+        let cs = convergents(11, 64);
+        assert_eq!(
+            cs,
+            vec![(0usize, 1usize), (1, 5), (1, 6), (5, 29), (11, 64)]
+        );
+        // 21/64 → [0;3,21] → 0/1, 1/3, 21/64.
+        assert_eq!(convergents(21, 64), vec![(0usize, 1usize), (1, 3), (21, 64)]);
+        // 53/64 → [0;1,4,1,4,2] → 0/1, 1/1, 4/5, 5/6, 24/29, 53/64.
+        assert_eq!(
+            convergents(53, 64),
+            vec![(0usize, 1usize), (1, 1), (4, 5), (5, 6), (24, 29), (53, 64)]
+        );
+        // Кандидаты периода из k=11, n=6: {5, 6, 29, 64} → фильтр → 5,6,29.
+        assert_eq!(period_candidates(11, 6), vec![5usize, 6, 29]);
+    }
+
+    #[test]
+    fn period_finding_bad_args() {
+        assert!(period_finding(0, 4, 0).is_err());
+        assert!(period_finding(6, 0, 0).is_err());
+        assert!(period_finding(6, 64, 0).is_err());
+        assert!(period_finding(6, 4, 4).is_err());
+        assert!(period_finding(6, 4, 9).is_err());
     }
 }

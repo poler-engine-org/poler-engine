@@ -51,6 +51,12 @@ pub enum Op {
     FlipIndex { idx: usize },
     /// Фаза −1 на всех состояниях, кроме |0…0⟩.
     FlipZero,
+    /// Подготовка гребёнки: равная суперпозиция базисных состояний
+    /// x ≡ offset (mod period). Привилегия владельца вектора состояния
+    /// (как оракул Гровера): идеальная машина не платит за синтез
+    /// модульной экспоненты — теоретико-числовой субстрат УДЕ (Том VII §2.3:
+    /// «фазовые вращения a^x», поиск периода через автокорреляционный пик).
+    PrepComb { period: usize, offset: usize },
     /// Барьер (семантический маркер, на динамику не влияет).
     Barrier,
 }
@@ -107,7 +113,11 @@ impl Circuit {
         let last_gate = self.ops.iter().rposition(|op| {
             matches!(
                 op,
-                Op::Gate(_) | Op::FlipPhase { .. } | Op::FlipIndex { .. } | Op::FlipZero
+                Op::Gate(_)
+                    | Op::FlipPhase { .. }
+                    | Op::FlipIndex { .. }
+                    | Op::FlipZero
+                    | Op::PrepComb { .. }
             )
         });
         let first_measure = self
@@ -272,6 +282,23 @@ impl Circuit {
                     }
                     ops.push(Op::FlipZero);
                 }
+                "prep" => {
+                    let n = n_qubits
+                        .ok_or_else(|| bad("`qubits N` must come first".into()))? as usize;
+                    let period = usize_arg(1, 1)?;
+                    let offset = usize_arg(2, 0)?;
+                    if offset >= period {
+                        return Err(bad(format!(
+                            "prep: offset {offset} must be < period {period}"
+                        )));
+                    }
+                    if period >= 1usize << n {
+                        return Err(bad(format!(
+                            "prep: period {period} must be < 2^{n} (dim)"
+                        )));
+                    }
+                    ops.push(Op::PrepComb { period, offset });
+                }
                 "measure" => {
                     let which = *toks
                         .get(1)
@@ -301,7 +328,7 @@ impl Circuit {
 
     /// Применить неразрушающие операции к состоянию (гейты и фазовые
     /// оракулы). `Measure` игнорируются — измерениями управляет раннер.
-    fn apply_unitary(sv: &mut Statevector, ops: &[Op]) -> Result<()> {
+    pub(crate) fn apply_unitary(sv: &mut Statevector, ops: &[Op]) -> Result<()> {
         for op in ops {
             match op {
                 Op::Gate(g) => sv.apply(*g)?,
@@ -324,6 +351,29 @@ impl Circuit {
                         }
                     }
                 }
+                Op::PrepComb { period: period_, offset: offset_ } => {
+                    let (period, offset) = (*period_, *offset_);
+                    // Гребёнка: x ≡ offset (mod period), амплитуда 1/√m.
+                    // Заменяет текущее состояние (привилегия state-owner).
+                    let mut m = 0usize;
+                    for x in 0..sv.amplitudes().len() {
+                        if x % period == offset {
+                            m += 1;
+                        }
+                    }
+                    if m == 0 {
+                        return Err(PqcError::BadArgument {
+                            what: format!("prep: no indices ≡ {offset} (mod {period})"),
+                        });
+                    }
+                    let a = Cx {
+                        re: 1.0 / (m as f64).sqrt(),
+                        im: 0.0,
+                    };
+                    for (x, amp) in sv.amplitudes_mut().iter_mut().enumerate() {
+                        *amp = if x % period == offset { a } else { Cx::ZERO };
+                    }
+                }
                 Op::Measure { .. } | Op::MeasureAll | Op::Barrier => {}
             }
         }
@@ -331,7 +381,7 @@ impl Circuit {
     }
 
     /// Коллапс кубита `q` по исходу `bit` (перенормировка включена).
-    fn collapse(sv: &mut Statevector, q: usize, bit: usize) -> Result<()> {
+    pub(crate) fn collapse(sv: &mut Statevector, q: usize, bit: usize) -> Result<()> {
         let mask = 1usize << q;
         let mut acc = 0.0f64;
         for (i, a) in sv.amplitudes_mut().iter_mut().enumerate() {
@@ -407,7 +457,11 @@ pub fn run(circuit: &Circuit, shots: u64, seed: u64) -> Result<QpcReport> {
         .filter(|op| {
             matches!(
                 op,
-                Op::Gate(_) | Op::FlipPhase { .. } | Op::FlipIndex { .. } | Op::FlipZero
+                Op::Gate(_)
+                    | Op::FlipPhase { .. }
+                    | Op::FlipIndex { .. }
+                    | Op::FlipZero
+                    | Op::PrepComb { .. }
             )
         })
         .count();
@@ -437,7 +491,11 @@ pub fn run(circuit: &Circuit, shots: u64, seed: u64) -> Result<QpcReport> {
             let mut trial = Statevector::new(n)?;
             for op in circuit.ops() {
                 match op {
-                    Op::Gate(_) | Op::FlipPhase { .. } | Op::FlipIndex { .. } | Op::FlipZero => {
+                    Op::Gate(_)
+                    | Op::FlipPhase { .. }
+                    | Op::FlipIndex { .. }
+                    | Op::FlipZero
+                    | Op::PrepComb { .. } => {
                         Circuit::apply_unitary(&mut trial, std::slice::from_ref(op))?;
                     }
                     Op::Measure { q } => {
@@ -575,5 +633,63 @@ mod tests {
         assert!((h - 1.0).abs() < 1e-12);
         let one_bit = K_B * LANDAUER_T * core::f64::consts::LN_2;
         assert!((one_bit - 2.87e-21).abs() < 0.02e-21);
+    }
+
+    #[test]
+    fn prep_comb_builds_equal_superposition() {
+        // Гребёнка с периодом 3, сдвиг 1, 8 состояний: зубья {1,4,7}.
+        let c = Circuit::parse("qubits 3\nprep 3 1\nmeasure all\n").unwrap();
+        let rep = run(&c, 0, 1).unwrap();
+        for (x, p) in rep.probabilities.iter().enumerate() {
+            let want = if x % 3 == 1 { 1.0 / 3.0 } else { 0.0 };
+            assert!((p - want).abs() < 1e-12, "x={x}: {p} vs {want}");
+        }
+        assert!((rep.norm - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prep_comb_parse_rejects_bad_offsets() {
+        assert!(Circuit::parse("qubits 3\nprep 3 3\n").is_err(), "offset ≥ period");
+        assert!(Circuit::parse("qubits 3\nprep 0 0\n").is_err(), "period 0");
+        assert!(Circuit::parse("qubits 3\nprep 9 1\n").is_err(), "period ≥ dim");
+        assert!(Circuit::parse("prep 3 1\n").is_err(), "no qubits directive");
+        // period=1 — легальная равномерная суперпозиция (аналог H^n).
+        let c = Circuit::parse("qubits 2\nprep 1 0\n").unwrap();
+        let rep = run(&c, 0, 1).unwrap();
+        for p in &rep.probabilities {
+            assert!((p - 0.25).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn prep_comb_is_periodic_under_shift() {
+        // Автокорреляционный критерий (Thm F.9/Q_Λ) для КОНЕЧНОЙ гребёнки:
+        // лаг = периоду даёт строгий максимум автокорреляции (зубья на краю
+        // заворачиваются, поэтому corr(r) < Σp², но пик — единственный лидер;
+        // точное равенство corr = Σp² — свойство бесконечной гребёнки).
+        let c = Circuit::parse("qubits 4\nprep 5 2\n").unwrap();
+        let rep = run(&c, 0, 1).unwrap();
+        let n = 16usize;
+        let corr = |lag: usize| -> f64 {
+            (0..n)
+                .map(|x| rep.probabilities[x] * rep.probabilities[(x + lag) % n])
+                .sum()
+        };
+        let peak = corr(5);
+        assert!(peak > 0.0);
+        // Круговая автокорреляция симметрична: corr(d) = corr(N−d),
+        // поэтому пик — на лагах ±5 (mod 16): и 5, и 11.
+        assert!((corr(11) - peak).abs() < 1e-14, "mirror peak at N−r");
+        for lag in 1..n {
+            if lag == 5 || lag == 11 {
+                continue;
+            }
+            // Кратные периода дают убывающие субпики (2/9, 1/9), чужие — 0.
+            assert!(
+                corr(lag) < peak - 1e-12,
+                "lag {lag}: {} must be below peak {peak}",
+                corr(lag)
+            );
+        }
     }
 }

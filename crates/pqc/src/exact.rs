@@ -520,6 +520,50 @@ impl ExactStatevector {
                         }
                     }
                 }
+                Op::PrepComb { period: period_, offset: offset_ } => {
+                    let (period, offset) = (*period_, *offset_);
+                    // Зубья 1/√m точны в кольце ⟺ m = 2^s:
+                    // 2^{-s/2} = 1/2^{s/2} (чётное s) или √2/2^{(s+1)/2}
+                    // (нечётное s). Иначе — честный отказ (как Ry вне {0,π/2,π}).
+                    let dim = self.amps.len();
+                    let mut m = 0usize;
+                    for x in 0..dim {
+                        if x % period == offset {
+                            m += 1;
+                        }
+                    }
+                    let s = m.trailing_zeros() as u32;
+                    if m == 0 || (1usize << s) != m {
+                        return Err(PqcError::NotExactGate {
+                            gate: format!(
+                                "prepcomb: 1/sqrt(m={m}) outside Z[1/sqrt(2), i] \
+                                 (m = N/r must be a power of two)"
+                            ),
+                        });
+                    }
+                    let tooth = if s % 2 == 0 {
+                        // 1/2^{s/2}
+                        ExactCx {
+                            a: 1,
+                            b: 0,
+                            c: 0,
+                            d: 0,
+                            k: s / 2,
+                        }
+                    } else {
+                        // √2/2^{(s+1)/2}
+                        ExactCx {
+                            a: 0,
+                            b: 1,
+                            c: 0,
+                            d: 0,
+                            k: (s + 1) / 2,
+                        }
+                    };
+                    for (x, v) in self.amps.iter_mut().enumerate() {
+                        *v = if x % period == offset { tooth } else { ExactCx::ZERO };
+                    }
+                }
                 Op::Measure { .. } | Op::MeasureAll | Op::Barrier => {}
             }
         }

@@ -47,3 +47,10 @@ docs/MONOREPO_CONSOLIDATION_PLAN.md).
 
 Верификация: `tools/verifiers/verify_quantum_pc.py` — 19/19
 (паспорт `scratch/passports/cycle_G.json`), qiskit-паритет 2.2e-16.
+
+## v0.45 (циклы H–I)
+
+* `pqc src/stabilizer.rs` — Gottesman–Knill: до 16 384 кубитов (stab-only + RREF-кэш).
+* `pqc src/noise.rs` — шумовые модели: MCWF (деполяризация, T1/T2, чтение), пресеты железа.
+* `pqc algo period` — поиск периода (ядро Шора) с Z3-сертификацией (цикл H 27/27).
+* `quantum.poler` — контейнер со всем Quantum PC (tools/boxdemo/build_quantum_poler.sh).

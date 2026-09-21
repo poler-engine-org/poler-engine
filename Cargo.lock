@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "poler-engine"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "aho-corasick",
  "arboard",
@@ -2562,14 +2562,14 @@ dependencies = [
 
 [[package]]
 name = "pqc"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "pqw",
 ]
 
 [[package]]
 name = "pqw"
-version = "1.4.0"
+version = "1.5.0"
 
 [[package]]
 name = "proc-macro2"

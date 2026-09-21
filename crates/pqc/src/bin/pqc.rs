@@ -57,7 +57,10 @@ USAGE:
     pqc qc <file.qc> [opts]                                  v0.44: Quantum PC — идеальные кубиты
                                                               (QCASM-схемы; --exact — кольцо
                                                               Z[1/sqrt(2), i], бит-в-бит)
-    pqc algo <bell|ghz|qft|iqft|grover|bv|dj> [opts]         v0.44: алгоритмы на идеальных кубитах
+    pqc algo <bell|ghz|qft|iqft|grover|bv|dj|period> [opts]  v0.44: алгоритмы на идеальных кубитах
+                                                              period: --period R [--offset O] —
+                                                              поиск периода (ядро Шора,
+                                                              теоретико-числовой субстрат УДЕ)
     pqc substrate [opts]                                     v0.44: субстрат УДЕ — P-поток Ауфбау,
                                                               γ-прецессия, SCF-режим
 
@@ -345,6 +348,8 @@ fn main() {
         Some("qc") => cmd_qc(&args[1..]),
         Some("algo") => cmd_algo(&args[1..]),
         Some("substrate") => cmd_substrate(&args[1..]),
+        Some("stab") => cmd_stab(&args[1..]),
+        Some("noise") => cmd_noise(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -6297,6 +6302,21 @@ fn cmd_algo(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // period: параметры гребёнки (теоретико-числовой субстрат).
+    let period: usize = match arg_num(args, "--period", 0usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
+    let offset: usize = match arg_num(args, "--offset", 0usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
+            return 2;
+        }
+    };
 
     use pqc::algorithms as alg;
     let circuit_result = match name {
@@ -6307,8 +6327,15 @@ fn cmd_algo(args: &[String]) -> i32 {
         "grover" => alg::grover(n, &marks),
         "bv" => alg::bernstein_vazirani(n, secret).map(|c| (c, 0usize)),
         "dj" => alg::deutsch_jozsa(n, &marks).map(|c| (c, 0usize)),
+        "period" => {
+            if period == 0 {
+                eprintln!("pqc algo period: --period R required (comb period, 1 ≤ R < 2^n)");
+                return 2;
+            }
+            alg::period_finding(n, period, offset).map(|c| (c, 0usize))
+        }
         other => {
-            eprintln!("pqc algo: unknown algorithm `{other}` (bell|ghz|qft|iqft|grover|bv|dj)");
+            eprintln!("pqc algo: unknown algorithm `{other}` (bell|ghz|qft|iqft|grover|bv|dj|period)");
             return 2;
         }
     };
@@ -6328,23 +6355,63 @@ fn cmd_algo(args: &[String]) -> i32 {
                     .iter()
                     .map(|(o, c)| pqc::Json::Arr(vec![pqc::Json::num(*o as f64), pqc::Json::num(*c as f64)]))
                     .collect();
-                let obj = pqc::Json::Obj(vec![
-                    ("engine".into(), pqc::Json::str("qpc-algo")),
-                    ("algorithm".into(), pqc::Json::str(name)),
-                    ("n_qubits".into(), pqc::Json::num(rep.n_qubits as f64)),
-                    ("gate_count".into(), pqc::Json::num(rep.gate_count as f64)),
-                    ("iterations".into(), pqc::Json::num(iterations as f64)),
-                    ("shots".into(), pqc::Json::num(rep.shots as f64)),
-                    ("norm".into(), pqc::Json::num(rep.norm)),
-                    ("entropy_bits".into(), pqc::Json::num(rep.entropy_bits)),
-                    ("landauer_j".into(), pqc::Json::num(rep.landauer_j)),
-                    ("probabilities".into(), pqc::Json::num_arr(rep.probabilities.clone())),
-                    ("marginals".into(), pqc::Json::num_arr(rep.marginals.clone())),
-                    ("counts".into(), pqc::Json::Arr(counts)),
-                ]);
-                println!("{}", obj.to_string());
-                return 0;
+            let mut obj_fields = vec![
+                ("engine".into(), pqc::Json::str("qpc-algo")),
+                ("algorithm".into(), pqc::Json::str(name)),
+                ("n_qubits".into(), pqc::Json::num(rep.n_qubits as f64)),
+                ("gate_count".into(), pqc::Json::num(rep.gate_count as f64)),
+                ("iterations".into(), pqc::Json::num(iterations as f64)),
+                ("shots".into(), pqc::Json::num(rep.shots as f64)),
+                ("norm".into(), pqc::Json::num(rep.norm)),
+                ("entropy_bits".into(), pqc::Json::num(rep.entropy_bits)),
+                ("landauer_j".into(), pqc::Json::num(rep.landauer_j)),
+                ("probabilities".into(), pqc::Json::num_arr(rep.probabilities.clone())),
+                ("marginals".into(), pqc::Json::num_arr(rep.marginals.clone())),
+                ("counts".into(), pqc::Json::Arr(counts)),
+            ];
+            if name == "period" {
+                // Пики → восстановление периода (min-q правило целостности).
+                let max_cnt = rep
+                    .counts
+                    .iter()
+                    .map(|(_, c)| *c)
+                    .max()
+                    .unwrap_or(0);
+                let thr = ((max_cnt as f64) * 0.3) as u64;
+                let peaks: Vec<usize> = rep
+                    .counts
+                    .iter()
+                    .filter(|&&(o, cnt)| o != 0 && cnt >= thr.max(6))
+                    .map(|&(o, _)| o as usize)
+                    .collect();
+                let recovered = pqc::algorithms::recover_period(&peaks, rep.n_qubits);
+                let candidates: Vec<pqc::Json> = peaks
+                    .iter()
+                    .map(|&k| {
+                        let cs = pqc::algorithms::period_candidates(k, rep.n_qubits);
+                        pqc::Json::Arr(vec![
+                            pqc::Json::num(k as f64),
+                            pqc::Json::Arr(cs.into_iter().map(|q| pqc::Json::num(q as f64)).collect()),
+                        ])
+                    })
+                    .collect();
+                obj_fields.push(("peaks".into(), pqc::Json::Arr(
+                    peaks.iter().map(|&k| pqc::Json::num(k as f64)).collect(),
+                )));
+                obj_fields.push(("candidates".into(), pqc::Json::Arr(candidates)));
+                obj_fields.push((
+                    "recovered_period".into(),
+                    match recovered {
+                        Some(r) => pqc::Json::num(r as f64),
+                        None => pqc::Json::str("unresolved"),
+                    },
+                ));
+                obj_fields.push(("true_period".into(), pqc::Json::num(period as f64)));
             }
+            let obj = pqc::Json::Obj(obj_fields);
+            println!("{}", obj.to_string());
+            return 0;
+        }
             println!("POLER Quantum PC — algorithm: {}", name);
             println!(
                 "qubits: {}, gates: {}, iterations: {}, shots: {}",
@@ -6370,6 +6437,36 @@ fn cmd_algo(args: &[String]) -> i32 {
                     }
                 }
             }
+            if name == "period" && !rep.counts.is_empty() {
+                let max_cnt = rep.counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+                let thr = ((max_cnt as f64) * 0.3) as u64;
+                let peaks: Vec<usize> = rep
+                    .counts
+                    .iter()
+                    .filter(|&&(o, cnt)| o != 0 && cnt >= thr.max(6))
+                    .map(|&(o, _)| o as usize)
+                    .collect();
+                println!("\nperiod-finding report:");
+                println!("  peaks (main lobes): {peaks:?}");
+                for &k in peaks.iter().take(8) {
+                    let cs = pqc::algorithms::period_candidates(k, rep.n_qubits);
+                    println!("  k = {k:>6}  convergent candidates: {cs:?}");
+                }
+                match pqc::algorithms::recover_period(&peaks, rep.n_qubits) {
+                    Some(r) => {
+                        println!("  recovered period: r = {r} (true {period})");
+                        if r == period {
+                            println!("  ✅ MATCH");
+                        } else {
+                            println!("  ❌ MISMATCH");
+                        }
+                    }
+                    None => println!("  recovered period: unresolved"),
+                }
+                println!(
+                    "  сертификация a^r ≡ 1 (mod N) — SMT: tools/verifiers/verify_number_theory_smt.py"
+                );
+            }
             0
         }
         Err(e) => {
@@ -6377,6 +6474,405 @@ fn cmd_algo(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `pqc stab [--n N] [--preset ghz|cluster|random] [--depth D] [--shots S]
+///          [--seed S] [--json]`
+///
+/// Gottesman–Knill: стабилизаторный симулятор за пределами 26 кубитов
+/// (память n·n/4 байт вместо 2^n·16; GHZ-2048 и случайные Клиффорды
+/// на 1024 кубитах — за секунды). Идеальные кубиты: исходы точны по
+/// построению, ноль ошибок гейтов/зчитывания/декогеренции.
+fn cmd_stab(args: &[String]) -> i32 {
+    let n: usize = match arg_num(args, "--n", 64usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc stab: {e}");
+            return 2;
+        }
+    };
+    let preset = args
+        .iter()
+        .position(|a| a == "--preset")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "ghz".to_string());
+    let depth: usize = match arg_num(args, "--depth", 20usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc stab: {e}");
+            return 2;
+        }
+    };
+    let shots: u64 = match arg_num(args, "--shots", 32u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc stab: {e}");
+            return 2;
+        }
+    };
+    let seed: u64 = match arg_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc stab: {e}");
+            return 2;
+        }
+    };
+    let as_json = arg_flag(args, "--json");
+    // --expect "0,1,3": точное ⟨Z_S⟩ (спектральная теорема: 0 или ±1;
+    // "null" = 0 — оператор не в стабилизаторной группе). Можно повторять.
+    let expect_sets: Vec<Vec<usize>> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == "--expect")
+        .filter_map(|(i, _)| args.get(i + 1))
+        .map(|v| {
+            v.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect::<Vec<usize>>()
+        })
+        .collect();
+
+    use pqc::rng::Rng;
+    use pqc::stabilizer::StabilizerState;
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let build = |rng: &mut Rng| -> std::io::Result<StabilizerState> {
+        let mut st = StabilizerState::new(n).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}"))
+        })?;
+        match preset.as_str() {
+            "ghz" => {
+                st.h(0);
+                for q in 1..n {
+                    st.cx(0, q);
+                }
+            }
+            "cluster" => {
+                // линейный кластер: H везде, CZ по рёбрам
+                for q in 0..n {
+                    st.h(q);
+                }
+                for q in 0..n.saturating_sub(1) {
+                    st.cz(q, q + 1);
+                }
+            }
+            "random" => {
+                for _ in 0..depth * n / 4 {
+                    let g = (rng.next_u64() as usize) % 4;
+                    let a = rng.next_u64() as usize % n;
+                    let b = (a + 1 + rng.next_u64() as usize % 8.min(n - 1)) % n;
+                    match g {
+                        0 => st.h(a),
+                        1 => st.s(a),
+                        2 => st.cx(a, b),
+                        _ => st.cz(a, b),
+                    }
+                }
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown preset `{other}` (ghz|cluster|random)"),
+                ))
+            }
+        }
+        Ok(st)
+    };
+    let mut rng = Rng::seed_from_u64(seed);
+    let mut st = match build(&mut rng) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc stab: {e}");
+            return 2;
+        }
+    };
+    let build_dt = t0.elapsed();
+
+    // Точные ожидания (без измерений): до всяких мутаций measure_all.
+    let expects: Vec<(Vec<usize>, Option<f64>)> = expect_sets
+        .iter()
+        .map(|subset| {
+            let mut s = build(&mut Rng::seed_from_u64(seed)).unwrap();
+            let v = s.expect_z_product(subset);
+            (subset.clone(), v)
+        })
+        .collect();
+
+    // Прогоны измерений: гистограмма чётности/энтропия исходов.
+    let t1 = Instant::now();
+    let mut outcome_counts: std::collections::BTreeMap<Vec<u8>, u64> =
+        std::collections::BTreeMap::new();
+    let mut random_events_total = 0usize;
+    let mut first_outcomes: Vec<u8> = Vec::new();
+    for shot in 0..shots {
+        let mut s = if shot == 0 {
+            std::mem::replace(&mut st, build(&mut rng).unwrap())
+        } else {
+            build(&mut rng).unwrap()
+        };
+        let (out, rnd) = s.measure_all(&mut rng);
+        random_events_total += rnd;
+        if shot == 0 {
+            first_outcomes = out.clone();
+        }
+        *outcome_counts.entry(out).or_insert(0) += 1;
+    }
+    let meas_dt = t1.elapsed();
+    let total_dt = t0.elapsed();
+
+    // Энтропия распределения исходов (по битовой строке — грубая,
+    // для GHZ она = 1: два исхода).
+    let entropy = {
+        let tot = shots as f64;
+        -outcome_counts
+            .values()
+            .map(|c| {
+                let p = *c as f64 / tot;
+                p * p.log2()
+            })
+            .sum::<f64>()
+    };
+    let hamming: Vec<f64> = (0..n)
+        .map(|q| {
+            let ones: u64 = outcome_counts
+                .keys()
+                .zip(outcome_counts.values())
+                .map(|(k, c)| u64::from(k.get(q).copied().unwrap_or(0)) * c)
+                .sum();
+            ones as f64 / shots as f64
+        })
+        .collect();
+
+    if as_json {
+        let counts_json: Vec<pqc::Json> = outcome_counts
+            .iter()
+            .map(|(k, c)| {
+                let bits: Vec<pqc::Json> =
+                    k.iter().map(|b| pqc::Json::num(f64::from(*b))).collect();
+                pqc::Json::Arr(vec![
+                    pqc::Json::Arr(bits),
+                    pqc::Json::num(*c as f64),
+                ])
+            })
+            .collect();
+        let expect_json: Vec<pqc::Json> = expects
+            .iter()
+            .map(|(subset, v)| {
+                let bits: Vec<pqc::Json> =
+                    subset.iter().map(|q| pqc::Json::num(*q as f64)).collect();
+                let val = match v {
+                    Some(x) => pqc::Json::num(*x),
+                    None => pqc::Json::str("null"),
+                };
+                pqc::Json::Arr(vec![pqc::Json::Arr(bits), val])
+            })
+            .collect();
+        let obj = pqc::Json::Obj(vec![
+            ("engine".into(), pqc::Json::str("stabilizer-gottesman-knill")),
+            ("preset".into(), pqc::Json::str(&preset)),
+            ("n_qubits".into(), pqc::Json::num(n as f64)),
+            ("shots".into(), pqc::Json::num(shots as f64)),
+            ("expect_z".into(), pqc::Json::Arr(expect_json)),
+            ("random_events_total".into(), pqc::Json::num(random_events_total as f64)),
+            ("outcome_entropy_bits".into(), pqc::Json::num(entropy)),
+            ("marginals_p1".into(), pqc::Json::num_arr(hamming.clone())),
+            ("distinct_outcomes".into(), pqc::Json::num(outcome_counts.len() as f64)),
+            ("build_ms".into(), pqc::Json::num(build_dt.as_secs_f64() * 1e3)),
+            ("measure_ms".into(), pqc::Json::num(meas_dt.as_secs_f64() * 1e3)),
+            ("total_ms".into(), pqc::Json::num(total_dt.as_secs_f64() * 1e3)),
+            ("counts".into(), pqc::Json::Arr(counts_json)),
+        ]);
+        println!("{}", obj.to_string());
+        return 0;
+    }
+
+    println!("POLER Quantum PC — стабилизаторный движок (Gottesman–Knill)");
+    println!("preset: {preset}, qubits: {n}, shots: {shots}");
+    println!(
+        "память таблицы: ~{} КБ (statevector потребовал бы {} ГБ)",
+        n * n / 4 / 1024,
+        {
+            let bytes = 16u128 << n.min(80);
+            (bytes / (1u128 << 30)) as u64
+        }
+    );
+    println!(
+        "случайных событий Борна: {} (точная вероятность ½ каждое)",
+        random_events_total
+    );
+    println!("исходов в гистограмме: {}, энтропия: {:.4} бит", outcome_counts.len(), entropy);
+    println!(
+        "время: построение {:.1} мс + измерения {:.1} мс = {:.1} мс",
+        build_dt.as_secs_f64() * 1e3,
+        meas_dt.as_secs_f64() * 1e3,
+        total_dt.as_secs_f64() * 1e3
+    );
+    if !expects.is_empty() {
+        println!("\nточные ожидания ⟨Z_S⟩ (спектральная теорема: 0 или ±1):");
+        for (subset, v) in &expects {
+            let vs = match v {
+                Some(x) => format!("{x:+.1}"),
+                None => "0 (null — вне группы)".to_string(),
+            };
+            println!("  Z_{{{}}}: {}", subset.iter().map(|q| q.to_string()).collect::<Vec<_>>().join(","), vs);
+        }
+    }
+    if !first_outcomes.is_empty() && n <= 64 {
+        let s: String = first_outcomes.iter().map(|b| char::from(b + b'0')).collect();
+        println!("первый исход: {s}");
+    }
+    if preset == "ghz" && !first_outcomes.is_empty() {
+        let all_eq = first_outcomes.iter().all(|b| *b == first_outcomes[0]);
+        println!("GHZ-корреляция (все биты равны): {}", if all_eq { "✅" } else { "❌" });
+    }
+    0
+}
+
+/// `pqc noise <bell|ghz|grover|bv|qft|dj> [--n N] [--preset P|--p1q V --p2q V
+///           --pread V --t1 V --t2 V] [--shots S] [--compare] [--json]`
+///
+/// «Идеал vs железо»: та же схема на идеальном субстрате и на
+/// калиброванном шуме (квантовые траектории: деполяризация, T1/T2,
+/// чтение). Пресеты: ideal|ibm-heron|google-willow|noisy-90s.
+fn cmd_noise(args: &[String]) -> i32 {
+    let name = match args.first() {
+        Some(n) if !n.starts_with("--") => n.as_str(),
+        _ => {
+            eprintln!("pqc noise: algorithm required (bell|ghz|grover|bv|qft|dj)\n\n{USAGE}");
+            return 2;
+        }
+    };
+    let n: usize = match arg_num(args, "--n", 6usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc noise: {e}");
+            return 2;
+        }
+    };
+    let shots: u64 = match arg_num(args, "--shots", 20_000u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc noise: {e}");
+            return 2;
+        }
+    };
+    let seed: u64 = match arg_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc noise: {e}");
+            return 2;
+        }
+    };
+    let as_json = arg_flag(args, "--json");
+    let compare = arg_flag(args, "--compare");
+    let preset = args
+        .iter()
+        .position(|a| a == "--preset")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "ibm-heron".to_string());
+
+    use pqc::algorithms as alg;
+    use pqc::noise::{run_noisy, NoiseModel};
+    let circuit = match name {
+        "bell" => alg::bell().unwrap(),
+        "ghz" => alg::ghz(n).unwrap(),
+        "grover" => alg::grover(n, &[22]).unwrap().0,
+        "bv" => alg::bernstein_vazirani(n, 0b1011).unwrap(),
+        "dj" => alg::deutsch_jozsa(n, &(0..1usize << n.min(4)).filter(|x| x & 1 == 1).collect::<Vec<_>>()).unwrap(),
+        "qft" => {
+            let mut c = alg::qft(n, false).unwrap();
+            c.push(pqc::qpc::Op::MeasureAll);
+            c
+        }
+        other => {
+            eprintln!("pqc noise: unknown algorithm `{other}`");
+            return 2;
+        }
+    };
+
+    // кастомные параметры шума (переопределяют пресет)
+    let has_custom = args.iter().any(|a| ["--p1q", "--p2q", "--pread", "--t1", "--t2", "--tg1", "--tg2"].contains(&a.as_str()));
+    let farg = |flag: &str, def: f64| -> f64 {
+        arg_num(args, flag, def.to_string())
+            .ok()
+            .and_then(|v: String| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(def)
+    };
+    let custom_model = NoiseModel {
+        p1q: farg("--p1q", 0.0),
+        p2q: farg("--p2q", 0.0),
+        p_read: farg("--pread", 0.0),
+        t1_us: farg("--t1", f64::INFINITY),
+        t2_us: farg("--t2", f64::INFINITY),
+        gate1_ns: farg("--tg1", 0.0),
+        gate2_ns: farg("--tg2", 0.0),
+    };
+
+    let presets: Vec<&str> = if compare {
+        vec!["ideal", "google-willow", "ibm-heron", "noisy-90s"]
+    } else if has_custom {
+        vec!["custom"]
+    } else {
+        if NoiseModel::preset(&preset).is_none() {
+            eprintln!("pqc noise: unknown preset `{preset}` (ideal|ibm-heron|google-willow|noisy-90s)");
+            return 2;
+        }
+        vec![preset.as_str()]
+    };
+
+    let mut rows: Vec<(String, f64, f64, f64, f64)> = Vec::new(); // (name, ideal_peak, noisy_peak, tvd, fidelity)
+    for p in &presets {
+        let m = if *p == "custom" {
+            custom_model.clone()
+        } else {
+            NoiseModel::preset(p).unwrap()
+        };
+        let rep = run_noisy(&circuit, &m, shots, seed).unwrap();
+        rows.push((p.to_string(), rep.ideal_peak, rep.noisy_peak, rep.tvd, rep.classical_fidelity));
+    }
+
+    if as_json {
+        let arr: Vec<pqc::Json> = rows
+            .iter()
+            .map(|(p, ip, np, tvd, f)| {
+                pqc::Json::Obj(vec![
+                    ("preset".into(), pqc::Json::str(p)),
+                    ("ideal_peak".into(), pqc::Json::num(*ip)),
+                    ("noisy_peak".into(), pqc::Json::num(*np)),
+                    ("tvd".into(), pqc::Json::num(*tvd)),
+                    ("classical_fidelity".into(), pqc::Json::num(*f)),
+                ])
+            })
+            .collect();
+        let obj = pqc::Json::Obj(vec![
+            ("engine".into(), pqc::Json::str("noise-mcwf")),
+            ("algorithm".into(), pqc::Json::str(name)),
+            ("n_qubits".into(), pqc::Json::num(circuit.n_qubits() as f64)),
+            ("shots".into(), pqc::Json::num(shots as f64)),
+            ("results".into(), pqc::Json::Arr(arr)),
+        ]);
+        println!("{}", obj.to_string());
+        return 0;
+    }
+
+    println!("POLER Quantum PC — идеал vs железо (Monte Carlo траектории)");
+    println!("схема: {name}, кубитов: {}, выстрелов: {shots}", circuit.n_qubits());
+    println!(
+        "\n{:<14} {:>12} {:>12} {:>10} {:>10}",
+        "субстрат", "пик идеал", "пик железо", "TVD", "F_класс"
+    );
+    for (p, ip, np, tvd, f) in &rows {
+        println!("{:<14} {:>12.4} {:>12.4} {:>10.4} {:>10.4}", p, ip, np, tvd, f);
+    }
+    println!(
+        "\nидеальный субстрат: нуль ошибок гейтов/чтения/декогеренции;\
+         физическое железо платит на каждом шаге (T1/T2, деполяризация, чтение)"
+    );
+    0
 }
 
 /// `pqc substrate [--dim N] [--steps N] [--eta H] [--gamma G] [--mu M]
