@@ -1,0 +1,18 @@
+[package]
+name = "poler-reader"
+description = "POLER Reader: living-voice book synthesizer - rotor resonator (J=A-At), trit slit {-1,0,+1}, coarticulation glides, .poler-book format - zero external dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["tts", "living-voice", "rotor", "resonator", "audiobook"]
+categories = ["multimedia::audio", "science"]
+
+[lib]
+name = "poler_reader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "poler-reader"
+path = "src/main.rs"

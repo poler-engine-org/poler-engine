@@ -123,6 +123,9 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Agent, cmd: "agent", short: "Статус і поради агенту: --exec, --json, MCP, таймінги" },
         HelpEntry { group: HelpGroup::Agent, cmd: "--exec '<cmd>' [--json]", short: "CLI: одноразове виконання без банера; --json — машиночитаний конверт" },
 
+        // v0.47.0: POLER Reader — приложение живого голоса
+        HelpEntry { group: HelpGroup::Agent, cmd: "read <книга> [--out x.wav] [--voice V] [--seed N]", short: "ЖИВОЙ ГОЛОС книги: роторный резонатор + коартикуляция (txt/md/fb2/poler-book)" },
+
         HelpEntry { group: HelpGroup::Meta, cmd: "version | v", short: "Версія poler-engine + poler-shell" },
         HelpEntry { group: HelpGroup::Meta, cmd: "quit | exit | q", short: "Вийти з шелу" },
         HelpEntry { group: HelpGroup::Meta, cmd: "help | ?", short: "Ця справка" },

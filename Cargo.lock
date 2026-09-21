@@ -2516,6 +2516,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "petgraph",
+ "poler-reader",
  "pqc",
  "pqw",
  "ratatui",
@@ -2535,6 +2536,10 @@ dependencies = [
  "zip",
  "zstd",
 ]
+
+[[package]]
+name = "poler-reader"
+version = "1.5.0"
 
 [[package]]
 name = "portable-atomic"

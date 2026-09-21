@@ -100,6 +100,8 @@ impl ShellState {
                 // v0.47.0: Win+Linux словарь и среда агента
                 "cd", "pwd", "clear", "engine",
                 "sysinfo", "env", "agent", "pty", "win",
+                // v0.47.0: POLER Reader
+                "read", "reader",
             ]
         })
     }

@@ -14,7 +14,7 @@
 # ============================================================
 [workspace]
 resolver = "2"
-members = ["crates/pqc", "crates/pqw"]
+members = ["crates/pqc", "crates/pqw", "crates/reader"]
 
 # Наследуемые метаданные pqc/pqw (манифесты крейтов используют
 # version.workspace = true и пр.). Квантовое ядро живёт на своей
@@ -106,6 +106,7 @@ globset = "0.4"
 # зависимостей; история — через merge-родителя f5e53dc^2.
 pqc_core = { package = "pqc", path = "crates/pqc" }
 pqw_core = { package = "pqw", path = "crates/pqw" }
+poler_reader = { package = "poler-reader", path = "crates/reader" }
 
 # v2.0 Foundation (Приоритет 2, PLAN_POLER_V2): бесплатные победы.
 # whatlang — определение языка (75 языков, байт-граммы с трешолдом уверенности);

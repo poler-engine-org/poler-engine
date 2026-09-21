@@ -31,6 +31,7 @@ only, нативный инференс через собственное ядр
 | [LITERARY.md](LITERARY.md) | **Литературный Двигатель POLER[Ψ] (L1/v0.34.0)**: физика смысла — канонический интегратор, калиброванный мухой; MCP poler_literary_*, архетипы, призма No-Excuses, Trit5 No-Mul, стратегия допроса | агенты, нарратив |
 | [CONNECTOME.md](CONNECTOME.md) | **«Живая муха» (C2/v0.33.0)**: руководство агента по коннектому FLYCSR1 — 10 MCP-инструментов poler_fly_*, стратегия допроса, интерпретация, золотые числа | агенты, нейронаука |
 | [TESTING.md](TESTING.md) | Философия тестирования: дифференциалы, golden, детерминизм | контрибьюторы |
+| [../crates/reader/README.md](../crates/reader/README.md) | **POLER Reader (v0.47.0)**: приложение живого голоса — роторный резонатор + коартикуляция, формат .poler-book (книга ×1500 меньше PCM), CLI poler-reader + команда шелла `read`, suite V1–V8 | аудиокниги, живой голос |
 | [formats/PQW_FORMAT.md](formats/PQW_FORMAT.md) | Спецификация формата весов `.pqw` v2 | конвертеры, ядро pqc |
 | [formats/PRBQ_FORMAT.md](formats/PRBQ_FORMAT.md) | Спецификация хранилища квантованных векторов PRBQ v1 | векторный субстрат |
 | [formats/WEB_INDEX_FORMAT.md](formats/WEB_INDEX_FORMAT.md) | Схема SQLite веб-индекса (pages/terms/links/hosts) | веб-краулер, --web-search |

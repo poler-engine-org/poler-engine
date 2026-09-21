@@ -146,6 +146,8 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         "pty" => cmd_pty(args),
         // v0.47.0: прямые команды движка
         "engine" => cmd_engine(args),
+        // v0.47.0: POLER Reader — живой голос книги
+        "read" | "reader" => cmd_read(args),
         other => {
             // v0.47.0: echo с Windows-переменными %NAME% → ${NAME}
             if other == "echo" && args.iter().any(|a| contains_win_var(a)) {
@@ -388,6 +390,115 @@ fn cmd_engine(args: &[String]) -> CmdResult {
     let mut res = format_output("engine", &output);
     res.push_str(&agent_timing_suffix(t0));
     CmdResult::Done(res)
+}
+
+// ---------------------------------------------------------------------------
+// v0.47.0: read — POLER Reader внутри шелла
+// ---------------------------------------------------------------------------
+
+/// `read <книга.txt|md|fb2|poler-book> [--out x.wav] [--voice a_calm] [--seed N]`
+/// Живой голос книги: роторный резонатор + коартикуляция. Без --out —
+/// только статистика (сколько будет звучать).
+fn cmd_read(args: &[String]) -> CmdResult {
+    let mut input: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut voice = "a_calm".to_string();
+    let mut seed: u64 = 42;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" | "-o" => {
+                out = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--voice" | "-v" => {
+                if let Some(v) = args.get(i + 1) {
+                    voice = v.clone();
+                }
+                i += 1;
+            }
+            "--seed" | "-s" => {
+                if let Some(s) = args.get(i + 1) {
+                    seed = s.parse().unwrap_or(42);
+                }
+                i += 1;
+            }
+            "--info" => {
+                if let Some(p) = args.get(i + 1) {
+                    return match poler_reader::polerbook::PolerBook::load(std::path::Path::new(p)) {
+                        Ok(b) => CmdResult::Done(poler_reader::verify::book_info(&b)),
+                        Err(e) => CmdResult::Done(format!("❌ {e}")),
+                    };
+                }
+            }
+            other if input.is_none() => input = Some(other.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(path) = input else {
+        return CmdResult::Done(
+            "read <книга.txt|md|fb2|poler-book> [--out звук.wav] [--voice a_calm|a_bright|i_dark|u_calm] [--seed N]\n\nЖивой голос книги: роторный резонатор J=A−Aᵀ + тритная щель {-1,0,+1} +\nкоартикуляция (форманты плывут между звуками). Один seed = один голос навсегда.\n\nПримеры:\n  read книга.txt --out демо.wav --voice a_calm --seed 4242\n  read книга.poler-book --out демо.wav\n  read --info книга.poler-book\n\nКонвейер: pack через `poler-reader pack` (CLI-бинарник) — книга в 1500× меньше WAV.".into(),
+        );
+    };
+    let path = PathBuf::from(&path);
+    if !path.exists() {
+        return CmdResult::Done(format!("❌ файл не найден: {}", path.display()));
+    }
+
+    let t0 = Instant::now();
+    let arch = match poler_reader::voice::Archetype::from_name(&voice) {
+        Some(a) => a,
+        None => {
+            return CmdResult::Done(format!(
+                "❌ неизвестный голос {voice} (a_calm | a_bright | i_dark | u_calm)"
+            ))
+        }
+    };
+
+    // .poler-book — готовый паспорт; иначе текст → паспорт на лету
+    let book = if poler_reader::book::detect_format(&path)
+        == poler_reader::book::Format::PolerBook
+    {
+        match poler_reader::polerbook::PolerBook::load(&path) {
+            Ok(b) => b,
+            Err(e) => return CmdResult::Done(format!("❌ {e}")),
+        }
+    } else {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => return CmdResult::Done(format!("❌ {e}")),
+        };
+        match poler_reader::stream::pack_book(&text, seed, arch) {
+            Ok(b) => b,
+            Err(e) => return CmdResult::Done(format!("❌ {e}")),
+        }
+    };
+
+    match out {
+        None => CmdResult::Done(poler_reader::verify::book_info(&book)),
+        Some(out_path) => {
+            let outp = PathBuf::from(&out_path);
+            match poler_reader::stream::render_book_file(&book, seed, &outp) {
+                Ok(r) => {
+                    let mut res = format!(
+                        "✓ {} — {:.1} с звука, {} фраз, {} периодов щели, jitter {:.2}%\nкнига: {} Б; WAV: {} Б (сжатие ×{:.0})",
+                        out_path,
+                        r.duration_s,
+                        r.n_phrases,
+                        r.passport.n_periods,
+                        r.passport.jitter_std_pct,
+                        book.size_bytes(),
+                        r.samples.len() * 2,
+                        (r.samples.len() * 2) as f64 / book.size_bytes() as f64,
+                    );
+                    res.push_str(&agent_timing_suffix(t0));
+                    CmdResult::Done(res)
+                }
+                Err(e) => CmdResult::Done(format!("❌ {e}")),
+            }
+        }
+    }
 }
 
 fn run_system_cmd(cmd: &str, args: &[String]) -> CmdResult {
@@ -2011,6 +2122,87 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn read_bare_shows_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "read") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Живой голос книги"));
+                assert!(out.contains("--voice"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn read_missing_file_errors() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "read /no/such/file.txt") {
+            CmdResult::Done(out) => assert!(out.contains("❌")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn read_bad_voice_errors() {
+        let dir = std::env::temp_dir().join("poler_sh_read");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("b.txt");
+        std::fs::write(&f, "Тест.").unwrap();
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let line = format!("read {} --voice robot", f.display());
+        match dispatch(&mut s, &line) {
+            CmdResult::Done(out) => assert!(out.contains("❌")),
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn read_stats_without_out() {
+        let dir = std::env::temp_dir().join("poler_sh_read");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("c.txt");
+        std::fs::write(&f, "Первая фраза. Вторая фраза!").unwrap();
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let line = format!("read {}", f.display());
+        match dispatch(&mut s, &line) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("фраз"), "инфо о книге: {out}");
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn read_renders_wav_end_to_end() {
+        let dir = std::env::temp_dir().join("poler_sh_read");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("d.txt");
+        std::fs::write(&f, "Живой голос книги работает.").unwrap();
+        let wav = dir.join("d.wav");
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        let line = format!(
+            "read {} --out {} --voice a_calm --seed 7",
+            f.display(),
+            wav.display()
+        );
+        match dispatch(&mut s, &line) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("✓"), "рендер: {out}");
+                assert!(out.contains("сжатие"));
+            }
+            _ => panic!(),
+        }
+        assert!(wav.exists(), "WAV должен быть создан");
+        // валидный заголовок
+        let head = std::fs::read(&wav).unwrap();
+        assert_eq!(&head[0..4], b"RIFF");
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_file(&wav);
     }
 
     #[test]
