@@ -36,6 +36,9 @@ pub mod mouse;
 pub mod state;
 pub mod transcript;
 pub mod tui;
+// v0.47.0: Windows-словарь + среда для ИИ-агентов
+pub mod agentenv;
+pub mod wincompat;
 
 pub use commands::{dispatch, run_shell, tokenize, CmdResult};
 pub use state::{ShellState, OutputFormat};

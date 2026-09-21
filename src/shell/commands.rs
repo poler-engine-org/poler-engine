@@ -17,13 +17,16 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use crate::notes;
 use crate::sources;
 use crate::vcs::VcsAdapter;
 
+use super::agentenv;
 use super::help;
 use super::state::ShellState;
+use super::wincompat::{self, WinTranslation};
 
 
 /// Результат исполнения одной команды.
@@ -100,7 +103,7 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
             }
         }
         "version" | "v" => CmdResult::Done(format!(
-            "poler-engine {} (poler-shell — v2.0 sovereign stack: без Google/NotebookLM, локальный поиск без лимитов)",
+            "poler-engine {} (poler-shell v0.47.0 — sovereign stack: без Google/NotebookLM; Win+Linux словарь, среда агента: sysinfo/env/pty/--exec --json)",
             env!("CARGO_PKG_VERSION")
         )),
         "search" | "web" => cmd_search(state, args),
@@ -127,7 +130,36 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
                 run_sh_command(&args.join(" "))
             }
         }
-        other => run_system_cmd(other, args),
+        // v0.47.0: навигация ФС и терминал (Linux + Windows словари)
+        "cd" | "chdir" => cmd_cd(args),
+        "pwd" => CmdResult::Done(
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("❌ {e}")),
+        ),
+        "clear" | "cls" => CmdResult::Done("\x1b[2J\x1b[H".into()),
+        // v0.47.0: среда для ИИ-агентов (Antigravity)
+        "sysinfo" | "systeminfo" => CmdResult::Done(agentenv::sysinfo()),
+        "env" => CmdResult::Done(agentenv::env_snapshot(args.first().map(|s| s.as_str()))),
+        "agent" => CmdResult::Done(agentenv::agent_status()),
+        "win" | "winhelp" => CmdResult::Done(wincompat::catalog()),
+        "pty" => cmd_pty(args),
+        // v0.47.0: прямые команды движка
+        "engine" => cmd_engine(args),
+        other => {
+            // v0.47.0: echo с Windows-переменными %NAME% → ${NAME}
+            if other == "echo" && args.iter().any(|a| contains_win_var(a)) {
+                let rewritten: Vec<String> =
+                    args.iter().map(|a| expand_win_vars(a)).collect();
+                return run_sh_command(&format!("echo {}", rewritten.join(" ")));
+            }
+            // v0.47.0: Windows-словарь (dir/type/copy/findstr/taskkill…) —
+            // трансляция ПЕРЕД PATH-поиском; Linux-команды не перехватываются
+            match wincompat::translate(other, args) {
+                Some(tr) => run_win_translation(tr),
+                None => run_system_cmd(other, args),
+            }
+        }
     }
 }
 
@@ -137,10 +169,18 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
 // ---------------------------------------------------------------------------
 
 fn run_sh_command(raw_cmd: &str) -> CmdResult {
+    let t0 = Instant::now();
     let output = match std::process::Command::new("sh").arg("-c").arg(raw_cmd).output() {
         Ok(o) => o,
         Err(e) => return CmdResult::Done(format!("❌ помилка виклику sh: {e}")),
     };
+    let mut res = format_output("sh", &output);
+    res.push_str(&agent_timing_suffix(t0));
+    CmdResult::Done(res)
+}
+
+/// Свести stdout+stderr команды в единый текст (v0.47.0 — общий хелпер).
+fn format_output(label: &str, output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut res = String::new();
@@ -154,9 +194,200 @@ fn run_sh_command(raw_cmd: &str) -> CmdResult {
         res.push_str(&stderr);
     }
     if res.is_empty() {
-        res = format!("✓ виконано (код: {})", output.status);
+        res = format!("✓ [{label}] виконано (код: {})", output.status);
     }
-    CmdResult::Done(res.trim_end_matches('\n').to_string())
+    res.trim_end_matches('\n').to_string()
+}
+
+/// Суффикс ⏱ <мс> для внешних команд в агентном режиме (POLER_SHELL_AGENT=1).
+fn agent_timing_suffix(t0: Instant) -> String {
+    let on = std::env::var("POLER_SHELL_AGENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if on {
+        format!("\n⏱ {} мс", t0.elapsed().as_millis())
+    } else {
+        String::new()
+    }
+}
+
+/// v0.47.0: исполнение трансляции Windows-команды.
+fn run_win_translation(tr: WinTranslation) -> CmdResult {
+    match tr {
+        WinTranslation::Exec { program, args, note } => {
+            let t0 = Instant::now();
+            let output =
+                match std::process::Command::new(&program).args(&args).output() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return CmdResult::Done(format!(
+                            "❌ {program}: {e} (нет в системе?)"
+                        ))
+                    }
+                };
+            let mut res = format_output(&program, &output);
+            if let Some(n) = note {
+                res.push_str(&format!("\nℹ {n}"));
+            }
+            res.push_str(&agent_timing_suffix(t0));
+            CmdResult::Done(res)
+        }
+        WinTranslation::Shell { script, note } => {
+            let mut res = run_sh_command(&script);
+            if let CmdResult::Done(ref mut s) = res {
+                if let Some(n) = note {
+                    s.push_str(&format!("\nℹ {n}"));
+                }
+            }
+            res
+        }
+        WinTranslation::Notice(msg) => CmdResult::Done(msg),
+    }
+}
+
+/// Есть ли в токене Windows-переменная вида %NAME%.
+fn contains_win_var(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    let mut pct: Vec<usize> = Vec::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'%' {
+            pct.push(i);
+        }
+    }
+    if pct.len() < 2 {
+        return false;
+    }
+    // хотя бы одна пара %...% с валидным именем
+    for w in pct.windows(2) {
+        let name = &tok[w[0] + 1..w[1]];
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// %NAME% → ${NAME} (для передачи в sh).
+fn expand_win_vars(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len() + 4);
+    let mut chars = tok.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let mut name = String::new();
+            let mut consumed = false;
+            for c2 in chars.by_ref() {
+                if c2 == '%' {
+                    consumed = true;
+                    break;
+                }
+                name.push(c2);
+            }
+            if consumed
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                out.push_str(&format!("${{{name}}}"));
+            } else {
+                out.push('%');
+                out.push_str(&name);
+                if consumed {
+                    out.push('%');
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// v0.47.0: cd / pty / engine — нативные команды
+// ---------------------------------------------------------------------------
+
+fn cmd_cd(args: &[String]) -> CmdResult {
+    let target = match args.first() {
+        None => {
+            // Windows `cd` без аргументов печатает текущий каталог
+            return CmdResult::Done(
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("❌ {e}")),
+            );
+        }
+        Some(s) if s.is_empty() => {
+            return CmdResult::Done(
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("❌ {e}")),
+            );
+        }
+        Some(s) => s.clone(),
+    };
+    let target = if target == "~" {
+        std::env::var("HOME").unwrap_or(target)
+    } else if let Some(rest) = target.strip_prefix("~/") {
+        format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest)
+    } else {
+        target
+    };
+    match std::env::set_current_dir(&target) {
+        Ok(()) => CmdResult::Done(
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        Err(e) => CmdResult::Done(format!("❌ cd: {e}")),
+    }
+}
+
+fn cmd_pty(args: &[String]) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(
+            "pty <command> — запуск команды в псевдотерминале (PTY-мост для top, gdb, htop и других интерактивных утилит)".into(),
+        );
+    }
+    // script (util-linux) выделяет pseudo-tty: интерактивные утилиты видят TTY
+    let script_cmd = args.join(" ");
+    let t0 = Instant::now();
+    let output = match std::process::Command::new("script")
+        .arg("-qec")
+        .arg(&script_cmd)
+        .arg("/dev/null")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return CmdResult::Done(format!(
+                "❌ pty: {e} — утилита `script` (util-linux) не найдена"
+            ))
+        }
+    };
+    let mut res = format_output("pty", &output);
+    res.push_str(&agent_timing_suffix(t0));
+    CmdResult::Done(res)
+}
+
+fn cmd_engine(args: &[String]) -> CmdResult {
+    if args.is_empty() {
+        return CmdResult::Done(
+            "engine <args...> — вызов CLI самого движка (self-exec).\nПримеры: engine --benchmark, engine --poler-box app.poler, engine --license\nКрейты pqc/pqw доступны напрямую через PATH (transparent passthrough).".into(),
+        );
+    }
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("poler-engine"));
+    let t0 = Instant::now();
+    let output = match std::process::Command::new(&exe).args(args).output() {
+        Ok(o) => o,
+        Err(e) => return CmdResult::Done(format!("❌ engine: {e}")),
+    };
+    let mut res = format_output("engine", &output);
+    res.push_str(&agent_timing_suffix(t0));
+    CmdResult::Done(res)
 }
 
 fn run_system_cmd(cmd: &str, args: &[String]) -> CmdResult {
@@ -212,29 +443,17 @@ fn run_system_cmd(cmd: &str, args: &[String]) -> CmdResult {
     };
 
     if exists {
+        let t0 = Instant::now();
         let output = match std::process::Command::new(&expanded).args(args).output() {
             Ok(o) => o,
             Err(e) => return CmdResult::Done(format!("❌ помилка запуску {cmd}: {e}")),
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut res = String::new();
-        if !stdout.is_empty() {
-            res.push_str(&stdout);
-        }
-        if !stderr.is_empty() {
-            if !res.is_empty() && !res.ends_with('\n') {
-                res.push('\n');
-            }
-            res.push_str(&stderr);
-        }
-        if res.is_empty() {
-            res = format!("✓ [{cmd}] виконано (код: {})", output.status);
-        }
-        CmdResult::Done(res.trim_end_matches('\n').to_string())
+        let mut res = format_output(cmd, &output);
+        res.push_str(&agent_timing_suffix(t0));
+        CmdResult::Done(res)
     } else {
         CmdResult::Done(format!(
-            "неизвестная команда: {cmd} (введите `help` для списка, `! <cmd>` для шелла, либо путь к .poler контейнеру)"
+            "неизвестная команда: {cmd} (введите `help` для списка, `! <cmd>` для шелла, `win` для Windows-словаря, либо путь к .poler контейнеру)"
         ))
     }
 }
@@ -345,9 +564,36 @@ fn cmd_stats(state: &mut ShellState) -> CmdResult {
 // ---------------------------------------------------------------------------
 
 fn cmd_set(state: &mut ShellState, args: &[String]) -> CmdResult {
+    // v0.47.0: Windows-стиль `set NAME=VALUE` / `set NAME` / `set NAME=` (удалить)
+    if let Some(first) = args.first() {
+        if !matches!(first.as_str(), "format" | "top") && first.contains('=') {
+            let (name, val) = first.split_once('=').expect("checked above");
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return CmdResult::Done(
+                    "❌ set: имя переменной — латиница/цифры/подчёркивание".into(),
+                );
+            }
+            if val.is_empty() {
+                std::env::remove_var(name);
+                return CmdResult::Done(format!("✓ {name} — удалена из сессии"));
+            }
+            std::env::set_var(name, val);
+            return CmdResult::Done(format!("✓ {name}={val} (для этой сессии)"));
+        }
+        // `set NAME` — показать переменную (Windows-поведение)
+        if args.len() == 1 && !matches!(first.as_str(), "format" | "top") {
+            if let Ok(v) = std::env::var(first) {
+                return CmdResult::Done(format!("{first}={v}"));
+            }
+        }
+    }
     if args.len() < 2 {
         return CmdResult::Done(
-            "set <key> <value> — доступные ключи: format (md|json|simple), top (N)".into(),
+            "set <key> <value> — доступные ключи: format (md|json|simple), top (N)\nWindows-стиль: set NAME=VALUE — переменная сессии; set NAME — показать".into(),
         );
     }
     let (key, val) = (args[0].as_str(), args[1].as_str());
@@ -1535,6 +1781,238 @@ mod tests {
         let _ = std::fs::remove_file(&f);
     }
 
+    // -----------------------------------------------------------------
+    // v0.47.0: WinCompat + агентная среда
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn win_type_runs_cat() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "type /etc/hostname") {
+            CmdResult::Done(out) => {
+                assert!(!out.contains("неизвестная команда"), "type должен перевестись в cat: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn win_dir_runs_ls_not_unknown() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "dir /etc/hostname") {
+            CmdResult::Done(out) => {
+                assert!(!out.contains("неизвестная команда"), "dir должен перевестись в ls: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn win_tasklist_runs_ps() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "tasklist") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("PID") || out.contains("root") || out.is_empty(),
+                    "tasklist → ps aux: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn win_ver_runs_uname() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "ver") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Linux"), "ver → uname -sr: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn win_net_is_notice_not_execution() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "net use") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("🚫"), "net не должен выполняться: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cd_changes_and_restores_directory() {
+        let saved = std::env::current_dir().unwrap();
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "cd /tmp") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("/tmp"), "cd печатает новый каталог: {out}");
+            }
+            _ => panic!(),
+        }
+        assert_eq!(std::env::current_dir().unwrap(), std::path::PathBuf::from("/tmp"));
+        // возврат для изоляции остальных тестов
+        let back = format!("cd {}", saved.display());
+        let _ = dispatch(&mut s, &back);
+        assert_eq!(std::env::current_dir().unwrap(), saved);
+    }
+
+    #[test]
+    fn cd_bare_prints_cwd() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "cd") {
+            CmdResult::Done(out) => assert!(!out.is_empty()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn pwd_prints_absolute_path() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "pwd") {
+            CmdResult::Done(out) => {
+                assert!(out.starts_with('/'), "pwd — абсолютный путь: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn set_windows_env_var_and_show() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "set POLER_TEST_WIN=hello47") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("POLER_TEST_WIN"), "set NAME=VALUE: {out}");
+            }
+            _ => panic!(),
+        }
+        assert_eq!(std::env::var("POLER_TEST_WIN").unwrap(), "hello47");
+        match dispatch(&mut s, "set POLER_TEST_WIN") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("hello47"), "set NAME показывает: {out}");
+            }
+            _ => panic!(),
+        }
+        // удаление пустым значением
+        let _ = dispatch(&mut s, "set POLER_TEST_WIN=");
+        assert!(std::env::var("POLER_TEST_WIN").is_err());
+    }
+
+    #[test]
+    fn set_format_and_top_still_work() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "set format json") {
+            CmdResult::Done(out) => assert!(out.contains("json") || out.contains("Json")),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "set top 7") {
+            CmdResult::Done(out) => assert!(out.contains('7')),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn sysinfo_reports_sections() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "sysinfo") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("[cpu]"));
+                assert!(out.contains("[agent mode]"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn systeminfo_alias_works() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "systeminfo") {
+            CmdResult::Done(out) => assert!(out.contains("sysinfo")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn env_masks_token_values() {
+        std::env::set_var("POLER_SHELL_TEST_SECRET", "supersecretvalue123");
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "env POLER_SHELL_TEST") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("POLER_SHELL_TEST_SECRET"));
+                assert!(!out.contains("supersecretvalue123"), "секрет должен маскироваться: {out}");
+            }
+            _ => panic!(),
+        }
+        std::env::remove_var("POLER_SHELL_TEST_SECRET");
+    }
+
+    #[test]
+    fn win_catalog_command_lists_translations() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "win") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("findstr"));
+                assert!(out.contains("taskkill"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn agent_command_mentions_exec_json() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "agent") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("--exec"));
+                assert!(out.contains("--json"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn engine_bare_shows_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "engine") {
+            CmdResult::Done(out) => assert!(out.contains("self-exec")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn pty_bare_shows_help() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "pty") {
+            CmdResult::Done(out) => assert!(out.contains("PTY")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn echo_win_vars_expanded() {
+        // чистые функции: детекция и раскрытие %NAME%
+        assert!(contains_win_var("%PATH%"));
+        assert!(contains_win_var("hello %USER% x"));
+        assert!(!contains_win_var("100% done"));
+        assert!(!contains_win_var("no vars"));
+        assert_eq!(expand_win_vars("%HOME%"), "${HOME}");
+        assert_eq!(expand_win_vars("a %X_Y% b"), "a ${X_Y} b");
+        assert_eq!(expand_win_vars("50%"), "50%");
+        assert_eq!(expand_win_vars("%bad-name%"), "%bad-name%");
+    }
+
+    #[test]
+    fn unknown_command_hint_mentions_win() {
+        let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
+        match dispatch(&mut s, "zzzdefinitely_not_a_cmd") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("win"), "подсказка должна упоминать Windows-словарь: {out}");
+            }
+            _ => panic!(),
+        }
+    }
+
     #[test]
     fn cmd_quit_signals_exit() {
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
@@ -1767,14 +2245,15 @@ mod tests {
 
     #[test]
     fn cmd_version_string_updated_for_v0171() {
-        // v2.0: sovereign stack — бейдж poler-shell обновлён.
+        // v0.47.0: sovereign stack + Win/Linux словарь + среда агента.
         let mut s = ShellState::new(std::path::PathBuf::from("/tmp/x.db"));
         let r = dispatch(&mut s, "version");
         match r {
             CmdResult::Done(out) => {
-                assert!(out.contains("v2.0"));
+                assert!(out.contains("v0.47.0"));
                 assert!(out.contains("poler-shell"));
                 assert!(out.contains("sovereign"));
+                assert!(out.contains("sysinfo"), "v0.47.0: в бейдже упомянута среда агента");
                 assert!(!out.contains("Auth Companion"), "v2.0: Google-интеграция удалена");
             }
             _ => panic!(),

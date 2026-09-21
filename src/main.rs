@@ -162,7 +162,7 @@ struct Cli {
         long = "semantic-expand",
         value_name = "QUERY",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
             "benchmark"
         ]
@@ -177,7 +177,7 @@ struct Cli {
     #[arg(
         long = "benchmark",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
             "semantic_expand"
         ]
@@ -221,20 +221,20 @@ struct Cli {
     /// ИНДЕКСАЦИЯ ОДНОЙ СТРАНИЦЫ: URL → рендер (Chromium CDP) → веб-индекс.
     /// Явная команда пользователя: robots.txt не блокирует (но фиксируется
     /// в notes). После — доступен --web-search по общему индексу.
-    #[arg(long = "browser-index", value_name = "URL", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact"])]
+    #[arg(long = "browser-index", value_name = "URL", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact"])]
     browser_index: Option<String>,
 
     /// БРАУЗЕРНЫЙ РЕЖИМ: материализует WebLens (расширение MV3), запускает
     /// оконный Chromium с уже установленным WebLens и держит MCP-сервер
     /// на 127.0.0.1:8765 (BIND как у --mcp-http, или только порт).
-    #[arg(long = "web-lens", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens_install"])]
+    #[arg(long = "web-lens", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens_install"])]
     web_lens: Option<String>,
 
     /// Установить WebLens в ЕЖЕДНЕВНЫЙ браузер: материализует файлы
     /// и печатает шаги «Load unpacked» (chrome://-страницы автоматизировать
     /// нельзя — это защита браузера; управляемый движком браузер ставит
     /// WebLens сам через --web-lens).
-    #[arg(long = "web-lens-install", conflicts_with_all = ["web_lens", "mcp_http", "mcp", "shell", "tui", "crawl", "web_search", "browser_index"])]
+    #[arg(long = "web-lens-install", conflicts_with_all = ["web_lens", "mcp_http", "mcp", "shell", "exec", "tui", "crawl", "web_search", "browser_index"])]
     web_lens_install: bool,
 
     // ---------- Native Retrieval: grep-режим + RAG-чанки (v0.20.0) ----------
@@ -242,7 +242,7 @@ struct Cli {
     /// ТОЧНЫЙ ПОИСК (grep-режим): ВСЕ совпадения PATTERN по файлам
     /// (PATH или текущий каталог), без индекса, гарантия полноты.
     /// Exit-коды как у grep: 0 — найдено, 1 — пусто, 2 — ошибка.
-    #[arg(long = "grep", value_name = "PATTERN", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens", "web_lens_install", "chunk"])]
+    #[arg(long = "grep", value_name = "PATTERN", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens", "web_lens_install", "chunk"])]
     grep: Option<String>,
 
     /// Регулярное выражение вместо фиксированной строки (grep -E).
@@ -295,7 +295,7 @@ struct Cli {
         value_name = "ROOT_PATH",
         requires = "harvest_query",
         conflicts_with_all = [
-            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
             "benchmark", "semantic_expand"
         ]
@@ -374,7 +374,7 @@ struct Cli {
     #[arg(
         long = "edit-serve",
         conflicts_with_all = [
-            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
             "benchmark", "semantic_expand", "harvest_disk", "edit_bench", "browser_url"
         ]
@@ -388,7 +388,7 @@ struct Cli {
         long = "edit-bench",
         value_name = "FILE",
         conflicts_with_all = [
-            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web", "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
             "benchmark", "semantic_expand", "harvest_disk", "edit_serve", "browser_url"
         ]
@@ -420,7 +420,7 @@ struct Cli {
 
     /// ЛИСТИНГ АРХИВА: записи контейнера (имя/размеры/шифрование)
     /// без распаковки и без пароля — осмотр перед вскрытием.
-    #[arg(long = "archive-list", value_name = "ARCHIVE", conflicts_with_all = ["grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens", "web_lens_install"])]
+    #[arg(long = "archive-list", value_name = "ARCHIVE", conflicts_with_all = ["grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens", "web_lens_install"])]
     archive_list: Option<PathBuf>,
 
     /// JSON-вывод листинга архива (с --archive-list) — для агента.
@@ -430,7 +430,7 @@ struct Cli {
     /// RAG-ЧАНКИ: нарезать документ PATH на фрагменты с якорями
     /// (byte range, номера строк, breadcrumb заголовков) —
     /// passage-уровень для агента вместо чтения документа целиком.
-    #[arg(long = "chunk", requires = "path", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens", "web_lens_install", "grep"])]
+    #[arg(long = "chunk", requires = "path", conflicts_with_all = ["web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens", "web_lens_install", "grep"])]
     chunk: bool,
 
     /// Целевой размер чанка в токенах POLER [default: 384].
@@ -457,7 +457,7 @@ struct Cli {
     /// `cloudflared tunnel --url http://127.0.0.1:8765`). POST / или /mcp,
     /// заголовок Authorization: Bearer <токен>.
     /// BIND = «127.0.0.1:8765» (по умолчанию) или просто порт «8765».
-    #[arg(long = "mcp-http", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["mcp", "shell", "tui", "web_search", "crawl", "web_stats", "impact"])]
+    #[arg(long = "mcp-http", value_name = "BIND", num_args = 0..=1, default_missing_value = "127.0.0.1:8765", conflicts_with_all = ["mcp", "shell", "exec", "tui", "web_search", "crawl", "web_stats", "impact"])]
     mcp_http: Option<String>,
 
     /// Токен доступа для --mcp-http (или env POLER_MCP_TOKEN; без него
@@ -486,7 +486,7 @@ struct Cli {
     /// query_poler_knowledge холодный-против-тёплого (p50/p95/p99),
     /// RAM кэша и проверка бюджета <5 мс. Без --path/--knowledge-db
     /// строит временный корпус (самодостаточная верификация M6).
-    #[arg(long = "mcp-bench", value_name = "N", num_args = 0..=1, default_missing_value = "200", conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "license", "semantic_expand"])]
+    #[arg(long = "mcp-bench", value_name = "N", num_args = 0..=1, default_missing_value = "200", conflicts_with_all = ["shell", "exec", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "license", "semantic_expand"])]
     mcp_bench: Option<usize>,
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
@@ -495,7 +495,7 @@ struct Cli {
     /// контур исполнения (engine-native приоритет + sandboxed host proxy),
     /// конвейеры host↔engine, service/attach управление нижним слоем.
     /// Верхний уровень управления на Linux/macOS.
-    #[arg(long, conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "license", "semantic_expand"])]
+    #[arg(long, conflicts_with_all = ["shell", "exec", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "grep", "chunk", "benchmark", "web_lens", "web_lens_install", "browser_index", "license", "semantic_expand"])]
     gateway: bool,
 
     /// v0.23.0 DANGER OVERRIDE: полностью отключить sandbox Terminal
@@ -511,9 +511,22 @@ struct Cli {
     #[arg(long = "shell", conflicts_with_all = ["tui", "mcp", "web_search", "crawl", "web_stats", "impact"])]
     shell: bool,
 
+    /// v0.47.0: одноразовое исполнение команды poler-shell без баннера
+    /// и промптов — интерфейс для ИИ-агентов и скриптов.
+    /// Примеры: --exec 'search "квант" --top 3'; --exec 'dir'; --exec 'sysinfo'.
+    /// Поддерживает полный словарь: Linux-команды, Windows-команды (WinCompat),
+    /// команды движка и пути к .poler-контейнерам.
+    #[arg(long = "exec", value_name = "CMD", conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact"])]
+    exec: Option<String>,
+
+    /// v0.47.0: вывести результат --exec одной JSON-строкой
+    /// {cmd, ok, exit_code, duration_ms, output} — машиночитаемый конверт.
+    #[arg(long = "json", requires = "exec")]
+    exec_json: bool,
+
     /// TUI Dashboard на ratatui (панели: chat + ввод | notes + sources).
     /// Tab — смена фокуса, Esc — выход. Команды как в --shell.
-    #[arg(long = "tui", conflicts_with_all = ["shell", "mcp", "web_search", "crawl", "web_stats", "impact"])]
+    #[arg(long = "tui", conflicts_with_all = ["shell", "exec", "mcp", "web_search", "crawl", "web_stats", "impact"])]
     tui: bool,
 
     // ---------- License / EULA (v2.0: статус модели, без гейта) ----------
@@ -521,7 +534,7 @@ struct Cli {
     /// Статус лицензии и модель распространения (Source-Available EULA).
     /// Локальный поиск и все функции движка — всегда без ограничений;
     /// v2.0 не содержит ключей и гейтов.
-    #[arg(long = "license", conflicts_with_all = ["shell", "tui", "mcp", "mcp_http"])]
+    #[arg(long = "license", conflicts_with_all = ["shell", "exec", "tui", "mcp", "mcp_http"])]
     license: bool,
     /// Разрешить краулеру переход на другие хосты.
     #[arg(long = "cross-site", default_value_t = false)]
@@ -604,7 +617,7 @@ struct Cli {
         long = "knowledge-ingest",
         value_name = "PATH",
         conflicts_with_all = [
-            "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell",
+            "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec",
             "tui", "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_search", "knowledge_stats"
         ]
@@ -628,7 +641,7 @@ struct Cli {
         long = "knowledge-search",
         value_name = "QUERY",
         conflicts_with_all = [
-            "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell",
+            "web", "crawl", "web_search", "web_stats", "mcp", "mcp_http", "shell", "exec",
             "tui", "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_stats"
         ]
@@ -648,7 +661,7 @@ struct Cli {
     #[arg(
         long = "knowledge-stats",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search"
         ]
@@ -668,7 +681,7 @@ struct Cli {
         long = "memory-seal",
         value_name = "PATH",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search", "knowledge_stats",
             "memory_open", "memory_verify", "memory_info"
@@ -683,7 +696,7 @@ struct Cli {
         long = "memory-open",
         value_name = "VAULT",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search", "knowledge_stats",
             "memory_seal", "memory_verify", "memory_info"
@@ -698,7 +711,7 @@ struct Cli {
         long = "memory-verify",
         value_name = "VAULT",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search", "knowledge_stats",
             "memory_seal", "memory_open", "memory_info"
@@ -713,7 +726,7 @@ struct Cli {
         long = "memory-info",
         value_name = "VAULT",
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search", "knowledge_stats",
             "memory_seal", "memory_open", "memory_verify"
@@ -771,7 +784,7 @@ struct Cli {
         num_args = 1..,
         allow_hyphen_values = true,
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search", "knowledge_stats",
             "memory_seal", "memory_open", "memory_verify", "memory_info"
@@ -848,7 +861,7 @@ struct Cli {
         value_name = "CSR_ZST",
         conflicts_with_all = [
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "archive_list"
         ]
     )]
@@ -947,7 +960,7 @@ struct Cli {
         value_name = "TEXT",
         conflicts_with_all = [
             "literary_generate", "grep", "chunk", "web", "crawl", "web_search",
-            "web_stats", "mcp", "mcp_http", "shell", "tui", "impact",
+            "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact",
             "browser_index", "web_lens", "web_lens_install", "archive_list",
             "connectome"
         ]
@@ -960,7 +973,7 @@ struct Cli {
         value_name = "TEXT",
         conflicts_with_all = [
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "archive_list", "connectome"
         ]
     )]
@@ -1176,7 +1189,7 @@ struct Cli {
         value_name = "URL",
         conflicts_with_all = [
             "crawl", "web_search", "web_stats", "browser_index", "learn_dir",
-            "mcp", "mcp_http", "shell", "tui", "impact", "web_lens",
+            "mcp", "mcp_http", "shell", "exec", "tui", "impact", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir",
         ]
     )]
@@ -1189,7 +1202,7 @@ struct Cli {
         value_name = "DIR",
         conflicts_with_all = [
             "crawl", "web_search", "web_stats", "browser_index", "learn_web",
-            "mcp", "mcp_http", "shell", "tui", "impact", "web_lens",
+            "mcp", "mcp_http", "shell", "exec", "tui", "impact", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir",
         ]
     )]
@@ -1228,7 +1241,7 @@ struct Cli {
             "stream_file", "stream_bench", "browser_crawl", "archive_to_crystal",
             "poler_list", "poler_verify", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1244,7 +1257,7 @@ struct Cli {
             "stream_download", "stream_bench", "browser_crawl", "archive_to_crystal",
             "poler_list", "poler_verify", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1261,7 +1274,7 @@ struct Cli {
             "stream_download", "stream_file", "browser_crawl", "archive_to_crystal",
             "poler_list", "poler_verify", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1291,7 +1304,7 @@ struct Cli {
             "stream_download", "stream_file", "stream_bench", "archive_to_crystal",
             "poler_list", "poler_verify", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1310,7 +1323,7 @@ struct Cli {
             "stream_download", "stream_file", "stream_bench", "browser_crawl",
             "poler_list", "poler_verify", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1329,7 +1342,7 @@ struct Cli {
             "stream_download", "stream_file", "stream_bench", "browser_crawl",
             "archive_to_crystal", "poler_verify", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1344,7 +1357,7 @@ struct Cli {
             "stream_download", "stream_file", "stream_bench", "browser_crawl",
             "archive_to_crystal", "poler_list", "poler_extract",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -1359,7 +1372,7 @@ struct Cli {
             "stream_download", "stream_file", "stream_bench", "browser_crawl",
             "archive_to_crystal", "poler_list", "poler_verify",
             "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
-            "mcp_http", "shell", "tui", "impact", "browser_index", "web_lens",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
             "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
             "learn_dir", "stream_quant",
         ]
@@ -2272,6 +2285,53 @@ fn run(cli: Cli) -> ExitCode {
     }
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
+    // ---------- v0.47.0: one-shot --exec для ИИ-агентов ----------
+    if let Some(cmd) = cli.exec.as_deref() {
+        use std::time::Instant;
+        let db_path =
+            cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
+        let t0 = Instant::now();
+        let mut state = poler_engine::shell::ShellState::new(db_path);
+        let result = poler_engine::shell::dispatch(&mut state, cmd);
+        let dt = t0.elapsed().as_millis();
+        match result {
+            poler_engine::shell::CmdResult::Quit => {
+                if cli.exec_json {
+                    println!(
+                        "{}",
+                        poler_engine::shell::agentenv::json_envelope(cmd, true, 0, dt, "")
+                    );
+                }
+                return ExitCode::SUCCESS;
+            }
+            poler_engine::shell::CmdResult::Empty => {
+                if cli.exec_json {
+                    println!(
+                        "{}",
+                        poler_engine::shell::agentenv::json_envelope(cmd, true, 0, dt, "")
+                    );
+                }
+                return ExitCode::SUCCESS;
+            }
+            poler_engine::shell::CmdResult::Done(out) => {
+                if cli.exec_json {
+                    // Критерий ошибки: маркер ❌ в начале вывода команды
+                    let ok = !out.starts_with('❌') && !out.contains("неизвестная команда");
+                    let code: u8 = if ok { 0 } else { 1 };
+                    println!(
+                        "{}",
+                        poler_engine::shell::agentenv::json_envelope(cmd, ok, code, dt, &out)
+                    );
+                    return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+                }
+                if !out.is_empty() {
+                    println!("{out}");
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+
     if cli.shell {
         let db_path = cli.web_db.clone().unwrap_or_else(poler_engine::web::default_db_path);
         return poler_engine::shell::run_shell(db_path);

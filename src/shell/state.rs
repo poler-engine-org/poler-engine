@@ -97,6 +97,9 @@ impl ShellState {
                 "notes", "sources",
                 // v0.16.0: vcs-sync alias
                 "sync",
+                // v0.47.0: Win+Linux словарь и среда агента
+                "cd", "pwd", "clear", "engine",
+                "sysinfo", "env", "agent", "pty", "win",
             ]
         })
     }

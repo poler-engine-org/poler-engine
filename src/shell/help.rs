@@ -25,6 +25,9 @@ pub enum HelpGroup {
     Set,
     Notes,
     Sources,
+    // v0.47.0
+    System,
+    Agent,
     Meta,
 }
 
@@ -40,6 +43,9 @@ impl HelpGroup {
             HelpGroup::Set => "Налаштування",
             HelpGroup::Notes => "Notes (CRUD)",
             HelpGroup::Sources => "Sources (CRUD)",
+            // v0.47.0
+            HelpGroup::System => "Система/Win+Linux (v0.47.0)",
+            HelpGroup::Agent => "Середа агента (v0.47.0)",
             HelpGroup::Meta => "Мета",
         }
     }
@@ -96,6 +102,27 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Sources, cmd: "sources test <id>", short: "Перевірити доступність" },
         HelpEntry { group: HelpGroup::Sources, cmd: "sources open <id>", short: "Відкрити в системі через xdg-open" },
 
+        // v0.47.0: система — Win+Linux словарь + прямой шелл
+        HelpEntry { group: HelpGroup::System, cmd: "cd <path> | cd", short: "Змінити каталог (без аргументів — показати поточний, як у cmd.exe)" },
+        HelpEntry { group: HelpGroup::System, cmd: "pwd", short: "Показати поточний каталог" },
+        HelpEntry { group: HelpGroup::System, cmd: "clear | cls", short: "Очистити екран (ANSI; cls — Windows-словарь)" },
+        HelpEntry { group: HelpGroup::System, cmd: "engine <args...>", short: "Виклик CLI самого движка (self-exec): engine --benchmark, engine --poler-box ..." },
+        HelpEntry { group: HelpGroup::System, cmd: "! <command>", short: "Прямий виклик системного шелла (sh -c)" },
+        HelpEntry { group: HelpGroup::System, cmd: "sh | bash | exec <command>", short: "Виконати команду в системному шеллі" },
+        HelpEntry { group: HelpGroup::System, cmd: "<path>.poler [args]", short: "Автозапуск .poler-контейнера в ізольованому poler-box" },
+        HelpEntry { group: HelpGroup::System, cmd: "<системна команда>", short: "Transparent PATH passthrough: ls, cargo, python3, git..." },
+        HelpEntry { group: HelpGroup::System, cmd: "dir | type | copy | del | md | ren | move", short: "Windows-словарь → ls/cat/cp/rm/mkdir/mv (деталі: `win`)" },
+        HelpEntry { group: HelpGroup::System, cmd: "findstr | tasklist | taskkill | ipconfig | ping", short: "Windows-словарь → grep/ps/kill/ip addr (флаги переводяться)" },
+        HelpEntry { group: HelpGroup::System, cmd: "win", short: "Повний каталог Windows-команд і їх трансляцій" },
+
+        // v0.47.0: середа для ІІ-агентів (Antigravity)
+        HelpEntry { group: HelpGroup::Agent, cmd: "sysinfo | systeminfo", short: "Карта середовища: CPU/RAM/GPU/диск/тулчейни/локаль/TTY — звіт для агента" },
+        HelpEntry { group: HelpGroup::Agent, cmd: "env [PREFIX]", short: "Знімок змінних сесії (токени маскуються)" },
+        HelpEntry { group: HelpGroup::Agent, cmd: "set NAME=VALUE", short: "Змінна сесії (Windows-стиль); set NAME — показати" },
+        HelpEntry { group: HelpGroup::Agent, cmd: "pty <command>", short: "PTY-міст: запуск інтерактивних утиліт (top, gdb) через pseudo-tty" },
+        HelpEntry { group: HelpGroup::Agent, cmd: "agent", short: "Статус і поради агенту: --exec, --json, MCP, таймінги" },
+        HelpEntry { group: HelpGroup::Agent, cmd: "--exec '<cmd>' [--json]", short: "CLI: одноразове виконання без банера; --json — машиночитаний конверт" },
+
         HelpEntry { group: HelpGroup::Meta, cmd: "version | v", short: "Версія poler-engine + poler-shell" },
         HelpEntry { group: HelpGroup::Meta, cmd: "quit | exit | q", short: "Вийти з шелу" },
         HelpEntry { group: HelpGroup::Meta, cmd: "help | ?", short: "Ця справка" },
@@ -117,6 +144,8 @@ pub fn help_overview() -> String {
         HelpGroup::Set,
         HelpGroup::Notes,
         HelpGroup::Sources,
+        HelpGroup::System,
+        HelpGroup::Agent,
         HelpGroup::Meta,
     ];
     let _ = writeln!(s, "poler-shell v2.0 — sovereign stack: без Google/NotebookLM, локальный поиск без лимитов");
