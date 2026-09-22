@@ -403,11 +403,13 @@ fn is_ssn_tool(msg: &Value) -> bool {
 
 /// v0.48.0: Калькулятор Всего — в пул воркеров (числовой solve может
 /// сканировать диапазон ±100; состояние за Mutex — параллельно безопасно).
+/// v0.51.0: poler_quantum — туда же (GHZ-1024 ≈ 367 мс; верификатор —
+/// чистые вычисления без общего состояния).
 fn is_calc_tool(msg: &Value) -> bool {
     msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
         && matches!(
             msg.pointer("/params/name").and_then(|v| v.as_str()),
-            Some("poler_calc" | "poler_hw")
+            Some("poler_calc" | "poler_hw" | "poler_quantum")
         )
 }
 
@@ -871,6 +873,7 @@ impl McpServer {
             "poler_triune_state" => self.tool_triune_state(&args),
             "poler_calc" => self.tool_calc(&args),
             "poler_hw" => self.tool_hw(&args),
+            "poler_quantum" => self.tool_quantum(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -2568,6 +2571,237 @@ impl McpServer {
         Ok(report.to_json())
     }
 
+    /// v0.51.0 (цикл P): poler_quantum — квантовый мост для ИИ-агентов.
+    ///
+    /// Прямой доступ к идеальному симулятору POLER Quantum PC: запуск
+    /// эталонных схем, телепортация, сфера Блоха и формальная верификация
+    /// (точное кольцо ℤ[1/√2, i]). Возвращает структурированный JSON.
+    fn tool_quantum(&self, args: &Value) -> Result<String, String> {
+        use crate::quantum::core as pqc_core;
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент action обязателен: run | teleport | bloch | verify | list")?;
+        let get_usize = |k: &str| args.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+        let get_u64 = |k: &str| args.get(k).and_then(|v| v.as_u64());
+        let get_f64 = |k: &str| args.get(k).and_then(|v| v.as_f64());
+
+        match action {
+            "list" => {
+                let catalog: Vec<Value> = pqc_core::algorithms::catalog()
+                    .iter()
+                    .map(|(n, d)| json!({"algorithm": n, "description": d}))
+                    .collect();
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "algorithms": catalog,
+                    "actions": ["run", "teleport", "bloch", "verify", "list"],
+                    "physics_bridge": "poler_calc: schrodinger(H, psi0, t), pauli_x/y/z, kron, expm, eigen"
+                })
+                .to_string())
+            }
+            "run" => {
+                let name = args
+                    .get("algorithm")
+                    .and_then(|v| v.as_str())
+                    .ok_or("run: аргумент algorithm обязателен (bell ghz qft iqft grover bv dj period teleport)")?;
+                let params = pqc_core::algorithms::AlgoParams {
+                    n: get_usize("n").unwrap_or(4),
+                    marks: match args.get("marks").and_then(|v| v.as_array()) {
+                        Some(arr) => arr
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|x| x as usize))
+                            .collect(),
+                        None => Vec::new(),
+                    },
+                    secret: get_u64("secret").unwrap_or(0b1011),
+                    period: get_usize("period").unwrap_or(0),
+                    offset: get_usize("offset").unwrap_or(0),
+                    theta: get_f64("theta").unwrap_or(0.7),
+                };
+                let (circuit, iterations) = pqc_core::algorithms::build(name, &params)
+                    .map_err(|e| format!("run {name}: {e:?}"))?;
+                let shots = get_u64("shots").unwrap_or(1024);
+                let seed = get_u64("seed").unwrap_or(42);
+                let rep = pqc_core::qpc::run(&circuit, shots, seed)
+                    .map_err(|e| format!("run {name}: {e:?}"))?;
+                let counts: Vec<Value> = rep
+                    .counts
+                    .iter()
+                    .map(|(o, c)| json!([o, c]))
+                    .collect();
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "action": "run",
+                    "algorithm": name,
+                    "n_qubits": rep.n_qubits,
+                    "gate_count": rep.gate_count,
+                    "iterations": iterations,
+                    "shots": rep.shots,
+                    "norm": rep.norm,
+                    "entropy_bits": rep.entropy_bits,
+                    "landauer_j": rep.landauer_j,
+                    "probabilities": rep.probabilities,
+                    "marginals": rep.marginals,
+                    "counts": counts,
+                })
+                .to_string())
+            }
+            "teleport" => {
+                let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+                let theta = get_f64("theta").unwrap_or(0.7);
+                let t = if exact {
+                    pqc_core::algorithms::run_teleport_exact()
+                } else {
+                    pqc_core::algorithms::run_teleport(theta)
+                }
+                .map_err(|e| format!("teleport: {e:?}"))?;
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "action": "teleport",
+                    "mode": if t.exact { "exact:Z[1/sqrt(2),i]" } else { "numeric:f64" },
+                    "theta": t.theta,
+                    "psi_in": [t.psi_in[0].0, t.psi_in[0].1, t.psi_in[1].0, t.psi_in[1].1],
+                    "psi_out": [t.psi_out[0].0, t.psi_out[0].1, t.psi_out[1].0, t.psi_out[1].1],
+                    "fidelity": t.fidelity,
+                    "branch_deviation": t.branch_deviation,
+                    "exact": t.exact,
+                    "bloch_in": t.bloch_in,
+                    "bloch_out": t.bloch_out,
+                    "gate_count": t.gate_count,
+                })
+                .to_string())
+            }
+            "bloch" => {
+                // Амплитуды — выражения Калькулятора Всего (резидентное
+                // состояние warm_calc: константы и переменные доступны).
+                let a_src = args
+                    .get("alpha")
+                    .and_then(|v| v.as_str())
+                    .ok_or("bloch: аргумент alpha обязателен (выражение или число)")?;
+                let b_src = args.get("beta").and_then(|v| v.as_str()).unwrap_or("0");
+                let mut calc = self
+                    .warm_calc
+                    .lock()
+                    .map_err(|_| "bloch: состояние занято".to_string())?;
+                let alpha = calc
+                    .eval_complex(a_src)
+                    .map_err(|e| format!("bloch: α — {e}"))?;
+                let beta = calc
+                    .eval_complex(b_src)
+                    .map_err(|e| format!("bloch: β — {e}"))?;
+                let norm_sq =
+                    alpha.0 * alpha.0 + alpha.1 * alpha.1 + beta.0 * beta.0 + beta.1 * beta.1;
+                if norm_sq < 1e-30 {
+                    return Err("bloch: нулевое состояние".into());
+                }
+                let k = 1.0 / norm_sq.sqrt();
+                let (alpha, beta) = ((alpha.0 * k, alpha.1 * k), (beta.0 * k, beta.1 * k));
+                let b = pqc_core::algorithms::bloch_of(alpha, beta);
+                let p0 = alpha.0 * alpha.0 + alpha.1 * alpha.1;
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "action": "bloch",
+                    "normalized": (norm_sq - 1.0).abs() > 1e-9,
+                    "psi": {
+                        "alpha": [alpha.0, alpha.1],
+                        "beta": [beta.0, beta.1],
+                        "p0": p0,
+                        "p1": 1.0 - p0,
+                        "relative_phase_rad": beta.1.atan2(beta.0),
+                    },
+                    "bloch": {"x": b[0], "y": b[1], "z": b[2]},
+                })
+                .to_string())
+            }
+            "verify" => {
+                use pqc_core::verify::{Verdict, VerificationReport};
+                let check = args
+                    .get("check")
+                    .and_then(|v| v.as_str())
+                    .ok_or("verify: аргумент check обязателен (unitary | equivalence | teleport)")?;
+                let n = get_usize("n").unwrap_or(4);
+                let build_algo = |name: &str| -> Result<pqc_core::qpc::Circuit, String> {
+                    let p = pqc_core::algorithms::AlgoParams {
+                        n,
+                        marks: vec![22 % (1usize << n.max(1))],
+                        secret: 0b1011,
+                        period: 0,
+                        offset: 0,
+                        theta: 0.7,
+                    };
+                    pqc_core::algorithms::build(name, &p)
+                        .map(|(c, _)| c)
+                        .map_err(|e| format!("{e:?}"))
+                };
+                let report: VerificationReport = match check {
+                    "unitary" => {
+                        let algo = args
+                            .get("algorithm")
+                            .and_then(|v| v.as_str())
+                            .ok_or("verify unitary: аргумент algorithm обязателен")?;
+                        let circuit = build_algo(algo)?;
+                        pqc_core::verify::verify_unitary(&circuit)
+                            .map_err(|e| format!("{e:?}"))?
+                    }
+                    "equivalence" => {
+                        let names = args
+                            .get("algorithms")
+                            .and_then(|v| v.as_array())
+                            .ok_or("verify equivalence: аргумент algorithms — массив из двух имён")?;
+                        if names.len() != 2 {
+                            return Err(
+                                "verify equivalence: algorithms — ровно два имени".into()
+                            );
+                        }
+                        let a_name = names[0].as_str().ok_or("algorithms[0] — строка")?;
+                        let b_name = names[1].as_str().ok_or("algorithms[1] — строка")?;
+                        let a = build_algo(a_name)?;
+                        let b = build_algo(b_name)?;
+                        let up_to_phase = args
+                            .get("up_to_global_phase")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        pqc_core::verify::verify_equivalence(&a, &b, up_to_phase)
+                            .map_err(|e| format!("{e:?}"))?
+                    }
+                    "teleport" => pqc_core::verify::verify_teleport_channel()
+                        .map_err(|e| format!("{e:?}"))?,
+                    other => {
+                        return Err(format!(
+                            "verify: неизвестная проверка `{other}` (unitary | equivalence | teleport)"
+                        ))
+                    }
+                };
+                let verdict = match report.verdict {
+                    Verdict::ProvedExact => json!("proved_exact"),
+                    Verdict::VerifiedNumeric(tol) => json!(["verified_numeric", tol]),
+                    Verdict::VerifiedSampling(tol) => json!(["verified_sampling", tol]),
+                    Verdict::Refuted(d) => json!(["refuted", d]),
+                };
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "action": "verify",
+                    "property": report.property,
+                    "subject": report.subject,
+                    "n_qubits": report.n_qubits,
+                    "dim": report.dim,
+                    "gate_count": report.gate_count,
+                    "method": report.method,
+                    "verdict": verdict,
+                    "max_deviation": report.max_deviation,
+                    "checks": report.checks.iter().map(|(n, ok, d)| json!([n, ok, d])).collect::<Vec<_>>(),
+                    "notes": report.notes,
+                })
+                .to_string())
+            }
+            other => Err(format!(
+                "неизвестное действие `{other}` (run | teleport | bloch | verify | list)"
+            )),
+        }
+    }
+
     fn psi_mode_name(m: PsiMode) -> &'static str {
         match m {
             PsiMode::Attraction => "attraction",
@@ -3077,6 +3311,45 @@ expm([0,-1;1,0]*psi); moon_illum(2024,4,8,18.35); dist(50.45,30.52,49.84,24.03).
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        }),
+        json!({
+            "name": "poler_quantum",
+            "description": "Квантовый мост POLER (цикл P): идеальный симулятор кубитов без \
+декогеренции. Действия: run — эталонные схемы (bell, ghz, qft, iqft, grover, bv, dj, period, \
+teleport) с распределением Борна и энтропией; teleport — телепортация q0→q2 с фиделити \
+(theta — препарат Ry, exact — кольцо Z[1/sqrt(2),i]); bloch — сфера Блоха состояния \
+(амплитуды — выражения poler_calc: 1/sqrt(2), i/2…); verify — формальная верификация: \
+unitary (U†U = I), equivalence (две схемы, до глобальной фазы), teleport (канал на базисе) — \
+вердикты proved_exact / verified_numeric / verified_sampling / refuted; list — каталог. \
+Физика уровней/спектров — через poler_calc (schrodinger, pauli_*, kron, expm, eigen). \
+Примеры: {\"action\":\"run\",\"algorithm\":\"ghz\",\"n\":5,\"shots\":1024}; \
+{\"action\":\"teleport\",\"theta\":0.7,\"exact\":true}; \
+{\"action\":\"bloch\",\"alpha\":\"1/sqrt(2)\",\"beta\":\"i/sqrt(2)\"}; \
+{\"action\":\"verify\",\"check\":\"unitary\",\"algorithm\":\"qft\",\"n\":3}; \
+{\"action\":\"verify\",\"check\":\"equivalence\",\"algorithms\":[\"qft\",\"iqft\"],\"n\":3,\"up_to_global_phase\":false}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["run", "teleport", "bloch", "verify", "list"],
+                               "description": "Действие моста"},
+                    "algorithm": {"type": "string", "description": "bell|ghz|qft|iqft|grover|bv|dj|period|teleport"},
+                    "n": {"type": "integer", "default": 4, "minimum": 1, "maximum": 26, "description": "Число кубитов"},
+                    "shots": {"type": "integer", "default": 1024, "minimum": 0, "description": "Выстрелов Борна"},
+                    "seed": {"type": "integer", "default": 42, "description": "Семя xoshiro256++"},
+                    "marks": {"type": "array", "items": {"type": "integer"}, "description": "Пометки Гровера/ДЙ"},
+                    "secret": {"type": "integer", "default": 11, "description": "Секрет Бернштейна–Вазирани"},
+                    "period": {"type": "integer", "description": "Период гребёнки (period)"},
+                    "offset": {"type": "integer", "default": 0, "description": "Смещение гребёнки"},
+                    "theta": {"type": "number", "default": 0.7, "description": "Препарат телепортации Ry(theta)|0>"},
+                    "exact": {"type": "boolean", "default": false, "description": "Точный режим телепортации"},
+                    "alpha": {"type": "string", "description": "Амплитуда |0> (выражение calc)"},
+                    "beta": {"type": "string", "description": "Амплитуда |1> (выражение calc)"},
+                    "check": {"type": "string", "enum": ["unitary", "equivalence", "teleport"], "description": "Проверка верификатора"},
+                    "algorithms": {"type": "array", "items": {"type": "string"}, "maxItems": 2, "description": "Пара схем для equivalence"},
+                    "up_to_global_phase": {"type": "boolean", "default": false, "description": "Эквивалентность до глобальной фазы"}
+                },
+                "required": ["action"]
             }
         }),
         json!({
@@ -4907,5 +5180,131 @@ mod psi_family_tests {
         // но 9-я и 10-я живы
         let e = json_of(&call(&srv, "poler_literary_eject", json!({"session": "all"})));
         assert_eq!(e["ejected"], json!(8));
+    }
+}
+
+#[cfg(test)]
+mod quantum_tool_tests {
+    use super::*;
+
+    fn server() -> McpServer {
+        McpServer::new(9222, 10, PathBuf::from("/nonexistent-poler-quantum-test.db"))
+    }
+
+    fn call(srv: &McpServer, arguments: Value) -> Value {
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "poler_quantum", "arguments": arguments}
+            }))
+            .expect("dispatch не падает");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .expect("text есть");
+        serde_json::from_str(text).expect("валидный JSON инструмента")
+    }
+
+    #[test]
+    fn manifest_declares_poler_quantum() {
+        let m = tools_manifest();
+        let t = m
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("poler_quantum"))
+            .expect("poler_quantum в манифесте");
+        let props = t.pointer("/inputSchema/properties").unwrap();
+        assert!(props.to_string().contains("up_to_global_phase"));
+        let required = t.pointer("/inputSchema/required").unwrap();
+        assert!(required.to_string().contains("action"));
+    }
+
+    #[test]
+    fn list_returns_catalog_with_teleport() {
+        let v = call(&server(), json!({"action": "list"}));
+        let algos: Vec<&str> = v["algorithms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["algorithm"].as_str())
+            .collect();
+        assert!(algos.contains(&"bell"));
+        assert!(algos.contains(&"teleport"));
+        assert!(algos.contains(&"period"));
+    }
+
+    #[test]
+    fn run_ghz_born_distribution() {
+        let v = call(&server(), json!({"action": "run", "algorithm": "ghz", "n": 4, "shots": 512}));
+        assert_eq!(v["algorithm"], "ghz");
+        assert_eq!(v["n_qubits"], 4);
+        // GHZ-4: ровно две ненулевые вероятности по 0.5
+        let probs = v["probabilities"].as_array().unwrap();
+        let nonzero: Vec<&Value> = probs.iter().filter(|p| p.as_f64().unwrap() > 1e-9).collect();
+        assert_eq!(nonzero.len(), 2, "GHZ: {probs:?}");
+        for p in nonzero {
+            assert!((p.as_f64().unwrap() - 0.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn teleport_exact_has_unit_fidelity() {
+        let v = call(&server(), json!({"action": "teleport", "exact": true}));
+        assert_eq!(v["exact"], true);
+        assert_eq!(v["fidelity"], 1.0);
+        assert_eq!(v["branch_deviation"], 0.0);
+        assert_eq!(v["gate_count"], 6);
+    }
+
+    #[test]
+    fn bloch_accepts_calc_expressions() {
+        let v = call(
+            &server(),
+            json!({"action": "bloch", "alpha": "1/sqrt(2)", "beta": "1/sqrt(2)"}),
+        );
+        assert!((v["bloch"]["x"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+        assert!(v["bloch"]["z"].as_f64().unwrap().abs() < 1e-12);
+    }
+
+    #[test]
+    fn verify_teleport_channel_proved_exact() {
+        let v = call(&server(), json!({"action": "verify", "check": "teleport"}));
+        assert_eq!(v["property"], "teleport_channel");
+        assert_eq!(v["verdict"], "proved_exact");
+        assert_eq!(v["max_deviation"], 0.0);
+    }
+
+    #[test]
+    fn verify_unitary_qft3_exact_and_qft4_numeric() {
+        let v = call(
+            &server(),
+            json!({"action": "verify", "check": "unitary", "algorithm": "qft", "n": 3}),
+        );
+        assert_eq!(v["verdict"], "proved_exact", "{v}");
+        let v = call(
+            &server(),
+            json!({"action": "verify", "check": "unitary", "algorithm": "qft", "n": 4}),
+        );
+        assert_eq!(v["method"], "numeric:f64");
+        assert_eq!(v["verdict"][0], "verified_numeric");
+    }
+
+    #[test]
+    fn verify_equivalence_refutes_qft_vs_iqft() {
+        // U_qft ≠ U_iqft (это взаимно обратные, не равные) — честное
+        // опровержение слоем фальсификации; композиция qft∘iqft = I доказана
+        // юнит-тестами крейта pqc.
+        let v = call(
+            &server(),
+            json!({"action": "verify", "check": "equivalence", "algorithms": ["qft", "iqft"], "n": 3}),
+        );
+        assert_eq!(v["verdict"][0], "refuted", "{v}");
+    }
+
+    #[test]
+    fn quantum_requires_action() {
+        let r = server().tool_quantum(&json!({}));
+        assert!(r.is_err());
+        let e = r.unwrap_err();
+        assert!(e.contains("action"), "{e}");
     }
 }

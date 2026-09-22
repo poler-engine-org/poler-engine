@@ -57,10 +57,16 @@ USAGE:
     pqc qc <file.qc> [opts]                                  v0.44: Quantum PC — идеальные кубиты
                                                               (QCASM-схемы; --exact — кольцо
                                                               Z[1/sqrt(2), i], бит-в-бит)
-    pqc algo <bell|ghz|qft|iqft|grover|bv|dj|period> [opts]  v0.44: алгоритмы на идеальных кубитах
+    pqc algo <bell|ghz|qft|iqft|grover|bv|dj|period|teleport> [opts]  v0.44: алгоритмы на идеальных кубитах
                                                               period: --period R [--offset O] —
                                                               поиск периода (ядро Шора,
                                                               теоретико-числовой субстрат УДЕ)
+                                                              teleport: --theta T [--exact] —
+                                                              когерентная телепортация с
+                                                              контролем фиделити (цикл P)
+    pqc verify <unitary|equiv|teleport> [opts]               цикл P: формальный верификатор —
+                                                              унитарность и эквивалентность схем
+                                                              точно в кольце Z[1/sqrt(2), i]
     pqc substrate [opts]                                     v0.44: субстрат УДЕ — P-поток Ауфбау,
                                                               γ-прецессия, SCF-режим
 
@@ -78,6 +84,15 @@ ALGO OPTIONS:
     --n <N>                   число кубитов (default 4)
     --marks <a,b,..>          помеченные состояния (grover/dj)
     --secret <S>              секрет BV (default 11 = 0b1011)
+    --theta <T>               препарат телепортации Ry(T)|0⟩ (default 0.7)
+
+VERIFY OPTIONS (цикл P):
+    unitary <algo> [--n N]    доказать U†U = I для схемы алгоритма
+    equiv <A> <B> [--n N]     доказать U_A = U_B [--phase — с точностью
+                              до глобальной фазы]
+    teleport                  доказать канал телепортации на базисе
+                              {|0⟩,|1⟩} (по линейности — ∀α,β)
+    --json                    машинно-читаемый отчёт
 
 SUBSTRATE OPTIONS (УДЕ §2.2, цикл G):
     --dim <N>                 размерность гильбертова пространства (default 4)
@@ -347,6 +362,7 @@ fn main() {
         Some("merge") => cmd_merge(&args[1..]),
         Some("qc") => cmd_qc(&args[1..]),
         Some("algo") => cmd_algo(&args[1..]),
+        Some("verify") => cmd_verify(&args[1..]),
         Some("substrate") => cmd_substrate(&args[1..]),
         Some("stab") => cmd_stab(&args[1..]),
         Some("noise") => cmd_noise(&args[1..]),
@@ -6250,7 +6266,7 @@ fn cmd_algo(args: &[String]) -> i32 {
     let name = match args.first() {
         Some(n) if !n.starts_with("--") => n.as_str(),
         _ => {
-            eprintln!("pqc algo: algorithm name required (bell|ghz|qft|iqft|grover|bv|dj)\n\n{USAGE}");
+            eprintln!("pqc algo: algorithm name required (bell|ghz|qft|iqft|grover|bv|dj|period|teleport)\n\n{USAGE}");
             return 2;
         }
     };
@@ -6318,27 +6334,25 @@ fn cmd_algo(args: &[String]) -> i32 {
         }
     };
 
+    // Цикл P: единый реестр схем (та же точка правды, что у shell-команды
+    // `quantum` и MCP-инструмента `poler_quantum`).
     use pqc::algorithms as alg;
-    let circuit_result = match name {
-        "bell" => alg::bell().map(|c| (c, 0usize)),
-        "ghz" => alg::ghz(n).map(|c| (c, 0usize)),
-        "qft" => alg::qft(n, false).map(|c| (c, 0usize)),
-        "iqft" => alg::qft(n, true).map(|c| (c, 0usize)),
-        "grover" => alg::grover(n, &marks),
-        "bv" => alg::bernstein_vazirani(n, secret).map(|c| (c, 0usize)),
-        "dj" => alg::deutsch_jozsa(n, &marks).map(|c| (c, 0usize)),
-        "period" => {
-            if period == 0 {
-                eprintln!("pqc algo period: --period R required (comb period, 1 ≤ R < 2^n)");
-                return 2;
-            }
-            alg::period_finding(n, period, offset).map(|c| (c, 0usize))
-        }
-        other => {
-            eprintln!("pqc algo: unknown algorithm `{other}` (bell|ghz|qft|iqft|grover|bv|dj|period)");
+    let theta: f64 = match arg_num(args, "--theta", 0.7f64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc algo: {e}");
             return 2;
         }
     };
+    let params = alg::AlgoParams {
+        n,
+        marks,
+        secret,
+        period,
+        offset,
+        theta,
+    };
+    let circuit_result = alg::build(name, &params);
     let (circuit, iterations) = match circuit_result {
         Ok(v) => v,
         Err(e) => {
@@ -6467,12 +6481,245 @@ fn cmd_algo(args: &[String]) -> i32 {
                     "  сертификация a^r ≡ 1 (mod N) — SMT: tools/verifiers/verify_number_theory_smt.py"
                 );
             }
+            if name == "teleport" {
+                // Цикл P: канал под контролем фиделити.
+                let want_exact = arg_flag(args, "--exact");
+                let tr = if want_exact {
+                    alg::run_teleport_exact()
+                } else {
+                    alg::run_teleport(theta)
+                };
+                match tr {
+                    Ok(t) => {
+                        println!("\nteleport report:");
+                        println!("  канал: 6 Клиффорд-вентилей, когерентные коррекции");
+                        if want_exact {
+                            println!("  режим: ТОЧНО — кольцо Z[1/sqrt(2), i], структурное равенство");
+                        }
+                        println!(
+                            "  препарат q0: (α={:+.6}, β={:+.6})  Ry({:.4})|0⟩",
+                            t.psi_in[0].0, t.psi_in[1].0, t.theta
+                        );
+                        println!(
+                            "  выход   q2: (α={:+.6}, β={:+.6})",
+                            t.psi_out[0].0, t.psi_out[1].0
+                        );
+                        println!(
+                            "  фиделити |⟨ψ_in|ψ_out⟩|² = {}",
+                            if t.exact { "1 (точно)".to_string() } else { format!("{:.15}", t.fidelity) }
+                        );
+                        println!(
+                            "  расхождение веток: {:.3e}{}",
+                            t.branch_deviation,
+                            if t.branch_deviation < 1e-12 { "  ✓ канал идеален" } else { "" }
+                        );
+                        println!(
+                            "  Блох in : (x={:+.4}, y={:+.4}, z={:+.4})",
+                            t.bloch_in[0], t.bloch_in[1], t.bloch_in[2]
+                        );
+                        println!(
+                            "  Блох out: (x={:+.4}, y={:+.4}, z={:+.4})",
+                            t.bloch_out[0], t.bloch_out[1], t.bloch_out[2]
+                        );
+                    }
+                    Err(e) => println!("  teleport report: {e}"),
+                }
+            }
             0
         }
         Err(e) => {
             eprintln!("pqc algo: {e}");
             1
         }
+    }
+}
+
+/// Позиционные аргументы `pqc verify` (значения флагов вроде `--n 3`
+/// пропускаются вместе с самим флагом).
+fn verify_positionals(args: &[String]) -> impl Iterator<Item = &String> {
+    let mut skip_next = false;
+    args.iter().filter(move |a| {
+        if skip_next {
+            skip_next = false;
+            return false;
+        }
+        if a.starts_with("--") {
+            skip_next = *a == "--n";
+            return false;
+        }
+        true
+    })
+}
+
+/// `pqc verify <unitary|equiv|teleport> [opts]` — цикл P: формальный
+/// верификатор квантовых схем.
+///
+/// Три слоя в духе SMT: структурный линт → фальсификация на случайных
+/// состояниях → полное доказательство (кольцо Z[1/sqrt(2), i] — точно;
+/// f64 — с допуском). Вердикты градуированы честно: ProvedExact /
+/// VerifiedNumeric / VerifiedSampling / Refuted.
+fn cmd_verify(args: &[String]) -> i32 {
+    let mode = match args.first() {
+        Some(m) if !m.starts_with("--") => m.as_str(),
+        _ => {
+            eprintln!(
+                "pqc verify: mode required (unitary <algo> | equiv <A> <B> | teleport)\n\n{USAGE}"
+            );
+            return 2;
+        }
+    };
+    let as_json = arg_flag(args, "--json");
+    let n: usize = match arg_num(args, "--n", 4usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc verify: {e}");
+            return 2;
+        }
+    };
+
+    use pqc::algorithms as alg;
+    use pqc::verify::{self as ver, Verdict};
+
+    let build_algo = |name: &str| -> Result<pqc::qpc::Circuit, String> {
+        let p = alg::AlgoParams {
+            n,
+            marks: vec![22 % (1usize << n.max(1))],
+            secret: 0b1011,
+            period: 0,
+            offset: 0,
+            theta: 0.7,
+        };
+        alg::build(name, &p).map(|(c, _)| c).map_err(|e| format!("{e:?}"))
+    };
+
+    let report = match mode {
+        "unitary" => {
+            // Второй позиционный аргумент (первый — сам режим).
+            let algo = verify_positionals(args).nth(1).cloned();
+            let algo = match algo {
+                Some(a) => a,
+                None => {
+                    eprintln!("pqc verify unitary: algorithm name required (bell|ghz|qft|…)");
+                    return 2;
+                }
+            };
+            let circuit = match build_algo(&algo) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("pqc verify: {e}");
+                    return 1;
+                }
+            };
+            ver::verify_unitary(&circuit).map_err(|e| format!("{e:?}"))
+        }
+        "equiv" => {
+            // Позиционные после режима: ровно два алгоритма.
+            let names: Vec<String> = verify_positionals(args).skip(1).cloned().collect();
+            if names.len() != 2 {
+                eprintln!("pqc verify equiv: два алгоритма обязательны: equiv <A> <B> [--n N] [--phase]");
+                return 2;
+            }
+            let (a, b) = match (build_algo(&names[0]), build_algo(&names[1])) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("pqc verify: {e}");
+                    return 1;
+                }
+            };
+            let up_to_phase = arg_flag(args, "--phase");
+            ver::verify_equivalence(&a, &b, up_to_phase).map_err(|e| format!("{e:?}"))
+        }
+        "teleport" => ver::verify_teleport_channel().map_err(|e| format!("{e:?}")),
+        other => {
+            eprintln!("pqc verify: неизвестный режим `{other}` (unitary|equiv|teleport)");
+            return 2;
+        }
+    };
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc verify: {e}");
+            return 1;
+        }
+    };
+
+    if as_json {
+        let verdict = match report.verdict {
+            Verdict::ProvedExact => pqc::Json::str("proved_exact"),
+            Verdict::VerifiedNumeric(tol) => pqc::Json::Arr(vec![
+                pqc::Json::str("verified_numeric"),
+                pqc::Json::num(tol),
+            ]),
+            Verdict::VerifiedSampling(tol) => pqc::Json::Arr(vec![
+                pqc::Json::str("verified_sampling"),
+                pqc::Json::num(tol),
+            ]),
+            Verdict::Refuted(d) => {
+                pqc::Json::Arr(vec![pqc::Json::str("refuted"), pqc::Json::num(d)])
+            }
+        };
+        let obj = pqc::Json::Obj(vec![
+            ("engine".into(), pqc::Json::str("pqc-verify")),
+            ("property".into(), pqc::Json::str(report.property)),
+            ("subject".into(), pqc::Json::str(&report.subject)),
+            ("n_qubits".into(), pqc::Json::num(report.n_qubits as f64)),
+            ("dim".into(), pqc::Json::num(report.dim as f64)),
+            ("gate_count".into(), pqc::Json::num(report.gate_count as f64)),
+            ("method".into(), pqc::Json::str(report.method)),
+            ("verdict".into(), verdict),
+            ("max_deviation".into(), pqc::Json::num(report.max_deviation)),
+            (
+                "checks".into(),
+                pqc::Json::Arr(
+                    report
+                        .checks
+                        .iter()
+                        .map(|(name, ok, dev)| {
+                            pqc::Json::Arr(vec![
+                                pqc::Json::str(*name),
+                                pqc::Json::num(if *ok { 1.0 } else { 0.0 }),
+                                pqc::Json::num(*dev),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "notes".into(),
+                pqc::Json::Arr(
+                    report
+                        .notes
+                        .iter()
+                        .map(|s| pqc::Json::str(s))
+                        .collect(),
+                ),
+            ),
+        ]);
+        println!("{}", obj.to_string());
+        return match report.verdict {
+            Verdict::Refuted(_) => 1,
+            _ => 0,
+        };
+    }
+
+    println!("POLER Quantum PC — формальная верификация (цикл P)");
+    println!("свойство: {}", report.property);
+    println!("субъект:  {}", report.subject);
+    println!(
+        "схема:    {} кубитов, {} унитарных операций, dim {}",
+        report.n_qubits, report.gate_count, report.dim
+    );
+    println!("метод:    {}", report.method);
+    println!("вердикт:  {}", report.verdict_line());
+    for (name, ok, dev) in &report.checks {
+        println!("  [{}] {:<24} невязка {:.3e}", if *ok { "✓" } else { "✗" }, name, dev);
+    }
+    for note in &report.notes {
+        println!("  · {note}");
+    }
+    match report.verdict {
+        Verdict::Refuted(_) => 1,
+        _ => 0,
     }
 }
 

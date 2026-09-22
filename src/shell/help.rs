@@ -31,6 +31,8 @@ pub enum HelpGroup {
     Meta,
     // v0.48.0
     Calc,
+    // v0.51.0 (цикл P)
+    Quantum,
 }
 
 impl HelpGroup {
@@ -50,6 +52,7 @@ impl HelpGroup {
             HelpGroup::Agent => "Середа агента (v0.47.0)",
             HelpGroup::Meta => "Мета",
             HelpGroup::Calc => "Калькулятор Всего (v0.48.0)",
+            HelpGroup::Quantum => "Квантовый мост (v0.51.0)",
         }
     }
 }
@@ -124,6 +127,12 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Calc, cmd: "calc constants|units|funcs|laws", short: "Каталоги: константы CODATA/IAU, единицы, функции, законы физики" },
         HelpEntry { group: HelpGroup::Calc, cmd: "calc script <law> [k=v]", short: "Сгенерировать скрипт/.poler-правило по закону физики (Kepler, Циолковский…)" },
         HelpEntry { group: HelpGroup::Calc, cmd: "hw [--json]", short: "Скрытые параметры ПК: кеши L1-L3, ISA-флаги, NUMA, GPU, топология" },
+        // v0.51.0 (цикл P): квантовый мост
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum run <algo> [--n K --shots M]", short: "Схемы на идеальных кубитах: bell ghz qft iqft grover bv dj period teleport" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum teleport [--theta T --exact]", short: "Телепортация q0 → q2: фиделити 1, когерентные коррекции (отложенное измерение)" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum bloch <alpha> [beta]", short: "Сфера Блоха с ASCII-диаграммой; амплитуды — выражения calc (1/sqrt(2), i…)" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum verify unitary|equiv|teleport", short: "Формальная верификация: U†U = I, эквивалентность схем — точно в ℤ[1/√2, i]" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum calc <физика>", short: "Мост в цикл O: schrodinger, pauli_x/y/z, kron, expm, eigen" },
 
         // v0.47.0: середа для ІІ-агентів (Antigravity)
         HelpEntry { group: HelpGroup::Agent, cmd: "sysinfo | systeminfo", short: "Карта середовища: CPU/RAM/GPU/диск/тулчейни/локаль/TTY — звіт для агента" },
@@ -211,7 +220,7 @@ pub fn help_topic(name: &str) -> String {
     let parent_cmds = [
         "search", "web", "stats", "sync", "set", "crawl", "impact",
         "gh", "gl", "gt", "gix", "notes", "sources", "version", "quit", "help",
-        "calc", "hw",
+        "calc", "hw", "quantum", "qm",
     ];
     if parent_cmds.contains(&name_lower.as_str()) {
         let matching: Vec<&HelpEntry> = entries
@@ -274,7 +283,54 @@ NUMA-узлы, bogomips, размеры страниц, диски (HDD/SSD), GP
             "Зонд железа: то, что не видно в htop"
         );
     }
+    // v0.51.0: развёрнутая тема квантового моста
+    if name_lower == "quantum" || name_lower == "qm" || name_lower == "квант" {
+        return quantum_help_topic();
+    }
     format!("тема не знайдена: {name} (введіть `help` для повного списку)")
+}
+
+/// v0.51.0 (цикл P): полная справка квантового моста.
+fn quantum_help_topic() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "─── Квантовый мост (v0.51.0, цикл P) ───");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "pqc встроен в шелл движка: идеальные кубиты без декогеренции.");
+    let _ = writeln!(s, "Три входа: poler> quantum … · алиас qm · --exec \"quantum …\" --json");
+    let _ = writeln!(s, "MCP-инструмент: poler_quantum (действия run/teleport/bloch/verify/list).");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Схемы (quantum run) ──");
+    let _ = writeln!(s, "  quantum run bell                       пара Белла (|00⟩+|11⟩)/√2");
+    let _ = writeln!(s, "  quantum run ghz --n 5 --shots 512      GHZ: только |00000⟩ и |11111⟩");
+    let _ = writeln!(s, "  quantum run qft --n 4                  преобразование Фурье");
+    let _ = writeln!(s, "  quantum run grover --n 6 --marks 22    поиск: пики на помеченных");
+    let _ = writeln!(s, "  quantum run bv --secret 0b1011         Бернштейн–Вазирани");
+    let _ = writeln!(s, "  quantum run period --n 6 --period 5    ядро Шора (поиск периода)");
+    let _ = writeln!(s, "  … --json                               отчёт для ИИ-агента");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Телепортация (цикл P) ──");
+    let _ = writeln!(s, "  quantum teleport --theta 0.7           препарат Ry(0.7)|0⟩, фиделити = 1");
+    let _ = writeln!(s, "  quantum teleport --exact               точно в ℤ[1/√2, i]: структурное равенство");
+    let _ = writeln!(s, "  канал: 6 Клиффорд-вентилей, когерентные коррекции — классический");
+    let _ = writeln!(s, "  канал связи не нужен (принцип отложенного измерения)");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Сфера Блоха ──");
+    let _ = writeln!(s, "  quantum bloch 1/sqrt(2) 1/sqrt(2)      |+⟩: x = +1, экватор");
+    let _ = writeln!(s, "  quantum state 0.6 0.8i                 P(|0⟩), P(|1⟩), фаза, вектор");
+    let _ = writeln!(s, "  амплитуды — любые выражения calc (константы, i, sqrt…)");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Формальная верификация (SMT-стиль) ──");
+    let _ = writeln!(s, "  quantum verify unitary qft --n 3        U†U = I — ДОКАЗАНО ТОЧНО");
+    let _ = writeln!(s, "  quantum verify equiv qft iqft --n 3    две схемы (до фазы: --phase)");
+    let _ = writeln!(s, "  quantum verify teleport                 канал на базисе {{|0⟩,|1⟩}}");
+    let _ = writeln!(s, "  вердикты: ДОКАЗАНО ТОЧНО (кольцо) / ЧИСЛЕННО / ВЕРОЯТНОСТНО /");
+    let _ = writeln!(s, "  ОПРОВЕРГНУТО (контрпример найден)");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Мост в физику цикла O ──");
+    let _ = writeln!(s, "  quantum calc schrodinger(pauli_y(), [1; 0], pi/2)   спин-флип");
+    let _ = writeln!(s, "  quantum calc eigen(tridiag(289, -144.5, 16))        квантовая яма");
+    let _ = writeln!(s, "  quantum calc exp(i * pi)                             = -1.0");
+    s
 }
 
 /// v0.48.0: полная справка «Калькулятора Всего» с примерами.

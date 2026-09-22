@@ -370,6 +370,322 @@ pub fn period_finding(n: usize, period: usize, offset: usize) -> Result<Circuit>
     Ok(c)
 }
 
+// ---------------------------------------------------------------------------
+// Цикл P: квантовая телепортация и реестр алгоритмов (CLI / shell / MCP)
+// ---------------------------------------------------------------------------
+
+/// Когерентная квантовая телепортация (Нильсен–Чанг §1.3.7 + принцип
+/// отложенного измерения §4.4).
+///
+/// Три кубита: q0 — состояние |ψ⟩ = α|0⟩ + β|1⟩, пара Белла q1–q2.
+/// Классический канал и коррекции по битам измерения заменены когерентными
+/// CNOT/CZ (измерение коммутирует с операциями на чужих кубитах), поэтому
+/// телепортация детерминирована: финальное состояние — |+⟩₀⊗|+⟩₁⊗|ψ⟩₂,
+/// кубит q2 несёт |ψ⟩ точно.
+///
+/// Все вентили — Клиффорд (H, CNOT, CZ): канал допускает машинное
+/// доказательство в кольце ℤ[1/√2, i] — см. [`crate::verify`].
+pub fn teleport() -> Result<Circuit> {
+    let mut c = Circuit::new(3)?;
+    // Пара Белла на (q1, q2).
+    c.gate(Gate::H { q: 1 })
+        .gate(Gate::Cx {
+            control: 1,
+            target: 2,
+        })
+        // Разрушающее взаимодействие: q0 ⊗ q1 → базис Белла.
+        .gate(Gate::Cx {
+            control: 0,
+            target: 1,
+        })
+        .gate(Gate::H { q: 0 })
+        // Когерентные коррекции (отложенное измерение):
+        // X^{m1} — CNOT(q1→q2), Z^{m0} — CZ(q0→q2).
+        .gate(Gate::Cx {
+            control: 1,
+            target: 2,
+        })
+        .gate(Gate::Cz {
+            control: 0,
+            target: 2,
+        });
+    Ok(c)
+}
+
+/// Телепортация с препаратом Ry(θ)|0⟩ = cos(θ/2)|0⟩ + sin(θ/2)|1⟩ на q0
+/// и терминальным измерением (для Born-статистики).
+pub fn teleport_prepared(theta: f64) -> Result<Circuit> {
+    let mut c = Circuit::new(3)?;
+    c.gate(Gate::Ry { q: 0, theta });
+    for op in teleport()?.ops() {
+        c.push(op.clone());
+    }
+    c.push(Op::MeasureAll);
+    Ok(c)
+}
+
+/// Отчёт о телепортации: канал q0 → q2 под контролем фиделити.
+#[derive(Clone, Debug)]
+pub struct TeleportReport {
+    /// Угол препарата Ry(θ)|0⟩ (для точного прогона — |+⟩, θ условно π/2).
+    pub theta: f64,
+    /// Входное состояние q0: амплитуды (re, im).
+    pub psi_in: [(f64, f64); 2],
+    /// Восстановленное состояние q2 (ветка q0=q1=0; все ветки совпадают).
+    pub psi_out: [(f64, f64); 2],
+    /// Фиделити |⟨ψ_in|ψ_out⟩|².
+    pub fidelity: f64,
+    /// Максимальное расхождение амплитуд по всем четырём веткам (q0, q1).
+    pub branch_deviation: f64,
+    /// Точный прогон в кольце ℤ[1/√2, i] (препарат — Клиффорд |+⟩).
+    pub exact: bool,
+    /// Вектор Блоха входа (x, y, z).
+    pub bloch_in: [f64; 3],
+    /// Вектор Блоха выхода (q2).
+    pub bloch_out: [f64; 3],
+    /// Число вентилей канала.
+    pub gate_count: usize,
+}
+
+/// Вектор Блоха состояния α|0⟩ + β|1⟩:
+/// x = 2Re(α*β), y = 2Im(α*β)... строго: x = 2Re(ᾱβ), y = 2Im(ᾱβ), z = |α|²−|β|².
+pub fn bloch_of(alpha: (f64, f64), beta: (f64, f64)) -> [f64; 3] {
+    let (ar, ai) = alpha;
+    let (br, bi) = beta;
+    // ᾱβ = (ar − i·ai)(br + i·bi)
+    let re = ar * br + ai * bi;
+    let im = ar * bi - ai * br;
+    let na = ar * ar + ai * ai;
+    let nb = br * br + bi * bi;
+    [2.0 * re, 2.0 * im, na - nb]
+}
+
+/// Фиделити двух чистых состояний |⟨a|b⟩|².
+fn fidelity_of(a: [(f64, f64); 2], b: [(f64, f64); 2]) -> f64 {
+    let dot = (a[0].0 * b[0].0 + a[0].1 * b[0].1)
+        + (a[1].0 * b[1].0 + a[1].1 * b[1].1);
+    dot * dot
+}
+
+/// Прогон телепортации с препаратом Ry(θ)|0⟩ (f64-симуляция).
+///
+/// Фиделити канала обязана быть 1 с точностью до округлений f64 —
+/// это и есть контроль отсутствия шума в кремнии.
+pub fn run_teleport(theta: f64) -> Result<TeleportReport> {
+    use crate::statevector::Statevector;
+    let psi_in = [(cos_half(theta), 0.0), (sin_half(theta), 0.0)];
+    let mut sv = Statevector::new(3)?;
+    sv.apply(Gate::Ry { q: 0, theta })?;
+    let core = teleport()?;
+    let gate_count = core.ops().len();
+    for op in core.ops() {
+        if let Op::Gate(g) = op {
+            sv.apply(*g)?;
+        }
+    }
+    Ok(teleport_report_from_raw(
+        theta,
+        psi_in,
+        sv.amplitudes(),
+        false,
+        gate_count,
+    ))
+}
+
+/// Точный прогон телепортации: препарат |+⟩ = H|0⟩, кольцо ℤ[1/√2, i].
+///
+/// Финальные амплитуды обязаны быть РОВНО √2/4 (структурное равенство
+/// элементов кольца, не f64-сравнение) — машинное доказательство канала.
+pub fn run_teleport_exact() -> Result<TeleportReport> {
+    let mut sv = crate::exact::ExactStatevector::new(3)?;
+    sv.apply(Gate::H { q: 0 })?;
+    let core = teleport()?;
+    let gate_count = core.ops().len();
+    for op in core.ops() {
+        if let Op::Gate(g) = op {
+            sv.apply(*g)?;
+        }
+    }
+    // Ожидание: |+⟩|+⟩|+⟩ — все восемь амплитуд √2/4 (вещественная):
+    // Re = √2/4 = b/2^k при b=1, k=2; Im = 0.
+    let expected = crate::exact::ExactCx {
+        a: 0,
+        b: 1,
+        c: 0,
+        d: 0,
+        k: 2,
+    };
+    let amps = sv.amplitudes();
+    for (i, a) in amps.iter().enumerate() {
+        if *a != expected {
+            return Err(PqcError::BadArgument {
+                what: format!(
+                    "точная телепортация нарушена: amps[{i}] = {a:?}, ожидалось √2/4"
+                ),
+            });
+        }
+    }
+    let psi_in = [(std::f64::consts::FRAC_1_SQRT_2, 0.0); 2];
+    let raw: Vec<crate::complex::Cx> = amps
+        .iter()
+        .map(|a| {
+            let (re, im) = a.to_f64();
+            crate::complex::Cx { re, im }
+        })
+        .collect();
+    let mut rep = teleport_report_from_raw(
+        std::f64::consts::FRAC_PI_2,
+        psi_in,
+        &raw,
+        true,
+        gate_count,
+    );
+    // Точный путь: равенство амплитуд уже доказано структурно —
+    // фиделити 1 и нулевая невязка по определению, не по f64.
+    rep.branch_deviation = 0.0;
+    rep.fidelity = 1.0;
+    Ok(rep)
+}
+
+fn cos_half(theta: f64) -> f64 {
+    (theta * 0.5).cos()
+}
+fn sin_half(theta: f64) -> f64 {
+    (theta * 0.5).sin()
+}
+
+/// Сборка отчёта из сырых амплитуд (f64-путь).
+fn teleport_report_from_raw(
+    theta: f64,
+    psi_in: [(f64, f64); 2],
+    raw: &[crate::complex::Cx],
+    exact: bool,
+    gate_count: usize,
+) -> TeleportReport {
+    let mut worst = 0.0f64;
+    let mut psi_out = [(0.0, 0.0); 2];
+    let mut first = true;
+    for m1 in 0..2usize {
+        for m0 in 0..2usize {
+            let x = m0 + 2 * m1;
+            let a0 = (raw[x].re, raw[x].im);
+            let a1 = (raw[x + 4].re, raw[x + 4].im);
+            let e0 = (psi_in[0].0 * 0.5, psi_in[0].1 * 0.5);
+            let e1 = (psi_in[1].0 * 0.5, psi_in[1].1 * 0.5);
+            let d0 = ((a0.0 - e0.0).powi(2) + (a0.1 - e0.1).powi(2)).sqrt();
+            let d1 = ((a1.0 - e1.0).powi(2) + (a1.1 - e1.1).powi(2)).sqrt();
+            worst = worst.max(d0).max(d1);
+            if first {
+                psi_out = [(a0.0 * 2.0, a0.1 * 2.0), (a1.0 * 2.0, a1.1 * 2.0)];
+                first = false;
+            }
+        }
+    }
+    TeleportReport {
+        theta,
+        psi_in,
+        psi_out,
+        fidelity: fidelity_of(psi_in, psi_out),
+        branch_deviation: worst,
+        exact,
+        bloch_in: bloch_of(psi_in[0], psi_in[1]),
+        bloch_out: bloch_of(psi_out[0], psi_out[1]),
+        gate_count,
+    }
+}
+
+/// Параметры реестра эталонных алгоритмов (цикл P: одна точка правды
+/// для CLI-бинаря `pqc`, shell-команды `quantum` и MCP `poler_quantum`).
+#[derive(Clone, Debug, Default)]
+pub struct AlgoParams {
+    /// Число кубитов (--n).
+    pub n: usize,
+    /// Пометки Гровера/Дойча–Йожи (--marks, запятые).
+    pub marks: Vec<usize>,
+    /// Секрет Бернштейна–Вазирани (--secret).
+    pub secret: u64,
+    /// Период гребёнки (--period).
+    pub period: usize,
+    /// Смещение гребёнки (--offset).
+    pub offset: usize,
+    /// Угол препарата телепортации (--theta).
+    pub theta: f64,
+}
+
+impl AlgoParams {
+    /// Разумные значения по умолчанию для демо-прогонов.
+    pub fn demo(n: usize) -> Self {
+        AlgoParams {
+            n,
+            marks: vec![22 % (1usize << n.max(1))],
+            secret: 0b1011,
+            period: 0,
+            offset: 0,
+            theta: 0.7,
+        }
+    }
+}
+
+/// Каталог эталонных алгоритмов: (имя, описание).
+pub fn catalog() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("bell", "пара Белла (|00⟩+|11⟩)/√2 — 2 кубита"),
+        ("ghz", "GHZ (|0…0⟩+|1…1⟩)/√2 — --n кубитов"),
+        ("qft", "квантовое преобразование Фурье — --n"),
+        ("iqft", "обратное QFT — --n"),
+        ("grover", "поиск Гровера — --n --marks 22"),
+        ("bv", "Бернштейн–Вазирани — --n --secret 11"),
+        ("dj", "Дойч–Йожа — --n --marks"),
+        ("period", "поиск периода (ядро Шора) — --n --period R"),
+        ("teleport", "квантовая телепортация — --theta rad"),
+    ]
+}
+
+/// Построить схему алгоритма по имени (общая точка входа CLI/shell/MCP).
+///
+/// Возвращает схему и число итераций (Гровер).
+pub fn build(name: &str, p: &AlgoParams) -> Result<(Circuit, usize)> {
+    let n = if p.n == 0 { 4 } else { p.n };
+    match name {
+        "bell" => bell().map(|c| (c, 0)),
+        "ghz" => ghz(n).map(|c| (c, 0)),
+        "qft" => qft(n, false).map(|c| (c, 0)),
+        "iqft" => qft(n, true).map(|c| (c, 0)),
+        "grover" => {
+            let marks = if p.marks.is_empty() {
+                vec![22 % (1usize << n)]
+            } else {
+                p.marks.clone()
+            };
+            grover(n, &marks)
+        }
+        "bv" => bernstein_vazirani(n, p.secret).map(|c| (c, 0)),
+        "dj" => {
+            let marks = if p.marks.is_empty() {
+                vec![22 % (1usize << n)]
+            } else {
+                p.marks.clone()
+            };
+            deutsch_jozsa(n, &marks).map(|c| (c, 0))
+        }
+        "period" => {
+            if p.period == 0 {
+                Err(PqcError::BadArgument {
+                    what: "period: задайте --period R (1 ≤ R < 2^n)".into(),
+                })
+            } else {
+                period_finding(n, p.period, p.offset).map(|c| (c, 0))
+            }
+        }
+        "teleport" => teleport_prepared(p.theta).map(|c| (c, 0)),
+        other => Err(PqcError::BadArgument {
+            what: format!(
+                "неизвестный алгоритм `{other}` (доступно: bell ghz qft iqft grover bv dj period teleport)"
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +898,118 @@ mod tests {
         assert!(period_finding(6, 64, 0).is_err());
         assert!(period_finding(6, 4, 4).is_err());
         assert!(period_finding(6, 4, 9).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Цикл P: телепортация
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn teleport_is_six_clifford_gates() {
+        let c = teleport().unwrap();
+        assert_eq!(c.n_qubits(), 3);
+        assert_eq!(c.ops().len(), 6);
+        // Все вентили — Клиффорд: точная верификация в кольце доступна.
+        for op in c.ops() {
+            match op {
+                Op::Gate(Gate::H { .. })
+                | Op::Gate(Gate::Cx { .. })
+                | Op::Gate(Gate::Cz { .. }) => {}
+                other => panic!("не-Клиффорд вентиль в канале: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn teleport_preserves_state_f64() {
+        // |0⟩, |1⟩, |+⟩, |−⟩ и общий Ry(0.7): фиделити обязана быть 1.
+        for theta in [0.0, core::f64::consts::PI, std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2, 0.7] {
+            let rep = run_teleport(theta).unwrap();
+            assert!(
+                (rep.fidelity - 1.0).abs() < 1e-12,
+                "theta={theta}: фиделити {} < 1",
+                rep.fidelity
+            );
+            assert!(
+                rep.branch_deviation < 1e-12,
+                "theta={theta}: расхождение веток {}",
+                rep.branch_deviation
+            );
+            // Вектор Блоха сохраняется каналом точно.
+            for i in 0..3 {
+                assert!(
+                    (rep.bloch_in[i] - rep.bloch_out[i]).abs() < 1e-12,
+                    "theta={theta}: Блох[{i}] in={} out={}",
+                    rep.bloch_in[i],
+                    rep.bloch_out[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn teleport_exact_in_ring() {
+        // Препарат |+⟩: все амплитуды — РОВНО √2/4 в ℤ[1/√2, i].
+        let rep = run_teleport_exact().unwrap();
+        assert!(rep.exact);
+        assert_eq!(rep.fidelity, 1.0);
+        assert_eq!(rep.branch_deviation, 0.0);
+        assert_eq!(rep.gate_count, 6);
+        // |+⟩: x = +1 на экваторе.
+        assert!((rep.bloch_out[0] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn teleport_prepared_runs_through_qpc() {
+        // Схема с MeasureAll совместима с общим раннером.
+        // Финал: |+⟩|+⟩|ψ⟩, ψ = Ry(0.7)|0⟩ ⟹ P = ¼·cos²(θ/2) или ¼·sin²(θ/2).
+        let theta = 0.7f64;
+        let c = teleport_prepared(theta).unwrap();
+        let rep = run(&c, 4096, 42).unwrap();
+        assert_eq!(rep.n_qubits, 3);
+        let p_lo = 0.25 * (theta * 0.5).cos().powi(2);
+        let p_hi = 0.25 * (theta * 0.5).sin().powi(2);
+        for (i, &p) in rep.probabilities.iter().enumerate() {
+            let expect = if (i >> 2) & 1 == 0 { p_lo } else { p_hi };
+            assert!(
+                (p - expect).abs() < 1e-9,
+                "P[{i}] = {p}, ожидалось {expect}"
+            );
+        }
+        // Маргинала q2: P(1) = sin²(θ/2) — состояние доставлено.
+        assert!((rep.marginals[2] - (theta * 0.5).sin().powi(2)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bloch_of_pure_states() {
+        // |0⟩: северный полюс.
+        assert_eq!(bloch_of((1.0, 0.0), (0.0, 0.0)), [0.0, 0.0, 1.0]);
+        // |1⟩: южный полюс.
+        assert_eq!(bloch_of((0.0, 0.0), (1.0, 0.0)), [0.0, 0.0, -1.0]);
+        // |+⟩: x = +1.
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let b = bloch_of((s, 0.0), (s, 0.0));
+        assert!((b[0] - 1.0).abs() < 1e-15 && b[2].abs() < 1e-15);
+        // |i+⟩ = (|0⟩ + i|1⟩)/√2: y = +1.
+        let b = bloch_of((s, 0.0), (0.0, s));
+        assert!((b[1] - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn registry_builds_all_algorithms() {
+        for (name, _) in catalog() {
+            let p = AlgoParams {
+                n: 4,
+                marks: vec![3],
+                secret: 11,
+                period: if *name == "period" { 5 } else { 0 },
+                offset: 0,
+                theta: 0.7,
+            };
+            let (c, _) = build(name, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(c.n_qubits() >= 2, "{name}: пустая схема");
+        }
+        // Неизвестное имя — честный отказ.
+        assert!(build("no-such-algo", &AlgoParams::demo(4)).is_err());
     }
 }

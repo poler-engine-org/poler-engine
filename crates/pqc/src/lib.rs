@@ -121,6 +121,7 @@ pub mod substrate;
 pub mod tls13;
 pub mod tlsprim;
 pub mod trite;
+pub mod verify;
 pub mod wikisrc;
 
 pub use ansatz::{

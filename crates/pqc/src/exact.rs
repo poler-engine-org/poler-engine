@@ -483,6 +483,49 @@ impl ExactStatevector {
                 }
                 Ok(())
             }
+            // Цикл P: CP(θ) точен в кольце ⟺ e^{iθ} ∈ ℤ[1/√2, i],
+            // т.е. θ = k·π/4 (mod 2π). Множитель — степень t = e^{iπ/4}
+            // (mul_t/mul_tdg уже живут в кольце). QFT-3 (CP(π/2), CP(π/4))
+            // становится доказуемо точным.
+            Gate::Cp {
+                control,
+                target,
+                theta,
+            } => {
+                self.check_q(control)?;
+                self.check_q(target)?;
+                if control == target {
+                    return Err(PqcError::SameQubit { control, target });
+                }
+                let quarter = core::f64::consts::FRAC_PI_4;
+                let tau = core::f64::consts::TAU;
+                // Кратчайшая дуга: k ∈ (−4…4], остаток сравнивается по mod 2π.
+                let mut k = (theta / quarter).round() as i64;
+                k = k.rem_euclid(8);
+                if k > 4 {
+                    k -= 8;
+                }
+                let residual = (theta - k as f64 * quarter).rem_euclid(tau);
+                let residual = residual.min(tau - residual);
+                if residual > 1e-9 {
+                    return Err(PqcError::NotExactGate {
+                        gate: format!("Cp({theta:.6})"),
+                    });
+                }
+                let steps = k.unsigned_abs() as u32;
+                let positive = k > 0;
+                let (bc, bt) = (1usize << control, 1usize << target);
+                for (i, v) in self.amps.iter_mut().enumerate() {
+                    if i & bc != 0 && i & bt != 0 && steps > 0 {
+                        let mut w = *v;
+                        for _ in 0..steps {
+                            w = if positive { w.mul_t()? } else { w.mul_tdg()? };
+                        }
+                        *v = w;
+                    }
+                }
+                Ok(())
+            }
             other => Err(PqcError::NotExactGate {
                 gate: format!("{other}"),
             }),

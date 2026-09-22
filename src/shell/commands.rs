@@ -169,6 +169,15 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         }
         // v0.48.0: зонд скрытых параметров ПК
         "hw" | "hardware" => cmd_hw(args),
+        // v0.51.0 (цикл P): квантовый мост — pqc прямо в шелле движка
+        "quantum" | "qm" => {
+            let raw = raw_args_of(line);
+            if raw.trim().is_empty() {
+                CmdResult::Done(quantum_usage())
+            } else {
+                cmd_quantum(state, &raw)
+            }
+        }
         other => {
             // v0.47.0: echo с Windows-переменными %NAME% → ${NAME}
             if other == "echo" && args.iter().any(|a| contains_win_var(a)) {
@@ -325,6 +334,557 @@ fn cmd_hw(args: &[String]) -> CmdResult {
         CmdResult::Done(out.trim_end().to_string())
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.51.0 (цикл P): квантовый мост — pqc прямо в шелле движка
+// ---------------------------------------------------------------------------
+
+/// Справка команды quantum.
+fn quantum_usage() -> String {
+    [
+        "quantum run <algo> [opts]   — схема на идеальных кубитах:",
+        "    bell ghz qft iqft grover bv dj period teleport",
+        "    opts: --n K --shots M --seed S --marks a,b --secret S --period R --theta T",
+        "quantum teleport [--theta T] [--exact] — телепортация q0 → q2 с фиделити",
+        "quantum bloch <alpha> [beta] — сфера Блоха (выражения calc: 1/sqrt(2), i/2…)",
+        "quantum state <alpha> <beta>  — состояние кубита: амплитуды, вероятности, Блох",
+        "quantum verify unitary <algo> [--n K] — формальное доказательство U†U = I",
+        "quantum verify equiv <A> <B> [--n K] [--phase] — эквивалентность схем",
+        "quantum verify teleport        — канал телепортации (точно, на базисе)",
+        "quantum calc <выражение>       — мост в Калькулятор Всего (schrodinger,",
+        "    pauli_x/y/z, kron, expm, eigen, ghz — физика цикла O)",
+        "quantum list                   — каталог алгоритмов",
+        "короткий псевдоним: qm run ghz --n 5 (q — занят под quit)",
+    ]
+    .join("\n")
+}
+
+/// Разбор общих флагов quantum (значение флага — следующий аргумент).
+fn q_flag_num<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Result<T, String> {
+    args.iter().position(|a| a == flag).map_or(Ok(default), |i| {
+        args.get(i + 1)
+            .and_then(|v| v.parse::<T>().ok())
+            .ok_or_else(|| format!("значение для {flag}"))
+    })
+}
+
+fn q_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+/// Позиционные аргументы (без флагов и их значений).
+fn q_positionals<'a>(args: &'a [String], valued: &[&str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with("--") {
+            if valued.contains(&a.as_str()) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(a.as_str());
+        i += 1;
+    }
+    out
+}
+
+const Q_FLAGS_VALUED: &[&str] = &[
+    "--n", "--shots", "--seed", "--marks", "--secret", "--period", "--offset", "--theta",
+];
+
+fn cmd_quantum(state: &mut ShellState, raw: &str) -> CmdResult {
+    use crate::quantum::core as pqc_core;
+
+    // симметричные кавычки вокруг всего хвоста
+    let raw = raw.trim();
+    let raw = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    let sub = parts.first().map(String::as_str).unwrap_or("");
+    let args = &parts[1..];
+    let as_json = q_flag(args, "--json");
+
+    match sub {
+        "help" | "usage" => CmdResult::Done(quantum_usage()),
+        "list" | "algos" | "catalog" => {
+            let mut out = String::from("Каталог эталонных алгоритмов POLER Quantum PC:");
+            for (name, desc) in pqc_core::algorithms::catalog() {
+                out.push_str(&format!("\n  {name:<10} {desc}"));
+            }
+            out.push_str("\n\nФизика цикла O (Шрёдингер, Паули, ⊗): quantum calc …");
+            CmdResult::Done(out)
+        }
+        "run" => cmd_quantum_run(args),
+        "teleport" => cmd_quantum_teleport(args),
+        "bloch" | "state" => cmd_quantum_bloch(state, args, sub == "state"),
+        "verify" => cmd_quantum_verify(args),
+        "calc" | "physics" => {
+            // мост в Калькулятор Всего: schrodinger(pauli_y(), [1;0], pi/2)…
+            let expr = parts[1..].join(" ");
+            if expr.trim().is_empty() {
+                CmdResult::Done(
+                    "quantum calc <выражение> — примеры:\n  quantum calc schrodinger(pauli_y(), [1; 0], pi/2)\n  quantum calc kron(pauli_x(), pauli_y())\n  quantum calc exp(i * pi)"
+                        .to_string(),
+                )
+            } else {
+                cmd_calc(state, &expr)
+            }
+        }
+        other => CmdResult::Done(format!(
+            "quantum: неизвестная подкоманда `{other}`\n\n{}",
+            quantum_usage()
+        )),
+    }
+}
+
+fn cmd_quantum_run(args: &[String]) -> CmdResult {
+    use crate::quantum::core as pqc_core;
+    let pos = q_positionals(args, Q_FLAGS_VALUED);
+    let name = match pos.first() {
+        Some(n) => *n,
+        None => {
+            return CmdResult::Done(format!(
+                "quantum run: имя алгоритма обязательно\n\n{}",
+                quantum_usage()
+            ))
+        }
+    };
+    let n: usize = match q_flag_num(args, "--n", 4usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let shots: u64 = match q_flag_num(args, "--shots", 1024u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let seed: u64 = match q_flag_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let theta: f64 = match q_flag_num(args, "--theta", 0.7f64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let secret: u64 = match q_flag_num(args, "--secret", 0b1011u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let period: usize = match q_flag_num(args, "--period", 0usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let offset: usize = match q_flag_num(args, "--offset", 0usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+    let marks: Vec<usize> = match q_flag_num(args, "--marks", String::new()) {
+        Ok(s) if s.is_empty() => Vec::new(),
+        Ok(s) => match s
+            .split(',')
+            .map(|t| t.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                return CmdResult::Done(format!("quantum run: --marks \"{s}\" — нужны числа через запятую"))
+            }
+        },
+        Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
+    };
+
+    let params = pqc_core::algorithms::AlgoParams {
+        n,
+        marks,
+        secret,
+        period,
+        offset,
+        theta,
+    };
+    let (circuit, iterations) = match pqc_core::algorithms::build(name, &params) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e:?}")),
+    };
+    let rep = match pqc_core::qpc::run(&circuit, shots, seed) {
+        Ok(r) => r,
+        Err(e) => return CmdResult::Done(format!("quantum run: {e:?}")),
+    };
+
+    if q_flag(args, "--json") {
+        let counts: Vec<serde_json::Value> = rep
+            .counts
+            .iter()
+            .map(|(o, c)| serde_json::json!([o, c]))
+            .collect();
+        let probs: Vec<f64> = rep.probabilities.clone();
+        return CmdResult::Done(
+            serde_json::json!({
+                "engine": "poler-quantum-shell",
+                "algorithm": name,
+                "n_qubits": rep.n_qubits,
+                "gate_count": rep.gate_count,
+                "iterations": iterations,
+                "shots": rep.shots,
+                "norm": rep.norm,
+                "entropy_bits": rep.entropy_bits,
+                "landauer_j": rep.landauer_j,
+                "probabilities": probs,
+                "marginals": rep.marginals,
+                "counts": counts,
+            })
+            .to_string(),
+        );
+    }
+
+    let mut out = format!("POLER Quantum PC — алгоритм {name}");
+    out.push_str(&format!(
+        "\nкубитов: {}, вентилей: {}, итераций: {}, выстрелов: {}",
+        rep.n_qubits, rep.gate_count, iterations, rep.shots
+    ));
+    out.push_str(&format!("\nэнтропия: {:.4} бит", rep.entropy_bits));
+    if !rep.counts.is_empty() {
+        out.push_str("\nтоп исходов:");
+        for (o, c) in rep.counts.iter().take(12) {
+            let mut bits = String::new();
+            for q in (0..rep.n_qubits).rev() {
+                bits.push(if o >> q & 1 == 1 { '1' } else { '0' });
+            }
+            out.push_str(&format!(
+                "\n  |{bits}⟩  {:>8}  p̂ = {:.4}",
+                c,
+                *c as f64 / rep.shots.max(1) as f64
+            ));
+        }
+    }
+    if q_flag(args, "--probs") {
+        out.push_str("\nраспределение Борна:");
+        for (i, p) in rep.probabilities.iter().enumerate() {
+            if *p > 1e-9 {
+                let mut bits = String::new();
+                for q in (0..rep.n_qubits).rev() {
+                    bits.push(if i >> q & 1 == 1 { '1' } else { '0' });
+                }
+                out.push_str(&format!("\n  |{bits}⟩  {p:.6}"));
+            }
+        }
+    }
+    CmdResult::Done(out)
+}
+
+fn cmd_quantum_teleport(args: &[String]) -> CmdResult {
+    use crate::quantum::core as pqc_core;
+    let theta: f64 = match q_flag_num(args, "--theta", 0.7f64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum teleport: {e}")),
+    };
+    let want_exact = q_flag(args, "--exact");
+    let t = match if want_exact {
+        pqc_core::algorithms::run_teleport_exact()
+    } else {
+        pqc_core::algorithms::run_teleport(theta)
+    } {
+        Ok(t) => t,
+        Err(e) => return CmdResult::Done(format!("quantum teleport: {e:?}")),
+    };
+    if q_flag(args, "--json") {
+        return CmdResult::Done(
+            serde_json::json!({
+                "engine": "poler-quantum-shell",
+                "algorithm": "teleport",
+                "mode": if t.exact { "exact:Z[1/sqrt(2),i]" } else { "numeric:f64" },
+                "theta": t.theta,
+                "psi_in": [t.psi_in[0].0, t.psi_in[0].1, t.psi_in[1].0, t.psi_in[1].1],
+                "psi_out": [t.psi_out[0].0, t.psi_out[0].1, t.psi_out[1].0, t.psi_out[1].1],
+                "fidelity": t.fidelity,
+                "branch_deviation": t.branch_deviation,
+                "exact": t.exact,
+                "bloch_in": t.bloch_in,
+                "bloch_out": t.bloch_out,
+                "gate_count": t.gate_count,
+            })
+            .to_string(),
+        );
+    }
+    let mut out = String::from("Квантовая телепортация: |ψ⟩ с q0 → q2 (цикл P)");
+    out.push_str("\nканал: 6 Клиффорд-вентилей, когерентные коррекции (отложенное измерение)");
+    if want_exact {
+        out.push_str("\nрежим: ТОЧНО — кольцо ℤ[1/√2, i], структурное равенство амплитуд");
+    }
+    out.push_str(&format!(
+        "\nпрепарат q0: (α={:+.6}, β={:+.6})  Ry({:.4})|0⟩",
+        t.psi_in[0].0, t.psi_in[1].0, t.theta
+    ));
+    out.push_str(&format!(
+        "\nвыход   q2: (α={:+.6}, β={:+.6})",
+        t.psi_out[0].0, t.psi_out[1].0
+    ));
+    out.push_str(&format!(
+        "\nфиделити |⟨ψ_in|ψ_out⟩|² = {}",
+        if t.exact {
+            "1 (точно)".to_string()
+        } else {
+            format!("{:.15}", t.fidelity)
+        }
+    ));
+    out.push_str(&format!(
+        "\nрасхождение веток: {:.3e}{}",
+        t.branch_deviation,
+        if t.branch_deviation < 1e-12 {
+            "  ✓ канал идеален"
+        } else {
+            ""
+        }
+    ));
+    out.push_str(&format!(
+        "\nБлох in : (x={:+.4}, y={:+.4}, z={:+.4})",
+        t.bloch_in[0], t.bloch_in[1], t.bloch_in[2]
+    ));
+    out.push_str(&format!(
+        "\nБлох out: (x={:+.4}, y={:+.4}, z={:+.4})",
+        t.bloch_out[0], t.bloch_out[1], t.bloch_out[2]
+    ));
+    CmdResult::Done(out)
+}
+
+fn cmd_quantum_bloch(state: &mut ShellState, args: &[String], full: bool) -> CmdResult {
+    let pos = q_positionals(args, &[]);
+    let (a_src, b_src) = match pos.len() {
+        0 => {
+            return CmdResult::Done(
+                "quantum bloch <alpha> [beta] — например: quantum bloch 1/sqrt(2) 1/sqrt(2)\nquantum bloch 1 i"
+                    .to_string(),
+            )
+        }
+        1 => (pos[0].to_string(), "0".to_string()),
+        _ => (pos[0].to_string(), pos[1].to_string()),
+    };
+    let alpha = match state.calc.eval_complex(&a_src) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum bloch: α — {e}")),
+    };
+    let beta = match state.calc.eval_complex(&b_src) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum bloch: β — {e}")),
+    };
+    // Нормализация: |α|² + |β|² обязана быть 1 (или нормируем с предупреждением).
+    let norm_sq = alpha.0 * alpha.0 + alpha.1 * alpha.1 + beta.0 * beta.0 + beta.1 * beta.1;
+    let (alpha, beta, warning) = if (norm_sq - 1.0).abs() > 1e-9 {
+        if norm_sq < 1e-30 {
+            return CmdResult::Done("quantum bloch: нулевое состояние".to_string());
+        }
+        let k = 1.0 / norm_sq.sqrt();
+        (
+            (alpha.0 * k, alpha.1 * k),
+            (beta.0 * k, beta.1 * k),
+            format!(
+                "\n⚠ нормализация: |ψ|² = {norm_sq:.6} ≠ 1 — амплитуды поделены на √|ψ|²"
+            ),
+        )
+    } else {
+        (alpha, beta, String::new())
+    };
+    let b = crate::quantum::core::algorithms::bloch_of(alpha, beta);
+    let p0 = alpha.0 * alpha.0 + alpha.1 * alpha.1;
+    let p1 = 1.0 - p0;
+    let phase = beta.1.atan2(beta.0);
+
+    let interp = if b[2] > 0.999 {
+        "северный полюс: |0⟩"
+    } else if b[2] < -0.999 {
+        "южный полюс: |1⟩"
+    } else if b[0] > 0.999 {
+        "экватор: |+⟩"
+    } else if b[0] < -0.999 {
+        "экватор: |−⟩"
+    } else if b[1] > 0.999 {
+        "экватор: |i+⟩"
+    } else if b[1] < -0.999 {
+        "экватор: |i−⟩"
+    } else {
+        "общее суперпозиционное состояние"
+    };
+
+    let mut out = format!(
+        "|ψ⟩ = ({:+.6}{:+.6}i)|0⟩ + ({:+.6}{:+.6}i)|1⟩",
+        alpha.0, alpha.1, beta.0, beta.1
+    );
+    if full {
+        out.push_str(&format!(
+            "\nP(|0⟩) = {:.6}   P(|1⟩) = {:.6}",
+            p0, p1
+        ));
+        if phase.abs() > 1e-12 {
+            out.push_str(&format!("\nотносительная фаза arg(β) = {:+.6} рад = {:+.3}°", phase, phase.to_degrees()));
+        }
+    }
+    out.push_str(&format!(
+        "\nсфера Блоха: x = {:+.6}, y = {:+.6}, z = {:+.6}   ({interp})",
+        b[0], b[1], b[2]
+    ));
+    // Мини-диаграмма меридиана (проекция на плоскость x–z).
+    let r = 9i32;
+    let px = (b[0] * r as f64).round() as i32;
+    let pz = (b[2] * r as f64).round() as i32;
+    let mut grid = String::from("\n        z\n        │\n");
+    for row in (0..=2 * r).rev() {
+        let z = row - r;
+        let mut line = if z == r {
+            String::from("      ┌─")
+        } else if z == -r {
+            String::from("      └─")
+        } else {
+            String::from("      │ ")
+        };
+        for col in -r..=r {
+            let x = col;
+            let on_circle = (x * x + z * z - r * r).abs() <= r / 3;
+            let is_point = x == px && z == pz;
+            let is_origin = x == 0 && z == 0;
+            line.push(if is_point {
+                '●'
+            } else if is_origin {
+                '┼'
+            } else if on_circle {
+                '·'
+            } else if z == 0 {
+                '─'
+            } else {
+                ' '
+            });
+        }
+        grid.push_str(&line);
+        grid.push('\n');
+    }
+    grid.push_str("       └─────── x\n        (проекция y отброшена)");
+    out.push_str(&grid);
+    out.push_str(&warning);
+    CmdResult::Done(out)
+}
+
+fn cmd_quantum_verify(args: &[String]) -> CmdResult {
+    use crate::quantum::core as pqc_core;
+    use pqc_core::verify::{Verdict, VerificationReport};
+    let pos = q_positionals(args, &["--n"]);
+    let mode = match pos.first() {
+        Some(m) => *m,
+        None => {
+            return CmdResult::Done(format!(
+                "quantum verify: режим обязателен (unitary|equiv|teleport)\n\n{}",
+                quantum_usage()
+            ))
+        }
+    };
+    let n: usize = match q_flag_num(args, "--n", 4usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum verify: {e}")),
+    };
+    let build_algo = |name: &str| -> Result<pqc_core::qpc::Circuit, String> {
+        let p = pqc_core::algorithms::AlgoParams {
+            n,
+            marks: vec![22 % (1usize << n.max(1))],
+            secret: 0b1011,
+            period: 0,
+            offset: 0,
+            theta: 0.7,
+        };
+        pqc_core::algorithms::build(name, &p)
+            .map(|(c, _)| c)
+            .map_err(|e| format!("{e:?}"))
+    };
+    let report: Result<VerificationReport, String> = match mode {
+        "unitary" => match pos.get(1) {
+            Some(algo) => build_algo(algo)
+                .map_err(String::from)
+                .and_then(|c| pqc_core::verify::verify_unitary(&c).map_err(|e| format!("{e:?}"))),
+            None => {
+                return CmdResult::Done(
+                    "quantum verify unitary <algo> [--n K] — имя алгоритма обязательно".to_string(),
+                )
+            }
+        },
+        "equiv" => {
+            let names: Vec<&str> = pos[1..].to_vec();
+            if names.len() != 2 {
+                return CmdResult::Done(
+                    "quantum verify equiv <A> <B> [--n K] [--phase] — ровно два алгоритма"
+                        .to_string(),
+                );
+            }
+            match (build_algo(names[0]), build_algo(names[1])) {
+                (Ok(a), Ok(b)) => {
+                    let up_to_phase = q_flag(args, "--phase");
+                    pqc_core::verify::verify_equivalence(&a, &b, up_to_phase)
+                        .map_err(|e| format!("{e:?}"))
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        "teleport" => pqc_core::verify::verify_teleport_channel().map_err(|e| format!("{e:?}")),
+        other => {
+            return CmdResult::Done(format!(
+                "quantum verify: неизвестный режим `{other}` (unitary|equiv|teleport)"
+            ))
+        }
+    };
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => return CmdResult::Done(format!("quantum verify: {e}")),
+    };
+
+    if q_flag(args, "--json") {
+        let verdict = match report.verdict {
+            Verdict::ProvedExact => serde_json::json!("proved_exact"),
+            Verdict::VerifiedNumeric(tol) => serde_json::json!(["verified_numeric", tol]),
+            Verdict::VerifiedSampling(tol) => serde_json::json!(["verified_sampling", tol]),
+            Verdict::Refuted(d) => serde_json::json!(["refuted", d]),
+        };
+        return CmdResult::Done(
+            serde_json::json!({
+                "engine": "poler-quantum-shell",
+                "property": report.property,
+                "subject": report.subject,
+                "n_qubits": report.n_qubits,
+                "dim": report.dim,
+                "gate_count": report.gate_count,
+                "method": report.method,
+                "verdict": verdict,
+                "max_deviation": report.max_deviation,
+                "checks": report.checks.iter().map(|(n, ok, d)| serde_json::json!([n, ok, d])).collect::<Vec<_>>(),
+                "notes": report.notes,
+            })
+            .to_string(),
+        );
+    }
+
+    let mut out = String::from("Формальная верификация (цикл P):");
+    out.push_str(&format!("\nсвойство: {}", report.property));
+    out.push_str(&format!("\nсубъект:  {}", report.subject));
+    out.push_str(&format!(
+        "\nсхема:    {} кубитов, {} унитарных операций, dim {}",
+        report.n_qubits, report.gate_count, report.dim
+    ));
+    out.push_str(&format!("\nметод:    {}", report.method));
+    out.push_str(&format!("\nвердикт:  {}", report.verdict_line()));
+    for (name, ok, dev) in &report.checks {
+        out.push_str(&format!(
+            "\n  [{}] {:<24} невязка {:.3e}",
+            if *ok { "✓" } else { "✗" },
+            name,
+            dev
+        ));
+    }
+    for note in &report.notes {
+        out.push_str(&format!("\n  · {note}"));
+    }
+    CmdResult::Done(out)
+}
+
 
 // ---------------------------------------------------------------------------
 // v0.46.0: Системный шелл, passthrough и запуск .poler-контейнеров
@@ -2383,6 +2943,130 @@ mod tests {
         assert_eq!(calc_out("calc 5!"), "120.0");
         assert_eq!(calc_out("calc sin(pi/2)"), "1.0");
         assert!(calc_out("calc 5 km to mi").starts_with("3.106"));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.51.0 (цикл P): квантовый мост
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cmd_quantum_usage_and_list() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q1.db"));
+        match dispatch(&mut s, "quantum") {
+            CmdResult::Done(out) => assert!(out.contains("quantum run"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "qm list") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("bell"), "{out}");
+                assert!(out.contains("teleport"), "{out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_quantum_run_ghz() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q2.db"));
+        match dispatch(&mut s, "quantum run ghz --n 4 --shots 256") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("GHZ") || out.contains("ghz"), "{out}");
+                assert!(out.contains("кубитов: 4"), "{out}");
+                // GHZ-4: только |0000⟩ и |1111⟩
+                assert!(out.contains("0000") && out.contains("1111"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // JSON-режим для агентов
+        match dispatch(&mut s, "quantum run bell --json") {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).expect("валидный JSON");
+                assert_eq!(v["algorithm"], "bell");
+                assert_eq!(v["n_qubits"], 2);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_quantum_teleport_fidelity() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q3.db"));
+        match dispatch(&mut s, "quantum teleport --theta 0.7") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("фиделити"), "{out}");
+                assert!(out.contains("1.000000000000000"), "{out}");
+                assert!(out.contains("канал идеален"), "{out}");
+            }
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "quantum teleport --exact --json") {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).expect("валидный JSON");
+                assert_eq!(v["fidelity"], 1.0);
+                assert_eq!(v["exact"], true);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_quantum_bloch_states() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q4.db"));
+        match dispatch(&mut s, "quantum bloch 1/sqrt(2) 1/sqrt(2)") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("x = +1.000000"), "{out}");
+                assert!(out.contains("|+⟩"), "{out}");
+            }
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "quantum state 0.6 0.8i") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("P(|0⟩) = 0.360000"), "{out}");
+                assert!(out.contains("y = +0.960000"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // |0⟩: северный полюс
+        match dispatch(&mut s, "quantum bloch 1") {
+            CmdResult::Done(out) => assert!(out.contains("z = +1.000000"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_quantum_verify_exact() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q5.db"));
+        match dispatch(&mut s, "quantum verify teleport") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("ДОКАЗАНО ТОЧНО"), "{out}");
+                assert!(out.contains("teleport_channel"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // QFT-3: CP(π/2), CP(π/4) — точно в кольце
+        match dispatch(&mut s, "quantum verify unitary qft --n 3") {
+            CmdResult::Done(out) => assert!(out.contains("ДОКАЗАНО ТОЧНО"), "{out}"),
+            _ => panic!(),
+        }
+        // опровержение фиксируется честно
+        match dispatch(&mut s, "quantum verify equiv qft iqft --n 3") {
+            CmdResult::Done(out) => assert!(out.contains("ОПРОВЕРГНУТО"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_quantum_calc_bridge() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q6.db"));
+        // мост в физику цикла O
+        match dispatch(&mut s, "quantum calc exp(i * pi)") {
+            CmdResult::Done(out) => assert!(out.starts_with("-1.0"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "quantum calc schrodinger(pauli_y(), [1; 0], pi/2)") {
+            CmdResult::Done(out) => assert!(out.contains("0") && out.contains("1"), "{out}"),
+            _ => panic!(),
+        }
     }
 
     #[test]

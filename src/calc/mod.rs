@@ -353,6 +353,34 @@ impl CalcState {
         }
     }
 
+    /// Вычислить выражение и вернуть комплексное число (re, im).
+    ///
+    /// Цикл P: парсинг амплитуд для сферы Блоха (`quantum bloch 1/sqrt(2) …`)
+    /// — скаляр трактуется как вещественное, комплексное проходит как есть.
+    pub fn eval_complex(&mut self, src: &str) -> Result<(f64, f64), String> {
+        let expr = parser::parse(src.trim(), false)?;
+        let val = parser::eval(&expr, &mut self.vars)?;
+        match val {
+            Value::Scalar(x) => Ok((x, 0.0)),
+            Value::Complex(c) => Ok((c.re, c.im)),
+            Value::Quantity(v, u) => {
+                if u.is_dimensionless() {
+                    Ok((v * u.factor, 0.0))
+                } else {
+                    Err(format!(
+                        "амплитуда не может иметь единицу: {} {}",
+                        v,
+                        u.display()
+                    ))
+                }
+            }
+            other => Err(format!(
+                "ожидалось число или комплексное, получено: {}",
+                other.type_name()
+            )),
+        }
+    }
+
     /// Безопасный предпросмотр для TUI (не мутирует состояние, не паникует).
     pub fn preview(&self, src: &str) -> String {
         let src = src.trim();

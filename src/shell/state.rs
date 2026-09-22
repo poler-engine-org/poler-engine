@@ -108,6 +108,8 @@ impl ShellState {
                 "read", "reader",
                 // v0.48.0: Калькулятор Всего
                 "calc", "hw",
+                // v0.51.0 (цикл P): квантовый мост
+                "quantum", "qm",
             ]
         })
     }
