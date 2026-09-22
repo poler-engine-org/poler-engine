@@ -428,6 +428,23 @@ libp3ffi.so: путь, тег ядра Zig 0.14.0, ABI-рукопожатие), 
 WxH --jz --hx --cloud --out). Библиотека коммитится в ffi/ (пересборка
 ffi/build.sh), поиск через P3_FFI_LIB. Отчёт: docs/P3_CONFORMANCE_REPORT_v0.53.0.md.
 
+**v0.54.0 (цикл S) Ядро Игры — шелл-команда `game`:** фундамент игрового
+движка по итогам разбора UE/Unity/Godot (см.
+docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md). `game info` (статус ядра:
+демо-сцена, физика, state-hash), `game demo [opts]` (демо-сцена
+«Этерия» из лора: 11 тел, иерархия глубины 3, кеплеровские орбиты
+ω=√(G·M)/r^1.5 → P³-рендер → 3 PNG; opts: --ticks --size --out
+--no-orbits --no-box --json), `game scene <json>` (своя сцена: тела
+id/class/mass/radius, иерархия parent, orbit_radius/inclination,
+камера dist/yaw/pitch, именованные цвета), `game write-demo <json>`
+(выгрузить демо-сцену как редактируемый JSON). Архитектура:
+Entity(index, generation) без GC, плотные компонентные хранилища,
+fixed-timestep аккумулятор (dt=1/60, cap на спираль смерти), фазы
+Orbit→Transform→Hash, state-hash FNV-1a по битам позиций — детерминизм
+бит-в-бит (replay/lockstep без дублирования логики). 2.7 млн тиков/с
+(0.37 мкс/тик = 2% бюджета 60 Гц кадра), бенчмарк
+docs/benchmarks/GAME_CORE_v0.54.0.md.
+
 **C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/
 eject коннектома в RAM), `poler_fly_node` (паспорт), `poler_fly_edge`
 (ребро + ротор J), `poler_fly_khop` (BFS фронтов), `poler_fly_path`

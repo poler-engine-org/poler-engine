@@ -45,6 +45,7 @@ only, нативный инференс через собственное ядр
 | Документ | Тема |
 |---|---|
 | [POLER_REVERSE_META_COMPILER.md](POLER_REVERSE_META_COMPILER.md) | Англоязычная техспецификация meta_compiler (параллельная сессия): Reverse/Meta-стадии, dual execution targets, 31 400 проходов/сек — дополнение к [quantum-eri.md](quantum-eri.md) |
+| [GAME_ENGINE_ROADMAP_UE_ANALYSIS.md](GAME_ENGINE_ROADMAP_UE_ANALYSIS.md) | **UE-анализ и архитектура игрового ядра (цикл S):** 10 болей UE/Unity/Godot, 8 паттернов UE что берём, Rust-ответы, роадмап G-циклов до сети, файлы UE для изучения в форке владельца |
 | [MONOREPO_CONSOLIDATION_PLAN.md](MONOREPO_CONSOLIDATION_PLAN.md) | Англоязычный мастер-план монорепо (параллельная сессия): дерево crates/ — дополнение к [MERGE_PLAN.md](MERGE_PLAN.md) (фазы M0–M5 и исторический контекст — там) |
 | [COGNITIVE_ARCHITECTURE_299_SOURCES_SYNTHESIS.md](COGNITIVE_ARCHITECTURE_299_SOURCES_SYNTHESIS.md) | Синтез теоретических столпов из 299 источников (FEP, резонанс фаз) — дополнение к [THEORY.md](THEORY.md) §1–2 и [HISTORY.md](HISTORY.md) (карта тем архива — там) |
 | [ENCYCLOPEDIA_299_SOURCES.md](ENCYCLOPEDIA_299_SOURCES.md) | **Полная энциклопедия и реестр всех 299 первоисточников** (215 КБ): сквозной каталог с #001 по #299 с описанием тем, математики и привязки к коду |

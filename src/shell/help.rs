@@ -35,6 +35,8 @@ pub enum HelpGroup {
     Quantum,
     // v0.53.0 (цикл R)
     P3,
+    // v0.54.0 (цикл S)
+    Game,
 }
 
 impl HelpGroup {
@@ -56,6 +58,7 @@ impl HelpGroup {
             HelpGroup::Calc => "Калькулятор Всего (v0.48.0)",
             HelpGroup::Quantum => "Квантовый мост (v0.51.0)",
             HelpGroup::P3 => "P³-Мост Rust↔Zig (v0.53.0)",
+            HelpGroup::Game => "Ядро Игры (v0.54.0)",
         }
     }
 }
@@ -143,6 +146,10 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::P3, cmd: "p3 info", short: "Библиотека P³: путь, тег ядра Zig, ABI-рукопожатие" },
         HelpEntry { group: HelpGroup::P3, cmd: "p3 conformance [--pairs N --json]", short: "Конформанс Rust ↔ Zig: d_FS, U†U=I, det, идемпотенты P²=P" },
         HelpEntry { group: HelpGroup::P3, cmd: "p3 frame [opts]", short: "Кадр из гамильтониана: Изинг → expm → P³ рендер → 3 PNG (rgb/depth/seg)" },
+        HelpEntry { group: HelpGroup::Game, cmd: "game info", short: "Статус ядра: демо-сцена, физика, детерминизм" },
+        HelpEntry { group: HelpGroup::Game, cmd: "game demo [opts]", short: "Демо-сцена «Этерия»: тики → P³ рендер → 3 PNG" },
+        HelpEntry { group: HelpGroup::Game, cmd: "game scene <json> [opts]", short: "Своя сцена: тела, иерархия, орбиты, камера" },
+        HelpEntry { group: HelpGroup::Game, cmd: "game write-demo <json>", short: "Выгрузить демо-сцену как редактируемый JSON" },
 
         // v0.47.0: середа для ІІ-агентів (Antigravity)
         HelpEntry { group: HelpGroup::Agent, cmd: "sysinfo | systeminfo", short: "Карта середовища: CPU/RAM/GPU/диск/тулчейни/локаль/TTY — звіт для агента" },
@@ -230,7 +237,7 @@ pub fn help_topic(name: &str) -> String {
     let parent_cmds = [
         "search", "web", "stats", "sync", "set", "crawl", "impact",
         "gh", "gl", "gt", "gix", "notes", "sources", "version", "quit", "help",
-        "calc", "hw", "quantum", "qm", "p3",
+        "calc", "hw", "quantum", "qm", "p3", "game",
     ];
     if parent_cmds.contains(&name_lower.as_str()) {
         let matching: Vec<&HelpEntry> = entries
@@ -300,6 +307,10 @@ NUMA-узлы, bogomips, размеры страниц, диски (HDD/SSD), GP
     // v0.53.0: развёрнутая тема P³-Моста
     if name_lower == "p3" || name_lower == "мост" || name_lower == "проектив" {
         return p3_help_topic();
+    }
+    // v0.54.0: развёрнутая тема Ядра Игры
+    if name_lower == "game" || name_lower == "игра" || name_lower == "движок" {
+        return game_help_topic();
     }
     format!("тема не знайдена: {name} (введіть `help` для повного списку)")
 }
@@ -709,4 +720,37 @@ mod tests {
         let s = help_topic("nlm");
         assert!(s.contains("не знайдена"), "v2.0: темы nlm больше нет: {s}");
     }
+}
+
+/// v0.54.0 (цикл S): полная справка Ядра Игры.
+fn game_help_topic() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.54.0) ───");
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "Фундамент игрового движка, построенный на разборе недостатков\nUE/Unity/Godot (docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md): сущности\nс поколениями вместо GC/UObject, фиксированный тик вместо плавающего\nвремени, кеплеровская физика вместо подобранных скоростей, рендер\nчерез P³-мост с честной глубиной d_FS."
+    );
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Команды:");
+    let _ = writeln!(s, "  game info                  — статус ядра: демо-сцена, физика, state-hash");
+    let _ = writeln!(s, "  game demo [opts]           — прогнать «Этерию» и отрендерить кадр:");
+    let _ = writeln!(s, "    opts: --ticks N(1..100000) --size WxH --out DIR --no-orbits");
+    let _ = writeln!(s, "    --no-box --json");
+    let _ = writeln!(s, "  game scene <file.json>     — своя сцена (JSON; формат — write-demo):");
+    let _ = writeln!(s, "    тела (id/class/mass/radius), иерархия parent, орбиты");
+    let _ = writeln!(s, "    (orbit_radius/inclination → ω=√(GM)/r^1.5), камера, цвета");
+    let _ = writeln!(s, "  game write-demo <file>     — выгрузить демо-сцену как редактируемый JSON");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Честность ядра:");
+    let _ = writeln!(s, "  детерминизм: state-hash после тиков бит-в-бит воспроизводим");
+    let _ = writeln!(s, "  (одинаковая история → одинаковый мир: replay и lockstep бесплатны);");
+    let _ = writeln!(s, "  физика: угловые скорости выводятся из масс (третий закон Кеплера);");
+    let _ = writeln!(s, "  рендер: тройной буфер RGB + depth (d_FS) + seg (ID объектов).");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Примеры:");
+    let _ = writeln!(s, "  poler> game demo --ticks 900 --size 960x540 --out ./demo");
+    let _ = writeln!(s, "  poler> game write-demo my.json && game scene my.json --ticks 60");
+    let _ = writeln!(s, "  poler-engine --exec \"game demo --json\" --json");
+    s
 }

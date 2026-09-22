@@ -187,6 +187,15 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
                 cmd_p3(&raw)
             }
         }
+        // v0.54.0 (цикл S): Ядро Игры — сущности, тики, сцены, рендер
+        "game" => {
+            let raw = raw_args_of(line);
+            if raw.trim().is_empty() {
+                CmdResult::Done(game_usage())
+            } else {
+                cmd_game(&raw)
+            }
+        }
         other => {
             // v0.47.0: echo с Windows-переменными %NAME% → ${NAME}
             if other == "echo" && args.iter().any(|a| contains_win_var(a)) {
@@ -546,6 +555,235 @@ fn cmd_p3_frame(args: &[String]) -> CmdResult {
         )),
         Err(e) => CmdResult::Done(format!("p3 frame: {e}")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.54.0 (цикл S): Ядро Игры — game info / demo / scene / write-demo
+// ---------------------------------------------------------------------------
+
+fn game_usage() -> String {
+    [
+        "game info                     — статус ядра: демо-сцена, счётчики, честность",
+        "game demo [opts]              — прогнать демо-сцену «Этерия» и отрендерить кадр:",
+        "    World → тики (fixed dt 1/60, кеплеровские ω) → P³ рендер → 3 PNG",
+        "    opts: --ticks N(1..100000) --size WxH --out DIR --no-orbits --no-box --json",
+        "game scene <file.json> [opts] — своя сцена (формат см. game write-demo):",
+        "    тела/иерархия/орбиты/камера; те же opts",
+        "game write-demo <file.json>   — выгрузить демо-сцену как редактируемый JSON",
+        "честность: детерминизм бит-в-бит (state-hash), ω=√(GM)/r^1.5, глубина=d_FS",
+    ]
+    .join("\n")
+}
+
+/// Разбор --size WxH (общий с p3 frame).
+fn game_parse_size(args: &[String]) -> Option<Result<(u32, u32), String>> {
+    let i = args.iter().position(|a| a == "--size")?;
+    let val = match args.get(i + 1) {
+        Some(v) => v.clone(),
+        None => return Some(Err("game: --size WxH (например 960x540)".into())),
+    };
+    let Some((w, h)) = val.split_once('x') else {
+        return Some(Err("game: --size WxH (например 960x540)".into()));
+    };
+    let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) else {
+        return Some(Err("game: --size WxH — целые числа".into()));
+    };
+    if !(64..=4096).contains(&w) || !(64..=4096).contains(&h) {
+        return Some(Err("game: --size 64..=4096 по каждой стороне".into()));
+    }
+    Some(Ok((w, h)))
+}
+
+/// Общие опции game-рендера.
+struct GameOpts {
+    ticks: u32,
+    width: u32,
+    height: u32,
+    out_dir: std::path::PathBuf,
+    orbits: bool,
+    render_box: bool,
+    as_json: bool,
+}
+
+fn game_parse_opts(args: &[String]) -> Result<GameOpts, String> {
+    let mut o = GameOpts {
+        ticks: 600,
+        width: 960,
+        height: 540,
+        out_dir: std::path::PathBuf::from("."),
+        orbits: true,
+        render_box: true,
+        as_json: false,
+    };
+    if let Ok(t) = q_flag_num(args, "--ticks", o.ticks) {
+        if !(1..=100_000).contains(&t) {
+            return Err("game: --ticks 1..=100000".into());
+        }
+        o.ticks = t;
+    }
+    if let Some(r) = game_parse_size(args) {
+        let (w, h) = r?;
+        o.width = w;
+        o.height = h;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out") {
+        match args.get(i + 1) {
+            Some(v) => o.out_dir = std::path::PathBuf::from(v.clone()),
+            None => return Err("game: --out DIR".into()),
+        }
+    }
+    o.orbits &= !q_flag(args, "--no-orbits");
+    o.render_box &= !q_flag(args, "--no-box");
+    o.as_json = q_flag(args, "--json");
+    Ok(o)
+}
+
+/// Прогнать мир N тиков и отрендерить кадр.
+fn game_run_and_render(
+    scene: &crate::game::SceneFile,
+    opts: &GameOpts,
+) -> CmdResult {
+    let mut world = match scene.build_world() {
+        Ok(w) => w,
+        Err(e) => return CmdResult::Done(format!("game: сцена `{}`: {e}", scene.name)),
+    };
+    let t0 = std::time::Instant::now();
+    for _ in 0..opts.ticks {
+        world.tick(crate::game::FIXED_DT);
+    }
+    let sim_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let state_hash = world.state_hash();
+
+    let cfg = crate::game::FrameConfig {
+        width: opts.width,
+        height: opts.height,
+        camera: scene.camera,
+        render_orbits: opts.orbits,
+        render_box: opts.render_box,
+        scene_name: scene.name.clone(),
+        out_dir: opts.out_dir.clone(),
+    };
+    match crate::game::render_frame(&world, &cfg) {
+        Ok(out) => {
+            if opts.as_json {
+                CmdResult::Done(format!(
+                    "{{\n  \"scene\": {},\n  \"bodies\": {},\n  \"ticks\": {},\n  \"state_hash\": \"0x{:016X}\",\n  \"sim_ms\": {:.3},\n  \"render\": {{\"points\": {}, \"edges\": {}, \"painted_px\": {}, \"max_fs_depth\": {:.4}, \"ms\": {:.1}}},\n  \"rgb_png\": {},\n  \"depth_png\": {},\n  \"seg_png\": {}\n}}",
+                    json_str(&scene.name),
+                    world.len(),
+                    world.tick,
+                    state_hash,
+                    sim_ms,
+                    out.n_points,
+                    out.n_edges,
+                    out.painted_px,
+                    out.max_fs_depth,
+                    out.elapsed_ms,
+                    json_str(&out.rgb_png.display().to_string()),
+                    json_str(&out.depth_png.display().to_string()),
+                    json_str(&out.seg_png.display().to_string()),
+                ))
+            } else {
+                CmdResult::Done(format!(
+                    "Ядро Игры: сцена «{}» (цикл S, v0.54.0)\n  мир        : {} тел, {} тиков (fixed dt = 1/60 c)\n  физика     : кеплеровские ω = √(G·M)/r^1.5, иерархия parent→child\n  честность  : state-hash 0x{:016X} (детерминизм бит-в-бит)\n  симуляция  : {sim_ms:.1} мс ({:.2} мс/тик, {:.0}x реального времени)\n  рендер     : {}×{}, {} точек, {} рёбер, закрашено {} пикселей, max d_FS = {:.4} рад\n  артефакты  :\n    {}\n    {}\n    {}",
+                    scene.name,
+                    world.len(),
+                    world.tick,
+                    state_hash,
+                    sim_ms / opts.ticks as f64,
+                    (opts.ticks as f64 * crate::game::FIXED_DT) / (sim_ms / 1000.0),
+                    opts.width,
+                    opts.height,
+                    out.n_points,
+                    out.n_edges,
+                    out.painted_px,
+                    out.max_fs_depth,
+                    out.rgb_png.display(),
+                    out.depth_png.display(),
+                    out.seg_png.display(),
+                ))
+            }
+        }
+        Err(e) => CmdResult::Done(format!("game: рендер: {e}")),
+    }
+}
+
+fn cmd_game(raw: &str) -> CmdResult {
+    let raw = raw.trim();
+    let raw = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    let sub = parts.first().map(String::as_str).unwrap_or("");
+    let args = &parts[1..];
+
+    match sub {
+        "help" | "usage" => CmdResult::Done(game_usage()),
+        "info" => cmd_game_info(),
+        "demo" => {
+            let opts = match game_parse_opts(args) {
+                Ok(o) => o,
+                Err(e) => return CmdResult::Done(format!("game demo: {e}")),
+            };
+            game_run_and_render(&crate::game::demo_scene(), &opts)
+        }
+        "scene" => {
+            let Some(file) = args.iter().find(|a| !a.starts_with("--")) else {
+                return CmdResult::Done(
+                    "game scene: укажите файл сцены (game scene my.json --ticks 300)".into(),
+                );
+            };
+            let opts = match game_parse_opts(args) {
+                Ok(o) => o,
+                Err(e) => return CmdResult::Done(format!("game scene: {e}")),
+            };
+            match crate::game::SceneFile::load_json(std::path::Path::new(file)) {
+                Ok(scene) => game_run_and_render(&scene, &opts),
+                Err(e) => CmdResult::Done(format!("game scene: {e}")),
+            }
+        }
+        "write-demo" => {
+            let Some(file) = args.iter().find(|a| !a.starts_with("--")) else {
+                return CmdResult::Done("game write-demo: укажите файл".into());
+            };
+            let scene = crate::game::demo_scene();
+            match serde_json::to_string_pretty(&scene) {
+                Ok(json) => match std::fs::write(file, json + "\n") {
+                    Ok(_) => CmdResult::Done(format!(
+                        "Демо-сцена «{}» ({} тел) выгружена: {file}\nПравьте и запускайте: game scene {file} --ticks 300",
+                        scene.name, scene.bodies.len()
+                    )),
+                    Err(e) => CmdResult::Done(format!("game write-demo: {e}")),
+                },
+                Err(e) => CmdResult::Done(format!("game write-demo: сериализация: {e}")),
+            }
+        }
+        other => CmdResult::Done(format!(
+            "game: неизвестная подкоманда `{other}`\n\n{}",
+            game_usage()
+        )),
+    }
+}
+
+fn cmd_game_info() -> CmdResult {
+    let scene = crate::game::demo_scene();
+    let world = scene.build_world().expect("демо-сцена валидна (проверена тестами)");
+    let orbits = world.entities().iter().filter(|e| world.orbit(**e).is_some()).count();
+    let roots = world.entities().iter().filter(|e| world.parent(**e).is_none()).count();
+    let mut world2 = scene.build_world().expect("демо-сцена валидна");
+    for _ in 0..600 {
+        world2.tick(crate::game::FIXED_DT);
+    }
+    CmdResult::Done(format!(
+        "POLER GAME CORE (цикл S, v0.54.0) — фундамент игрового движка\n  архитектура: Entity(generation) + World, без GC/UHT (см. docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md)\n  демо-сцена : «{}» («Этерия» из лора POLER) — {} тел ({} корней, {} орбит), глубина иерархии 3\n  тик        : fixed dt = {:.4} c; фазы: Orbit → Transform → Hash\n  физика     : ω = √(G·M)/r^1.5 (третий закон Кеплера), наклоны плоскостей\n  детерминизм: state-hash после 600 тиков = 0x{:016X} (бит-в-бит)\n  рендер     : P³ FFI → RGB+depth(d_FS)+seg, PNG (headless-first)\n  команды    : game demo | game scene <json> | game write-demo <json>",
+        scene.name,
+        world.len(),
+        roots,
+        orbits,
+        crate::game::FIXED_DT,
+        world2.state_hash(),
+    ))
 }
 
 /// Разбор общих флагов quantum (значение флага — следующий аргумент).
@@ -3982,6 +4220,112 @@ mod tests {
         }
         match dispatch(&mut s, "p3 frame --size 10x10") {
             CmdResult::Done(out) => assert!(out.contains("64..=4096"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v0.54.0 (цикл S): Ядро Игры
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cmd_game_usage_and_unknown() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s1.db"));
+        match dispatch(&mut s, "game") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("game demo"), "{out}");
+                assert!(out.contains("game scene"), "{out}");
+                assert!(out.contains("write-demo"), "{out}");
+            }
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game help") {
+            CmdResult::Done(out) => assert!(out.contains("game info"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game bogus") {
+            CmdResult::Done(out) => assert!(out.contains("неизвестная подкоманда"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_game_info_reports_core() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s2.db"));
+        match dispatch(&mut s, "game info") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("POLER GAME CORE"), "{out}");
+                assert!(out.contains("aetheria"), "{out}");
+                assert!(out.contains("Этерия"), "{out}");
+                assert!(out.contains("state-hash") && out.contains("0x"), "{out}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn cmd_game_demo_renders_pngs() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s3.db"));
+        let dir = std::env::temp_dir().join("poler_game_shell_test");
+        match dispatch(
+            &mut s,
+            &format!("game demo --ticks 90 --size 160x120 --out {}", dir.display()),
+        ) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Ядро Игры"), "{out}");
+                assert!(out.contains("aetheria"), "{out}");
+                assert!(out.contains("state-hash 0x"), "{out}");
+                assert!(out.contains("мс/тик"), "{out}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn cmd_game_scene_roundtrip() {
+        // write-demo → правка не нужна, прогон как пользовательской сцены
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s4.db"));
+        let dir = std::env::temp_dir().join("poler_game_scene_shell");
+        std::fs::create_dir_all(&dir).unwrap();
+        let scene_path = dir.join("my_scene.json");
+        match dispatch(&mut s, &format!("game write-demo {}", scene_path.display())) {
+            CmdResult::Done(out) => assert!(out.contains("выгружена"), "{out}"),
+            _ => panic!(),
+        }
+        assert!(scene_path.exists());
+        // сцена запускается и рендерится
+        match dispatch(
+            &mut s,
+            &format!(
+                "game scene {} --ticks 30 --size 96x96 --out {}",
+                scene_path.display(),
+                dir.display()
+            ),
+        ) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Ядро Игры"), "{out}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_game_demo_validates_args() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s5.db"));
+        match dispatch(&mut s, "game demo --ticks 0") {
+            CmdResult::Done(out) => assert!(out.contains("--ticks 1..=100000"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game demo --size 10x10") {
+            CmdResult::Done(out) => assert!(out.contains("64..=4096"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game scene /nonexistent.json") {
+            CmdResult::Done(out) => assert!(out.contains("чтение"), "{out}"),
             _ => panic!(),
         }
     }

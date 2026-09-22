@@ -66,6 +66,7 @@ pub mod universal_letters;
 pub mod exec;
 
 pub mod gateway;
+pub mod game;
 pub mod graph;
 pub mod license;
 pub mod literary;

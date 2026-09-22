@@ -507,7 +507,7 @@ pub fn render_hamiltonian_frame(cfg: &FrameConfig) -> Result<FrameOutput, String
 
 /// Классический 5×7 растровый шрифт (7 строк по 5 бит, MSB слева).
 /// Только то, что нужно для заголовка/легенды.
-fn glyph(c: char) -> [u8; 7] {
+pub(crate) fn glyph(c: char) -> [u8; 7] {
     match c.to_ascii_uppercase() {
         '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
         '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
@@ -566,7 +566,7 @@ fn glyph(c: char) -> [u8; 7] {
 }
 
 /// Нарисовать текст в RGB-буфер (масштаб 1 = 5×7 + межбуквенный пиксель).
-fn draw_text(
+pub(crate) fn draw_text(
     rgb: &mut [u8],
     width: u32,
     x0: usize,
@@ -606,7 +606,7 @@ fn draw_text(
 }
 
 /// Свотч легенды: цветной квадратик.
-fn draw_swatch(rgb: &mut [u8], width: u32, x0: usize, y0: usize, color: [u8; 3], size: usize) {
+pub(crate) fn draw_swatch(rgb: &mut [u8], width: u32, x0: usize, y0: usize, color: [u8; 3], size: usize) {
     for dy in 0..size {
         for dx in 0..size {
             let px = x0 + dx;
