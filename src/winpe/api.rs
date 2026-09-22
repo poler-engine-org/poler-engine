@@ -1487,19 +1487,26 @@ unsafe fn cas_u64(at: u64, expect: u64, new: u64) -> bool {
 }
 
 unsafe fn h_EnterCriticalSection(cs: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u64, _c: u64) -> u64 {
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
-    let word = cs as *const u64 as *const i32; // фьютекс на молодших 4 байтах
+    let tid = (unsafe { libc::syscall(libc::SYS_gettid) } as u64) & 0xFFFFFFFF;
+    let word = (cs + 4) as *const i32;
     loop {
         let cur = unsafe { read_u64(cs) };
-        if cur >> 32 == tid {
+        let owner = cur >> 32;
+        if owner == tid {
             unsafe { write_u64(cs, cur + 1) };
             return 0;
         }
-        if cur == 0 && unsafe { cas_u64(cs, 0, (tid << 32) | 1) } {
-            return 0;
+        if owner == 0 {
+            if unsafe { cas_u64(cs, cur, (tid << 32) | 1) } {
+                return 0;
+            }
+            continue;
         }
+        // Чекаємо, поки owner зміниться
         unsafe {
-            libc::syscall(libc::SYS_futex, word, 0 /*WAIT*/, 0i32);
+            let val = owner as i32;
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 /* 50ms */ };
+            libc::syscall(libc::SYS_futex, word, 0 /*FUTEX_WAIT*/, val, &ts);
         }
     }
 }
@@ -1511,7 +1518,7 @@ unsafe fn h_LeaveCriticalSection(cs: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5
         let depth = cur & 0xFFFFFFFF;
         if depth <= 1 {
             unsafe { write_u64(cs, 0) };
-            let word = cs as *const u64 as *const i32;
+            let word = (cs + 4) as *const u64 as *const i32;
             unsafe {
                 libc::syscall(libc::SYS_futex, word, 1 /*WAKE*/, i32::MAX);
             }
