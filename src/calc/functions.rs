@@ -11,6 +11,7 @@ use super::astro;
 use super::geodesy;
 use super::matrix::Matrix;
 use super::numbers;
+use super::solve::Complex;
 use super::trits::Trits;
 use super::units;
 use super::units::Unit;
@@ -106,7 +107,9 @@ pub fn gamma_impl(x: f64) -> Result<f64, String> {
         return Err("NaN".into());
     }
     if x == 0.0 || (x < 0.0 && x.fract() == 0.0) {
-        return Err("Γ имеет полюса в неположительных целых".into());
+        // цикл N: полюс — расходимость на расширенной прямой.
+        // Вычет в x = −n равен (−1)ⁿ/n! (для анализа — solve вокруг полюса)
+        return Ok(f64::INFINITY);
     }
     const G: f64 = 7.0;
     const C: [f64; 9] = [
@@ -172,7 +175,9 @@ pub fn zeta_impl(s: f64) -> Result<f64, String> {
         return Err("ζ: аргумент должен быть конечен".into());
     }
     if s == 1.0 {
-        return Err("ζ(1) расходится (гармонический ряд)".into());
+        // гармонический ряд расходится к +∞ — расширенная прямая,
+        // в одном стиле с полюсами Γ (gamma(-1) → ∞)
+        return Ok(f64::INFINITY);
     }
     // тривиальные нули: s = −2, −4, −6, …
     if s < 0.0 && s.fract() == 0.0 && (s / 2.0).fract() == 0.0 {
@@ -226,8 +231,11 @@ pub fn is_function(name: &str) -> bool {
         // теория чисел
         | "gcd" | "lcm" | "mod" | "is_prime" | "next_prime" | "prev_prime"
         | "factorize" | "divisors" | "fib" | "binomial" | "catalan"
+        | "factorial" | "fact"
+        // физика (цикл N)
+        | "lorentz"
         // матрицы/квант
-        | "transpose" | "det" | "inv" | "trace" | "expm" | "charpoly" | "eigen"
+        | "transpose" | "det" | "inv" | "pinv" | "trace" | "expm" | "charpoly" | "eigen"
         | "identity" | "rot2" | "rotx" | "roty" | "rotz" | "so_gen"
         // триты
         | "trits" | "trit_val" | "trit_and" | "trit_or" | "trit_not"
@@ -264,18 +272,39 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         "cos" => Ok(Value::Scalar(angle_arg(args, 0)?.cos())),
         "tan" => Ok(Value::Scalar(angle_arg(args, 0)?.tan())),
         "asin" => {
+            // цикл N: |x| > 1 — комплексная ветвь (DLMF 4.23):
+            // asin(x) = π/2 − i·acosh(x) при x > 1; нечётность при x < −1
             let x = one_arg(args, name)?;
-            if x < -1.0 || x > 1.0 {
-                return Err(format!("asin({x}) вне [−1, 1] — комплексный результат (см. solve)"));
+            if x > 1.0 {
+                Ok(Value::Complex(Complex::new(
+                    std::f64::consts::FRAC_PI_2,
+                    -(x + (x * x - 1.0).sqrt()).ln(),
+                )))
+            } else if x < -1.0 {
+                Ok(Value::Complex(Complex::new(
+                    -std::f64::consts::FRAC_PI_2,
+                    (-x + (x * x - 1.0).sqrt()).ln(),
+                )))
+            } else {
+                Ok(Value::Scalar(x.asin()))
             }
-            Ok(Value::Scalar(x.asin()))
         }
         "acos" => {
+            // цикл N: acos(x) = i·acosh(x) при x > 1; π − i·acosh(−x) при x < −1
             let x = one_arg(args, name)?;
-            if x < -1.0 || x > 1.0 {
-                return Err(format!("acos({x}) вне [−1, 1]"));
+            if x > 1.0 {
+                Ok(Value::Complex(Complex::new(
+                    0.0,
+                    (x + (x * x - 1.0).sqrt()).ln(),
+                )))
+            } else if x < -1.0 {
+                Ok(Value::Complex(Complex::new(
+                    std::f64::consts::PI,
+                    -(-x + (x * x - 1.0).sqrt()).ln(),
+                )))
+            } else {
+                Ok(Value::Scalar(x.acos()))
             }
-            Ok(Value::Scalar(x.acos()))
         }
         "atan" => Ok(Value::Scalar(one_arg(args, name)?.atan())),
         "atan2" => {
@@ -287,18 +316,42 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         "tanh" => Ok(Value::Scalar(one_arg(args, name)?.tanh())),
         "asinh" => Ok(Value::Scalar(one_arg(args, name)?.asinh())),
         "acosh" => {
+            // цикл N: x < 1 — комплексная ветвь acosh(x) = i·acos(x)
             let x = one_arg(args, name)?;
             if x < 1.0 {
-                return Err(format!("acosh({x}) требует x ≥ 1"));
+                // acos(x) для x<−1 сам комплексный: acosh = i·acos(x)
+                if x < -1.0 {
+                    let a = (-x + (x * x - 1.0).sqrt()).ln();
+                    // acos(x) = π − i·a → i·acos = i·π + a
+                    return Ok(Value::Complex(Complex::new(a, std::f64::consts::PI)));
+                }
+                return Ok(Value::Complex(Complex::new(0.0, x.acos())));
             }
             Ok(Value::Scalar(x.acosh()))
         }
         "atanh" => {
+            // цикл N: |x| ≥ 1 — расширенный результат (DLMF 4.37):
+            // x=±1 → ±∞; x>1 → ½ln((x+1)/(x−1)) − i·π/2; x<−1 — нечётно
             let x = one_arg(args, name)?;
-            if x.abs() >= 1.0 {
-                return Err(format!("atanh({x}) требует |x| < 1"));
+            if x == 1.0 {
+                return Ok(Value::Scalar(f64::INFINITY));
             }
-            Ok(Value::Scalar(x.atanh()))
+            if x == -1.0 {
+                return Ok(Value::Scalar(f64::NEG_INFINITY));
+            }
+            if x > 1.0 {
+                Ok(Value::Complex(Complex::new(
+                    0.5 * ((x + 1.0) / (x - 1.0)).ln(),
+                    -std::f64::consts::FRAC_PI_2,
+                )))
+            } else if x < -1.0 {
+                Ok(Value::Complex(Complex::new(
+                    0.5 * ((-x - 1.0) / (1.0 - x)).ln(),
+                    std::f64::consts::FRAC_PI_2,
+                )))
+            } else {
+                Ok(Value::Scalar(x.atanh()))
+            }
         }
         "sind" => Ok(Value::Scalar(one_arg(args, name)?.to_radians().sin())),
         "cosd" => Ok(Value::Scalar(one_arg(args, name)?.to_radians().cos())),
@@ -313,19 +366,35 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         // ---------- экспоненты/логарифмы ----------
         "exp" => Ok(Value::Scalar(one_arg(args, name)?.exp())),
         "ln" => {
+            // цикл N: расширенный логарифм — ln(0) = −∞ (предел),
+            // ln(x<0) = ln|x| + iπ (главная ветвь)
             let x = one_arg(args, name)?;
-            if x <= 0.0 {
-                return Err(format!("ln({x}): аргумент должен быть > 0 (см. solve x = e^y)"));
+            if x == 0.0 {
+                return Ok(Value::Scalar(f64::NEG_INFINITY));
+            }
+            if x < 0.0 {
+                return Ok(Value::Complex(Complex::new(
+                    (-x).ln(),
+                    std::f64::consts::PI,
+                )));
             }
             Ok(Value::Scalar(x.ln()))
         }
         "log" => {
             // log(x) = log10 (калькуляторная конвенция); log(x, b) — по основанию b
+            // цикл N: x ≤ 0 — расширенно (0 → −∞; отрицательное → комплексно)
             match args.len() {
                 1 => {
                     let x = scalar_arg(args, 0)?;
-                    if x <= 0.0 {
-                        return Err(format!("log({x}): аргумент должен быть > 0"));
+                    if x == 0.0 {
+                        return Ok(Value::Scalar(f64::NEG_INFINITY));
+                    }
+                    if x < 0.0 {
+                        let l = Complex::new((-x).ln(), std::f64::consts::PI);
+                        return Ok(Value::Complex(Complex::new(
+                            l.re / std::f64::consts::LN_10,
+                            l.im / std::f64::consts::LN_10,
+                        )));
                     }
                     Ok(Value::Scalar(x.log10()))
                 }
@@ -341,15 +410,28 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "log2" => {
             let x = one_arg(args, name)?;
-            if x <= 0.0 {
-                return Err(format!("log2({x}): аргумент должен быть > 0"));
+            if x == 0.0 {
+                return Ok(Value::Scalar(f64::NEG_INFINITY));
+            }
+            if x < 0.0 {
+                let l = Complex::new((-x).ln(), std::f64::consts::PI);
+                return Ok(Value::Complex(Complex::new(
+                    l.re / std::f64::consts::LN_2,
+                    l.im / std::f64::consts::LN_2,
+                )));
             }
             Ok(Value::Scalar(x.log2()))
         }
         "log10" => {
             let x = one_arg(args, name)?;
-            if x <= 0.0 {
-                return Err(format!("log10({x}): аргумент должен быть > 0"));
+            if x == 0.0 {
+                return Ok(Value::Scalar(f64::NEG_INFINITY));
+            }
+            if x < 0.0 {
+                return Ok(Value::Complex(Complex::new(
+                    (-x).log10(),
+                    std::f64::consts::PI / std::f64::consts::LN_10,
+                )));
             }
             Ok(Value::Scalar(x.log10()))
         }
@@ -367,11 +449,11 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 }
                 return Err("sqrt: размерности величины должны быть чётными (√(s²)=s ок, √(m) — нет)".into());
             }
+            // цикл N: sqrt(x<0) = i·√|x| — тахионный множитель Лоренца
+            // и любая мнимая ось без обходного пути через solve
             let x = one_arg(args, name)?;
             if x < 0.0 {
-                return Err(format!(
-                    "sqrt({x}) < 0 — вещественных корней нет; комплексные: solve x^2 = {x}"
-                ));
+                return Ok(Value::Complex(Complex::new(0.0, (-x).sqrt())));
             }
             Ok(Value::Scalar(x.sqrt()))
         }
@@ -486,20 +568,97 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let ds = numbers::divisors(one_arg(args, name)?)?;
             Ok(Value::List(ds.into_iter().map(Value::Scalar).collect()))
         }
-        "fib" => Ok(Value::Scalar(numbers::fib(one_arg(args, name)?)?)),
-        "binomial" => {
-            need(args, 2, name)?;
-            Ok(Value::Scalar(numbers::binomial(
-                scalar_arg(args, 0)?,
-                scalar_arg(args, 1)?,
-            )?))
+        "fib" => {
+            // цикл N: точный big-путь за f64-пределом (F(78))
+            let n = one_arg(args, name)?;
+            if !n.is_finite() || n.fract() != 0.0 {
+                return Err("fib: ожидается целое".into());
+            }
+            if n < 0.0 {
+                return Err("fib: ожидается неотрицательное (реализация без негафибоначчи)".into());
+            }
+            if n <= 78.0 {
+                Ok(Value::Scalar(numbers::fib(n)?))
+            } else {
+                Ok(Value::BigInt(numbers::fib_big(n as u64)?))
+            }
         }
-        "catalan" => Ok(Value::Scalar(numbers::catalan(one_arg(args, name)?)?)),
+        "binomial" => {
+            // цикл N: точный big-путь (C(100,50) уже неточен в f64)
+            need(args, 2, name)?;
+            let (n, k) = (scalar_arg(args, 0)?, scalar_arg(args, 1)?);
+            if n.fract() != 0.0 || k.fract() != 0.0 {
+                return Err("binomial: ожидается целые".into());
+            }
+            if n < 0.0 || k < 0.0 {
+                return Err("binomial: n, k ≥ 0".into());
+            }
+            if k > n {
+                return Ok(Value::Scalar(0.0));
+            }
+            if n > 10_000.0 {
+                return Err("binomial: n ≤ 10 000 (точный big-путь)".into());
+            }
+            let s = numbers::binomial_big(n as u64, k as u64)?;
+            // малые результаты — Scalar (совместимость), гиганты — точное целое
+            if let Ok(iv) = s.parse::<i64>() {
+                if iv.abs() <= 9_007_199_254_740_992 {
+                    return Ok(Value::Scalar(iv as f64));
+                }
+            }
+            Ok(Value::BigInt(s))
+        }
+        "catalan" => {
+            // цикл N: точный big-путь (C_n = C(2n,n)/(n+1), деление нацело)
+            let n = one_arg(args, name)?;
+            if n.fract() != 0.0 || n < 0.0 {
+                return Err("catalan: ожидается целое n ≥ 0".into());
+            }
+            if n > 5_000.0 {
+                return Err("catalan: n ≤ 5 000 (точный big-путь)".into());
+            }
+            let b = numbers::binomial_big(2 * n as u64, n as u64)?;
+            let s = numbers::big_div_small(&b, n as u64 + 1);
+            if let Ok(iv) = s.parse::<i64>() {
+                if iv.abs() <= 9_007_199_254_740_992 {
+                    return Ok(Value::Scalar(iv as f64));
+                }
+            }
+            Ok(Value::BigInt(s))
+        }
+        "factorial" | "fact" => {
+            // цикл N: точный факториал (18! — потолок f64-точности)
+            let n = one_arg(args, name)?;
+            if !n.is_finite() || n.fract() != 0.0 || n < 0.0 {
+                return Err("factorial: ожидается целое n ≥ 0".into());
+            }
+            if n <= 18.0 {
+                let r: u64 = (2..=n as u64).product();
+                return Ok(Value::Scalar(r as f64));
+            }
+            Ok(Value::BigInt(numbers::factorial_big(n as u64)?))
+        }
+        "lorentz" => {
+            // цикл N: γ(v) = 1/√(1−v²), v в долях c.
+            // v < c → вещественная γ; v = c → ∞ (расходимость);
+            // v > c → комплексная γ = −i/√(v²−1) — тахионная ветвь
+            // (мнимое собственное время).
+            let v = one_arg(args, name)?;
+            let s = 1.0 - v * v;
+            if s > 0.0 {
+                Ok(Value::Scalar(1.0 / s.sqrt()))
+            } else if s == 0.0 {
+                Ok(Value::Scalar(f64::INFINITY))
+            } else {
+                Ok(Value::Complex(Complex::new(0.0, -1.0 / (-s).sqrt())))
+            }
+        }
 
         // ---------- матрицы/квант ----------
         "transpose" => Ok(Value::Matrix(matrix_arg(args, 0)?.transpose())),
         "det" => Ok(Value::Scalar(matrix_arg(args, 0)?.det()?)),
         "inv" => Ok(Value::Matrix(matrix_arg(args, 0)?.inv()?)),
+        "pinv" => Ok(Value::Matrix(matrix_arg(args, 0)?.pinv()?)),
         "trace" => Ok(Value::Scalar(matrix_arg(args, 0)?.trace()?)),
         "expm" => Ok(Value::Matrix(matrix_arg(args, 0)?.expm()?)),
         "charpoly" => {
@@ -779,8 +938,10 @@ mod tests {
         assert!(close(gamma_impl(6.0).unwrap(), 120.0, 1e-12));
         // Γ(−0.5) = −2√π (отражение)
         assert!(close(gamma_impl(-0.5).unwrap(), -2.0 * std::f64::consts::PI.sqrt(), 1e-12));
-        assert!(gamma_impl(-1.0).is_err());
-        assert!(gamma_impl(-2.0).is_err());
+        // цикл N: полюса — расходимость на расширенной прямой (не ошибка)
+        assert!(gamma_impl(-1.0).unwrap().is_infinite());
+        assert!(gamma_impl(-2.0).unwrap().is_infinite());
+        assert!(gamma_impl(0.0).unwrap().is_infinite());
 
         // erf: документированная точность A&S — 1.5e-7
         assert!(close(erf_impl(1.0), 0.8427007929497149, 1.5e-7));
@@ -798,7 +959,7 @@ mod tests {
         assert!(close(zeta_impl(-1.0).unwrap(), -1.0 / 12.0, 1e-10));
         assert!(close(zeta_impl(-2.0).unwrap(), 0.0, 1e-15)); // тривиальный нуль
         assert!(close(zeta_impl(3.0).unwrap(), 1.2020569031595942, 1e-10));
-        assert!(zeta_impl(1.0).is_err());
+        assert!(zeta_impl(1.0).unwrap().is_infinite()); // полюс: ζ(1) = +∞
 
         // beta(2,3) = 1/12
         let b = call("beta", &[s(2.0), s(3.0)]).unwrap();
@@ -817,13 +978,53 @@ mod tests {
 
     #[test]
     fn trig_domain_checks() {
-        assert!(call("asin", &[s(2.0)]).is_err());
-        assert!(call("acos", &[s(-1.5)]).is_err());
-        assert!(call("ln", &[s(-1.0)]).is_err());
-        assert!(call("sqrt", &[s(-4.0)]).is_err());
-        assert!(call("log", &[s(0.0)]).is_err());
-        assert!(call("acosh", &[s(0.5)]).is_err());
-        assert!(call("atanh", &[s(1.0)]).is_err());
+        // цикл N: домены расширены — «невозможное → возможное».
+        // Вне старой области определения функции возвращают КОМПЛЕКСНЫЙ
+        // результат или ∞, а не ошибку.
+        // asin(2) = π/2 − i·acosh(2)
+        match call("asin", &[s(2.0)]).unwrap() {
+            Value::Complex(c) => {
+                assert!(close(c.re, std::f64::consts::FRAC_PI_2, 1e-12));
+                assert!(c.im < 0.0 && close(c.im, -(2.0f64 + 3.0f64.sqrt()).ln(), 1e-12));
+            }
+            _ => panic!("asin(2) должен быть комплексным"),
+        }
+        // acos(−1.5) = π − i·acosh(1.5)
+        match call("acos", &[s(-1.5)]).unwrap() {
+            Value::Complex(c) => {
+                assert!(close(c.re, std::f64::consts::PI, 1e-12));
+                assert!(c.im < 0.0);
+            }
+            _ => panic!("acos(−1.5) должен быть комплексным"),
+        }
+        // ln(−1) = iπ (главная ветвь)
+        match call("ln", &[s(-1.0)]).unwrap() {
+            Value::Complex(c) => {
+                assert!(c.re.abs() < 1e-15);
+                assert!(close(c.im, std::f64::consts::PI, 1e-12));
+            }
+            _ => panic!("ln(−1) должен быть iπ"),
+        }
+        // sqrt(−4) = 2i
+        match call("sqrt", &[s(-4.0)]).unwrap() {
+            Value::Complex(c) => {
+                assert!(c.re.abs() < 1e-15);
+                assert!(close(c.im, 2.0, 1e-12));
+            }
+            _ => panic!("sqrt(−4) должен быть 2i"),
+        }
+        // log(0) = −∞ (предел)
+        assert_eq!(call("log", &[s(0.0)]).unwrap().as_f64(), Some(f64::NEG_INFINITY));
+        // acosh(0.5) = i·acos(0.5) = i·π/3
+        match call("acosh", &[s(0.5)]).unwrap() {
+            Value::Complex(c) => {
+                assert!(c.re.abs() < 1e-15);
+                assert!(close(c.im, std::f64::consts::PI / 3.0, 1e-12));
+            }
+            _ => panic!("acosh(0.5) должен быть i·π/3"),
+        }
+        // atanh(1) = ∞ (расходимость на границе)
+        assert_eq!(call("atanh", &[s(1.0)]).unwrap().as_f64(), Some(f64::INFINITY));
         // угловые величины
         let v = call("sin", &[Value::Quantity(180.0, units::by_name("deg").unwrap())]).unwrap();
         assert!(close(v.as_f64().unwrap(), 0.0, 1e-14));

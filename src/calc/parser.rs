@@ -27,6 +27,7 @@ use super::constants;
 use super::functions;
 use super::lexer::{tokenize, Tok};
 use super::matrix::Matrix;
+use super::numbers;
 use super::solve::Complex;
 use super::units;
 use super::units::Unit;
@@ -530,6 +531,15 @@ fn negate(v: &Value) -> Result<Value, String> {
         Value::Quantity(x, u) => Ok(Value::Quantity(-x, *u)),
         Value::Matrix(m) => Ok(Value::Matrix(m.scale(-1.0))),
         Value::Complex(c) => Ok(Value::Complex(Complex::new(-c.re, -c.im))),
+        Value::BigInt(s) => Ok(Value::BigInt(
+            if s.starts_with('-') {
+                s[1..].to_string()
+            } else if s != "0" {
+                format!("-{s}")
+            } else {
+                s.clone()
+            },
+        )),
         Value::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
@@ -553,7 +563,41 @@ pub fn binary_op(op: BinOp, a: &Value, b: &Value) -> Result<Value, String> {
 
     match (a, b) {
         // --- скаляры ---
-        (Value::Scalar(x), Value::Scalar(y)) => Ok(Value::Scalar(scalar_op(op, *x, *y)?)),
+        (Value::Scalar(x), Value::Scalar(y)) => {
+            if op == Pow {
+                // цикл N: точный большой целый путь (2^100 → 21 цифра, без потерь)
+                if let Some(v) = try_big_pow(*x, *y)? {
+                    return Ok(v);
+                }
+                // цикл N: отрицательное основание с дробной степенью —
+                // (-8)^(1/3) = -2 (нечётный знаменатель), иначе комплексная ветвь
+                if *x < 0.0 && y.fract() != 0.0 {
+                    return Ok(neg_frac_pow(*x, *y));
+                }
+            }
+            Ok(Value::Scalar(scalar_op(op, *x, *y)?))
+        }
+
+        // --- точные большие целые (цикл N) ---
+        (Value::BigInt(a), Value::BigInt(b)) => big_int_op(op, a, b),
+        (Value::BigInt(a), Value::Scalar(y)) => {
+            // целый малый скаляр — точный big-путь (fib(100) + 1)
+            if y.fract() == 0.0 && y.abs() <= 9.0e15 {
+                let ys = small_int_str(*y);
+                return big_int_op(op, a, &ys);
+            }
+            // дробное — осознанный f64-мир (fib(100)/2.5)
+            let xa = a.parse::<f64>().unwrap_or(f64::NAN);
+            Ok(Value::Scalar(scalar_op(op, xa, *y)?))
+        }
+        (Value::Scalar(x), Value::BigInt(b)) => {
+            if x.fract() == 0.0 && x.abs() <= 9.0e15 {
+                let xs = small_int_str(*x);
+                return big_int_op(op, &xs, b);
+            }
+            let yb = b.parse::<f64>().unwrap_or(f64::NAN);
+            Ok(Value::Scalar(scalar_op(op, *x, yb)?))
+        }
 
         // --- величины с единицами ---
         (Value::Quantity(x, u), Value::Scalar(y)) => match op {
@@ -665,6 +709,16 @@ pub fn binary_op(op: BinOp, a: &Value, b: &Value) -> Result<Value, String> {
         (Value::Str(_), _) | (_, Value::Str(_)) => {
             Err("арифметика со строками не определена".into())
         }
+        // --- BigInt с остальными типами: f64-приближение (физика/матрицы ---
+        // живут в f64-мире; точность больших целых — в big-операциях выше)
+        (Value::BigInt(a), _) => {
+            let xa = a.parse::<f64>().unwrap_or(f64::NAN);
+            binary_op(op, &Value::Scalar(xa), b)
+        }
+        (_, Value::BigInt(b)) => {
+            let yb = b.parse::<f64>().unwrap_or(f64::NAN);
+            binary_op(op, a, &Value::Scalar(yb))
+        }
         // списки пойманы выше broadcast-ами — сюда попадаем только с
         // нестандартными комбинациями (List с матрицей и т.п.)
         _ => Err("операция не определена для этих типов".into()),
@@ -686,14 +740,159 @@ fn broadcast_rhs(op: BinOp, a: &Value, items: &[Value]) -> Result<Value, String>
     Ok(Value::List(out))
 }
 
+/// Малое целое → каноническая строка (для моста BigInt↔Scalar).
+fn small_int_str(v: f64) -> String {
+    if v < 0.0 {
+        format!("-{}", (-v) as u64)
+    } else {
+        format!("{}", v as u64)
+    }
+}
+
+/// Знаковые операции над точными большими целыми.
+fn big_int_op(op: BinOp, a: &str, b: &str) -> Result<Value, String> {
+    use BinOp::*;
+    let approx = |s: &str| s.parse::<f64>().unwrap_or(f64::NAN);
+    Ok(match op {
+        Add => Value::BigInt(numbers::big_add(a, b)),
+        Sub => Value::BigInt(numbers::big_sub(a, b)),
+        Mul => Value::BigInt(numbers::big_mul(a, b)),
+        Div => {
+            if let Ok(d) = b.parse::<i64>() {
+                if d == 0 {
+                    if a == "0" {
+                        return Err(
+                            "0/0 — неопределённость: предел зависит от пути (x/x → 1, 0/x → 0)"
+                                .into(),
+                        );
+                    }
+                    // расширенная прямая: ±∞ по знаку числителя
+                    return Ok(Value::Scalar(if a.starts_with('-') {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    }));
+                }
+                // деление нацело? q·d == a — тогда точный путь
+                let q = numbers::big_div_small(a, d.unsigned_abs());
+                let mut qs = q.clone();
+                if (d < 0) != a.starts_with('-') && q != "0" {
+                    qs = format!("-{q}");
+                }
+                if numbers::big_mul(&qs, b) == a {
+                    return Ok(Value::BigInt(qs));
+                }
+            }
+            // неточное деление — f64-приближение
+            Value::Scalar(scalar_op(op, approx(a), approx(b))?)
+        }
+        Pow => {
+            let e: i64 = b
+                .parse()
+                .map_err(|_| "степень точного целого должна быть малым целым".to_string())?;
+            if e < 0 {
+                return Ok(Value::Scalar(scalar_op(op, approx(a), e as f64)?));
+            }
+            if let Ok(base) = a.parse::<i64>() {
+                return Ok(Value::BigInt(numbers::big_pow(base, e as u64)?));
+            }
+            // большое основание, малый целый показатель
+            Value::BigInt(numbers::big_pow_big(a, e as u64)?)
+        }
+        Mod => {
+            return Err(
+                "остаток для точных больших целых не поддерживается (mod — целочисленный f64-путь)"
+                    .into(),
+            )
+        }
+    })
+}
+
+/// Точный большой целый путь для Scalar^Scalar: 2^100, (-3)^71…
+/// Возвращает None, если результат точно представим в f64 (совместимость).
+fn try_big_pow(x: f64, y: f64) -> Result<Option<Value>, String> {
+    if x.fract() != 0.0 || y.fract() != 0.0 || y <= 0.0 {
+        return Ok(None);
+    }
+    let ax = x.abs();
+    if !(2.0..=9.0e18).contains(&ax) {
+        return Ok(None);
+    }
+    // оценка числа цифр результата
+    let digits = ax.log10() * y;
+    if digits <= 15.95 {
+        return Ok(None); // точно в f64 — остаёмся в Scalar (2^10 → 1024.0)
+    }
+    let base = x as i64;
+    let exp = y as u64;
+    Ok(Some(Value::BigInt(numbers::big_pow(base, exp)?)))
+}
+
+/// Поиск рационального p/q (q ≤ max_q), ближайшего к y с точностью f64.
+fn rat_denominator(y: f64, max_q: u64) -> Option<(i64, u64)> {
+    fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        if a == 0 { 1 } else { a }
+    }
+    if y.abs() > 1e6 {
+        return None; // гигантские дробные степени — сразу комплексная ветвь
+    }
+    for q in 2..=max_q {
+        let p = (y * q as f64).round();
+        if (y - p / q as f64).abs() < 1e-12 * (1.0 + y.abs()) {
+            let g = gcd_u64(p.abs() as u64, q);
+            return Some(((p as i64) / g as i64, q / g));
+        }
+    }
+    None
+}
+
+/// Отрицательное основание с дробной степенью (цикл N):
+/// нечётный знаменатель рациональной степени → вещественный корень
+/// ((-8)^(1/3) = -2); иначе главная комплексная ветвь
+/// x^y = |x|^y·(cos πy + i·sin πy) ((-2)^0.5 = i·√2).
+fn neg_frac_pow(x: f64, y: f64) -> Value {
+    if let Some((p, q)) = rat_denominator(y, 64) {
+        if q % 2 == 1 {
+            let mag = x.abs().powf(y);
+            return Value::Scalar(if p % 2 != 0 { -mag } else { mag });
+        }
+    }
+    let mag = x.abs().powf(y);
+    let (s, c) = (std::f64::consts::PI * y).sin_cos();
+    Value::Complex(Complex::new(mag * c, mag * s))
+}
+
 fn scalar_op(op: BinOp, x: f64, y: f64) -> Result<f64, String> {
     use BinOp::*;
     Ok(match op {
         Add => x + y,
         Sub => x - y,
         Mul => x * y,
-        Div => x / y,
-        Mod => x.rem_euclid(y),
+        Div => {
+            if y == 0.0 {
+                if x == 0.0 {
+                    return Err(
+                        "0/0 — неопределённость: предел зависит от пути (x/x → 1, 0/x → 0); используйте solve для предельного анализа"
+                            .into(),
+                    );
+                }
+                // расширенная прямая: ±∞ (1/0 → ∞, -1/0 → -∞)
+                x / y
+            } else {
+                x / y
+            }
+        }
+        Mod => {
+            if y == 0.0 {
+                return Err("x mod 0 не определён".into());
+            }
+            x.rem_euclid(y)
+        }
         Pow => x.powf(y),
     })
 }

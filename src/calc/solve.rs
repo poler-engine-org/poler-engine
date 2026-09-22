@@ -201,6 +201,10 @@ pub enum SolveOutcome {
     Contradiction(f64),
     /// Найденные корни (полином — все; численно — найденные).
     Roots(Vec<Complex>, &'static str),
+    /// f(x) → 0 лишь асимптотически (exp(x) = 0): нуль не достигается
+    /// никогда. Цикл N: честный вердикт вместо ложных корней в зоне
+    /// машинного underflow (e^x округляется в 0.0 при x ≲ −708).
+    AsymptoticZero,
 }
 
 /// Попытка распознать полином степени ≤ max_deg по значениям f в
@@ -333,6 +337,8 @@ pub fn solve_real(f: &dyn Fn(f64) -> f64) -> SolveOutcome {
 
     // 2) численно: мультстарт-Ньютон
     let mut roots: Vec<f64> = Vec::new();
+    // цикл N: был ли отклонён кандидат из зоны underflow (exp-плато)
+    let mut asymptotic_hit = false;
     let starts: Vec<f64> = (-20..=20)
         .map(|i| i as f64 * 10.0)
         .chain((-40..=40).map(|i| i as f64 * 0.25))
@@ -362,9 +368,27 @@ pub fn solve_real(f: &dyn Fn(f64) -> f64) -> SolveOutcome {
             }
         }
         if f(x).abs() < 1e-9 {
-            // дедупликация
-            if !roots.iter().any(|&r| (r - x).abs() < 1e-6 * (1.0 + x.abs())) {
-                roots.push(x);
+            // цикл N — ОТСЕВ ЛОЖНЫХ КОРНЕЙ В ЗОНЕ UNDERFLOW:
+            // настоящий корень = смена знака в окрестности ИЛИ касание
+            // нуля (|f| на 2 порядка меньше соседей — кратные корни);
+            // экспоненциальное плато (f(x±h) ≈ f(x) ≠ 0) — НЕ корень.
+            // h больше ньютоновской точности (1e-6): для кратных корней
+            // fx = ε² при ε ≤ 1e-6 нужен h ≳ 1e-4, чтобы соседи выросли.
+            let h = 1e-4 * (1.0 + x.abs());
+            let (fl, fr) = (f(x - h), f(x + h));
+            let fx = f(x);
+            let sign_cross = (fl <= 0.0 && fr >= 0.0) || (fr <= 0.0 && fl >= 0.0);
+            let touch = fx.abs() < 1e-12
+                && fl.abs() > 100.0 * fx.abs().max(1e-300)
+                && fr.abs() > 100.0 * fx.abs().max(1e-300);
+            if sign_cross || touch {
+                // дедупликация
+                if !roots.iter().any(|&r| (r - x).abs() < 1e-6 * (1.0 + x.abs())) {
+                    roots.push(x);
+                }
+            } else if fx.abs() < 1e-12 {
+                // малое, но ненулевое плато — метка асимптотического нуля
+                asymptotic_hit = true;
             }
         }
     }
@@ -406,6 +430,11 @@ pub fn solve_real(f: &dyn Fn(f64) -> f64) -> SolveOutcome {
     roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     if roots.is_empty() {
+        if asymptotic_hit {
+            // exp(x) = 0: числитель под e^x уходит в underflow — корней нет,
+            // но |f| плато-малое; сообщаем асимптотическую правду
+            return SolveOutcome::AsymptoticZero;
+        }
         // последний шанс: может, f нигде не определена/нет корней
         SolveOutcome::Roots(Vec::new(), "численный поиск: вещественных корней не найдено")
     } else {
@@ -532,6 +561,32 @@ mod tests {
                     rs.iter().any(|r| close(*r, std::f64::consts::FRAC_PI_6, 1e-5)),
                     "нет π/6 в {rs:?}"
                 );
+            }
+            other => panic!("ожидались корни, got {other:?}"),
+        }
+    }
+
+    // ГЛАВНАЯ регрессия цикла N: exp(x) = 0 — корней нет, но старый
+    // решатель возвращал ложные [-200, -90] (зона машинного underflow,
+    // где e^x < 1e-12 ломает критерий сходимости Ньютона).
+    #[test]
+    fn underflow_asymptotic_zero() {
+        let f = |x: f64| x.exp();
+        match solve_real(&f) {
+            SolveOutcome::AsymptoticZero => {}
+            other => panic!("ожидался AsymptoticZero, got {other:?}"),
+        }
+        // родственный случай: 2^x = 0 — та же асимптотика
+        let g = |x: f64| (2.0f64).powf(x);
+        match solve_real(&g) {
+            SolveOutcome::AsymptoticZero => {}
+            other => panic!("ожидался AsymptoticZero, got {other:?}"),
+        }
+        // контроль: exp(x) = 2 по-прежнему решается
+        let h = |x: f64| x.exp() - 2.0;
+        match solve_real(&h) {
+            SolveOutcome::Roots(rs, _) => {
+                assert!(rs.iter().any(|r| close(r.re, 2.0f64.ln(), 1e-6)));
             }
             other => panic!("ожидались корни, got {other:?}"),
         }

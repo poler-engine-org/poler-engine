@@ -347,6 +347,289 @@ pub fn catalan(n: f64) -> Result<f64, String> {
     Ok(r)
 }
 
+// =====================================================================
+// ТОЧНЫЕ БОЛЬШИЕ ЦЕЛЫЕ (цикл N: «невозможное → возможное»).
+// Десятичное строковое представление (возможен ведущий '-'), школьные
+// алгоритмы O(n²) — для калькуляторных масштабов (до ~100 тыс. цифр)
+// этого достаточно, а точность — абсолютная.
+// =====================================================================
+
+/// Разобрать строку в (знак, модуль-цифры). Гарантирует отсутствие
+/// ведущих нулей в модуле (кроме "0").
+fn big_parts(s: &str) -> (bool, &str) {
+    let neg = s.starts_with('-');
+    let mag = if neg { &s[1..] } else { s };
+    let mag = mag.trim_start_matches('0');
+    (neg, if mag.is_empty() { "0" } else { mag })
+}
+
+/// Собрать строку из знака и модуля.
+fn big_from(neg: bool, mag: &str) -> String {
+    let mag = mag.trim_start_matches('0');
+    if mag.is_empty() {
+        return "0".into();
+    }
+    if neg {
+        format!("-{mag}")
+    } else {
+        mag.into()
+    }
+}
+
+/// Школьное сложение модулей.
+fn mag_add(a: &str, b: &str) -> String {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(ab.len().max(bb.len()) + 1);
+    let (mut i, mut j, mut carry) = (ab.len(), bb.len(), 0u32);
+    while i > 0 || j > 0 || carry > 0 {
+        let da = if i > 0 { (ab[i - 1] - b'0') as u32 } else { 0 };
+        let db = if j > 0 { (bb[j - 1] - b'0') as u32 } else { 0 };
+        let s = da + db + carry;
+        out.push(b'0' + (s % 10) as u8);
+        carry = s / 10;
+        i -= (i > 0) as usize;
+        j -= (j > 0) as usize;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_else(|_| "0".into())
+}
+
+/// Школьное вычитание модулей (требует a ≥ b, иначе None).
+fn mag_sub(a: &str, b: &str) -> Option<String> {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(ab.len());
+    let (mut i, mut j, mut borrow) = (ab.len(), bb.len(), 0i32);
+    while i > 0 {
+        let da = (ab[i - 1] - b'0') as i32;
+        let db = if j > 0 { (bb[j - 1] - b'0') as i32 } else { 0 };
+        let mut d = da - db - borrow;
+        if d < 0 {
+            d += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(b'0' + d as u8);
+        i -= 1;
+        j -= (j > 0) as usize;
+    }
+    if borrow != 0 {
+        return None; // a < b
+    }
+    while out.len() > 1 && *out.last().unwrap() == b'0' {
+        out.pop();
+    }
+    out.reverse();
+    Some(String::from_utf8(out).unwrap_or_else(|_| "0".into()))
+}
+
+/// Сравнение модулей.
+fn mag_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    let (a, b) = (if a.is_empty() { "0" } else { a }, if b.is_empty() { "0" } else { b });
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Школьное умножение модулей (O(n·m), устойчивые переносы).
+fn mag_mul(a: &str, b: &str) -> String {
+    let a = a.trim_start_matches('0');
+    let b = b.trim_start_matches('0');
+    if a.is_empty() || b.is_empty() {
+        return "0".into();
+    }
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut acc = vec![0u32; ab.len() + bb.len() + 1];
+    for (i, &da) in ab.iter().enumerate().rev() {
+        if da == b'0' {
+            continue;
+        }
+        let da = (da - b'0') as u32;
+        let mut carry = 0u32;
+        let mut k = acc.len() - 1 - (ab.len() - 1 - i);
+        for &db in bb.iter().rev() {
+            let cur = acc[k] + da * (db - b'0') as u32 + carry;
+            acc[k] = cur % 10;
+            carry = cur / 10;
+            k -= 1;
+        }
+        while carry > 0 {
+            let cur = acc[k] + carry;
+            acc[k] = cur % 10;
+            carry = cur / 10;
+            if k == 0 {
+                break;
+            }
+            k -= 1;
+        }
+    }
+    let mut s: String = acc.iter().map(|&d| (b'0' + d as u8) as char).collect();
+    while s.len() > 1 && s.starts_with('0') {
+        s.remove(0);
+    }
+    s
+}
+
+/// Знаковое сложение больших целых.
+pub fn big_add(a: &str, b: &str) -> String {
+    let (na, ma) = big_parts(a);
+    let (nb, mb) = big_parts(b);
+    if na == nb {
+        big_from(na, &mag_add(ma, mb))
+    } else {
+        match mag_cmp(ma, mb) {
+            std::cmp::Ordering::Equal => "0".into(),
+            std::cmp::Ordering::Greater => {
+                let d = mag_sub(ma, mb).unwrap_or_else(|| "0".into());
+                big_from(na, &d)
+            }
+            std::cmp::Ordering::Less => {
+                let d = mag_sub(mb, ma).unwrap_or_else(|| "0".into());
+                big_from(nb, &d)
+            }
+        }
+    }
+}
+
+/// Знаковое вычитание больших целых.
+pub fn big_sub(a: &str, b: &str) -> String {
+    let (nb, mb) = big_parts(b);
+    let neg_b = big_from(!nb, mb);
+    big_add(a, &neg_b)
+}
+
+/// Знаковое умножение больших целых.
+pub fn big_mul(a: &str, b: &str) -> String {
+    let (na, ma) = big_parts(a);
+    let (nb, mb) = big_parts(b);
+    big_from(na != nb, &mag_mul(ma, mb))
+}
+
+/// Деление большого целого на малое (u64). Остаток отбрасывается —
+/// вызовы обязаны гарантировать делимость (биномиальные схемы).
+pub fn big_div_small(a: &str, d: u64) -> String {
+    let (neg, mag) = big_parts(a);
+    let mut out = String::with_capacity(mag.len());
+    let mut rem: u64 = 0;
+    for c in mag.bytes() {
+        let cur = rem * 10 + (c - b'0') as u64;
+        out.push((b'0' + (cur / d) as u8) as char);
+        rem = cur % d;
+    }
+    big_from(neg, &out)
+}
+
+/// Возведение малого целого основания в большую степень — точный путь
+/// для `2^10000` и т.п. (повторное возведение в квадрат).
+/// Кап: ~100 тыс. цифр результата (защита от вечного счёта).
+pub fn big_pow(base: i64, exp: u64) -> Result<String, String> {
+    // кап по числу цифр результата (~0.3·log10(2)·exp для base=2)
+    let digits = (base.unsigned_abs() as f64).log10() * exp as f64;
+    if digits > 100_000.0 {
+        return Err(format!(
+            "big_pow: результат ≈ {digits:.0} цифр превысил бы лимит 100 000"
+        ));
+    }
+    let neg_base = base < 0;
+    let mut result = "1".to_string();
+    let mut sq = base.unsigned_abs().to_string();
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = mag_mul(&result, &sq);
+        }
+        e >>= 1;
+        if e > 0 {
+            sq = mag_mul(&sq, &sq);
+        }
+    }
+    // знак: минус ⟺ основание отрицательно И показатель нечётен
+    Ok(big_from(neg_base && exp % 2 == 1, &result))
+}
+
+/// Большое целое основание в малую целую степень (fib(100)^2):
+/// повторное возведение в квадрат на модулях. Кап по цифрам — как выше.
+pub fn big_pow_big(a: &str, e: u64) -> Result<String, String> {
+    let (neg, mag) = big_parts(a);
+    let digits = mag.len() as f64 * e as f64;
+    if digits > 100_000.0 {
+        return Err(format!(
+            "big_pow: результат ≈ {digits:.0} цифр превысил бы лимит 100 000"
+        ));
+    }
+    let mut r = "1".to_string();
+    let mut sq = mag.to_string();
+    let mut k = e;
+    while k > 0 {
+        if k & 1 == 1 {
+            r = mag_mul(&r, &sq);
+        }
+        k >>= 1;
+        if k > 0 {
+            sq = mag_mul(&sq, &sq);
+        }
+    }
+    Ok(big_from(neg && e % 2 == 1, &r))
+}
+
+/// Точное F(n) — быстрое удвоение на больших целых.
+/// F(2k) = F(k)·(2F(k+1) − F(k)); F(2k+1) = F(k)² + F(k+1)².
+pub fn fib_big(n: u64) -> Result<String, String> {
+    if n > 100_000 {
+        return Err("fib_big: n ≤ 100 000 (F(100000) ≈ 20 899 цифр — потолок O(n²)-умножения)".into());
+    }
+    let (mut a, mut b) = ("0".to_string(), "1".to_string()); // F(0), F(1)
+    if n == 0 {
+        return Ok(a);
+    }
+    for bit in (0..=63 - n.leading_zeros()).rev() {
+        let two_b = big_add(&b, &b);
+        let t = big_sub(&two_b, &a); // 2F(k+1) − F(k) ≥ 0 всегда
+        let c = big_mul(&a, &t); // F(2k)
+        let d = big_add(&big_mul(&a, &a), &big_mul(&b, &b)); // F(2k+1)
+        if (n >> bit) & 1 == 1 {
+            let s = big_add(&c, &d);
+            a = d;
+            b = s;
+        } else {
+            a = c;
+            b = d;
+        }
+    }
+    Ok(a)
+}
+
+/// Точное n! (умножение накопителя на малые множители). Кап 10 000
+/// (10 000! ≈ 35 660 цифр).
+pub fn factorial_big(n: u64) -> Result<String, String> {
+    if n > 10_000 {
+        return Err("factorial: n ≤ 10 000 (10 000! ≈ 35 660 цифр)".into());
+    }
+    let mut r = "1".to_string();
+    for k in 2..=n {
+        r = mag_mul(&r, &k.to_string());
+    }
+    Ok(r)
+}
+
+/// Точный C(n, k) — мультипликативная схема с целочисленным делением
+/// на каждом шаге (промежуточное значение = C(n−k+i, i), всегда целое).
+pub fn binomial_big(n: u64, k: u64) -> Result<String, String> {
+    if k > n {
+        return Ok("0".into());
+    }
+    let k = k.min(n - k);
+    if n > 10_000 {
+        return Err("binomial_big: n ≤ 10 000".into());
+    }
+    let mut r = "1".to_string();
+    for i in 0..k {
+        // r = r·(n−k+1+i)/(i+1) — порядок: сначала умножение, потом деление
+        let num = big_mul(&r, &(n - k + 1 + i).to_string());
+        r = big_div_small(&num, i + 1);
+    }
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +738,62 @@ mod tests {
         let v = pow_mod(2, 64, 1_000_000_007);
         let want = (2u128).pow(64) % (1_000_000_007 as u128);
         assert_eq!(v as u128, want);
+    }
+
+    // =============================================================
+    // ЦИКЛ N: точные большие целые — якоря
+    // =============================================================
+
+    #[test]
+    fn big_arith_basics() {
+        assert_eq!(big_add("99999999999999999999", "1"), "100000000000000000000");
+        assert_eq!(big_add("0", "0"), "0");
+        assert_eq!(big_sub("100000000000000000000", "1"), "99999999999999999999");
+        assert_eq!(big_sub("5", "7"), "-2"); // знаковый переход
+        assert_eq!(big_sub("-5", "-7"), "2");
+        assert_eq!(big_mul("123456789", "987654321"), "121932631112635269");
+        assert_eq!(big_mul("0", "999999999999"), "0");
+        assert_eq!(big_mul("-3", "7"), "-21");
+        assert_eq!(big_mul("-3", "-7"), "21");
+        // деление на малое с проверкой делимости
+        assert_eq!(big_div_small("1267650600228229401496703205376", 2), "633825300114114700748351602688");
+        assert_eq!(big_div_small("-100", 4), "-25");
+    }
+
+    #[test]
+    fn big_pow_anchors() {
+        assert_eq!(big_pow(2, 100).unwrap(), "1267650600228229401496703205376");
+        // знак: нечётная степень отрицательного основания
+        assert_eq!(big_pow(-3, 3).unwrap(), "-27");
+        assert_eq!(big_pow(-3, 4).unwrap(), "81");
+        assert_eq!(big_pow(-2, 63).unwrap(), "-9223372036854775808");
+        assert_eq!(big_pow(10, 0).unwrap(), "1");
+        // большое основание
+        assert_eq!(
+            big_pow_big("354224848179261915075", 2).unwrap(),
+            big_mul("354224848179261915075", "354224848179261915075")
+        );
+        // кап: 2^400000 превышает 100 тыс. цифр
+        assert!(big_pow(2, 400_000).is_err());
+    }
+
+    #[test]
+    fn fib_factorial_binomial_big() {
+        // F(100) — за f64-точностью (стресс-тест прошлой сессии)
+        assert_eq!(fib_big(100).unwrap(), "354224848179261915075");
+        // F(79) — первая за пределом
+        assert_eq!(fib_big(79).unwrap(), "14472334024676221");
+        // 25! точно
+        assert_eq!(factorial_big(25).unwrap(), "15511210043330985984000000");
+        assert_eq!(factorial_big(0).unwrap(), "1");
+        assert_eq!(factorial_big(1).unwrap(), "1");
+        // C(100, 50) — гигант вне f64
+        assert_eq!(
+            binomial_big(100, 50).unwrap(),
+            "100891344545564193334812497256"
+        );
+        assert_eq!(binomial_big(10, 3).unwrap(), "120");
+        assert_eq!(binomial_big(10, 0).unwrap(), "1");
+        assert_eq!(binomial_big(10, 11).unwrap(), "0");
     }
 }

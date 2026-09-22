@@ -62,8 +62,12 @@ pub enum Value {
     Quantity(f64, Unit),
     /// Матрица (безразмерная).
     Matrix(Matrix),
-    /// Комплексное число (корни уравнений, собственные значения).
+    /// Комплексное число (корни уравнений, собственные значения,
+    /// авточисленные sqrt/ln отрицательных).
     Complex(Complex),
+    /// Точное большое целое (fib(1000), 1000!, 2^10000) — десятичная
+    /// запись, возможен ведущий '-'. Цикл N: «невозможное → возможное».
+    BigInt(String),
     /// Список значений (корни, делители, midpoint…).
     List(Vec<Value>),
     /// Строка (имена планет, тритные записи).
@@ -79,6 +83,8 @@ impl Value {
         match self {
             Value::Scalar(v) => Some(*v),
             Value::Quantity(v, u) => Some(v * u.factor),
+            // приближение (для физики/solve достаточно; точность — в Display)
+            Value::BigInt(s) => s.parse::<f64>().ok(),
             _ => None,
         }
     }
@@ -89,6 +95,7 @@ impl Value {
             Value::Quantity(..) => "величина",
             Value::Matrix(_) => "матрица",
             Value::Complex(_) => "комплексное",
+            Value::BigInt(_) => "точное целое",
             Value::List(_) => "список",
             Value::Str(_) => "строка",
         }
@@ -128,6 +135,16 @@ impl fmt::Display for Value {
                 write!(f, "]")
             }
             Value::Complex(c) => write!(f, "{c}"),
+            Value::BigInt(s) => {
+                // длинные точные целые: значение целиком + подсказка порядка
+                if s.len() > 40 {
+                    let approx: f64 = s.parse::<f64>().unwrap_or(f64::NAN);
+                    let digits = s.trim_start_matches('-').len();
+                    write!(f, "{s}  (≈ {approx:.3e}, {digits} цифр)")
+                } else {
+                    write!(f, "{s}")
+                }
+            }
             Value::List(items) => {
                 write!(f, "[")?;
                 for (i, it) in items.iter().enumerate() {
@@ -154,10 +171,11 @@ impl fmt::Debug for Value {
 /// экспонента для крайних порядков.
 pub fn py_float(v: f64) -> String {
     if v.is_nan() {
-        return "nan".into();
+        // расширенная прямая: NaN = неопределённость (0/0, ∞−∞ и т.п.)
+        return "неопределённость".into();
     }
     if v.is_infinite() {
-        return if v > 0.0 { "inf".into() } else { "-inf".into() };
+        return if v > 0.0 { "∞".into() } else { "-∞".into() };
     }
     if v == 0.0 {
         return if v.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
@@ -295,6 +313,13 @@ impl CalcState {
             solve::SolveOutcome::Contradiction(c) => {
                 Ok((format!("нет решений (f ≡ {c} ≠ 0)"), None))
             }
+            solve::SolveOutcome::AsymptoticZero => Ok((
+                "вещественных корней нет: f(x) → 0 лишь асимптотически — нуль не достигается \
+                 никогда (классика: e^x → 0 при x → −∞); в зоне x ≲ −708 экспонента уходит в \
+                 машинный underflow f64 и округляется в 0.0, но это предел, не решение"
+                    .into(),
+                None,
+            )),
             solve::SolveOutcome::Roots(roots, how) => {
                 if roots.is_empty() {
                     return Ok((format!("вещественных корней не найдено ({how})"), None));
@@ -406,8 +431,9 @@ mod tests {
         assert_eq!(Value::Scalar(1024.0).to_string(), "1024.0");
         assert_eq!(Value::Scalar(0.5).to_string(), "0.5");
         assert_eq!(Value::Scalar(-0.0).to_string(), "-0.0");
-        assert_eq!(Value::Scalar(f64::NAN).to_string(), "nan");
-        assert_eq!(Value::Scalar(f64::INFINITY).to_string(), "inf");
+        assert_eq!(Value::Scalar(f64::NAN).to_string(), "неопределённость");
+        assert_eq!(Value::Scalar(f64::INFINITY).to_string(), "∞");
+        assert_eq!(Value::Scalar(f64::NEG_INFINITY).to_string(), "-∞");
         assert_eq!(Value::Str("mars".into()).to_string(), "\"mars\"");
         assert_eq!(
             Value::List(vec![Value::Scalar(1.0), Value::Scalar(2.0)]).to_string(),
@@ -492,6 +518,145 @@ mod tests {
         assert!(st.preview("unknown_x").starts_with("⚠"));
         // solve в preview
         assert!(st.preview("solve x^2 = 4").contains("2.0"));
+    }
+
+    // =================================================================
+    // ЦИКЛ N: «НЕВОЗМОЖНОЕ → ВОЗМОЖНОЕ» — интеграционные якоря
+    // =================================================================
+
+    #[test]
+    fn extended_reals_infinity() {
+        // расширенная прямая: деление на ноль вместо ошибки
+        assert!(calc("1 / 0").contains("∞"), "{}", calc("1 / 0"));
+        assert!(calc("-1 / 0").contains("-∞"));
+        assert!(calc("1 / 0 + 5").contains("∞"));
+        // ln(0) = −∞ (предел, не ошибка)
+        assert!(calc("ln(0)").contains("-∞"));
+        // 0/0 — честная неопределённость с пояснением
+        let r = CalcState::new().eval_line("0 / 0");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("0/0"));
+        // gamma-полюса → расходимость
+        assert!(calc("gamma(-1)").contains("∞"));
+        assert!(calc("gamma(0)").contains("∞"));
+    }
+
+    #[test]
+    fn auto_complex_arithmetic() {
+        // sqrt отрицательного — мнимая ось без обхода через solve
+        assert!(calc("sqrt(-4)").contains("2.0i"), "{}", calc("sqrt(-4)"));
+        // тахионный Лоренц: γ(1.5) = −i/√(1.25) ≈ −0.894i
+        let r = calc("lorentz(1.5)");
+        assert!(r.contains("i"), "{r}");
+        // прямая формула через sqrt отрицательного дискриминанта
+        let r = calc("1 / sqrt(1 - 1.5^2)");
+        assert!(r.contains("i"), "{r}");
+        // рациональная нечётная степень: (-8)^(1/3) = -2
+        let r = calc("(-8)^(1/3)");
+        assert!(r.contains("-2"), "{r}");
+        // чётный знаменатель — комплексная ветвь: (-2)^0.5 = i·√2
+        let r = calc("(-2)^0.5");
+        assert!(r.contains("i"), "{r}");
+        // ln(-1) = iπ
+        let r = calc("ln(-1)");
+        assert!(r.contains("i"), "{r}");
+        // комплексная арифметика продолжается: (0+2i)·(0+2i) = -4
+        let r = calc("sqrt(-4) * sqrt(-4)");
+        assert!(r.contains("-4"), "{r}");
+    }
+
+    #[test]
+    fn exact_big_integers() {
+        // fib за f64-пределом — ТОЧНО (стресс-тест прошлой сессии: fib(100))
+        assert!(calc("fib(100)").contains("354224848179261915075"), "{}", calc("fib(100)"));
+        // совместимость: малые остались Scalar
+        assert!(calc("fib(10)").contains("55.0"));
+        // факториал точен за 18!
+        let r = calc("factorial(25)");
+        assert!(r.contains("15511210043330985984000000"), "{r}");
+        // 2^100 — точное целое (f64 давал 1.2676506002282294e30)
+        let r = calc("2^100");
+        assert!(r.contains("1267650600228229401496703205376"), "{r}");
+        // совместимость степени: 2^10 остаётся Scalar 1024.0
+        assert!(calc("2^10").contains("1024.0"));
+        // знак нечётной степени: (-3)^41 — точное отрицательное целое
+        let r = calc("(-3)^41");
+        assert!(r.starts_with("-"), "{r}");
+        assert!(r.contains("36472996377170786403"), "{r}");
+        // binomial точен: C(100,50)
+        let r = calc("binomial(100, 50)");
+        assert!(r.contains("100891344545564193334812497256"), "{r}");
+        // малые binomial остаются Scalar
+        assert!(calc("binomial(5, 2)").contains("10.0"));
+        // catalan за f64: C_31 = 14544636039226909
+        let r = calc("catalan(31)");
+        assert!(r.contains("14544636039226909"), "{r}");
+        // big-арифметика: fib(100) + 1 — точный путь
+        let r = calc("fib(100) + 1");
+        assert!(r.contains("354224848179261915076"), "{r}");
+        // fib(100) * fib(100) — точное умножение (F(100)² ≈ 1.2547e41)
+        let r = calc("fib(100) * fib(100)");
+        assert!(r.contains("125475243067621153271396401396356512255625"), "{}", r);
+        // деление нацело большого: fib(100) / 5
+        let r = calc("fib(100) / 5");
+        assert!(r.contains("70844969635852383015"), "{r}");
+        // fib(1000) — 209 цифр, точность сохранена (канонический якорь)
+        let r = calc("fib(1000)");
+        assert!(r.contains("43466557686937456435688527675040625802564660517371780402481729089536555417949051890403879840079255169295922593080322634775209689623239873322471161642996440906533187938298969649928516003704476137795166849228875"), "{r}");
+    }
+
+    #[test]
+    fn solve_underflow_asymptotic() {
+        // ГЛАВНАЯ регрессия цикла N: exp(x) = 0 не имеет корней,
+        // а старый решатель возвращал ложные [-200, -90] из-за underflow
+        let r = calc("solve exp(x) = 0");
+        assert!(r.contains("асимптотически"), "{r}");
+        assert!(!r.contains("x ∈"), "ложные корни: {r}");
+        // настоящий трансцендентный корень работает как раньше
+        let r = calc("solve exp(x) = 2");
+        assert!(r.contains("0.693"), "{r}");
+        // касание нуля (чётная кратность) — численный путь: sin²(x) = 0
+        // имеет корни ровно в кратных π — все настоящие (47 найдено)
+        let r = calc("solve sin(x)^2 = 0");
+        assert!(r.contains("корней"), "{r}");
+        // полный список — в ans: π и 0 присутствуют точно
+        let mut st = CalcState::new();
+        st.eval_line("solve sin(x)^2 = 0").unwrap();
+        let s = format!("{}", st.vars.get("ans").unwrap());
+        assert!(s.contains("3.1415"), "{s}");
+        assert!(s.contains("0.0"), "{s}");
+    }
+
+    #[test]
+    fn lorentz_tachyon() {
+        // досветовая γ
+        let r = calc("lorentz(0.5)");
+        assert!(r.contains("1.154"), "{r}");
+        // v = c → расходимость
+        let r = calc("lorentz(1)");
+        assert!(r.contains("∞"), "{r}");
+        // тахионная ветвь: γ(1.5) = −i/√1.25 ≈ −0.894i
+        let r = calc("lorentz(1.5)");
+        assert!(r.contains("-0.894"), "{r}");
+    }
+
+    #[test]
+    fn pinv_singular_and_rect() {
+        // ГЛАВНАЯ регрессия цикла N: inv([1,2;2,4]) был «невозможен»
+        // (det = 0) — псевдообратная Мура–Пенроуза считает любую матрицу
+        let r = calc("pinv([1, 2; 2, 4])");
+        assert!(r.contains("0.04"), "{r}");
+        assert!(r.contains("0.16"), "{r}");
+        // inv вырожденной — ошибка с подсказкой на pinv
+        let r = CalcState::new().eval_line("inv([1, 2; 2, 4])");
+        assert!(r.unwrap_err().contains("pinv"));
+        // прямоугольная строка: [1,2,3]⁺ = [1,2,3]ᵀ/14
+        let r = calc("pinv([1, 2, 3])");
+        assert!(r.contains("0.071"), "{r}"); // 1/14 ≈ 0.0714
+        assert!(r.contains("0.214"), "{r}"); // 3/14 ≈ 0.2143
+        // ζ(1) — полюс на расширенной прямой, как у Γ в целых точках
+        let r = calc("zeta(1)");
+        assert!(r.contains("∞"), "{r}");
     }
 
     #[test]

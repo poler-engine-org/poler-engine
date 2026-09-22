@@ -191,7 +191,9 @@ impl Matrix {
                 }
             }
             if a[piv * n + col].abs() < 1e-13 {
-                return Err("матрица вырождена (сингулярна)".into());
+                return Err(
+                    "матрица вырождена (сингулярна) — псевдообратная Мура–Пенроуза: pinv(...)".into(),
+                );
             }
             swap_rows_vec(&mut a, n, piv, col);
             swap_rows_vec(&mut b, n, piv, col);
@@ -213,6 +215,72 @@ impl Matrix {
             }
         }
         Ok(Matrix { rows: n, cols: n, data: b })
+    }
+
+    /// Псевдообратная Мура–Пенроуза: алгоритм Гревилля (колоночный, без SVD).
+    ///
+    /// A⁺ определена для ЛЮБОЙ матрицы — вырожденной, прямоугольной, нулевой.
+    /// Строится наращиванием по столбцам: для нового столбца aₖ остаток
+    /// cₖ = aₖ − Aₖ₋₁Aₖ₋₁⁺aₖ вне образа предыдущих столбцов либо становится
+    /// новой строкой bₖᵀ = cₖᵀ/(cₖᵀcₖ), либо (cₖ ≈ 0) сворачивается в
+    /// bₖᵀ = dₖᵀAₖ₋₁⁺/(1+dₖᵀdₖ), а прошлые строки корректируются на dₖbₖᵀ.
+    /// Удовлетворяет четырём условиям Мура–Пенроуза (см. тест): проекции
+    /// AA⁺ и A⁺A симметричны и идемпотентны. Для плохо обусловленных
+    /// матриц шум усиливается — это цена отказа от SVD-пути.
+    pub fn pinv(&self) -> Result<Matrix, String> {
+        let (m, n) = (self.rows, self.cols);
+        if !self.data.iter().all(|v| v.is_finite()) {
+            return Err("pinv: элементы должны быть конечны".into());
+        }
+        let scale = self.norm_inf();
+        if scale == 0.0 {
+            return Ok(Matrix::zeros(n, m)); // нулевая матрица → нулевая A⁺
+        }
+        // P — растущая Aₖ⁺: k строк × m столбцов.
+        let mut p: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for k in 0..n {
+            // столбец aₖ (m-вектор)
+            let a: Vec<f64> = (0..m).map(|i| self.get(i, k)).collect();
+            // d = P·aₖ (k-вектор)
+            let d: Vec<f64> = p
+                .iter()
+                .map(|r| r.iter().zip(&a).map(|(x, y)| x * y).sum())
+                .collect();
+            // c = aₖ − Aₖ₋₁·d — остаток вне образа предыдущих столбцов
+            let mut c = a.clone();
+            for (j, dj) in d.iter().enumerate() {
+                if *dj != 0.0 {
+                    for i in 0..m {
+                        c[i] -= self.get(i, j) * dj;
+                    }
+                }
+            }
+            let c2: f64 = c.iter().map(|x| x * x).sum();
+            // относительный порог численного нуля (к столбцу и к масштабу A)
+            let a2: f64 = a.iter().map(|x| x * x).sum();
+            let tol2 = (1e-10 * a2.sqrt().max(1e-12 * scale)).powi(2);
+            let b: Vec<f64> = if c2 > tol2 {
+                c.iter().map(|x| x / c2).collect()
+            } else {
+                let d2: f64 = d.iter().map(|x| x * x).sum();
+                let denom = 1.0 + d2;
+                (0..m)
+                    .map(|col| {
+                        d.iter().zip(&p).map(|(dv, r)| dv * r[col]).sum::<f64>() / denom
+                    })
+                    .collect()
+            };
+            // Pₖ = [Pₖ₋₁ − d·bᵀ ; b]
+            for (i, dv) in d.iter().enumerate() {
+                if *dv != 0.0 {
+                    for col in 0..m {
+                        p[i][col] -= dv * b[col];
+                    }
+                }
+            }
+            p.push(b);
+        }
+        Matrix::from_rows(&p)
     }
 
     /// Норма ∞ (максимум сумм модулей строк).
@@ -415,6 +483,68 @@ mod tests {
         assert!(Matrix::from_rows(&[]).is_err());
         assert!(Matrix::from_rows(&[vec![1.0], vec![1.0, 2.0]]).is_err());
         assert!(Matrix::from_rows(&[vec![]]).is_err());
+    }
+
+    #[test]
+    fn pinv_moore_penrose() {
+        // вырожденная [1,2;2,4] (det = 0, stress-тест цикла N):
+        // A = u·vᵀ с u = v = [1;2] → A⁺ = A/25
+        let a = m22(1.0, 2.0, 2.0, 4.0);
+        let p = a.pinv().unwrap();
+        assert!(close(p.get(0, 0), 0.04, 1e-12), "{}", p.get(0, 0));
+        assert!(close(p.get(0, 1), 0.08, 1e-12));
+        assert!(close(p.get(1, 0), 0.08, 1e-12));
+        assert!(close(p.get(1, 1), 0.16, 1e-12));
+
+        // четыре условия Мура–Пенроуза: AA⁺A=A, A⁺AA⁺=A⁺,
+        // (AA⁺)ᵀ=AA⁺, (A⁺A)ᵀ=A⁺A
+        let apa = a.mul(&p).unwrap().mul(&a).unwrap();
+        assert!(close(apa.get(0, 0), 1.0, 1e-12) && close(apa.get(1, 1), 4.0, 1e-12));
+        let pap = p.mul(&a).unwrap().mul(&p).unwrap();
+        assert!(close(pap.get(0, 0), 0.04, 1e-12) && close(pap.get(1, 1), 0.16, 1e-12));
+        let aat = a.mul(&p).unwrap();
+        let sym1 = aat.transpose();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(close(aat.get(i, j), sym1.get(i, j), 1e-12));
+            }
+        }
+
+        // невырожденная: pinv = inv
+        let b = m22(4.0, 7.0, 2.0, 6.0);
+        let bp = b.pinv().unwrap();
+        let bi = b.inv().unwrap();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(close(bp.get(i, j), bi.get(i, j), 1e-9));
+            }
+        }
+
+        // прямоугольная строка [1,2,3]: A⁺ = aᵀ/‖a‖² = [1,2,3]ᵀ/14
+        let row = Matrix::from_rows(&[vec![1.0, 2.0, 3.0]]).unwrap();
+        let rp = row.pinv().unwrap();
+        assert_eq!((rp.rows, rp.cols), (3, 1));
+        assert!(close(rp.get(0, 0), 1.0 / 14.0, 1e-12));
+        assert!(close(rp.get(1, 0), 2.0 / 14.0, 1e-12));
+        assert!(close(rp.get(2, 0), 3.0 / 14.0, 1e-12));
+
+        // нулевой столбец — нулевая строка A⁺; единичная — сама себя
+        let z = Matrix::from_rows(&[vec![0.0, 1.0], vec![0.0, 2.0]]).unwrap();
+        let zp = z.pinv().unwrap();
+        assert_eq!(zp.get(0, 0).abs() + zp.get(0, 1).abs(), 0.0);
+        let eye = Matrix::identity(3);
+        let ep = eye.pinv().unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(ep.get(i, j), eye.get(i, j));
+            }
+        }
+
+        // нулевая матрица — нулевая A⁺ (транспонированной формы)
+        let zz = Matrix::from_rows(&[vec![0.0, 0.0], vec![0.0, 0.0]]).unwrap();
+        let zpp = zz.pinv().unwrap();
+        assert_eq!((zpp.rows, zpp.cols), (2, 2));
+        assert!(zpp.data.iter().all(|&v| v == 0.0));
     }
 
     #[test]
