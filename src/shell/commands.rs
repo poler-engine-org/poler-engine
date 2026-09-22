@@ -178,6 +178,15 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
                 cmd_quantum(state, &raw)
             }
         }
+        // v0.53.0 (цикл R): P³-Мост — конформанс Rust↔Zig и рендер
+        "p3" => {
+            let raw = raw_args_of(line);
+            if raw.trim().is_empty() {
+                CmdResult::Done(p3_usage())
+            } else {
+                cmd_p3(&raw)
+            }
+        }
         other => {
             // v0.47.0: echo с Windows-переменными %NAME% → ${NAME}
             if other == "echo" && args.iter().any(|a| contains_win_var(a)) {
@@ -365,6 +374,180 @@ fn quantum_usage() -> String {
     .join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// v0.53.0 (цикл R): P³-Мост — p3 info / conformance / frame
+// ---------------------------------------------------------------------------
+
+fn p3_usage() -> String {
+    [
+        "p3 info                      — библиотека P³: путь, ядро, ABI-рукопожатие",
+        "p3 conformance [--pairs N] [--json] — конформанс Rust ↔ Zig:",
+        "    d_FS, гомогенность, U†U=I, (AB)v=A(Bv), det, идемпотенты P²=P",
+        "p3 frame [opts]              — «кадр из гамильтониана» (цикл R3):",
+        "    цепочка Изинга → эволюция expm → P³ рендер → 3 PNG (rgb/depth/seg)",
+        "    opts: --n K(2..8) --steps T --size WxH --out DIR --jz J --hx H --cloud M",
+        "пути библиотеки: P3_FFI_LIB → ffi/ рядом с бинарником → ffi/ репо",
+    ]
+    .join("\n")
+}
+
+fn cmd_p3(raw: &str) -> CmdResult {
+    let raw = raw.trim();
+    let raw = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    let sub = parts.first().map(String::as_str).unwrap_or("");
+    let args = &parts[1..];
+
+    match sub {
+        "help" | "usage" => CmdResult::Done(p3_usage()),
+        "info" => cmd_p3_info(),
+        "conformance" | "conf" => cmd_p3_conformance(args),
+        "frame" | "render" => cmd_p3_frame(args),
+        other => CmdResult::Done(format!(
+            "p3: неизвестная подкоманда `{other}`\n\n{}",
+            p3_usage()
+        )),
+    }
+}
+
+fn cmd_p3_info() -> CmdResult {
+    match crate::p3::ffi::P3Lib::open() {
+        Ok(lib) => CmdResult::Done(format!(
+            "P³-Мост активен\n  библиотека : {}\n  ядро       : {}\n  ABI        : v{} (ожидалась v{})\n  экспорты   : fs_distance, pgl_identity/mul/transpose/apply/det,\n              givens4, spectral_projector, idempotent_rank/residual,\n              ortho_residual, render_frame",
+            lib.path.display(),
+            lib.kernel_tag,
+            lib.abi_version,
+            crate::p3::ffi::EXPECTED_ABI,
+        )),
+        Err(e) => CmdResult::Done(format!("P³-Мост недоступен: {e}")),
+    }
+}
+
+fn cmd_p3_conformance(args: &[String]) -> CmdResult {
+    let pairs = match q_flag_num(args, "--pairs", 96u32) {
+        Ok(p) => p.clamp(4, 4096),
+        Err(e) => return CmdResult::Done(format!("p3 conformance: {e}")),
+    };
+    let as_json = q_flag(args, "--json");
+    match crate::p3::conformance::run_conformance(pairs) {
+        Ok(report) => {
+            if as_json {
+                let mut j = String::from("{\n");
+                j.push_str(&format!(
+                    "  \"library\": {},\n  \"kernel\": {},\n  \"abi\": {},\n  \"pairs\": {},\n  \"passed\": {},\n  \"checks\": [\n",
+                    json_str(&report.lib_path),
+                    json_str(&report.kernel_tag),
+                    report.abi_version,
+                    report.pairs,
+                    report.passed()
+                ));
+                for (i, c) in report.checks.iter().enumerate() {
+                    j.push_str(&format!(
+                        "    {{\"name\": {}, \"checked\": {}, \"max_dev\": {:e}, \"tol\": {:e}, \"passed\": {}}}{}\n",
+                        json_str(c.name),
+                        c.checked,
+                        c.max_dev,
+                        c.tol,
+                        c.passed(),
+                        if i + 1 < report.checks.len() { "," } else { "" }
+                    ));
+                }
+                j.push_str("  ]\n}");
+                CmdResult::Done(j)
+            } else {
+                CmdResult::Done(report.summary())
+            }
+        }
+        Err(e) => CmdResult::Done(format!("p3 conformance: {e}")),
+    }
+}
+
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn cmd_p3_frame(args: &[String]) -> CmdResult {
+    let mut cfg = crate::p3::render::FrameConfig::default();
+    if let Ok(n) = q_flag_num(args, "--n", cfg.n_qubits as u32) {
+        if !(2..=8).contains(&n) {
+            return CmdResult::Done("p3 frame: --n 2..=8".into());
+        }
+        cfg.n_qubits = n as usize;
+    }
+    if let Ok(t) = q_flag_num(args, "--steps", cfg.steps as u32) {
+        if !(4..=512).contains(&t) {
+            return CmdResult::Done("p3 frame: --steps 4..=512".into());
+        }
+        cfg.steps = t as usize;
+    }
+    if let Some(size) = args.iter().position(|a| a == "--size") {
+        let val = match args.get(size + 1) {
+            Some(v) => v.clone(),
+            None => return CmdResult::Done("p3 frame: --size WxH (например 960x540)".into()),
+        };
+        let Some((w, h)) = val.split_once('x') else {
+            return CmdResult::Done("p3 frame: --size WxH (например 960x540)".into());
+        };
+        let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) else {
+            return CmdResult::Done("p3 frame: --size WxH — целые числа".into());
+        };
+        if !(64..=4096).contains(&w) || !(64..=4096).contains(&h) {
+            return CmdResult::Done("p3 frame: --size 64..=4096 по каждой стороне".into());
+        }
+        cfg.width = w;
+        cfg.height = h;
+    }
+    if let Ok(jz) = q_flag_num(args, "--jz", cfg.jz) {
+        if !(-10.0..=10.0).contains(&jz) || !jz.is_finite() {
+            return CmdResult::Done("p3 frame: --jz -10..=10".into());
+        }
+        cfg.jz = jz;
+    }
+    if let Ok(hx) = q_flag_num(args, "--hx", cfg.hx) {
+        if !(-10.0..=10.0).contains(&hx) || !hx.is_finite() {
+            return CmdResult::Done("p3 frame: --hx -10..=10".into());
+        }
+        cfg.hx = hx;
+    }
+    if let Ok(m) = q_flag_num(args, "--cloud", cfg.cloud_top as u32) {
+        if !(1..=64).contains(&m) {
+            return CmdResult::Done("p3 frame: --cloud 1..=64".into());
+        }
+        cfg.cloud_top = m as usize;
+    }
+    if let Some(p) = args.iter().position(|a| a == "--out") {
+        match args.get(p + 1) {
+            Some(v) => cfg.out_dir = std::path::PathBuf::from(v.clone()),
+            None => return CmdResult::Done("p3 frame: --out DIR".into()),
+        }
+    }
+
+    match crate::p3::render::render_hamiltonian_frame(&cfg) {
+        Ok(out) => CmdResult::Done(format!(
+            "Кадр из гамильтониана (P³ рендер, цикл R3)\n  схема      : цепочка Изинга n={}, J={}, h={}, шагов {}\n  геометрия  : {} точек P³, {} рёбер\n  рендер     : {}×{}, закрашено {} пикселей, max d_FS = {:.4} рад\n  честность  : дрейф энергии/нормы = {:.2e} (унитарность expm)\n  артефакты  :\n    {}\n    {}\n    {}",
+            cfg.n_qubits,
+            cfg.jz,
+            cfg.hx,
+            cfg.steps,
+            out.n_points,
+            out.n_edges,
+            cfg.width,
+            cfg.height,
+            out.painted_px,
+            out.max_fs_depth,
+            out.energy_drift,
+            out.rgb_png.display(),
+            out.depth_png.display(),
+            out.seg_png.display(),
+        )),
+        Err(e) => CmdResult::Done(format!("p3 frame: {e}")),
+    }
+}
+
 /// Разбор общих флагов quantum (значение флага — следующий аргумент).
 fn q_flag_num<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Result<T, String> {
     args.iter().position(|a| a == flag).map_or(Ok(default), |i| {
@@ -416,7 +599,6 @@ fn cmd_quantum(state: &mut ShellState, raw: &str) -> CmdResult {
     let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
     let sub = parts.first().map(String::as_str).unwrap_or("");
     let args = &parts[1..];
-    let as_json = q_flag(args, "--json");
 
     match sub {
         "help" | "usage" => CmdResult::Done(quantum_usage()),
@@ -3700,6 +3882,106 @@ mod tests {
         // equiv: две схемы — шум честно не применяется
         match dispatch(&mut s, "quantum verify equiv qft iqft --n 3 --noise ibm-heron") {
             CmdResult::Done(out) => assert!(out.contains("Шум не применён"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v0.53.0 (цикл R): P³-Мост — info / conformance / frame
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cmd_p3_usage_and_unknown() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-r1.db"));
+        match dispatch(&mut s, "p3") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("p3 conformance"), "{out}");
+                assert!(out.contains("p3 frame"), "{out}");
+            }
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "p3 help") {
+            CmdResult::Done(out) => assert!(out.contains("p3 info"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "p3 bogus") {
+            CmdResult::Done(out) => assert!(out.contains("неизвестная подкоманда"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_p3_info_loads_library() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-r2.db"));
+        match dispatch(&mut s, "p3 info") {
+            CmdResult::Done(out) => {
+                // библиотека коммитится в ffi/ — на Linux x86_64 обязана
+                // загрузиться; на иных платформах честный отказ
+                assert!(
+                    out.contains("P³-Мост активен") || out.contains("P³-Мост недоступен"),
+                    "{out}"
+                );
+                if out.contains("активен") {
+                    assert!(out.contains("p3-kernel"), "{out}");
+                    assert!(out.contains("ABI        : v1"), "{out}");
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn cmd_p3_conformance_report() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-r3.db"));
+        match dispatch(&mut s, "p3 conformance --pairs 12") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("КОНФОРМАНС ПОДТВЕРЖДЁН"), "{out}");
+                assert!(out.contains("d_FS(a,b)"), "{out}");
+                assert!(out.contains("U†U = I"), "{out}");
+                assert!(out.contains("P² − P") || out.contains("Идемпотент"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // JSON-режим — машиночитаемый отчёт
+        match dispatch(&mut s, "p3 conformance --pairs 8 --json") {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).expect("JSON: {out}");
+                assert_eq!(v["passed"], serde_json::json!(true));
+                assert!(v["checks"].as_array().unwrap().len() >= 7);
+                assert!(v["kernel"].as_str().unwrap().contains("p3-kernel"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn cmd_p3_frame_renders_pngs() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-r4.db"));
+        let dir = std::env::temp_dir().join("poler_p3_shell_test");
+        match dispatch(
+            &mut s,
+            &format!("p3 frame --n 3 --steps 6 --size 128x96 --cloud 4 --out {}", dir.display()),
+        ) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Кадр из гамильтониана"), "{out}");
+                assert!(out.contains("дрейф энергии"), "{out}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_p3_frame_validates_args() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-r5.db"));
+        match dispatch(&mut s, "p3 frame --n 12") {
+            CmdResult::Done(out) => assert!(out.contains("--n 2..=8"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "p3 frame --size 10x10") {
+            CmdResult::Done(out) => assert!(out.contains("64..=4096"), "{out}"),
             _ => panic!(),
         }
     }

@@ -33,6 +33,8 @@ pub enum HelpGroup {
     Calc,
     // v0.51.0 (цикл P)
     Quantum,
+    // v0.53.0 (цикл R)
+    P3,
 }
 
 impl HelpGroup {
@@ -53,6 +55,7 @@ impl HelpGroup {
             HelpGroup::Meta => "Мета",
             HelpGroup::Calc => "Калькулятор Всего (v0.48.0)",
             HelpGroup::Quantum => "Квантовый мост (v0.51.0)",
+            HelpGroup::P3 => "P³-Мост Rust↔Zig (v0.53.0)",
         }
     }
 }
@@ -135,6 +138,11 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum bloch <alpha> [beta]", short: "Сфера Блоха с ASCII-диаграммой; амплитуды — выражения calc (1/sqrt(2), i…)" },
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum verify unitary|equiv|teleport", short: "Формальная верификация: U†U = I, эквивалентность — точно в ℤ[1/√2, i]; --noise — шум поверх вердикта" },
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum calc <физика>", short: "Мост в цикл O: schrodinger, pauli_x/y/z, kron, expm, eigen" },
+
+        // v0.53.0 (цикл R): P³-Мост — живое соединение с Zig-движком
+        HelpEntry { group: HelpGroup::P3, cmd: "p3 info", short: "Библиотека P³: путь, тег ядра Zig, ABI-рукопожатие" },
+        HelpEntry { group: HelpGroup::P3, cmd: "p3 conformance [--pairs N --json]", short: "Конформанс Rust ↔ Zig: d_FS, U†U=I, det, идемпотенты P²=P" },
+        HelpEntry { group: HelpGroup::P3, cmd: "p3 frame [opts]", short: "Кадр из гамильтониана: Изинг → expm → P³ рендер → 3 PNG (rgb/depth/seg)" },
 
         // v0.47.0: середа для ІІ-агентів (Antigravity)
         HelpEntry { group: HelpGroup::Agent, cmd: "sysinfo | systeminfo", short: "Карта середовища: CPU/RAM/GPU/диск/тулчейни/локаль/TTY — звіт для агента" },
@@ -222,7 +230,7 @@ pub fn help_topic(name: &str) -> String {
     let parent_cmds = [
         "search", "web", "stats", "sync", "set", "crawl", "impact",
         "gh", "gl", "gt", "gix", "notes", "sources", "version", "quit", "help",
-        "calc", "hw", "quantum", "qm",
+        "calc", "hw", "quantum", "qm", "p3",
     ];
     if parent_cmds.contains(&name_lower.as_str()) {
         let matching: Vec<&HelpEntry> = entries
@@ -288,6 +296,10 @@ NUMA-узлы, bogomips, размеры страниц, диски (HDD/SSD), GP
     // v0.51.0: развёрнутая тема квантового моста
     if name_lower == "quantum" || name_lower == "qm" || name_lower == "квант" {
         return quantum_help_topic();
+    }
+    // v0.53.0: развёрнутая тема P³-Моста
+    if name_lower == "p3" || name_lower == "мост" || name_lower == "проектив" {
+        return p3_help_topic();
     }
     format!("тема не знайдена: {name} (введіть `help` для повного списку)")
 }
@@ -578,6 +590,38 @@ pub fn palette_scenarios() -> Vec<Scenario> {
             help: "Індексує коміти/issues відслідковуваних GitHub-репо у web-index.",
         },
     ]
+}
+
+/// v0.53.0 (цикл R): полная справка P³-Моста.
+fn p3_help_topic() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "─── P³-Мост: POLER ENGINE (Rust) ↔ P³ ENGINE (Zig) ───");
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "Живое соединение ядра и движка через C-ABI (libp3ffi.so). Ядро P³\n(проективная геометрия: метрика Фубини–Штуди, PGL(4), идемпотенты)\nсобрано Zig 0.14.0 в разделяемую библиотеку; POLER вызывает её\nнапрямую и сверяет со своей Rust-реализацией той же математики."
+    );
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Команды:");
+    let _ = writeln!(s, "  p3 info                    — библиотека, тег ядра, ABI-рукопожатие");
+    let _ = writeln!(s, "  p3 conformance [--pairs N] — конформанс Rust ↔ Zig (--json — машиночитаемо):");
+    let _ = writeln!(s, "    d_FS(a,b), гомогенность λ·μ, U†U = I (Гивенс), (A·B)v = A(Bv),");
+    let _ = writeln!(s, "    det(PGL4), идемпотенты P² = P (спектральные проекторы)");
+    let _ = writeln!(s, "  p3 frame [opts]            — «кадр из гамильтониана» (первый публичный");
+    let _ = writeln!(s, "    артефакт «изображение, просчитанное математически»):");
+    let _ = writeln!(s, "    цепочка Изинга −J·ΣZᵢZᵢ₊₁ − h·ΣXᵢ → эволюция expm → worldlines ⟨Zᵢ⟩(t)");
+    let _ = writeln!(s, "    + облако |⟨b|Ψ⟩|² → P³ рендер в тройной буфер (RGB+depth+seg) → 3 PNG");
+    let _ = writeln!(s, "    opts: --n K(2..8) --steps T --size WxH --out DIR --jz J --hx H --cloud M");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Поиск библиотеки: $P3_FFI_LIB → ffi/ рядом с бинарником →");
+    let _ = writeln!(s, "ffi/ репозитория (коммитится) → P3_Engine/zig-out/lib.");
+    let _ = writeln!(s, "Пересборка: ffi/build.sh (Zig 0.14.0, ReleaseFast).");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Примеры:");
+    let _ = writeln!(s, "  poler> p3 conformance --pairs 256");
+    let _ = writeln!(s, "  poler> p3 frame --n 6 --steps 64 --size 960x540 --out ./demo");
+    let _ = writeln!(s, "  poler-engine --exec \"p3 frame --json\" --json");
+    s
 }
 
 #[cfg(test)]

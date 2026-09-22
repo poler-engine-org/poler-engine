@@ -78,6 +78,9 @@ pub mod mcp_http;
 pub mod ner;
 pub mod notes;
 pub mod output;
+/// Цикл R (v0.53.0): P³-Мост — C-ABI конформанс Rust↔Zig и рендер
+/// «кадр из гамильтониана» (libp3ffi.so поверх ядра P³ Engine).
+pub mod p3;
 pub mod parser;
 pub mod poler;
 pub mod psi;

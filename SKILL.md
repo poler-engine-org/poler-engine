@@ -418,6 +418,16 @@ TVD/фиделити/χ² поверх вердикта), `list`.
 Тот же мост в шелле: `quantum run|qcasm|qaoa|teleport|bloch|verify|calc`
 (алиас `qm`), физика уровней — `quantum calc schrodinger(…)`.
 
+**v0.53.0 (цикл R) P³-Мост — шелл-команда `p3`:** `p3 info` (библиотека
+libp3ffi.so: путь, тег ядра Zig 0.14.0, ABI-рукопожатие), `p3 conformance
+[--pairs N --json]` (живой конформанс Rust ↔ Zig через C-ABI: d_FS
+Фубини–Штуди, гомогенность, U†U = I, (A·B)v = A(Bv), det(PGL4),
+идемпотенты P² = P — расхождения на уровне 1 ulp), `p3 frame [opts]`
+(«кадр из гамильтониана»: цепочка Изинга → эволюция expm → P³-рендер
+тройного буфера RGB+depth+seg → 3 PNG; opts: --n 2..8 --steps --size
+WxH --jz --hx --cloud --out). Библиотека коммитится в ffi/ (пересборка
+ffi/build.sh), поиск через P3_FFI_LIB. Отчёт: docs/P3_CONFORMANCE_REPORT_v0.53.0.md.
+
 **C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/
 eject коннектома в RAM), `poler_fly_node` (паспорт), `poler_fly_edge`
 (ребро + ротор J), `poler_fly_khop` (BFS фронтов), `poler_fly_path`
