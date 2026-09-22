@@ -7,6 +7,27 @@
 
 ---
 
+## 0. UE-референсы в родном контейнере `ue_reference.poler` (v0.55.0)
+
+Заголовки Unreal Engine (коммит 266477d: LevelTick.cpp, Actor.h,
+ActorComponent.h, ActorChannel.h, GarbageCollection.h,
+RenderGraphBuilder.h) хранятся **только** внутри суверенного
+`.poler`-контейнера — без распакованных копий на диске.
+
+Протокол «полер-бокс» (директива владельца):
+
+```bash
+poler-engine --archive-list ue_reference.poler            # листинг O(1)
+poler-engine --grep "RunTickGroup" docs/research-archive/ --archives  # grep внутри
+poler-engine --poler-cat ue_reference.poler --file ue_reference/Actor.h  # чтение записи
+poler-engine --poler-patch ue_reference.poler --manifest notes.json     # CoW-патч внутри
+```
+
+Аналитика — в записи `ue_reference/POLER_NOTES.md` **внутри** архива
+(добавлена in-place патчем). Сжатие ratio ≈ 0.21.
+
+---
+
 ## 1. Содержимое архива `omni_vision_streaming_references.tar.gz`
 
 1. **`mini-omni` / `mini-omni2` (GPT-Omni)**:

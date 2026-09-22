@@ -50,6 +50,7 @@
 //! | [`ArchiveKind::TarZst`] | tar.zst, tzst | tar + zstd | — |
 //! | [`ArchiveKind::GzSingle`] | gz | gzip (мульти-член: ротация логов) | — |
 //! | [`ArchiveKind::ZstSingle`] | zst | zstd-стрим | — |
+//! | [`ArchiveKind::Poler`] | poler, t5z | CDC-чанки zstd fast/deep + дедуп | — |
 //!
 //! bzip2/xz/deflate64 не поддерживаются сознательно: C-зависимости
 //! (bzip2, lzma) и/или экзотика — суверенный минимум зависимостей.
@@ -112,6 +113,10 @@ pub enum ArchiveKind {
     GzSingle,
     /// Одиночный zstd-файл (одна псевдо-запись).
     ZstSingle,
+    /// Родной контейнер `.poler`/`.t5z`: mmap + файловая таблица из
+    /// трейлера, O(log n) доступ к любому чанку, CDC-дедуп,
+    /// in-place CoW-патчинг (см. [`reader`], [`patcher`]).
+    Poler,
 }
 
 impl ArchiveKind {
@@ -124,6 +129,7 @@ impl ArchiveKind {
             ArchiveKind::TarZst => "tar.zst",
             ArchiveKind::GzSingle => "gz",
             ArchiveKind::ZstSingle => "zst",
+            ArchiveKind::Poler => "poler",
         }
     }
 }
@@ -133,6 +139,11 @@ impl ArchiveKind {
 /// `archive.tar.gz` — это TarGz, а не GzSingle.
 pub fn kind_of(path: &Path) -> Option<ArchiveKind> {
     let name = path.file_name()?.to_string_lossy().to_lowercase();
+    // Родной контейнер — раньше остальных: `.poler` и `.t5z` не
+    // пересекаются с составными расширениями tar-семейства.
+    if name.ends_with(".poler") || name.ends_with(".t5z") {
+        return Some(ArchiveKind::Poler);
+    }
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         return Some(ArchiveKind::TarGz);
     }
@@ -208,6 +219,7 @@ pub fn open_info(path: &Path) -> Result<ArchiveInfo, String> {
         .ok_or_else(|| format!("{}: не архив (zip/tar/tar.gz/tar.zst/gz/zst)", path.display()))?;
     let entries = match kind {
         ArchiveKind::Zip => zip_info(path)?,
+        ArchiveKind::Poler => poler_info(path)?,
         ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarZst => tar_info(path, kind)?,
         ArchiveKind::GzSingle | ArchiveKind::ZstSingle => {
             let compressed = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -334,6 +346,67 @@ pub fn virtual_name(archive: &Path, entry: &str) -> String {
     format!("{}{}{}", archive.display(), VIRTUAL_SEP, entry)
 }
 
+/// Файловая таблица родного `.poler`: O(1) открытие (mmap + трейлер),
+/// метаданные без декомпрессии чанков. `size` — несжатая длина записи
+/// (`raw_len`); сжатие в `.poler` посчитано на уровне чанков CDC,
+/// поэтому `compressed = 0` (в листинге «-»).
+fn poler_info(path: &Path) -> Result<Vec<EntryMeta>, String> {
+    let r = reader::PolerReader::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(r
+        .files()
+        .iter()
+        .map(|f| EntryMeta {
+            name: f.name.clone(),
+            size: f.raw_len,
+            compressed: 0,
+            is_dir: false,
+            encrypted: false,
+        })
+        .collect())
+}
+
+/// Чтение записи `.poler` как байтов: поиск по файловой таблице,
+/// затем декомпрессия только покрывающих чанков (≤ 1 МиБ скретч),
+/// шаг 1 МиБ — как в `PolerReader::verify` (RAM-дисциплина).
+fn poler_read_entry(
+    path: &Path,
+    entry: &str,
+    limits: &ReadLimits,
+) -> Result<Vec<u8>, String> {
+    let r = reader::PolerReader::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let norm = norm_name(entry);
+    let f = r
+        .find_file(&norm)
+        .or_else(|| {
+            r.files()
+                .iter()
+                .find(|f| norm_name(&f.name) == norm)
+        })
+        .ok_or_else(|| format!("{}::{}: запись не найдена", path.display(), norm))?;
+    if f.raw_len > limits.max_entry_bytes {
+        return Err(format!(
+            "{}::{}: несжатый размер {} байт > лимита {} байт — запись пропущена \
+             (--archive-max-entry-mb)",
+            path.display(),
+            f.name,
+            f.raw_len,
+            limits.max_entry_bytes
+        ));
+    }
+    let mut out = Vec::with_capacity(f.raw_len.min(8 * 1024 * 1024) as usize);
+    let mut step_buf = Vec::new();
+    let mut off = f.raw_off;
+    let end = f.raw_off + f.raw_len;
+    while off < end {
+        let step = ((end - off) as usize).min(1024 * 1024);
+        r.read_range(off, step, &mut step_buf)
+            .map_err(|e| format!("{}::{}: {e}", path.display(), f.name))?;
+        out.extend_from_slice(&step_buf);
+        off += step as u64;
+    }
+    Ok(out)
+}
+
 /// Разбор виртуального пути `архив::запись` → (путь к архиву, имя записи).
 /// Возвращает None, если разделителя нет или одна из сторон пуста.
 pub fn split_virtual(spec: &str) -> Option<(PathBuf, String)> {
@@ -372,9 +445,10 @@ pub fn read_entry(
     limits: &ReadLimits,
 ) -> Result<Vec<u8>, String> {
     let kind = kind_of(path)
-        .ok_or_else(|| format!("{}: не архив", path.display()))?;
+        .ok_or_else(|| format!("{}: не архив (zip/tar/tar.gz/tar.zst/gz/zst/poler)", path.display()))?;
     match kind {
         ArchiveKind::Zip => zip_read_entry(path, entry, password, limits),
+        ArchiveKind::Poler => poler_read_entry(path, entry, limits),
         ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarZst => {
             let mut found: Option<Vec<u8>> = None;
             let mut hit_err: Option<String> = None;
@@ -458,6 +532,20 @@ pub fn for_each_entry(
     let kind = kind_of(path)
         .ok_or_else(|| format!("{}: не архив", path.display()))?;
     match kind {
+        ArchiveKind::Poler => {
+            let metas = poler_info(path)?;
+            // Детерминизм вывода — по имени, как у zip-ветки.
+            let mut metas = metas;
+            metas.sort_by(|a, b| norm_name(&a.name).cmp(&norm_name(&b.name)));
+            for meta in &metas {
+                if meta.is_dir {
+                    continue;
+                }
+                let bytes = poler_read_entry(path, &meta.name, limits);
+                f(meta, bytes);
+            }
+            Ok(())
+        }
         ArchiveKind::Zip => {
             let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let mut ar = zip::ZipArchive::new(file)
@@ -751,6 +839,81 @@ mod tests {
             virtual_name(Path::new("a.zip"), "b.md"),
             "a.zip::b.md".to_string()
         );
+    }
+
+    /// Мини-tar в памяти → StreamWriter → .poler (как CLI
+    /// `tar -cf - | poler-engine --stream-file -`).
+    fn write_poler(path: &Path, files: &[(&str, &str)]) {
+        use super::stream_writer::{StreamWriteConfig, StreamWriter};
+        let mut tarbuf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tarbuf);
+            for (name, data) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, *name, data.as_bytes()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let cfg = StreamWriteConfig { dedup: false, ..Default::default() };
+        let mut w = StreamWriter::open(path, cfg).unwrap();
+        w.push_bytes(&tarbuf).unwrap();
+        w.finish("stream.tar").unwrap();
+    }
+
+    #[test]
+    fn poler_native_transparency() {
+        let d = dir();
+        let p = d.path().join("vault.poler");
+        write_poler(&p, &[("notes/secret.md", SECRET_MD), ("src/main.rs", "fn main() {}\n")]);
+
+        // kind_of: расширения родного контейнера
+        let k = |n: &str| kind_of(Path::new(n));
+        assert_eq!(k("vault.poler"), Some(ArchiveKind::Poler));
+        assert_eq!(k("crystal.t5z"), Some(ArchiveKind::Poler));
+        assert_eq!(k("a.POLER"), Some(ArchiveKind::Poler));
+
+        // Листинг без декомпрессии
+        let info = open_info(&p).unwrap();
+        assert_eq!(info.kind, ArchiveKind::Poler);
+        assert_eq!(info.kind.as_str(), "poler");
+        assert_eq!(info.entries.len(), 2);
+        assert!(info.entries.iter().any(|e| e.name == "notes/secret.md" && e.size == SECRET_MD.len() as u64));
+        assert!(!info.encrypted());
+
+        // Random-access чтение записи (только покрывающие чанки)
+        let text = read_entry_text(&p, "notes/secret.md", None, &ReadLimits::default()).unwrap();
+        assert_eq!(text, SECRET_MD);
+        // Нормализованное имя
+        let text2 = read_entry_text(&p, "./notes\\secret.md", None, &ReadLimits::default()).unwrap();
+        assert_eq!(text2, SECRET_MD);
+        // Несуществующая запись
+        assert!(read_entry(&p, "нет.md", None, &ReadLimits::default()).is_err());
+
+        // Полный обход: все записи доставляются, порядок детерминирован
+        let mut seen = Vec::new();
+        for_each_entry(&p, None, &ReadLimits::default(), |meta, res| {
+            assert!(res.is_ok());
+            seen.push(norm_name(&meta.name));
+        })
+        .unwrap();
+        seen.sort();
+        assert_eq!(seen, vec!["notes/secret.md".to_string(), "src/main.rs".to_string()]);
+
+        // Лимит: запись больше max_entry_bytes отбрасывается с ошибкой,
+        // но не валит обход
+        let tiny = ReadLimits { max_entry_bytes: 4, ..Default::default() };
+        let mut errs = 0;
+        for_each_entry(&p, None, &tiny, |_meta, res| {
+            if res.is_err() {
+                errs += 1;
+            }
+        })
+        .unwrap();
+        assert_eq!(errs, 2);
+        assert!(read_entry(&p, "src/main.rs", None, &tiny).is_err());
     }
 
     #[test]
