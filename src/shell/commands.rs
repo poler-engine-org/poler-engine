@@ -570,7 +570,15 @@ fn game_usage() -> String {
         "game scene <file.json> [opts] — своя сцена (формат см. game write-demo):",
         "    тела/иерархия/орбиты/камера; те же opts",
         "game write-demo <file.json>   — выгрузить демо-сцену как редактируемый JSON",
-        "честность: детерминизм бит-в-бит (state-hash), ω=√(GM)/r^1.5, глубина=d_FS",
+        "game sound [opts]             — озвучить сцену (T1 «акустический кристалл»):",
+        "    ω→высота, радиус→гейн, X→панорама; WAV PCM16 + хеши",
+        "    opts: --ticks N --out F.wav --fs HZ(8000..96000) --gain X(0..1) --json",
+        "game texture [opts]            — процедурная текстура (T2 «спектральный синтез»):",
+        "    тайл-функция (беск. зум) → PNG; SVD rank-k кодек с кривой PSNR",
+        "    opts: --size WxH --style noise|marble|wood --palette gray|copper|ice|jade",
+        "          --seed N --freq F --octaves N --zoom F --out F.png",
+        "          --svd-rank K --rank-curve --json",
+        "честность: детерминизм бит-в-бит (state/audio/crystal/texture-hash), ω=√(GM)/r^1.5",
     ]
     .join("\n")
 }
@@ -759,10 +767,275 @@ fn cmd_game(raw: &str) -> CmdResult {
                 Err(e) => CmdResult::Done(format!("game write-demo: сериализация: {e}")),
             }
         }
+        "sound" => cmd_game_sound(args),
+        "texture" => cmd_game_texture(args),
         other => CmdResult::Done(format!(
             "game: неизвестная подкоманда `{other}`\n\n{}",
             game_usage()
         )),
+    }
+}
+
+/// `game sound`: T1 — сонофикация сцены в WAV + хеши детерминизма.
+fn cmd_game_sound(args: &[String]) -> CmdResult {
+    use crate::game::audio::{sonify_world, SonifyConfig, SpectralCrystal};
+
+    let mut ticks: u32 = 900;
+    let mut out = std::path::PathBuf::from("poler_track.wav");
+    let mut fs: u32 = crate::game::audio::AUDIO_FS;
+    let mut gain: f64 = 0.5;
+    let mut as_json = false;
+    if let Ok(t) = q_flag_num::<u32>(args, "--ticks", ticks) {
+        if !(1..=100_000).contains(&t) {
+            return CmdResult::Done("game sound: --ticks 1..=100000".into());
+        }
+        ticks = t;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out") {
+        match args.get(i + 1) {
+            Some(v) => out = std::path::PathBuf::from(v.clone()),
+            None => return CmdResult::Done("game sound: --out FILE.wav".into()),
+        }
+    }
+    if let Ok(f) = q_flag_num::<u32>(args, "--fs", fs) {
+        if !(8000..=96_000).contains(&f) {
+            return CmdResult::Done("game sound: --fs 8000..=96000".into());
+        }
+        fs = f;
+    }
+    if let Ok(g) = q_flag_num::<f64>(args, "--gain", gain) {
+        if !(0.0..=1.0).contains(&g) {
+            return CmdResult::Done("game sound: --gain 0..=1".into());
+        }
+        gain = g;
+    }
+    as_json |= q_flag(args, "--json");
+
+    let mut scene = crate::game::demo_scene();
+    let mut world = match scene.build_world() {
+        Ok(w) => w,
+        Err(e) => return CmdResult::Done(format!("game sound: сцена: {e}")),
+    };
+    let n_bodies = world.len();
+    let cfg = SonifyConfig { fs, master_gain: gain, ..Default::default() };
+    let t0 = std::time::Instant::now();
+    let track = sonify_world(&mut world, ticks, crate::game::FIXED_DT, &cfg);
+    let crystal = SpectralCrystal::from_track(&track, 4, 6);
+    let notes: Vec<String> = crystal
+        .top_hz(4)
+        .iter()
+        .map(|f| format!("{:.1} Гц ({})", f, crate::game::audio::note_name(*f)))
+        .collect();
+    let bytes = match track.write_wav(&out) {
+        Ok(b) => b,
+        Err(e) => return CmdResult::Done(format!("game sound: запись {}: {e}", out.display())),
+    };
+    let elapsed = t0.elapsed();
+    if as_json {
+        let j = serde_json::json!({
+            "track": out.display().to_string(),
+            "bytes": bytes,
+            "fs": fs,
+            "ticks": ticks,
+            "bodies": n_bodies,
+            "duration_s": (track.duration_s() * 1000.0).round() / 1000.0,
+            "audio_hash": format!("0x{:016X}", track.audio_hash()),
+            "crystal_hash": format!("0x{:016X}", crystal.crystal_hash()),
+            "peak_dbfs": (track.peak_dbfs() * 100.0).round() / 100.0,
+            "rms_dbfs": (track.rms_dbfs() * 100.0).round() / 100.0,
+            "top_hz": crystal.top_hz(4),
+            "elapsed_ms": elapsed.as_millis(),
+        });
+        CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+    } else {
+        CmdResult::Done(format!(
+            "T1 «Акустический кристалл»: сцена «{}» ({} тел) → звук\n  трек     : {} ({} байт, {:.2} c, fs {} Гц, PCM16 stereo)\n  физика   : ω→высота (до 3 октав), радиус→гейн, X→панорама (power-pan)\n  метрики  : peak {:.1} dBFS, RMS {:.1} dBFS\n  голоса   : {}\n  хеш аудио: 0x{:016X} (бит-в-бит)\n  хеш кристалла: 0x{:016X} (STFT 4×4096, топ-6 пиков)\n  время    : {} мс",
+            scene.name,
+            n_bodies,
+            out.display(),
+            bytes,
+            track.duration_s(),
+            fs,
+            track.peak_dbfs(),
+            track.rms_dbfs(),
+            if notes.is_empty() { "—".to_string() } else { notes.join(", ") },
+            track.audio_hash(),
+            crystal.crystal_hash(),
+            elapsed.as_millis(),
+        ))
+    }
+}
+
+/// `game texture`: T2 — процедурная текстура → PNG + SVD-кодек.
+fn cmd_game_texture(args: &[String]) -> CmdResult {
+    use crate::game::texture::{
+        rank_curve, svd_encode_gray, Palette, TextureSpec,
+    };
+
+    let mut w: u32 = 512;
+    let mut h: u32 = 512;
+    let mut spec = TextureSpec::default();
+    let mut pal_name = String::from("copper");
+    let mut zoom: f64 = 1.0;
+    let mut out = std::path::PathBuf::from("poler_texture.png");
+    let mut svd_rank: Option<usize> = None;
+    let mut want_curve = false;
+    let mut as_json = false;
+
+    if let Some(r) = game_parse_size(args) {
+        let (sw, sh) = match r {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("game texture: {e}")),
+        };
+        w = sw;
+        h = sh;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--style") {
+        match args.get(i + 1).and_then(|v| crate::game::texture::TexStyle::parse(v)) {
+            Some(s) => spec.style = s,
+            None => return CmdResult::Done("game texture: --style noise|marble|wood".into()),
+        }
+    }
+    if let Some(i) = args.iter().position(|a| a == "--palette") {
+        match args.get(i + 1).map(|v| v.to_string()) {
+            Some(v) if Palette::parse(&v).is_some() => pal_name = v,
+            _ => {
+                return CmdResult::Done(
+                    "game texture: --palette gray|copper|ice|jade".into(),
+                )
+            }
+        }
+    }
+    if let Ok(s) = q_flag_num::<u64>(args, "--seed", spec.seed) {
+        spec.seed = s;
+    }
+    if let Ok(f) = q_flag_num::<f64>(args, "--freq", spec.freq) {
+        if !(0.5..=64.0).contains(&f) {
+            return CmdResult::Done("game texture: --freq 0.5..=64".into());
+        }
+        spec.freq = f;
+    }
+    if let Ok(o) = q_flag_num::<u32>(args, "--octaves", spec.octaves) {
+        if !(1..=12).contains(&o) {
+            return CmdResult::Done("game texture: --octaves 1..=12".into());
+        }
+        spec.octaves = o;
+    }
+    if let Ok(z) = q_flag_num::<f64>(args, "--zoom", zoom) {
+        if !(1.0..=64.0).contains(&z) {
+            return CmdResult::Done("game texture: --zoom 1..=64".into());
+        }
+        zoom = z;
+    }
+    if let Ok(c) = q_flag_num::<f64>(args, "--contrast", spec.contrast) {
+        if !(0.25..=4.0).contains(&c) {
+            return CmdResult::Done("game texture: --contrast 0.25..=4".into());
+        }
+        spec.contrast = c;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out") {
+        match args.get(i + 1) {
+            Some(v) => out = std::path::PathBuf::from(v.clone()),
+            None => return CmdResult::Done("game texture: --out FILE.png".into()),
+        }
+    }
+    if args.iter().any(|a| a == "--svd-rank") {
+        match args
+            .iter()
+            .position(|a| a == "--svd-rank")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(k) if (1..=16).contains(&k) => svd_rank = Some(k),
+            _ => return CmdResult::Done("game texture: --svd-rank K (1..=16)".into()),
+        }
+    }
+    want_curve |= q_flag(args, "--rank-curve");
+    as_json |= q_flag(args, "--json");
+
+    let pal = Palette::parse(&pal_name).expect("проверено выше");
+    let t0 = std::time::Instant::now();
+    let tex = spec.render(w, h, zoom, &pal);
+    let render_ms = t0.elapsed().as_millis();
+    let gray = tex.gray();
+    let thash = tex.texture_hash();
+    match tex.write_png(&out) {
+        Ok(()) => {}
+        Err(e) => return CmdResult::Done(format!("game texture: запись {}: {e}", out.display())),
+    }
+
+    // SVD-анализ (тайл 16)
+    let svd_summary = if let Some(k) = svd_rank {
+        let (_, stats) = svd_encode_gray(&gray, w as usize, h as usize, 16, k);
+        Some(stats)
+    } else if want_curve {
+        None // кривая ниже
+    } else {
+        None
+    };
+    let curve: Vec<crate::game::texture::CodecStats> = if want_curve {
+        rank_curve(&gray, w as usize, h as usize, 16, &[1, 2, 4, 8, 16])
+    } else {
+        Vec::new()
+    };
+    let svd_ms = t0.elapsed().as_millis() - render_ms;
+
+    if as_json {
+        let j = serde_json::json!({
+            "png": out.display().to_string(),
+            "size": [w, h],
+            "style": spec.style.as_str(),
+            "palette": pal_name,
+            "seed": spec.seed,
+            "freq": spec.freq,
+            "octaves": spec.octaves,
+            "zoom": zoom,
+            "contrast": spec.contrast,
+            "texture_hash": format!("0x{:016X}", thash),
+            "render_ms": render_ms,
+            "svd_ms": svd_ms,
+            "svd_rank": svd_rank,
+            "svd_stats": svd_summary,
+            "rank_curve": curve,
+        });
+        CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+    } else {
+        let mut lines = vec![
+            format!(
+                "T2 «Спектральный синтез»: {} {}x{} (zoom {zoom})\n  материал : {} · палитра {} · зерно {} · fBm {} октав (freq {})\n  PNG      : {} · хеш текстуры 0x{:016X} (бит-в-бит)\n  рендер   : {} мс (аналитический тайл — пикселизации нет)",
+                spec.style.as_str(),
+                w,
+                h,
+                spec.style.as_str(),
+                pal_name,
+                spec.seed,
+                spec.octaves,
+                spec.freq,
+                out.display(),
+                thash,
+                render_ms,
+            ),
+        ];
+        if let Some(st) = svd_summary {
+            lines.push(format!(
+                "  SVD rank-{}: PSNR {:.1} dB · RMSE {:.2} · держим {}/{} компонент ({:.0}%)",
+                st.rank,
+                st.psnr_db,
+                st.rmse,
+                st.rank,
+                st.full_rank,
+                st.kept_ratio * 100.0
+            ));
+        }
+        if !curve.is_empty() {
+            let parts: Vec<String> = curve
+                .iter()
+                .map(|c| format!("r{}={:.1}dB", c.rank, c.psnr_db))
+                .collect();
+            lines.push(format!("  кривая   : {}", parts.join("  ")));
+        }
+        lines.push(format!("  SVD время: {} мс", svd_ms));
+        CmdResult::Done(lines.join("\n"))
     }
 }
 
@@ -4250,6 +4523,64 @@ mod tests {
     }
 
     #[test]
+    fn cmd_game_texture_writes_png() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s6.db"));
+        let dir = std::env::temp_dir().join("poler_game_tex_shell");
+        let _ = std::fs::create_dir_all(&dir);
+        let png = dir.join("t.png");
+        match dispatch(
+            &mut s,
+            &format!(
+                "game texture --style wood --size 96x64 --seed 3 --out {} --svd-rank 4",
+                png.display()
+            ),
+        ) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Спектральный синтез"), "{out}");
+                assert!(out.contains("хеш текстуры 0x"), "{out}");
+                assert!(out.contains("SVD rank-4"), "{out}");
+                assert!(png.exists(), "PNG не записан");
+                let raw = std::fs::read(&png).unwrap();
+                assert_eq!(&raw[1..4], b"PNG");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            _ => panic!(),
+        }
+        // --rank-curve без --svd-rank
+        let dir2 = std::env::temp_dir().join("poler_game_tex_curve");
+        let _ = std::fs::create_dir_all(&dir2);
+        let png2 = dir2.join("c.png");
+        match dispatch(
+            &mut s,
+            &format!(
+                "game texture --style noise --size 64x64 --out {} --rank-curve --json",
+                png2.display()
+            ),
+        ) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                let curve = j["rank_curve"].as_array().expect("кривая в JSON");
+                assert!(curve.len() == 5);
+                assert!(curve.last().unwrap()["psnr_db"].as_f64().unwrap() > 50.0);
+                let _ = std::fs::remove_dir_all(&dir2);
+            }
+            _ => panic!(),
+        }
+        // Валидация
+        for bad in [
+            "game texture --style bogus",
+            "game texture --palette neon",
+            "game texture --svd-rank 99",
+            "game texture --zoom 0",
+        ] {
+            match dispatch(&mut s, bad) {
+                CmdResult::Done(out) => assert!(out.contains("game texture:"), "{bad} → {out}"),
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
     fn cmd_game_info_reports_core() {
         let mut s = ShellState::new(PathBuf::from("/tmp/test-s2.db"));
         match dispatch(&mut s, "game info") {
@@ -4259,6 +4590,52 @@ mod tests {
                 assert!(out.contains("Этерия"), "{out}");
                 assert!(out.contains("state-hash") && out.contains("0x"), "{out}");
             }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_game_sound_writes_wav() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-s5.db"));
+        let dir = std::env::temp_dir().join("poler_game_sound_shell");
+        let _ = std::fs::create_dir_all(&dir);
+        let wav = dir.join("t.wav");
+        match dispatch(
+            &mut s,
+            &format!("game sound --ticks 60 --fs 22050 --out {}", wav.display()),
+        ) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("Акустический кристалл"), "{out}");
+                assert!(out.contains("хеш аудио: 0x"), "{out}");
+                assert!(out.contains("хеш кристалла: 0x"), "{out}");
+                assert!(out.contains("dBFS"), "{out}");
+                assert!(wav.exists(), "WAV не записан");
+                let raw = std::fs::read(&wav).unwrap();
+                assert_eq!(&raw[0..4], b"RIFF");
+                assert_eq!(&raw[8..12], b"WAVE");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            _ => panic!(),
+        }
+        // JSON-режим и валидация
+        let dir2 = std::env::temp_dir().join("poler_game_sound_json");
+        let _ = std::fs::create_dir_all(&dir2);
+        let wav2 = dir2.join("t2.wav");
+        match dispatch(&mut s, &format!("game sound --ticks 30 --json --out {}", wav2.display())) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).expect("валидный JSON");
+                assert!(j["audio_hash"].as_str().unwrap().starts_with("0x"));
+                assert!(j["fs"].as_u64().unwrap() > 0);
+                let _ = std::fs::remove_dir_all(&dir2);
+            }
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game sound --fs 100") {
+            CmdResult::Done(out) => assert!(out.contains("--fs"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game sound --gain 5") {
+            CmdResult::Done(out) => assert!(out.contains("--gain"), "{out}"),
             _ => panic!(),
         }
     }

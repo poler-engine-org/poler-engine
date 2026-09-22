@@ -445,6 +445,21 @@ Orbit→Transform→Hash, state-hash FNV-1a по битам позиций — �
 (0.37 мкс/тик = 2% бюджета 60 Гц кадра), бенчмарк
 docs/benchmarks/GAME_CORE_v0.54.0.md.
 
+**v0.55.0 (цикл T) Кристаллы — звук и текстуры:** `game sound [opts]`
+(T1 акустический кристалл: сонофикация мира физикой — ω→высота,
+радиус→гейн, X→power-pan; ADSR + 4 волны по классу тела, tanh-лимитер,
+свой WAV PCM16, свой радикс-2 FFT, STFT→топ-пики→crystal_hash; opts:
+--ticks --out F.wav --fs 8000..96000 --gain 0..1 --json) и
+`game texture [opts]` (T2 спектральный синтез: аналитический тайл
+value-noise/fBm/domain-warp → бесконечный зум без пикселизации;
+стили noise|marble|wood, палитры gray|copper|ice|jade, --contrast;
+SVD rank-k кодек Якоби–Хестенеса: rank 4/16 = 55–57 dB, --svd-rank
+K, --rank-curve; texture_hash бит-в-бит). Полер-бокс: UE-референсы в
+docs/research-archive/ue_reference.poler (ArchiveKind::Poler —
+--archive-list/grep --archives/--poler-cat прозрачно; POLER_NOTES.md
+внутри архива). Бенчмарк docs/benchmarks/GAME_CYCLE_T_v0.55.0.md;
+VLM: marble 8.5/10, noise 7.5/10, wood 7/10 — все SHIP.
+
 **C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/
 eject коннектома в RAM), `poler_fly_node` (паспорт), `poler_fly_edge`
 (ребро + ротор J), `poler_fly_khop` (BFS фронтов), `poler_fly_path`

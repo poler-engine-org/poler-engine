@@ -37,10 +37,12 @@
 //! Рендер headless-first: кадр = тройка PNG (RGB/depth/seg) через
 //! C-ABI в ядро P³ — тот же путь, что у «кадра из гамильтониана».
 
+pub mod audio;
 pub mod loop_;
 pub mod orbit;
 pub mod render;
 pub mod scene;
+pub mod texture;
 pub mod transform;
 pub mod world;
 
