@@ -396,6 +396,23 @@ raw-syscalls; умолчание capture=head_tail),
 `poler_exec_list` (обзор фоновых задач),
 `poler_knowledge` (query, top, min_provenance).
 
+**v0.48.0 Калькулятор Всего — 2 инструмента:** `poler_calc` (expression:
+арифметика, единицы to, solve, матрицы expm/eigen/pinv, триты, астрономия,
+геодезия; состояние резидентное — переменные/ans между вызовами) и
+`poler_hw` (скрытые параметры ПК: кеши, ISA-флаги, NUMA, GPU).
+
+**v0.51.0 (цикл P) Квантовый мост — `poler_quantum`:** действия
+`run` (bell/ghz/qft/iqft/grover/bv/dj/period/teleport: распределение
+Борна, энтропия, ландауэровская стоимость), `teleport` (телепортация
+q0→q2 — когерентный канал 6 Клиффорд-вентилей, фиделити 1; exact —
+структурное равенство в ℤ[1/√2, i]), `bloch` (сфера Блоха; амплитуды —
+выражения poler_calc: 1/sqrt(2), i/2…), `verify` (формальная верификация:
+unitary U†U = I, equivalence двух схем вплоть до глобальной фазы,
+teleport-канал на базисе; вердикты proved_exact / verified_numeric /
+verified_sampling / refuted — градуированная честность), `list`.
+Тот же мост в шелле: `quantum run|teleport|bloch|verify|calc`
+(алиас `qm`), физика уровней — `quantum calc schrodinger(…)`.
+
 **C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/
 eject коннектома в RAM), `poler_fly_node` (паспорт), `poler_fly_edge`
 (ребро + ротор J), `poler_fly_khop` (BFS фронтов), `poler_fly_path`
