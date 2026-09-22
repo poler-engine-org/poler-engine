@@ -111,6 +111,7 @@ pub mod noise;
 pub mod parallel;
 pub mod parity;
 pub mod qcurriculum;
+pub mod qaoa;
 pub mod qpc;
 pub mod rng;
 pub mod statevector;

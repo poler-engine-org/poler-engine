@@ -401,16 +401,21 @@ raw-syscalls; умолчание capture=head_tail),
 геодезия; состояние резидентное — переменные/ans между вызовами) и
 `poler_hw` (скрытые параметры ПК: кеши, ISA-флаги, NUMA, GPU).
 
-**v0.51.0 (цикл P) Квантовый мост — `poler_quantum`:** действия
+**v0.52.0 (циклы P+Q) Квантовый мост — `poler_quantum`:** действия
 `run` (bell/ghz/qft/iqft/grover/bv/dj/period/teleport: распределение
-Борна, энтропия, ландауэровская стоимость), `teleport` (телепортация
+Борна, энтропия, ландауэровская стоимость), `qcasm` (произвольная
+QCASM-lite схема из source/path; noise — пресет железа поверх идеала),
+`qaoa` (MaxCut-ансатц с классической оптимизацией углов: edges парами или
+строкой, p — глубина; отчёт с E[cut], лучшим битстрингом и
+аппроксимационным отношением), `teleport` (телепортация
 q0→q2 — когерентный канал 6 Клиффорд-вентилей, фиделити 1; exact —
 структурное равенство в ℤ[1/√2, i]), `bloch` (сфера Блоха; амплитуды —
 выражения poler_calc: 1/sqrt(2), i/2…), `verify` (формальная верификация:
 unitary U†U = I, equivalence двух схем вплоть до глобальной фазы,
 teleport-канал на базисе; вердикты proved_exact / verified_numeric /
-verified_sampling / refuted — градуированная честность), `list`.
-Тот же мост в шелле: `quantum run|teleport|bloch|verify|calc`
+verified_sampling / refuted — градуированная честность; noise —
+TVD/фиделити/χ² поверх вердикта), `list`.
+Тот же мост в шелле: `quantum run|qcasm|qaoa|teleport|bloch|verify|calc`
 (алиас `qm`), физика уровней — `quantum calc schrodinger(…)`.
 
 **C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/

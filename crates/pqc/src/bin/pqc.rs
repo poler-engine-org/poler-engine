@@ -67,6 +67,10 @@ USAGE:
     pqc verify <unitary|equiv|teleport> [opts]               цикл P: формальный верификатор —
                                                               унитарность и эквивалентность схем
                                                               точно в кольце Z[1/sqrt(2), i]
+    pqc qaoa [opts]                                          цикл Q: MaxCut-ансатц QAOA —
+                                                              cost-гамильтониан + mixer, углы
+                                                              оптимизируются координатным спуском
+                                                              (--edges 0-1,1-2 | демо-граф)
     pqc substrate [opts]                                     v0.44: субстрат УДЕ — P-поток Ауфбау,
                                                               γ-прецессия, SCF-режим
 
@@ -363,6 +367,7 @@ fn main() {
         Some("qc") => cmd_qc(&args[1..]),
         Some("algo") => cmd_algo(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
+        Some("qaoa") => cmd_qaoa(&args[1..]),
         Some("substrate") => cmd_substrate(&args[1..]),
         Some("stab") => cmd_stab(&args[1..]),
         Some("noise") => cmd_noise(&args[1..]),
@@ -7119,6 +7124,172 @@ fn cmd_noise(args: &[String]) -> i32 {
         "\nидеальный субстрат: нуль ошибок гейтов/чтения/декогеренции;\
          физическое железо платит на каждом шаге (T1/T2, деполяризация, чтение)"
     );
+    0
+}
+
+/// `pqc qaoa [--edges "0-1,1-2"] [--n K] [--p P] [--sweeps W] [--restarts R]
+///           [--shots M] [--seed S] [--json]` — цикл Q: MaxCut-ансатц QAOA
+/// с классической оптимизацией углов на идеальном субстрате.
+fn cmd_qaoa(args: &[String]) -> i32 {
+    let edges_str: String = arg_num(args, "--edges", String::new())
+        .ok()
+        .and_then(|v: String| v.parse::<String>().ok())
+        .unwrap_or_default();
+    let p: usize = match arg_num(args, "--p", 2usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qaoa: {e}");
+            return 2;
+        }
+    };
+    let sweeps: usize = match arg_num(args, "--sweeps", 12usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qaoa: {e}");
+            return 2;
+        }
+    };
+    let restarts: usize = match arg_num(args, "--restarts", 3usize) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qaoa: {e}");
+            return 2;
+        }
+    };
+    let shots: u64 = match arg_num(args, "--shots", 1024u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qaoa: {e}");
+            return 2;
+        }
+    };
+    let seed: u64 = match arg_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pqc qaoa: {e}");
+            return 2;
+        }
+    };
+    let as_json = arg_flag(args, "--json");
+
+    let problem = if edges_str.trim().is_empty() {
+        pqc::qaoa::MaxCut::demo()
+    } else {
+        let edges = match pqc::qaoa::MaxCut::parse_edges(&edges_str) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("pqc qaoa: {e:?}");
+                return 2;
+            }
+        };
+        let max_v = edges.iter().map(|&(i, j)| i.max(j)).max().unwrap_or(0);
+        let n: usize = arg_num(args, "--n", 0usize).unwrap_or(0);
+        let n = if n == 0 { max_v + 1 } else { n };
+        match pqc::qaoa::MaxCut::new(n, edges) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("pqc qaoa: {e:?}");
+                return 2;
+            }
+        }
+    };
+
+    let cfg = pqc::qaoa::QaoaConfig {
+        p,
+        sweeps,
+        restarts,
+        shots,
+        seed,
+    };
+    let rep = match pqc::qaoa::run_qaoa(&problem, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("pqc qaoa: {e:?}");
+            return 1;
+        }
+    };
+
+    let bits = |o: u64| -> String {
+        let mut s = String::new();
+        for q in (0..rep.n_qubits).rev() {
+            s.push(if o >> q & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    };
+
+    if as_json {
+        let counts: Vec<pqc::Json> = rep
+            .counts
+            .iter()
+            .map(|(o, c)| pqc::Json::Arr(vec![pqc::Json::num(*o as f64), pqc::Json::num(*c as f64)]))
+            .collect();
+        let edges: Vec<pqc::Json> = rep
+            .edges
+            .iter()
+            .map(|(i, j)| pqc::Json::Arr(vec![pqc::Json::num(*i as f64), pqc::Json::num(*j as f64)]))
+            .collect();
+        let gammas: Vec<pqc::Json> = rep.params[..rep.p].iter().map(|x| pqc::Json::num(*x)).collect();
+        let betas: Vec<pqc::Json> = rep.params[rep.p..].iter().map(|x| pqc::Json::num(*x)).collect();
+        let obj = pqc::Json::Obj(vec![
+            ("engine".into(), pqc::Json::str("qpc-qaoa")),
+            ("problem".into(), pqc::Json::str("maxcut")),
+            ("n_qubits".into(), pqc::Json::num(rep.n_qubits as f64)),
+            ("edges".into(), pqc::Json::Arr(edges)),
+            ("p".into(), pqc::Json::num(rep.p as f64)),
+            ("gammas".into(), pqc::Json::Arr(gammas)),
+            ("betas".into(), pqc::Json::Arr(betas)),
+            ("expected_cut".into(), pqc::Json::num(rep.expected_cut)),
+            ("expected_cut_init".into(), pqc::Json::num(rep.expected_cut_init)),
+            ("best_bits".into(), pqc::Json::str(bits(rep.best_bits))),
+            ("best_cut".into(), pqc::Json::num(rep.best_cut as f64)),
+            (
+                "optimum".into(),
+                match rep.optimum {
+                    Some(o) => pqc::Json::num(o as f64),
+                    None => pqc::Json::Null,
+                },
+            ),
+            (
+                "approx_ratio".into(),
+                match rep.approx_ratio {
+                    Some(r) => pqc::Json::num(r),
+                    None => pqc::Json::Null,
+                },
+            ),
+            ("evals".into(), pqc::Json::num(rep.evals as f64)),
+            ("gate_count".into(), pqc::Json::num(rep.gate_count as f64)),
+            ("shots".into(), pqc::Json::num(rep.shots as f64)),
+            ("norm".into(), pqc::Json::num(rep.norm)),
+            ("counts".into(), pqc::Json::Arr(counts)),
+        ]);
+        println!("{}", obj.to_string());
+        return 0;
+    }
+
+    println!("POLER Quantum PC — QAOA MaxCut (цикл Q)");
+    println!(
+        "граф: {} вершин, {} рёбер; анзац p = {}, вычислений E[cut]: {}",
+        rep.n_qubits,
+        rep.edges.len(),
+        rep.p,
+        rep.evals
+    );
+    println!(
+        "E[cut]: {:.4} → {:.4}",
+        rep.expected_cut_init, rep.expected_cut
+    );
+    println!(
+        "лучший битстринг |{}⟩ — разрез {} из {}",
+        bits(rep.best_bits),
+        rep.best_cut,
+        rep.optimum.map_or_else(|| "?".to_string(), |o| o.to_string())
+    );
+    if let (Some(_), Some(r)) = (rep.optimum, rep.approx_ratio) {
+        println!("аппроксимационное отношение: {:.1}%", 100.0 * r);
+    } else {
+        println!("переборный оптимум: n > 20 — честная граница");
+    }
+    println!("норма: {:.16}", rep.norm);
     0
 }
 

@@ -129,9 +129,11 @@ pub fn all_entries() -> Vec<HelpEntry> {
         HelpEntry { group: HelpGroup::Calc, cmd: "hw [--json]", short: "Скрытые параметры ПК: кеши L1-L3, ISA-флаги, NUMA, GPU, топология" },
         // v0.51.0 (цикл P): квантовый мост
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum run <algo> [--n K --shots M]", short: "Схемы на идеальных кубитах: bell ghz qft iqft grover bv dj period teleport" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum qcasm <файл|-> [opts]", short: "Произвольная QCASM-схема; --exact — кольцо ℤ[1/√2, i]; --noise — шум железа (цикл Q)" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum qaoa [--edges i-j,…] [--p P]", short: "QAOA MaxCut: анзац + оптимизация углов, аппроксимационное отношение (цикл Q)" },
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum teleport [--theta T --exact]", short: "Телепортация q0 → q2: фиделити 1, когерентные коррекции (отложенное измерение)" },
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum bloch <alpha> [beta]", short: "Сфера Блоха с ASCII-диаграммой; амплитуды — выражения calc (1/sqrt(2), i…)" },
-        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum verify unitary|equiv|teleport", short: "Формальная верификация: U†U = I, эквивалентность схем — точно в ℤ[1/√2, i]" },
+        HelpEntry { group: HelpGroup::Quantum, cmd: "quantum verify unitary|equiv|teleport", short: "Формальная верификация: U†U = I, эквивалентность — точно в ℤ[1/√2, i]; --noise — шум поверх вердикта" },
         HelpEntry { group: HelpGroup::Quantum, cmd: "quantum calc <физика>", short: "Мост в цикл O: schrodinger, pauli_x/y/z, kron, expm, eigen" },
 
         // v0.47.0: середа для ІІ-агентів (Antigravity)
@@ -290,14 +292,14 @@ NUMA-узлы, bogomips, размеры страниц, диски (HDD/SSD), GP
     format!("тема не знайдена: {name} (введіть `help` для повного списку)")
 }
 
-/// v0.51.0 (цикл P): полная справка квантового моста.
+/// v0.52.0 (цикл Q): полная справка квантового моста.
 fn quantum_help_topic() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "─── Квантовый мост (v0.51.0, цикл P) ───");
+    let _ = writeln!(s, "─── Квантовый мост (v0.52.0, циклы P+Q) ───");
     let _ = writeln!(s);
     let _ = writeln!(s, "pqc встроен в шелл движка: идеальные кубиты без декогеренции.");
     let _ = writeln!(s, "Три входа: poler> quantum … · алиас qm · --exec \"quantum …\" --json");
-    let _ = writeln!(s, "MCP-инструмент: poler_quantum (действия run/teleport/bloch/verify/list).");
+    let _ = writeln!(s, "MCP-инструмент: poler_quantum (действия run/qcasm/qaoa/teleport/bloch/verify/list).");
     let _ = writeln!(s);
     let _ = writeln!(s, "── Схемы (quantum run) ──");
     let _ = writeln!(s, "  quantum run bell                       пара Белла (|00⟩+|11⟩)/√2");
@@ -307,6 +309,18 @@ fn quantum_help_topic() -> String {
     let _ = writeln!(s, "  quantum run bv --secret 0b1011         Бернштейн–Вазирани");
     let _ = writeln!(s, "  quantum run period --n 6 --period 5    ядро Шора (поиск периода)");
     let _ = writeln!(s, "  … --json                               отчёт для ИИ-агента");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── Произвольные схемы QCASM (цикл Q) ──");
+    let _ = writeln!(s, "  quantum qcasm scheme.qc --shots 512    любая схема из файла (- = stdin)");
+    let _ = writeln!(s, "  quantum qcasm scheme.qc --exact        точно в ℤ[1/√2, i] (Clifford+T)");
+    let _ = writeln!(s, "  quantum qcasm scheme.qc --noise ibm-heron   шум железа поверх идеала");
+    let _ = writeln!(s, "  инструкции: qubits N, h/x/y/z/s/t…, cx/cz/swap/ccx/cp, ry/rx/rz,");
+    let _ = writeln!(s, "  flipphase/flipzero/prep, measure; комментарии #");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "── QAOA: MaxCut-оптимизация (цикл Q) ──");
+    let _ = writeln!(s, "  quantum qaoa --edges 0-1,1-2,0-2 --p 2  анзац + координатный спуск");
+    let _ = writeln!(s, "  отчёт: E[cut], лучший битстринг, аппроксимационное отношение");
+    let _ = writeln!(s, "  пресеты железа: ideal | ibm-heron | google-willow | noisy-90s");
     let _ = writeln!(s);
     let _ = writeln!(s, "── Телепортация (цикл P) ──");
     let _ = writeln!(s, "  quantum teleport --theta 0.7           препарат Ry(0.7)|0⟩, фиделити = 1");
@@ -323,6 +337,8 @@ fn quantum_help_topic() -> String {
     let _ = writeln!(s, "  quantum verify unitary qft --n 3        U†U = I — ДОКАЗАНО ТОЧНО");
     let _ = writeln!(s, "  quantum verify equiv qft iqft --n 3    две схемы (до фазы: --phase)");
     let _ = writeln!(s, "  quantum verify teleport                 канал на базисе {{|0⟩,|1⟩}}");
+    let _ = writeln!(s, "  quantum verify unitary qft --n 3 --noise ibm-heron --shots 4096");
+    let _ = writeln!(s, "                                         вердикт + шум железа: TVD, χ², пик");
     let _ = writeln!(s, "  вердикты: ДОКАЗАНО ТОЧНО (кольцо) / ЧИСЛЕННО / ВЕРОЯТНОСТНО /");
     let _ = writeln!(s, "  ОПРОВЕРГНУТО (контрпример найден)");
     let _ = writeln!(s);

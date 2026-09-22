@@ -154,6 +154,11 @@ pub struct NoisyReport {
     pub model: NoiseModel,
     /// Число кубитов.
     pub n_qubits: usize,
+    /// χ² Пирсона между идеалом и наблюдённым железом
+    /// (бункы с ожиданием ≥ 4; цикл Q).
+    pub chi2: f64,
+    /// Степени свободы χ² (учтённые бунки − 1).
+    pub chi2_dof: usize,
 }
 
 fn apply_pauli(sv: &mut Statevector, q: usize, which: u8) -> Result<()> {
@@ -240,6 +245,36 @@ fn phase_damp(sv: &mut Statevector, q: usize, p_phi: f64, rng: &mut Rng) -> Resu
         sv.apply(Gate::Z { q })?;
     }
     Ok(())
+}
+
+/// χ²-статистика Пирсона между идеальным распределением и наблюдёнными
+/// счётчиками: Σ_x (o_x − N·p_x)² / (N·p_x) по бункам с ожиданием
+/// N·p_x ≥ 4 (классическое правило достаточного ожидания).
+/// Возвращает (χ², dof). Цикл Q: шум поверх верификатора.
+pub fn chi2_stat(ideal_probs: &[f64], counts: &[(u64, u64)], shots: u64) -> (f64, usize) {
+    if shots == 0 {
+        return (0.0, 0);
+    }
+    let mut chi2 = 0.0f64;
+    let mut bins = 0usize;
+    // ожидание по идеалу для каждого наблюдённого исхода
+    let observed = |x: u64| -> f64 {
+        counts
+            .iter()
+            .find(|&&(o, _)| o == x)
+            .map(|&(_, c)| c as f64)
+            .unwrap_or(0.0)
+    };
+    let dim = ideal_probs.len();
+    for x in 0..dim {
+        let e = ideal_probs[x] * shots as f64;
+        if e >= 4.0 {
+            let o = observed(x as u64);
+            chi2 += (o - e) * (o - e) / e;
+            bins += 1;
+        }
+    }
+    (chi2, bins.saturating_sub(1))
 }
 
 /// Прогнать схему на зашумлённом железе. Оракулы-привилегии
@@ -359,17 +394,21 @@ pub fn run_noisy(
         .zip(&noisy_probs)
         .map(|(a, b)| (a * b).sqrt())
         .sum();
+    let counts: Vec<(u64, u64)> = counts.into_iter().collect();
+    let (chi2, chi2_dof) = chi2_stat(&ideal_probs, &counts, shots);
     Ok(NoisyReport {
         ideal_peak: ideal_probs.iter().cloned().fold(0.0, f64::max),
         noisy_peak: noisy_probs.iter().cloned().fold(0.0, f64::max),
         classical_fidelity: bc * bc,
-        counts: counts.into_iter().collect(),
+        counts,
         ideal_probs,
         noisy_probs,
         shots,
         tvd,
         model: model.clone(),
         n_qubits: n,
+        chi2,
+        chi2_dof,
     })
 }
 

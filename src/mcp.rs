@@ -2581,7 +2581,7 @@ impl McpServer {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
-            .ok_or("аргумент action обязателен: run | teleport | bloch | verify | list")?;
+            .ok_or("аргумент action обязателен: run | qcasm | qaoa | teleport | bloch | verify | list")?;
         let get_usize = |k: &str| args.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
         let get_u64 = |k: &str| args.get(k).and_then(|v| v.as_u64());
         let get_f64 = |k: &str| args.get(k).and_then(|v| v.as_f64());
@@ -2596,8 +2596,155 @@ impl McpServer {
                     "engine": "poler-quantum-mcp",
                     "version": env!("CARGO_PKG_VERSION"),
                     "algorithms": catalog,
-                    "actions": ["run", "teleport", "bloch", "verify", "list"],
+                    "actions": ["run", "qcasm", "qaoa", "teleport", "bloch", "verify", "list"],
+                    "noise_presets": ["ideal", "ibm-heron", "google-willow", "noisy-90s"],
                     "physics_bridge": "poler_calc: schrodinger(H, psi0, t), pauli_x/y/z, kron, expm, eigen"
+                })
+                .to_string())
+            }
+            "qcasm" => {
+                // Цикл Q: произвольная QCASM-схема — исходник прямо в аргументах
+                // (или путь к файлу).
+                let source = match args.get("source").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => match args.get("path").and_then(|v| v.as_str()) {
+                        Some(p) => std::fs::read_to_string(p)
+                            .map_err(|e| format!("qcasm: не читается {p}: {e}"))?,
+                        None => {
+                            return Err(
+                                "qcasm: аргумент source (текст схемы) или path (файл) обязателен"
+                                    .into()
+                            )
+                        }
+                    },
+                };
+                let circuit = pqc_core::qpc::Circuit::parse(&source)
+                    .map_err(|e| format!("qcasm: ошибка разбора: {e:?}"))?;
+                let shots = get_u64("shots").unwrap_or(1024);
+                let seed = get_u64("seed").unwrap_or(42);
+                // шум поверх идеала (цикл Q)
+                if let Some(preset) = args.get("noise").and_then(|v| v.as_str()) {
+                    let model = pqc_core::noise::NoiseModel::preset(preset)
+                        .ok_or_else(|| format!("qcasm: неизвестный пресет {preset}"))?;
+                    let nrep = pqc_core::noise::run_noisy(&circuit, &model, shots, seed)
+                        .map_err(|e| format!("qcasm noise: {e:?}"))?;
+                    let counts: Vec<Value> = nrep
+                        .counts
+                        .iter()
+                        .map(|(o, c)| json!([o, c]))
+                        .collect();
+                    return Ok(json!({
+                        "engine": "poler-quantum-mcp",
+                        "action": "qcasm",
+                        "mode": "noise-mcwf",
+                        "n_qubits": nrep.n_qubits,
+                        "preset": preset,
+                        "shots": nrep.shots,
+                        "tvd": nrep.tvd,
+                        "classical_fidelity": nrep.classical_fidelity,
+                        "chi2": nrep.chi2,
+                        "chi2_dof": nrep.chi2_dof,
+                        "ideal_peak": nrep.ideal_peak,
+                        "noisy_peak": nrep.noisy_peak,
+                        "ideal_probs": nrep.ideal_probs,
+                        "counts": counts,
+                    })
+                    .to_string());
+                }
+                let rep = pqc_core::qpc::run(&circuit, shots, seed)
+                    .map_err(|e| format!("qcasm: {e:?}"))?;
+                let counts: Vec<Value> = rep
+                    .counts
+                    .iter()
+                    .map(|(o, c)| json!([o, c]))
+                    .collect();
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "action": "qcasm",
+                    "n_qubits": rep.n_qubits,
+                    "gate_count": rep.gate_count,
+                    "per_shot": rep.per_shot,
+                    "shots": rep.shots,
+                    "norm": rep.norm,
+                    "entropy_bits": rep.entropy_bits,
+                    "landauer_j": rep.landauer_j,
+                    "probabilities": rep.probabilities,
+                    "marginals": rep.marginals,
+                    "counts": counts,
+                })
+                .to_string())
+            }
+            "qaoa" => {
+                // Цикл Q: MaxCut-ансатц с классической оптимизацией.
+                let edges: Vec<(usize, usize)> = if let Some(arr) =
+                    args.get("edges").and_then(|v| v.as_array())
+                {
+                    let mut v = Vec::new();
+                    for e in arr {
+                        let pair = e
+                            .as_array()
+                            .ok_or("qaoa: edges — массив пар [i, j] или строка \"0-1,1-2\"" )?;
+                        if pair.len() != 2 {
+                            return Err("qaoa: ребро — ровно две вершины".into());
+                        }
+                        let i = pair[0].as_u64().ok_or("qaoa: вершины — целые")? as usize;
+                        let j = pair[1].as_u64().ok_or("qaoa: вершины — целые")? as usize;
+                        v.push((i, j));
+                    }
+                    v
+                } else if let Some(s) = args.get("edges").and_then(|v| v.as_str()) {
+                    pqc_core::qaoa::MaxCut::parse_edges(s)
+                        .map_err(|e| format!("qaoa: {e:?}"))?
+                } else {
+                    // демо-граф: 4-цикл + диагональ
+                    pqc_core::qaoa::MaxCut::demo().edges
+                };
+                let n = get_usize("n").unwrap_or_else(|| {
+                    edges.iter().map(|&(i, j)| i.max(j)).max().unwrap_or(0) + 1
+                });
+                let problem = pqc_core::qaoa::MaxCut::new(n, edges.clone())
+                    .map_err(|e| format!("qaoa: {e:?}"))?;
+                let cfg = pqc_core::qaoa::QaoaConfig {
+                    p: get_usize("p").unwrap_or(2).clamp(1, pqc_core::qaoa::MAX_P),
+                    sweeps: get_usize("sweeps").unwrap_or(12),
+                    restarts: get_usize("restarts").unwrap_or(3),
+                    shots: get_u64("shots").unwrap_or(1024),
+                    seed: get_u64("seed").unwrap_or(42),
+                };
+                let rep = pqc_core::qaoa::run_qaoa(&problem, &cfg)
+                    .map_err(|e| format!("qaoa: {e:?}"))?;
+                let bitstring = |o: u64| -> String {
+                    let mut s = String::new();
+                    for q in (0..rep.n_qubits).rev() {
+                        s.push(if o >> q & 1 == 1 { '1' } else { '0' });
+                    }
+                    s
+                };
+                let counts: Vec<Value> = rep
+                    .counts
+                    .iter()
+                    .map(|(o, c)| json!([o, c]))
+                    .collect();
+                Ok(json!({
+                    "engine": "poler-quantum-mcp",
+                    "action": "qaoa",
+                    "problem": "maxcut",
+                    "n_qubits": rep.n_qubits,
+                    "edges": rep.edges.iter().map(|(i, j)| json!([i, j])).collect::<Vec<_>>(),
+                    "p": rep.p,
+                    "gammas": rep.params[..rep.p],
+                    "betas": rep.params[rep.p..],
+                    "expected_cut": rep.expected_cut,
+                    "expected_cut_init": rep.expected_cut_init,
+                    "best_bits": bitstring(rep.best_bits),
+                    "best_cut": rep.best_cut,
+                    "optimum": rep.optimum,
+                    "approx_ratio": rep.approx_ratio,
+                    "evals": rep.evals,
+                    "gate_count": rep.gate_count,
+                    "shots": rep.shots,
+                    "norm": rep.norm,
+                    "counts": counts,
                 })
                 .to_string())
             }
@@ -2780,6 +2927,36 @@ impl McpServer {
                     Verdict::VerifiedSampling(tol) => json!(["verified_sampling", tol]),
                     Verdict::Refuted(d) => json!(["refuted", d]),
                 };
+                // Цикл Q: шум поверх верификатора — вердикт + «идеал vs железо».
+                let mut noise: Option<Value> = None;
+                if let Some(preset) = args.get("noise").and_then(|v| v.as_str()) {
+                    let noise_shots = get_u64("noise_shots").unwrap_or(4096);
+                    let seed = get_u64("seed").unwrap_or(42);
+                    let circuit_opt: Option<pqc_core::qpc::Circuit> = match check {
+                        "unitary" => args
+                            .get("algorithm")
+                            .and_then(|v| v.as_str())
+                            .and_then(|a| build_algo(a).ok()),
+                        "teleport" => pqc_core::algorithms::teleport_prepared(0.7).ok(),
+                        _ => None,
+                    };
+                    if let Some(circuit) = circuit_opt {
+                        let model = pqc_core::noise::NoiseModel::preset(preset)
+                            .ok_or_else(|| format!("verify: неизвестный пресет {preset}"))?;
+                        let nrep = pqc_core::noise::run_noisy(&circuit, &model, noise_shots, seed)
+                            .map_err(|e| format!("verify noise: {e:?}"))?;
+                        noise = Some(json!({
+                            "preset": preset,
+                            "shots": nrep.shots,
+                            "tvd": nrep.tvd,
+                            "classical_fidelity": nrep.classical_fidelity,
+                            "chi2": nrep.chi2,
+                            "chi2_dof": nrep.chi2_dof,
+                            "ideal_peak": nrep.ideal_peak,
+                            "noisy_peak": nrep.noisy_peak,
+                        }));
+                    }
+                }
                 Ok(json!({
                     "engine": "poler-quantum-mcp",
                     "action": "verify",
@@ -2793,11 +2970,12 @@ impl McpServer {
                     "max_deviation": report.max_deviation,
                     "checks": report.checks.iter().map(|(n, ok, d)| json!([n, ok, d])).collect::<Vec<_>>(),
                     "notes": report.notes,
+                    "noise": noise,
                 })
                 .to_string())
             }
             other => Err(format!(
-                "неизвестное действие `{other}` (run | teleport | bloch | verify | list)"
+                "неизвестное действие `{other}` (run | qcasm | qaoa | teleport | bloch | verify | list)"
             )),
         }
     }
@@ -3315,13 +3493,15 @@ expm([0,-1;1,0]*psi); moon_illum(2024,4,8,18.35); dist(50.45,30.52,49.84,24.03).
         }),
         json!({
             "name": "poler_quantum",
-            "description": "Квантовый мост POLER (цикл P): идеальный симулятор кубитов без \
+            "description": "Квантовый мост POLER (циклы P+Q): идеальный симулятор кубитов без \
 декогеренции. Действия: run — эталонные схемы (bell, ghz, qft, iqft, grover, bv, dj, period, \
 teleport) с распределением Борна и энтропией; teleport — телепортация q0→q2 с фиделити \
 (theta — препарат Ry, exact — кольцо Z[1/sqrt(2),i]); bloch — сфера Блоха состояния \
 (амплитуды — выражения poler_calc: 1/sqrt(2), i/2…); verify — формальная верификация: \
 unitary (U†U = I), equivalence (две схемы, до глобальной фазы), teleport (канал на базисе) — \
-вердикты proved_exact / verified_numeric / verified_sampling / refuted; list — каталог. \
+вердикты proved_exact / verified_numeric / verified_sampling / refuted; noise в verify — \
+шум железа поверх вердикта (TVD, фиделити, χ²); qcasm — произвольная схема QCASM-lite \
+(source/path, noise); qaoa — MaxCut-ансатц с оптимизацией углов; list — каталог. \
 Физика уровней/спектров — через poler_calc (schrodinger, pauli_*, kron, expm, eigen). \
 Примеры: {\"action\":\"run\",\"algorithm\":\"ghz\",\"n\":5,\"shots\":1024}; \
 {\"action\":\"teleport\",\"theta\":0.7,\"exact\":true}; \
@@ -3331,7 +3511,7 @@ unitary (U†U = I), equivalence (две схемы, до глобальной �
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["run", "teleport", "bloch", "verify", "list"],
+                    "action": {"type": "string", "enum": ["run", "qcasm", "qaoa", "teleport", "bloch", "verify", "list"],
                                "description": "Действие моста"},
                     "algorithm": {"type": "string", "description": "bell|ghz|qft|iqft|grover|bv|dj|period|teleport"},
                     "n": {"type": "integer", "default": 4, "minimum": 1, "maximum": 26, "description": "Число кубитов"},
@@ -3345,6 +3525,14 @@ unitary (U†U = I), equivalence (две схемы, до глобальной �
                     "exact": {"type": "boolean", "default": false, "description": "Точный режим телепортации"},
                     "alpha": {"type": "string", "description": "Амплитуда |0> (выражение calc)"},
                     "beta": {"type": "string", "description": "Амплитуда |1> (выражение calc)"},
+                    "source": {"type": "string", "description": "Текст QCASM-схемы (для qcasm)"},
+                    "path": {"type": "string", "description": "Файл QCASM-схемы (альтернатива source)"},
+                    "noise": {"type": "string", "enum": ["ideal", "ibm-heron", "google-willow", "noisy-90s"], "description": "Пресет шума железа поверх идеала"},
+                    "edges": {"description": "Рёбра MaxCut: [[0,1],[1,2]] или \"0-1,1-2\" (для qaoa)"},
+                    "p": {"type": "integer", "default": 2, "minimum": 1, "maximum": 8, "description": "Глубина QAOA-ансатца"},
+                    "restarts": {"type": "integer", "default": 3, "minimum": 0, "maximum": 16, "description": "Перезапусков оптимизатора QAOA"},
+                    "sweeps": {"type": "integer", "default": 12, "minimum": 1, "maximum": 64, "description": "Проходов координатного спуска QAOA"},
+                    "noise_shots": {"type": "integer", "default": 4096, "minimum": 0, "description": "Выстрелов для шума в verify"},
                     "check": {"type": "string", "enum": ["unitary", "equivalence", "teleport"], "description": "Проверка верификатора"},
                     "algorithms": {"type": "array", "items": {"type": "string"}, "maxItems": 2, "description": "Пара схем для equivalence"},
                     "up_to_global_phase": {"type": "boolean", "default": false, "description": "Эквивалентность до глобальной фазы"}
@@ -5306,5 +5494,92 @@ mod quantum_tool_tests {
         assert!(r.is_err());
         let e = r.unwrap_err();
         assert!(e.contains("action"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.52.0 (цикл Q): qcasm, qaoa, шум поверх верификатора
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn qcasm_runs_bell_from_source() {
+        let v = call(
+            &server(),
+            json!({"action": "qcasm", "source": "qubits 2\nh 0\ncx 0 1\nmeasure all", "shots": 256}),
+        );
+        assert_eq!(v["action"], "qcasm");
+        assert_eq!(v["n_qubits"], 2);
+        let probs = v["probabilities"].as_array().unwrap();
+        assert!((probs[0].as_f64().unwrap() - 0.5).abs() < 1e-12);
+        assert!((probs[3].as_f64().unwrap() - 0.5).abs() < 1e-12);
+        assert!(probs[1].as_f64().unwrap() < 1e-12);
+        // ошибка разбора — честная
+        let r = server().tool_quantum(&json!({"action": "qcasm", "source": "h 0"}));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn qcasm_noise_degrades_ghz() {
+        let v = call(
+            &server(),
+            json!({
+                "action": "qcasm",
+                "source": "qubits 3\nh 0\ncx 0 1\ncx 0 2\nmeasure all",
+                "noise": "noisy-90s",
+                "shots": 4000,
+                "seed": 1
+            }),
+        );
+        assert_eq!(v["mode"], "noise-mcwf");
+        assert!(v["tvd"].as_f64().unwrap() > 0.10, "TVD = {}", v["tvd"]);
+        assert!(v["noisy_peak"].as_f64().unwrap() < v["ideal_peak"].as_f64().unwrap());
+        assert!(v["chi2"].as_f64().unwrap() > 30.0);
+    }
+
+    #[test]
+    fn qaoa_optimizes_triangle() {
+        let v = call(
+            &server(),
+            json!({"action": "qaoa", "edges": [[0, 1], [1, 2], [0, 2]], "p": 2, "restarts": 2, "sweeps": 10}),
+        );
+        assert_eq!(v["action"], "qaoa");
+        assert_eq!(v["problem"], "maxcut");
+        assert_eq!(v["n_qubits"], 3);
+        assert!(v["expected_cut"].as_f64().unwrap() > 1.8, "{v}");
+        assert_eq!(v["best_cut"], 2);
+        assert_eq!(v["optimum"], 2);
+        assert!(v["approx_ratio"].as_f64().unwrap() >= 0.999);
+        // edges строкой
+        let v2 = call(
+            &server(),
+            json!({"action": "qaoa", "edges": "0-1,1-2,0-2", "p": 1, "restarts": 1, "sweeps": 6}),
+        );
+        assert_eq!(v2["n_qubits"], 3);
+        assert!(v2["expected_cut"].as_f64().unwrap() > 1.7);
+    }
+
+    #[test]
+    fn verify_with_noise_block() {
+        let v = call(
+            &server(),
+            json!({
+                "action": "verify",
+                "check": "unitary",
+                "algorithm": "ghz",
+                "n": 4,
+                "noise": "ideal",
+                "noise_shots": 2000,
+                "seed": 1
+            }),
+        );
+        assert_eq!(v["verdict"], "proved_exact");
+        let noise = v["noise"].as_object().expect("блок шума");
+        assert_eq!(noise["preset"], "ideal");
+        assert!(noise["tvd"].as_f64().unwrap() < 0.08);
+        // без noise поле null
+        let v2 = call(
+            &server(),
+            json!({"action": "verify", "check": "teleport"}),
+        );
+        assert!(v2["noise"].is_null());
     }
 }

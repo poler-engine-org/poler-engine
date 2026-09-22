@@ -345,12 +345,18 @@ fn quantum_usage() -> String {
         "quantum run <algo> [opts]   — схема на идеальных кубитах:",
         "    bell ghz qft iqft grover bv dj period teleport",
         "    opts: --n K --shots M --seed S --marks a,b --secret S --period R --theta T",
+        "quantum run qcasm <файл|->    — произвольная схема QCASM (цикл Q)",
+        "quantum qcasm <файл|-> [opts] — opts: --shots M --seed S --top K --probs",
+        "    --amplitudes --exact --noise <preset> (ideal|ibm-heron|google-willow|noisy-90s)",
+        "quantum qaoa [--edges i-j,…] [--n K] [--p P] — MaxCut-ансатц с оптимизацией",
+        "    opts: --shots M --seed S --restarts R --sweeps W (цикл Q)",
         "quantum teleport [--theta T] [--exact] — телепортация q0 → q2 с фиделити",
         "quantum bloch <alpha> [beta] — сфера Блоха (выражения calc: 1/sqrt(2), i/2…)",
         "quantum state <alpha> <beta>  — состояние кубита: амплитуды, вероятности, Блох",
         "quantum verify unitary <algo> [--n K] — формальное доказательство U†U = I",
         "quantum verify equiv <A> <B> [--n K] [--phase] — эквивалентность схем",
         "quantum verify teleport        — канал телепортации (точно, на базисе)",
+        "    verify … --noise <preset> --shots M — вердикт + шум железа (цикл Q)",
         "quantum calc <выражение>       — мост в Калькулятор Всего (schrodinger,",
         "    pauli_x/y/z, kron, expm, eigen, ghz — физика цикла O)",
         "quantum list                   — каталог алгоритмов",
@@ -394,6 +400,7 @@ fn q_positionals<'a>(args: &'a [String], valued: &[&str]) -> Vec<&'a str> {
 
 const Q_FLAGS_VALUED: &[&str] = &[
     "--n", "--shots", "--seed", "--marks", "--secret", "--period", "--offset", "--theta",
+    "--top", "--noise", "--edges", "--p", "--restarts", "--sweeps",
 ];
 
 fn cmd_quantum(state: &mut ShellState, raw: &str) -> CmdResult {
@@ -422,6 +429,8 @@ fn cmd_quantum(state: &mut ShellState, raw: &str) -> CmdResult {
             CmdResult::Done(out)
         }
         "run" => cmd_quantum_run(args),
+        "qcasm" | "qasm" => cmd_quantum_qcasm(args),
+        "qaoa" => cmd_quantum_qaoa(args),
         "teleport" => cmd_quantum_teleport(args),
         "bloch" | "state" => cmd_quantum_bloch(state, args, sub == "state"),
         "verify" => cmd_quantum_verify(args),
@@ -456,6 +465,17 @@ fn cmd_quantum_run(args: &[String]) -> CmdResult {
             ))
         }
     };
+    // Цикл Q: `quantum run qcasm <файл|->` — произвольная схема.
+    if name == "qcasm" || name == "qasm" {
+        return match pos.get(1) {
+            Some(path) => quantum_qcasm_impl(path, args),
+            None => CmdResult::Done(
+                "quantum run qcasm: путь к файлу схемы (или - для stdin) обязателен\n\n"
+                    .to_string()
+                    + &quantum_usage(),
+            ),
+        };
+    }
     let n: usize = match q_flag_num(args, "--n", 4usize) {
         Ok(v) => v,
         Err(e) => return CmdResult::Done(format!("quantum run: {e}")),
@@ -574,6 +594,390 @@ fn cmd_quantum_run(args: &[String]) -> CmdResult {
             }
         }
     }
+    CmdResult::Done(out)
+}
+
+/// Цикл Q: `quantum qcasm <файл|->` — произвольная QCASM-схема из шелла.
+fn cmd_quantum_qcasm(args: &[String]) -> CmdResult {
+    let pos = q_positionals(args, Q_FLAGS_VALUED);
+    let path = match pos.first() {
+        Some(p) => *p,
+        None => {
+            return CmdResult::Done(
+                "quantum qcasm: путь к файлу схемы (или - для stdin) обязателен\n\n"
+                    .to_string()
+                    + &quantum_usage(),
+            )
+        }
+    };
+    quantum_qcasm_impl(path, args)
+}
+
+/// Общий движок QCASM: файл/stdin → parse → run | --exact | --noise.
+fn quantum_qcasm_impl(path: &str, args: &[String]) -> CmdResult {
+    use crate::quantum::core as pqc_core;
+    let shots: u64 = match q_flag_num(args, "--shots", 1024u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qcasm: {e}")),
+    };
+    let seed: u64 = match q_flag_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qcasm: {e}")),
+    };
+    let top: usize = match q_flag_num(args, "--top", 20usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qcasm: {e}")),
+    };
+    let text = if path == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        match std::io::stdin().read_to_string(&mut buf) {
+            Ok(_) => buf,
+            Err(e) => return CmdResult::Done(format!("quantum qcasm: stdin: {e}")),
+        }
+    } else {
+        match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                return CmdResult::Done(format!("quantum qcasm: не читается {path}: {e}"))
+            }
+        }
+    };
+    let circuit = match pqc_core::qpc::Circuit::parse(&text) {
+        Ok(c) => c,
+        Err(e) => return CmdResult::Done(format!("quantum qcasm: ошибка разбора: {e:?}")),
+    };
+
+    let bits = |o: u64, n: usize| -> String {
+        let mut s = String::new();
+        for q in (0..n).rev() {
+            s.push(if o >> q & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    };
+
+    // Точный режим: кольцо ℤ[1/√2, i] (Clifford+T).
+    if q_flag(args, "--exact") {
+        return match pqc_core::exact::run_exact(&circuit) {
+            Ok(rep) => {
+                if q_flag(args, "--json") {
+                    return CmdResult::Done(
+                        serde_json::json!({
+                            "engine": "poler-quantum-shell",
+                            "mode": "qcasm-exact:Z[1/sqrt(2),i]",
+                            "source": path,
+                            "n_qubits": rep.n_qubits,
+                            "norm_residual": rep.norm_residual,
+                            "probabilities": rep.probs_f64,
+                            "exact_probs": rep.exact_probs.iter().map(|p| format!("{p}")).collect::<Vec<_>>(),
+                        })
+                        .to_string(),
+                    );
+                }
+                let mut out = format!(
+                    "QCASM — ТОЧНОЕ КОЛЬЦО ℤ[1/√2, i]\nфайл: {path}\nкубитов: {}, невязка нормы: {:.2e}",
+                    rep.n_qubits, rep.norm_residual
+                );
+                out.push_str("\nраспределение Борна (точно):");
+                for (i, (p, ex)) in
+                    rep.probs_f64.iter().zip(rep.exact_probs.iter()).enumerate()
+                {
+                    if *p > 0.0 {
+                        out.push_str(&format!(
+                            "\n  |{}⟩  {:.6}   = {}",
+                            bits(i as u64, rep.n_qubits),
+                            p,
+                            ex
+                        ));
+                    }
+                }
+                CmdResult::Done(out)
+            }
+            Err(e) => CmdResult::Done(format!("quantum qcasm --exact: {e:?}")),
+        };
+    }
+
+    // Шум поверх идеала: MCWF-ансамбль траекторий (цикл Q).
+    let noise_preset: String = q_flag_num(args, "--noise", String::new()).unwrap_or_default();
+    if !noise_preset.is_empty() {
+        let model = match pqc_core::noise::NoiseModel::preset(&noise_preset) {
+            Some(m) => m,
+            None => {
+                return CmdResult::Done(format!(
+                    "quantum qcasm: неизвестный пресет `{noise_preset}` \
+                     (ideal|ibm-heron|google-willow|noisy-90s)"
+                ))
+            }
+        };
+        return match pqc_core::noise::run_noisy(&circuit, &model, shots, seed) {
+            Ok(rep) => {
+                if q_flag(args, "--json") {
+                    let counts: Vec<serde_json::Value> = rep
+                        .counts
+                        .iter()
+                        .map(|(o, c)| serde_json::json!([o, c]))
+                        .collect();
+                    return CmdResult::Done(
+                        serde_json::json!({
+                            "engine": "poler-quantum-shell",
+                            "mode": "qcasm-noise-mcwf",
+                            "source": path,
+                            "n_qubits": rep.n_qubits,
+                            "preset": noise_preset,
+                            "shots": rep.shots,
+                            "tvd": rep.tvd,
+                            "classical_fidelity": rep.classical_fidelity,
+                            "chi2": rep.chi2,
+                            "chi2_dof": rep.chi2_dof,
+                            "ideal_peak": rep.ideal_peak,
+                            "noisy_peak": rep.noisy_peak,
+                            "ideal_probs": rep.ideal_probs,
+                            "counts": counts,
+                        })
+                        .to_string(),
+                    );
+                }
+                let mut out = format!(
+                    "QCASM — шум поверх идеала (Monte Carlo траектории)\nфайл: {path}\nпресет: {noise_preset}, выстрелов: {}",
+                    rep.shots
+                );
+                out.push_str(&format!(
+                    "\nTVD ½Σ|p−q|:        {:.4}\nF_класс (Σ√pq)²:   {:.4}\nχ² Пирсона (dof {}):  {:.1}",
+                    rep.tvd, rep.classical_fidelity, rep.chi2_dof, rep.chi2
+                ));
+                out.push_str(&format!(
+                    "\nпик идеал → железо: {:.4} → {:.4}",
+                    rep.ideal_peak, rep.noisy_peak
+                ));
+                if !rep.counts.is_empty() {
+                    out.push_str("\nтоп исходов (зашумлённых):");
+                    for (o, c) in rep.counts.iter().take(top) {
+                        out.push_str(&format!(
+                            "\n  |{}⟩  {:>8}  p̂ = {:.4}",
+                            bits(*o, rep.n_qubits),
+                            c,
+                            *c as f64 / rep.shots.max(1) as f64
+                        ));
+                    }
+                }
+                CmdResult::Done(out)
+            }
+            Err(e) => CmdResult::Done(format!("quantum qcasm --noise: {e:?}")),
+        };
+    }
+
+    // Идеальный прогон.
+    match pqc_core::qpc::run(&circuit, shots, seed) {
+        Ok(rep) => {
+            if q_flag(args, "--json") {
+                let counts: Vec<serde_json::Value> = rep
+                    .counts
+                    .iter()
+                    .map(|(o, c)| serde_json::json!([o, c]))
+                    .collect();
+                return CmdResult::Done(
+                    serde_json::json!({
+                        "engine": "poler-quantum-shell",
+                        "mode": "qcasm",
+                        "source": path,
+                        "n_qubits": rep.n_qubits,
+                        "gate_count": rep.gate_count,
+                        "per_shot": rep.per_shot,
+                        "shots": rep.shots,
+                        "norm": rep.norm,
+                        "entropy_bits": rep.entropy_bits,
+                        "landauer_j": rep.landauer_j,
+                        "probabilities": rep.probabilities,
+                        "marginals": rep.marginals,
+                        "counts": counts,
+                    })
+                    .to_string(),
+                );
+            }
+            let mut out = format!(
+                "QCASM — идеальный субстрат\nфайл: {path}\nкубитов: {}, вентилей: {}, выстрелов: {}",
+                rep.n_qubits, rep.gate_count, rep.shots
+            );
+            out.push_str(&format!(
+                "\nрежим: {}\nнорма: {:.16}\nэнтропия: {:.4} бит",
+                if rep.per_shot { "per-shot коллапс" } else { "statevector" },
+                rep.norm,
+                rep.entropy_bits
+            ));
+            if !rep.counts.is_empty() {
+                out.push_str("\nтоп исходов:");
+                for (o, c) in rep.counts.iter().take(top) {
+                    out.push_str(&format!(
+                        "\n  |{}⟩  {:>8}  p̂ = {:.4}",
+                        bits(*o, rep.n_qubits),
+                        c,
+                        *c as f64 / rep.shots.max(1) as f64
+                    ));
+                }
+            }
+            if q_flag(args, "--probs") {
+                out.push_str("\nраспределение Борна:");
+                for (i, p) in rep.probabilities.iter().enumerate() {
+                    if *p > 1e-9 {
+                        out.push_str(&format!(
+                            "\n  |{}⟩  {p:.6}",
+                            bits(i as u64, rep.n_qubits)
+                        ));
+                    }
+                }
+            }
+            if q_flag(args, "--amplitudes") && rep.n_qubits <= 20 {
+                out.push_str("\nамплитуды:");
+                for (i, a) in rep.final_state.amplitudes().iter().enumerate() {
+                    if a.norm_sq() > 1e-24 {
+                        out.push_str(&format!(
+                            "\n  |{}⟩  ({:+.6} {:+.6}i)",
+                            bits(i as u64, rep.n_qubits),
+                            a.re,
+                            a.im
+                        ));
+                    }
+                }
+            }
+            out.push_str("\nмаргиналы P(b_q = 1):");
+            for (q, m) in rep.marginals.iter().enumerate() {
+                out.push_str(&format!("\n  q{q}: {m:.6}"));
+            }
+            CmdResult::Done(out)
+        }
+        Err(e) => CmdResult::Done(format!("quantum qcasm: {e:?}")),
+    }
+}
+
+/// Цикл Q: `quantum qaoa` — MaxCut-ансатц с классической оптимизацией.
+fn cmd_quantum_qaoa(args: &[String]) -> CmdResult {
+    use crate::quantum::core as pqc_core;
+    let t0 = Instant::now();
+    let edges_str: String = q_flag_num(args, "--edges", String::new()).unwrap_or_default();
+    let problem = if edges_str.trim().is_empty() {
+        pqc_core::qaoa::MaxCut::demo()
+    } else {
+        let edges = match pqc_core::qaoa::MaxCut::parse_edges(&edges_str) {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("quantum qaoa: {e:?}")),
+        };
+        let max_v = edges.iter().map(|&(i, j)| i.max(j)).max().unwrap_or(0);
+        let n: usize = match q_flag_num(args, "--n", 0usize) {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("quantum qaoa: {e}")),
+        };
+        let n = if n == 0 { max_v + 1 } else { n };
+        match pqc_core::qaoa::MaxCut::new(n, edges) {
+            Ok(p) => p,
+            Err(e) => return CmdResult::Done(format!("quantum qaoa: {e:?}")),
+        }
+    };
+    let p: usize = match q_flag_num(args, "--p", 2usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qaoa: {e}")),
+    };
+    let sweeps: usize = match q_flag_num(args, "--sweeps", 12usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qaoa: {e}")),
+    };
+    let restarts: usize = match q_flag_num(args, "--restarts", 3usize) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qaoa: {e}")),
+    };
+    let shots: u64 = match q_flag_num(args, "--shots", 1024u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qaoa: {e}")),
+    };
+    let seed: u64 = match q_flag_num(args, "--seed", 42u64) {
+        Ok(v) => v,
+        Err(e) => return CmdResult::Done(format!("quantum qaoa: {e}")),
+    };
+    let cfg = pqc_core::qaoa::QaoaConfig {
+        p,
+        sweeps,
+        restarts,
+        shots,
+        seed,
+    };
+    let rep = match pqc_core::qaoa::run_qaoa(&problem, &cfg) {
+        Ok(r) => r,
+        Err(e) => return CmdResult::Done(format!("quantum qaoa: {e:?}")),
+    };
+    let ms = t0.elapsed().as_millis();
+
+    let bitstring = |o: u64| -> String {
+        let mut s = String::new();
+        for q in (0..rep.n_qubits).rev() {
+            s.push(if o >> q & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    };
+
+    if q_flag(args, "--json") {
+        let gammas: Vec<f64> = rep.params[..rep.p].to_vec();
+        let betas: Vec<f64> = rep.params[rep.p..].to_vec();
+        let counts: Vec<serde_json::Value> = rep
+            .counts
+            .iter()
+            .map(|(o, c)| serde_json::json!([o, c]))
+            .collect();
+        return CmdResult::Done(
+            serde_json::json!({
+                "engine": "poler-quantum-shell",
+                "algorithm": "qaoa",
+                "problem": "maxcut",
+                "n_qubits": rep.n_qubits,
+                "edges": rep.edges.iter().map(|(i, j)| serde_json::json!([i, j])).collect::<Vec<_>>(),
+                "p": rep.p,
+                "gammas": gammas,
+                "betas": betas,
+                "expected_cut": rep.expected_cut,
+                "expected_cut_init": rep.expected_cut_init,
+                "best_bits": bitstring(rep.best_bits),
+                "best_cut": rep.best_cut,
+                "optimum": rep.optimum,
+                "approx_ratio": rep.approx_ratio,
+                "evals": rep.evals,
+                "history": rep.history,
+                "gate_count": rep.gate_count,
+                "shots": rep.shots,
+                "norm": rep.norm,
+                "counts": counts,
+                "elapsed_ms": ms,
+            })
+            .to_string(),
+        );
+    }
+
+    let mut out = String::from("QAOA — MaxCut-ансатц на идеальных кубитах (цикл Q)");
+    out.push_str(&format!(
+        "\nзадача: {} вершин, {} рёбер",
+        rep.n_qubits,
+        rep.edges.len()
+    ));
+    out.push_str(&format!(
+        "\nансатц: p = {} слоёв, вычислений E[cut]: {}",
+        rep.p, rep.evals
+    ));
+    out.push_str(&format!(
+        "\nE[cut]: {:.4} → {:.4} (после оптимизации)",
+        rep.expected_cut_init, rep.expected_cut
+    ));
+    out.push_str(&format!(
+        "\nлучший битстринг |{}⟩ — разрез {} из {}",
+        bitstring(rep.best_bits),
+        rep.best_cut,
+        rep.optimum.map_or_else(|| "?".to_string(), |o| o.to_string())
+    ));
+    if let (Some(_), Some(r)) = (rep.optimum, rep.approx_ratio) {
+        out.push_str(&format!("\nаппроксимационное отношение: {:.1}%", 100.0 * r));
+    } else {
+        out.push_str("\nпереборный оптимум: n > 20 — не вычисляется (честная граница)");
+    }
+    out.push_str(&format!("\nуглы γ: {:?}", &rep.params[..rep.p]));
+    out.push_str(&format!("\nуглы β: {:?}", &rep.params[rep.p..]));
+    out.push_str(&format!("\nнорма: {:.16}, выстрелов: {}", rep.norm, rep.shots));
+    out.push_str(&format!("\nвремя: {ms} мс"));
     CmdResult::Done(out)
 }
 
@@ -770,7 +1174,7 @@ fn cmd_quantum_bloch(state: &mut ShellState, args: &[String], full: bool) -> Cmd
 fn cmd_quantum_verify(args: &[String]) -> CmdResult {
     use crate::quantum::core as pqc_core;
     use pqc_core::verify::{Verdict, VerificationReport};
-    let pos = q_positionals(args, &["--n"]);
+    let pos = q_positionals(args, &["--n", "--shots", "--seed", "--noise"]);
     let mode = match pos.first() {
         Some(m) => *m,
         None => {
@@ -837,6 +1241,79 @@ fn cmd_quantum_verify(args: &[String]) -> CmdResult {
         Err(e) => return CmdResult::Done(format!("quantum verify: {e}")),
     };
 
+    // Цикл Q: шум поверх верификатора — вердикт + «идеал vs железо».
+    let noise_preset: String = q_flag_num(args, "--noise", String::new()).unwrap_or_default();
+    let mut noise_json: Option<serde_json::Value> = None;
+    let mut noise_text = String::new();
+    if !noise_preset.is_empty() {
+        let noise_shots: u64 = match q_flag_num(args, "--shots", 4096u64) {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("quantum verify --noise: {e}")),
+        };
+        let seed: u64 = match q_flag_num(args, "--seed", 42u64) {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("quantum verify --noise: {e}")),
+        };
+        let circuit_opt: Result<Option<pqc_core::qpc::Circuit>, String> = match mode {
+            "unitary" => match pos.get(1) {
+                Some(algo) => build_algo(algo).map(Some),
+                None => Ok(None),
+            },
+            "teleport" => pqc_core::algorithms::teleport_prepared(0.7)
+                .map(Some)
+                .map_err(|e| format!("{e:?}")),
+            _ => Ok(None), // equiv: две схемы — шум не применяется
+        };
+        match circuit_opt {
+            Ok(Some(circuit)) => {
+                let model = match pqc_core::noise::NoiseModel::preset(&noise_preset) {
+                    Some(m) => m,
+                    None => {
+                        return CmdResult::Done(format!(
+                            "quantum verify --noise: неизвестный пресет `{noise_preset}` \
+                             (ideal|ibm-heron|google-willow|noisy-90s)"
+                        ))
+                    }
+                };
+                match pqc_core::noise::run_noisy(&circuit, &model, noise_shots, seed) {
+                    Ok(nrep) => {
+                        noise_json = Some(serde_json::json!({
+                            "preset": noise_preset,
+                            "shots": nrep.shots,
+                            "tvd": nrep.tvd,
+                            "classical_fidelity": nrep.classical_fidelity,
+                            "chi2": nrep.chi2,
+                            "chi2_dof": nrep.chi2_dof,
+                            "ideal_peak": nrep.ideal_peak,
+                            "noisy_peak": nrep.noisy_peak,
+                        }));
+                        noise_text = format!(
+                            "\n\nШум поверх верификатора (цикл Q):\n  пресет: {noise_preset}, \
+                             выстрелов: {}\n  TVD ½Σ|p−q|: {:.4} · F_класс: {:.4} · χ²(dof {}): {:.1}\
+                             \n  пик идеал → железо: {:.4} → {:.4}",
+                            nrep.shots,
+                            nrep.tvd,
+                            nrep.classical_fidelity,
+                            nrep.chi2_dof,
+                            nrep.chi2,
+                            nrep.ideal_peak,
+                            nrep.noisy_peak
+                        );
+                    }
+                    Err(e) => {
+                        noise_text = format!("\n\nШум не применён: {e:?}");
+                    }
+                }
+            }
+            Ok(None) => {
+                noise_text = "\n\nШум не применён: equiv верифицирует две схемы — \
+                     прогоните каждую через `quantum qcasm <файл> --noise <пресет>`."
+                    .to_string();
+            }
+            Err(e) => noise_text = format!("\n\nШум не применён: {e}"),
+        }
+    }
+
     if q_flag(args, "--json") {
         let verdict = match report.verdict {
             Verdict::ProvedExact => serde_json::json!("proved_exact"),
@@ -857,6 +1334,7 @@ fn cmd_quantum_verify(args: &[String]) -> CmdResult {
                 "max_deviation": report.max_deviation,
                 "checks": report.checks.iter().map(|(n, ok, d)| serde_json::json!([n, ok, d])).collect::<Vec<_>>(),
                 "notes": report.notes,
+                "noise": noise_json,
             })
             .to_string(),
         );
@@ -882,6 +1360,7 @@ fn cmd_quantum_verify(args: &[String]) -> CmdResult {
     for note in &report.notes {
         out.push_str(&format!("\n  · {note}"));
     }
+    out.push_str(&noise_text);
     CmdResult::Done(out)
 }
 
@@ -3065,6 +3544,162 @@ mod tests {
         }
         match dispatch(&mut s, "quantum calc schrodinger(pauli_y(), [1; 0], pi/2)") {
             CmdResult::Done(out) => assert!(out.contains("0") && out.contains("1"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v0.52.0 (цикл Q): qcasm, qaoa, шум поверх верификатора
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cmd_quantum_qcasm_bell() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q7.db"));
+        let path = std::env::temp_dir().join("poler_qcasm_bell.qc");
+        std::fs::write(&path, "qubits 2\nh 0\ncx 0 1\nmeasure all\n").unwrap();
+        match dispatch(&mut s, &format!("quantum qcasm {} --shots 256 --seed 7", path.display())) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("кубитов: 2"), "{out}");
+                assert!(out.contains("|00⟩") && out.contains("|11⟩"), "{out}");
+                assert!(!out.contains("|01⟩"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // алиас `run qcasm` + JSON
+        match dispatch(&mut s, &format!("quantum run qcasm {} --json", path.display())) {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).expect("валидный JSON");
+                assert_eq!(v["mode"], "qcasm");
+                assert_eq!(v["n_qubits"], 2);
+                let p00 = v["probabilities"][0].as_f64().unwrap();
+                let p11 = v["probabilities"][3].as_f64().unwrap();
+                assert!((p00 - 0.5).abs() < 1e-12 && (p11 - 0.5).abs() < 1e-12);
+            }
+            _ => panic!(),
+        }
+        // точный режим: Белл в кольце Z[1/√2, i]
+        match dispatch(&mut s, &format!("quantum qcasm {} --exact", path.display())) {
+            CmdResult::Done(out) => {
+                assert!(out.contains("ТОЧНОЕ КОЛЬЦО"), "{out}");
+                assert!(out.contains("1/2"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // ошибка разбора честная, с номером строки
+        let bad = std::env::temp_dir().join("poler_qcasm_bad.qc");
+        std::fs::write(&bad, "qubits 2\nh 5\n").unwrap();
+        match dispatch(&mut s, &format!("quantum qcasm {}", bad.display())) {
+            CmdResult::Done(out) => assert!(out.contains("ошибка разбора"), "{out}"),
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn cmd_quantum_qcasm_noise() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q8.db"));
+        let path = std::env::temp_dir().join("poler_qcasm_ghz.qc");
+        std::fs::write(&path, "qubits 3\nh 0\ncx 0 1\ncx 0 2\nmeasure all\n").unwrap();
+        // ideal: расхождение — только биномиальный шум сэмплинга
+        match dispatch(
+            &mut s,
+            &format!("quantum qcasm {} --noise ideal --shots 2000 --seed 1 --json", path.display()),
+        ) {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["mode"], "qcasm-noise-mcwf");
+                assert!(v["tvd"].as_f64().unwrap() < 0.08, "TVD = {}", v["tvd"]);
+            }
+            _ => panic!(),
+        }
+        // noisy-90s: распределение реально деградирует
+        match dispatch(
+            &mut s,
+            &format!("quantum qcasm {} --noise noisy-90s --shots 4000 --seed 1 --json", path.display()),
+        ) {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert!(v["tvd"].as_f64().unwrap() > 0.10, "TVD = {}", v["tvd"]);
+                assert!(v["noisy_peak"].as_f64().unwrap() < v["ideal_peak"].as_f64().unwrap());
+                assert!(v["chi2"].as_f64().unwrap() > 30.0, "χ² = {}", v["chi2"]);
+            }
+            _ => panic!(),
+        }
+        // неизвестный пресет — честный отказ
+        match dispatch(&mut s, &format!("quantum qcasm {} --noise qpu-3000", path.display())) {
+            CmdResult::Done(out) => assert!(out.contains("неизвестный пресет"), "{out}"),
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cmd_quantum_qaoa_triangle() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q9.db"));
+        match dispatch(
+            &mut s,
+            "quantum qaoa --edges 0-1,1-2,0-2 --p 2 --restarts 2 --sweeps 10 --json",
+        ) {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["algorithm"], "qaoa");
+                assert_eq!(v["n_qubits"], 3);
+                assert!(v["expected_cut"].as_f64().unwrap() > 1.8, "{}", v["expected_cut"]);
+                assert_eq!(v["best_cut"], 2);
+                assert_eq!(v["optimum"], 2);
+                assert!(v["approx_ratio"].as_f64().unwrap() >= 0.999);
+                assert!(v["evals"].as_u64().unwrap() > 4);
+            }
+            _ => panic!(),
+        }
+        // текстовый отчёт демо-графа
+        match dispatch(&mut s, "quantum qaoa --p 1 --restarts 1 --sweeps 6") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("QAOA"), "{out}");
+                assert!(out.contains("аппроксимационное отношение"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // валидация честная
+        match dispatch(&mut s, "quantum qaoa --edges 1-1") {
+            CmdResult::Done(out) => assert!(out.contains("петля"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "quantum qaoa --edges a-b") {
+            CmdResult::Done(out) => assert!(out.contains("не число"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_quantum_verify_with_noise() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-q10.db"));
+        match dispatch(
+            &mut s,
+            "quantum verify unitary ghz --n 4 --noise ideal --shots 2000 --json",
+        ) {
+            CmdResult::Done(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["verdict"], "proved_exact");
+                let noise = v["noise"].as_object().expect("блок шума");
+                assert_eq!(noise["preset"], "ideal");
+                assert!(noise["tvd"].as_f64().unwrap() < 0.08);
+            }
+            _ => panic!(),
+        }
+        // телепортация: точный вердикт + деградация на железе 90-х
+        match dispatch(&mut s, "quantum verify teleport --noise noisy-90s --shots 3000") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("ДОКАЗАНО ТОЧНО"), "{out}");
+                assert!(out.contains("Шум поверх верификатора"), "{out}");
+                assert!(out.contains("TVD"), "{out}");
+            }
+            _ => panic!(),
+        }
+        // equiv: две схемы — шум честно не применяется
+        match dispatch(&mut s, "quantum verify equiv qft iqft --n 3 --noise ibm-heron") {
+            CmdResult::Done(out) => assert!(out.contains("Шум не применён"), "{out}"),
             _ => panic!(),
         }
     }
