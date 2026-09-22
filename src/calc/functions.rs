@@ -74,6 +74,30 @@ fn matrix_arg(args: &[Value], i: usize) -> Result<Matrix, String> {
     }
 }
 
+/// Complex → Value: вещественный результат остаётся числом (нулевая
+/// регрессия отображения), комплексный — Complex (цикл O).
+fn complex_to_value(c: Complex) -> Value {
+    if c.im == 0.0 {
+        Value::Scalar(c.re)
+    } else {
+        Value::Complex(c)
+    }
+}
+
+/// Гибкое число: Scalar | Quantity (в базовых СИ) | Complex (вещественная
+/// часть с диагностикуой) — для t и ħ в schrodinger (цикл O).
+fn flex_num(args: &[Value], i: usize, name: &str) -> Result<f64, String> {
+    match args.get(i) {
+        Some(Value::Scalar(v)) => Ok(*v),
+        Some(Value::Quantity(q, _)) => Ok(*q), // значение в базовых СИ (hbar → 1.05e-34)
+        Some(other) => Err(format!(
+            "{name}: аргумент {} должен быть числом, получено {other}",
+            i + 1
+        )),
+        None => Err(format!("{name}: не хватает аргументов")),
+    }
+}
+
 /// Строковый аргумент (имя планеты, тритная запись).
 fn str_arg(args: &[Value], i: usize) -> Result<String, String> {
     match args.get(i) {
@@ -237,6 +261,9 @@ pub fn is_function(name: &str) -> bool {
         // матрицы/квант
         | "transpose" | "det" | "inv" | "pinv" | "trace" | "expm" | "charpoly" | "eigen"
         | "identity" | "rot2" | "rotx" | "roty" | "rotz" | "so_gen"
+        // квант цикла O: Шрёдингер
+        | "schrodinger" | "dagger" | "kron" | "tridiag" | "eye"
+        | "pauli_x" | "pauli_y" | "pauli_z" | "hadamard"
         // триты
         | "trits" | "trit_val" | "trit_and" | "trit_or" | "trit_not"
         // единицы/температура
@@ -268,8 +295,26 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
 
     match name {
         // ---------- тригонометрия ----------
-        "sin" => Ok(Value::Scalar(angle_arg(args, 0)?.sin())),
-        "cos" => Ok(Value::Scalar(angle_arg(args, 0)?.cos())),
+        "sin" => {
+            // цикл O: sin(x+iy) = sin x·cosh y + i·cos x·sinh y
+            match args {
+                [Value::Complex(c)] => Ok(Value::Complex(Complex::new(
+                    c.re.sin() * c.im.cosh(),
+                    c.re.cos() * c.im.sinh(),
+                ))),
+                _ => Ok(Value::Scalar(angle_arg(args, 0)?.sin())),
+            }
+        }
+        "cos" => {
+            // цикл O: cos(x+iy) = cos x·cosh y − i·sin x·sinh y
+            match args {
+                [Value::Complex(c)] => Ok(Value::Complex(Complex::new(
+                    c.re.cos() * c.im.cosh(),
+                    -(c.re.sin() * c.im.sinh()),
+                ))),
+                _ => Ok(Value::Scalar(angle_arg(args, 0)?.cos())),
+            }
+        }
         "tan" => Ok(Value::Scalar(angle_arg(args, 0)?.tan())),
         "asin" => {
             // цикл N: |x| > 1 — комплексная ветвь (DLMF 4.23):
@@ -364,7 +409,16 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         }
 
         // ---------- экспоненты/логарифмы ----------
-        "exp" => Ok(Value::Scalar(one_arg(args, name)?.exp())),
+        "exp" => {
+            // цикл O: экспонента комплексного — тождество Эйлера
+            // exp(iπ) = −1; e^{x+iy} = e^x·(cos y + i·sin y)
+            match args {
+                [Value::Complex(c)] => {
+                    Ok(Value::Complex(Complex::from_polar(c.re.exp(), c.im)))
+                }
+                _ => Ok(Value::Scalar(one_arg(args, name)?.exp())),
+            }
+        }
         "ln" => {
             // цикл N: расширенный логарифм — ln(0) = −∞ (предел),
             // ln(x<0) = ln|x| + iπ (главная ветвь)
@@ -468,7 +522,17 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         }
 
         // ---------- округление/знак ----------
-        "abs" => Ok(Value::Scalar(one_arg(args, name)?.abs())),
+        "abs" => {
+            // цикл O: модуль комплексного |3+4i| = 5 и амплитуды 1×1
+            // (квантовая вероятность: abs(⟨1|ψ⟩)^2)
+            match args {
+                [Value::Complex(c)] => Ok(Value::Scalar(c.abs())),
+                [Value::Matrix(m)] if m.rows == 1 && m.cols == 1 => {
+                    Ok(Value::Scalar(m.get(0, 0).abs()))
+                }
+                _ => Ok(Value::Scalar(one_arg(args, name)?.abs())),
+            }
+        }
         "floor" => Ok(Value::Scalar(one_arg(args, name)?.floor())),
         "ceil" => Ok(Value::Scalar(one_arg(args, name)?.ceil())),
         "round" => Ok(Value::Scalar(one_arg(args, name)?.round())),
@@ -656,23 +720,31 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
 
         // ---------- матрицы/квант ----------
         "transpose" => Ok(Value::Matrix(matrix_arg(args, 0)?.transpose())),
-        "det" => Ok(Value::Scalar(matrix_arg(args, 0)?.det()?)),
+        "det" => Ok(complex_to_value(matrix_arg(args, 0)?.det()?)),
         "inv" => Ok(Value::Matrix(matrix_arg(args, 0)?.inv()?)),
         "pinv" => Ok(Value::Matrix(matrix_arg(args, 0)?.pinv()?)),
-        "trace" => Ok(Value::Scalar(matrix_arg(args, 0)?.trace()?)),
+        "trace" => Ok(complex_to_value(matrix_arg(args, 0)?.trace()?)),
         "expm" => Ok(Value::Matrix(matrix_arg(args, 0)?.expm()?)),
         "charpoly" => {
             let c = matrix_arg(args, 0)?.charpoly()?;
-            Ok(Value::List(c.into_iter().map(Value::Scalar).collect()))
+            Ok(Value::List(c.into_iter().map(complex_to_value).collect()))
         }
         "eigen" => {
             let ev = matrix_arg(args, 0)?.eigenvalues()?;
-            Ok(Value::List(ev.into_iter().map(Value::Complex).collect()))
+            Ok(Value::List(ev.into_iter().map(complex_to_value).collect()))
         }
         "identity" => {
             let n = one_arg(args, name)?;
             if n.fract() != 0.0 || !(1.0..=12.0).contains(&n) {
                 return Err("identity(n): n — целое 1..=12".into());
+            }
+            Ok(Value::Matrix(Matrix::identity(n as usize)))
+        }
+        // eye — алиас identity с квантовым лимитом (kron растит быстро)
+        "eye" => {
+            let n = one_arg(args, name)?;
+            if n.fract() != 0.0 || !(1.0..=64.0).contains(&n) {
+                return Err("eye(n): n — целое 1..=64".into());
             }
             Ok(Value::Matrix(Matrix::identity(n as usize)))
         }
@@ -687,6 +759,85 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 return Err("so_gen(n, i, j): целые аргументы".into());
             }
             Ok(Value::Matrix(Matrix::so_generator(n as usize, i as usize, j as usize)?))
+        }
+
+        // ---------- квант цикла O: Шрёдингер ----------
+        "schrodinger" => {
+            // |Ψ(t)⟩ = expm(−i·H·t/ħ)·|Ψ₀⟩ — решатель уравнения Шрёдингера.
+            // ħ = 1 по умолчанию (натуральные единицы); для СИ передайте
+            // четвёртым аргументом hbar (или t уже в t/ħ).
+            if args.len() != 3 && args.len() != 4 {
+                return Err(
+                    "schrodinger(H, psi0, t[, hbar]): 3 или 4 аргумента (по умолчанию ħ = 1)"
+                        .into(),
+                );
+            }
+            let h = matrix_arg(args, 0)?;
+            let psi0 = matrix_arg(args, 1)?;
+            let t = flex_num(args, 2, name)?;
+            let hbar = if args.len() == 4 { flex_num(args, 3, name)? } else { 1.0 };
+            if !hbar.is_finite() || hbar == 0.0 {
+                return Err("schrodinger: ħ должен быть конечным и ненулевым".into());
+            }
+            if !h.is_square() {
+                return Err("schrodinger: гамильтониан H — квадратная матрица".into());
+            }
+            if psi0.cols != 1 || psi0.rows != h.rows {
+                return Err(format!(
+                    "schrodinger: psi0 — вектор-столбец {}×1, получено {}×{}",
+                    h.rows, psi0.rows, psi0.cols
+                ));
+            }
+            let u = h.scale_c(Complex::new(0.0, -t / hbar)).expm()?;
+            Ok(Value::Matrix(u.mul(&psi0)?))
+        }
+        "dagger" => Ok(Value::Matrix(matrix_arg(args, 0)?.dagger())),
+        "kron" => {
+            need(args, 2, name)?;
+            Ok(Value::Matrix(matrix_arg(args, 0)?.kron(&matrix_arg(args, 1)?)))
+        }
+        "pauli_x" => {
+            need(args, 0, name)?;
+            Ok(Value::Matrix(Matrix::from_rows(&[vec![0.0, 1.0], vec![1.0, 0.0]])?))
+        }
+        "pauli_y" => {
+            need(args, 0, name)?;
+            Ok(Value::Matrix(Matrix::from_complex_rows(&[
+                vec![Complex::ZERO, Complex::new(0.0, -1.0)],
+                vec![Complex::new(0.0, 1.0), Complex::ZERO],
+            ])?))
+        }
+        "pauli_z" => {
+            need(args, 0, name)?;
+            Ok(Value::Matrix(Matrix::from_rows(&[vec![1.0, 0.0], vec![0.0, -1.0]])?))
+        }
+        "hadamard" => {
+            need(args, 0, name)?;
+            let k = std::f64::consts::FRAC_1_SQRT_2;
+            Ok(Value::Matrix(Matrix::from_rows(&[vec![k, k], vec![k, -k]])?))
+        }
+        "tridiag" => {
+            // трёхдиагональная матрица: d на диагонали, off на соседях —
+            // дискретизация лапласиана (яма, осциллятор на сетке)
+            need(args, 3, name)?;
+            let (d, off, n) = (
+                scalar_arg(args, 0)?,
+                scalar_arg(args, 1)?,
+                scalar_arg(args, 2)?,
+            );
+            if n.fract() != 0.0 || !(2.0..=64.0).contains(&n) {
+                return Err("tridiag(d, off, n): n — целое 2..=64".into());
+            }
+            let n = n as usize;
+            let mut m = Matrix::zeros(n, n);
+            for i in 0..n {
+                m.set(i, i, Complex::new(d, 0.0));
+            }
+            for i in 0..n - 1 {
+                m.set(i, i + 1, Complex::new(off, 0.0));
+                m.set(i + 1, i, Complex::new(off, 0.0));
+            }
+            Ok(Value::Matrix(m))
         }
 
         // ---------- триты ----------
@@ -873,9 +1024,11 @@ pub fn catalog(filter: &str) -> String {
             "gcd lcm mod is_prime next_prime prev_prime factorize divisors fib binomial catalan",
         ]),
         ("матрицы/квант", &[
-            "transpose det inv trace expm charpoly eigen identity",
-            "rot2 rotx roty rotz so_gen",
-            "A^(-1) — обратная; expm(J·θ) — вращение Ли",
+            "transpose det inv pinv trace expm charpoly eigen identity eye",
+            "rot2 rotx roty rotz so_gen kron dagger tridiag",
+            "квант O: schrodinger(H, psi0, t[, hbar]) — уравнение Шрёдингера",
+            "pauli_x pauli_y pauli_z hadamard — пресеты кубитных вентилей",
+            "A^(-1) — обратная; expm(J·θ) — вращение Ли; kron — тензорное произведение",
         ]),
         ("триты", &["trits trit_val trit_and trit_or trit_not"]),
         ("температура", &["degC(x) degF(x) — конструкторы: degC(25) to degF"]),

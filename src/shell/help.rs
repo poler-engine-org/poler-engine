@@ -317,6 +317,14 @@ fn calc_help_topic() -> String {
     let _ = writeln!(s, "  calc charpoly([1,2;3,4])        = [1, -5, -2] (Фаддеев–Леврерье)");
     let _ = writeln!(s, "  calc so_gen(3,0,2) * 1.0        генератор so(3); A^(-1) — обратная");
     let _ = writeln!(s);
+    let _ = writeln!(s, "── Цикл O: уравнение Шрёдингера (кремний вместо QPU) ──");
+    let _ = writeln!(s, "  calc schrodinger(pauli_y(), [1; 0], pi/2)   спин-флип |↑⟩ → |↓⟩");
+    let _ = writeln!(s, "  calc eigen(tridiag(289, -144.5, 16))        яма: уровни ≈ (πk)²/2");
+    let _ = writeln!(s, "  calc exp(i * pi)                 тождество Эйлера = -1.0");
+    let _ = writeln!(s, "  calc kron(hadamard(), eye(2))    тензорное произведение H⊗I");
+    let _ = writeln!(s, "  calc dagger([0, -i; i, 0])       эрмитово сопряжение σ_y†");
+    let _ = writeln!(s, "  calc pinv([1, 2; 2, 4])          Мур–Пенроуз (Гревилль)");
+    let _ = writeln!(s);
     let _ = writeln!(s, "── Триты POLER (сбалансированная троичная) ──");
     let _ = writeln!(s, "  calc trits(5)                   = \"1TT\"; trit_val(\"1TT\") = 5");
     let _ = writeln!(s, "  calc trit_and(\"1TT\", \"10T\")   вентили Клини: min/max/инверсия");

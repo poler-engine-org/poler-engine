@@ -57,6 +57,11 @@ impl Complex {
     pub fn scale(self, k: f64) -> Self {
         Complex::new(self.re * k, self.im * k)
     }
+    /// Деление на вещественный скаляр без промежуточного обращения —
+    /// побитовая преемственность с f64-путём (pinv-регрессия цикла O).
+    pub fn div_real(self, d: f64) -> Self {
+        Complex::new(self.re / d, self.im / d)
+    }
     pub fn from_polar(r: f64, theta: f64) -> Self {
         Complex::new(r * theta.cos(), r * theta.sin())
     }
@@ -83,6 +88,65 @@ impl Complex {
         } else {
             self
         }
+    }
+}
+
+/// Смешанная арифметика Complex ↔ f64 (цикл O): детерминированная,
+/// математически однозначная (f64 ≡ вещественное с im = 0).
+/// Нужна матричному слою (Vec<Complex>) и тестам, чтобы старые
+/// f64-сравнения продолжали компилироваться без перепахивания.
+impl PartialEq<f64> for Complex {
+    fn eq(&self, other: &f64) -> bool {
+        self.im == 0.0 && self.re == *other
+    }
+}
+impl std::ops::Add for Complex {
+    type Output = Complex;
+    fn add(self, o: Complex) -> Complex {
+        Complex::new(self.re + o.re, self.im + o.im)
+    }
+}
+impl std::ops::Sub for Complex {
+    type Output = Complex;
+    fn sub(self, o: Complex) -> Complex {
+        Complex::new(self.re - o.re, self.im - o.im)
+    }
+}
+impl std::ops::Mul for Complex {
+    type Output = Complex;
+    fn mul(self, o: Complex) -> Complex {
+        Complex::new(
+            self.re * o.re - self.im * o.im,
+            self.re * o.im + self.im * o.re,
+        )
+    }
+}
+impl std::ops::Div for Complex {
+    type Output = Complex;
+    fn div(self, o: Complex) -> Complex {
+        let d = o.re * o.re + o.im * o.im;
+        Complex::new(
+            (self.re * o.re + self.im * o.im) / d,
+            (self.im * o.re - self.re * o.im) / d,
+        )
+    }
+}
+impl std::ops::Add<f64> for Complex {
+    type Output = Complex;
+    fn add(self, o: f64) -> Complex {
+        Complex::new(self.re + o, self.im)
+    }
+}
+impl std::ops::Sub<f64> for Complex {
+    type Output = Complex;
+    fn sub(self, o: f64) -> Complex {
+        Complex::new(self.re - o, self.im)
+    }
+}
+impl std::ops::Mul<f64> for Complex {
+    type Output = Complex;
+    fn mul(self, o: f64) -> Complex {
+        self.scale(o)
     }
 }
 
@@ -176,6 +240,62 @@ pub fn durand_kerner(coeffs: &[f64], iters: usize) -> Vec<Complex> {
         .iter()
         .map(|&r| r.snap_real(1e-8 * scale))
         .collect()
+}
+
+/// Значение полинома с КОМПЛЕКСНЫМИ коэффициентами (по убыванию степени).
+/// Цикл O: характеристический полином комплексной матрицы комплексен.
+pub fn poly_eval_c(coeffs: &[Complex], z: Complex) -> Complex {
+    let mut acc = Complex::ZERO;
+    for &c in coeffs {
+        acc = acc.mul(z).add(c);
+    }
+    acc
+}
+
+/// Дюран–Кернер для комплексных коэффициентов (зеркало f64-версии).
+/// Для вещественных коэффициентов ведёт себя идентично ей (im = 0).
+pub fn durand_kerner_c(coeffs: &[Complex], iters: usize) -> Vec<Complex> {
+    let n = coeffs.len() - 1;
+    if n == 0 {
+        return Vec::new();
+    }
+    // нормируем к monic
+    let lead = coeffs[0];
+    let c: Vec<Complex> = coeffs.iter().map(|v| v.div(lead)).collect();
+    let mut roots: Vec<Complex> = (0..n)
+        .map(|i| {
+            let ang = 0.4 * (i + 1) as f64;
+            let r = 0.9_f64.powi(i as i32 + 1);
+            Complex::from_polar(r, ang).add(Complex::new(0.4, 0.9))
+        })
+        .collect();
+    let tol = 1e-14;
+    for _ in 0..iters {
+        let mut max_delta = 0.0f64;
+        for i in 0..n {
+            let zi = roots[i];
+            let num = poly_eval_c(&c, zi);
+            let mut den = Complex::ONE;
+            for (j, &rj) in roots.iter().enumerate() {
+                if j != i {
+                    den = den.mul(zi.sub(rj));
+                }
+            }
+            if den.abs() < 1e-300 {
+                continue;
+            }
+            let step = num.div(den);
+            let delta = step.abs();
+            if delta.is_finite() {
+                roots[i] = zi.sub(step);
+                max_delta = max_delta.max(delta);
+            }
+        }
+        if max_delta < tol {
+            break;
+        }
+    }
+    roots
 }
 
 /// Сортировка корней для стабильного вывода: по Re, затем по Im.

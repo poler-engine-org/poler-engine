@@ -1,4 +1,8 @@
-//! Матрично-квантовое ядро POLER Matrix Calc (цикл M, v0.48.0).
+//! Матрично-квантовое ядро POLER Matrix Calc (цикл M → цикл O).
+//!
+//! Цикл O: элементы — комплексные числа ℂ; эрмитово сопряжение dagger,
+//! тензорное произведение kron, унитарность — решатель уравнения
+//! Шрёдингера |Ψ(t)⟩ = expm(−i·H·t/ħ)·|Ψ₀⟩ живёт поверх этого слоя.
 //!
 //! Исправленные дефекты прошлой сессии (задокументированы тестами):
 //! - Паде [6/6] для expm: коэффициент b4 = **1/792** (не 1/1584);
@@ -10,25 +14,26 @@
 //! Квантовая часть: генераторы Ли so(2)/so(3) и их экспоненты —
 //! точные вращения expm(J·θ), как в живом голосе (J = A − Aᵀ).
 
-use super::solve::{durand_kerner, sort_roots, Complex};
+use super::solve::{durand_kerner, durand_kerner_c, sort_roots, Complex};
 
-/// Плотная матрица, row-major.
+/// Плотная матрица, row-major. Цикл O: элементы — комплексные числа
+/// (вещественная матрица ≡ все im = 0); вся линейная алгебра — над ℂ.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
-    pub data: Vec<f64>,
+    pub data: Vec<Complex>,
 }
 
 impl Matrix {
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Matrix { rows, cols, data: vec![0.0; rows * cols] }
+        Matrix { rows, cols, data: vec![Complex::ZERO; rows * cols] }
     }
 
     pub fn identity(n: usize) -> Self {
         let mut m = Self::zeros(n, n);
         for i in 0..n {
-            m.data[i * n + i] = 1.0;
+            m.data[i * n + i] = Complex::ONE;
         }
         m
     }
@@ -44,16 +49,35 @@ impl Matrix {
         Ok(Matrix {
             rows: rows.len(),
             cols,
+            data: rows
+                .iter()
+                .flat_map(|r| r.iter().map(|&v| Complex::new(v, 0.0)))
+                .collect(),
+        })
+    }
+
+    /// Матрица из комплексных строк (цикл O: [0, −i; i, 0]).
+    pub fn from_complex_rows(rows: &[Vec<Complex>]) -> Result<Self, String> {
+        if rows.is_empty() {
+            return Err("пустая матрица".into());
+        }
+        let cols = rows[0].len();
+        if cols == 0 || rows.iter().any(|r| r.len() != cols) {
+            return Err("строки матрицы разной длины".into());
+        }
+        Ok(Matrix {
+            rows: rows.len(),
+            cols,
             data: rows.iter().flat_map(|r| r.iter().copied()).collect(),
         })
     }
 
     #[inline]
-    pub fn get(&self, i: usize, j: usize) -> f64 {
+    pub fn get(&self, i: usize, j: usize) -> Complex {
         self.data[i * self.cols + j]
     }
     #[inline]
-    pub fn set(&mut self, i: usize, j: usize, v: f64) {
+    pub fn set(&mut self, i: usize, j: usize, v: Complex) {
         self.data[i * self.cols + j] = v;
     }
 
@@ -71,11 +95,11 @@ impl Matrix {
         t
     }
 
-    pub fn trace(&self) -> Result<f64, String> {
+    pub fn trace(&self) -> Result<Complex, String> {
         if !self.is_square() {
             return Err("след определён только для квадратных матриц".into());
         }
-        Ok((0..self.rows).map(|i| self.get(i, i)).sum())
+        Ok((0..self.rows).fold(Complex::ZERO, |s, i| s.add(self.get(i, i))))
     }
 
     pub fn add(&self, o: &Matrix) -> Result<Matrix, String> {
@@ -87,7 +111,7 @@ impl Matrix {
         }
         let mut r = self.clone();
         for (a, b) in r.data.iter_mut().zip(o.data.iter()) {
-            *a += b;
+            *a = *a + *b;
         }
         Ok(r)
     }
@@ -101,7 +125,7 @@ impl Matrix {
         }
         let mut r = self.clone();
         for (a, b) in r.data.iter_mut().zip(o.data.iter()) {
-            *a -= b;
+            *a = *a - *b;
         }
         Ok(r)
     }
@@ -109,7 +133,16 @@ impl Matrix {
     pub fn scale(&self, k: f64) -> Matrix {
         let mut r = self.clone();
         for v in r.data.iter_mut() {
-            *v *= k;
+            *v = v.scale(k);
+        }
+        r
+    }
+
+    /// Умножение на комплексный скаляр (цикл O: i·A, (2+3i)·A).
+    pub fn scale_c(&self, k: Complex) -> Matrix {
+        let mut r = self.clone();
+        for v in r.data.iter_mut() {
+            *v = v.mul(k);
         }
         r
     }
@@ -137,14 +170,14 @@ impl Matrix {
         Ok(r)
     }
 
-    /// Определитель: LU с частичным выбором ведущего элемента.
-    pub fn det(&self) -> Result<f64, String> {
+    /// Определитель: LU с частичным выбором ведущего элемента (над ℂ).
+    pub fn det(&self) -> Result<Complex, String> {
         if !self.is_square() {
             return Err("определитель только для квадратных матриц".into());
         }
         let n = self.rows;
         let mut a = self.data.clone();
-        let mut det = 1.0;
+        let mut det = Complex::ONE;
         for col in 0..n {
             let mut piv = col;
             for r in col + 1..n {
@@ -153,21 +186,21 @@ impl Matrix {
                 }
             }
             if a[piv * n + col].abs() < 1e-300 {
-                return Ok(0.0);
+                return Ok(Complex::ZERO);
             }
             if piv != col {
                 for j in 0..n {
                     a.swap(piv * n + j, col * n + j);
                 }
-                det = -det;
+                det = Complex::ZERO.sub(det);
             }
             let d = a[col * n + col];
-            det *= d;
+            det = det.mul(d);
             for r in col + 1..n {
-                let k = a[r * n + col] / d;
-                if k != 0.0 {
+                let k = a[r * n + col].div(d);
+                if k != Complex::ZERO {
                     for j in col..n {
-                        a[r * n + j] -= k * a[col * n + j];
+                        a[r * n + j] = a[r * n + j].sub(k.mul(a[col * n + j]));
                     }
                 }
             }
@@ -199,16 +232,16 @@ impl Matrix {
             swap_rows_vec(&mut b, n, piv, col);
             let d = a[col * n + col];
             for j in 0..n {
-                a[col * n + j] /= d;
-                b[col * n + j] /= d;
+                a[col * n + j] = a[col * n + j].div(d);
+                b[col * n + j] = b[col * n + j].div(d);
             }
             for r in 0..n {
                 if r != col {
                     let k = a[r * n + col];
-                    if k != 0.0 {
+                    if k != Complex::ZERO {
                         for j in 0..n {
-                            a[r * n + j] -= k * a[col * n + j];
-                            b[r * n + j] -= k * b[col * n + j];
+                            a[r * n + j] = a[r * n + j].sub(k.mul(a[col * n + j]));
+                            b[r * n + j] = b[r * n + j].sub(k.mul(b[col * n + j]));
                         }
                     }
                 }
@@ -229,7 +262,11 @@ impl Matrix {
     /// матриц шум усиливается — это цена отказа от SVD-пути.
     pub fn pinv(&self) -> Result<Matrix, String> {
         let (m, n) = (self.rows, self.cols);
-        if !self.data.iter().all(|v| v.is_finite()) {
+        if !self
+            .data
+            .iter()
+            .all(|v| v.re.is_finite() && v.im.is_finite())
+        {
             return Err("pinv: элементы должны быть конечны".into());
         }
         let scale = self.norm_inf();
@@ -237,50 +274,64 @@ impl Matrix {
             return Ok(Matrix::zeros(n, m)); // нулевая матрица → нулевая A⁺
         }
         // P — растущая Aₖ⁺: k строк × m столбцов.
-        let mut p: Vec<Vec<f64>> = Vec::with_capacity(n);
+        // Цикл O: комплексная версия — внутренние произведения эрмитовы
+        // (сопряжение в b и в d⁴; внешние d·bᵀ — без сопряжения).
+        let mut p: Vec<Vec<Complex>> = Vec::with_capacity(n);
         for k in 0..n {
             // столбец aₖ (m-вектор)
-            let a: Vec<f64> = (0..m).map(|i| self.get(i, k)).collect();
+            let a: Vec<Complex> = (0..m).map(|i| self.get(i, k)).collect();
             // d = P·aₖ (k-вектор)
-            let d: Vec<f64> = p
+            let d: Vec<Complex> = p
                 .iter()
-                .map(|r| r.iter().zip(&a).map(|(x, y)| x * y).sum())
+                .map(|r| {
+                    r.iter()
+                        .zip(&a)
+                        .map(|(x, y)| x.mul(*y))
+                        .fold(Complex::ZERO, |s, v| s.add(v))
+                })
                 .collect();
             // c = aₖ − Aₖ₋₁·d — остаток вне образа предыдущих столбцов
             let mut c = a.clone();
             for (j, dj) in d.iter().enumerate() {
-                if *dj != 0.0 {
+                if *dj != Complex::ZERO {
                     for i in 0..m {
-                        c[i] -= self.get(i, j) * dj;
+                        c[i] = c[i].sub(self.get(i, j).mul(*dj));
                     }
                 }
             }
-            let c2: f64 = c.iter().map(|x| x * x).sum();
+            let c2: f64 = c.iter().map(|x| x.abs().powi(2)).sum();
             // относительный порог численного нуля (к столбцу и к масштабу A)
-            let a2: f64 = a.iter().map(|x| x * x).sum();
+            let a2: f64 = a.iter().map(|x| x.abs().powi(2)).sum();
             let tol2 = (1e-10 * a2.sqrt().max(1e-12 * scale)).powi(2);
-            let b: Vec<f64> = if c2 > tol2 {
-                c.iter().map(|x| x / c2).collect()
+            let b: Vec<Complex> = if c2 > tol2 {
+                // b = c^H/(c^H·c) — сопряжение для эрмитовой проекции;
+                // деление напрямую (не умножение на 1/c2) — побитовая
+                // преемственность с f64-путём (0.04, а не 0.039999…)
+                c.iter().map(|x| x.conj().div_real(c2)).collect()
             } else {
-                let d2: f64 = d.iter().map(|x| x * x).sum();
+                let d2: f64 = d.iter().map(|x| x.abs().powi(2)).sum();
                 let denom = 1.0 + d2;
                 (0..m)
                     .map(|col| {
-                        d.iter().zip(&p).map(|(dv, r)| dv * r[col]).sum::<f64>() / denom
+                        d.iter()
+                            .zip(&p)
+                            .map(|(dv, r)| dv.conj().mul(r[col]))
+                            .fold(Complex::ZERO, |s, v| s.add(v))
+                            .div_real(denom)
                     })
                     .collect()
             };
             // Pₖ = [Pₖ₋₁ − d·bᵀ ; b]
             for (i, dv) in d.iter().enumerate() {
-                if *dv != 0.0 {
+                if *dv != Complex::ZERO {
                     for col in 0..m {
-                        p[i][col] -= dv * b[col];
+                        p[i][col] = p[i][col].sub(dv.mul(b[col]));
                     }
                 }
             }
             p.push(b);
         }
-        Matrix::from_rows(&p)
+        Matrix::from_complex_rows(&p)
     }
 
     /// Норма ∞ (максимум сумм модулей строк).
@@ -349,19 +400,19 @@ impl Matrix {
         Ok(x)
     }
 
-    /// Характеристический полином по Фаддееву–Леврерье.
+    /// Характеристический полином по Фаддееву–Леврерье (над ℂ).
     /// Возвращает коэффициенты по убыванию степени (monic):
     /// p(λ) = λⁿ + c₁λⁿ⁻¹ + … + cₙ.
     ///
     /// ИНВАРИАНТ (регрессия прошлой сессии): прибавление c_k·I — только
     /// к ДИАГОНАЛИ M_k, ни в коем случае не ко всем элементам.
-    pub fn charpoly(&self) -> Result<Vec<f64>, String> {
+    pub fn charpoly(&self) -> Result<Vec<Complex>, String> {
         if !self.is_square() {
             return Err("характеристический полином — только для квадратных".into());
         }
         let n = self.rows;
-        let mut coeffs = vec![0.0; n + 1];
-        coeffs[0] = 1.0; // старший (monic)
+        let mut coeffs = vec![Complex::ZERO; n + 1];
+        coeffs[0] = Complex::ONE; // старший (monic)
         let mut m = Matrix::zeros(n, n); // M_0 = 0
         for k in 1..=n {
             // M_k = A·M_{k−1} + c_{k−1}·I  (c с индексом n−k+1 в 1-based нотации)
@@ -372,19 +423,91 @@ impl Matrix {
             }
             // c_k = −tr(A·M_k)/k
             let am = self.mul(&m)?;
-            let tr: f64 = (0..n).map(|i| am.get(i, i)).sum();
-            coeffs[k] = -tr / k as f64;
+            let tr: Complex = (0..n).fold(Complex::ZERO, |s, i| s.add(am.get(i, i)));
+            coeffs[k] = Complex::ZERO.sub(tr).scale(1.0 / k as f64);
         }
         Ok(coeffs)
     }
 
     /// Собственные значения: charpoly → Дюран–Кернер (комплексные).
+    /// Цикл O: МАСШТАБНАЯ НОРМИРОВКА — спектр приводится к O(1)
+    /// (B = A/‖A‖∞), динамический диапазон коэффициентов charpoly
+    /// сжимается с ~10³⁹ до ~10⁷ (яма 16×16 без нормировки разваливала
+    /// ДК), корни масштабируются обратно. Вещественные коэффициенты
+    /// идут по проверенному f64-пути (нулевая регрессия), комплексные —
+    /// по зеркальному ℂ-пути.
     pub fn eigenvalues(&self) -> Result<Vec<Complex>, String> {
-        let coeffs = self.charpoly()?;
         if self.rows == 0 {
             return Ok(Vec::new());
         }
-        Ok(sort_roots(durand_kerner(&coeffs, 300)))
+        let s = self.norm_inf();
+        if s == 0.0 || !s.is_finite() {
+            return Ok(vec![Complex::ZERO; self.rows]); // нулевая матрица
+        }
+        let b = self.scale(1.0 / s);
+        let coeffs = b.charpoly()?;
+        // итерации растут с размером: 2×2 хватает 300, 16×16 — ~1000
+        let iters = 300 + 40 * self.rows;
+        let roots = if coeffs.iter().all(|c| c.im == 0.0) {
+            let rc: Vec<f64> = coeffs.iter().map(|c| c.re).collect();
+            sort_roots(durand_kerner(&rc, iters))
+        } else {
+            sort_roots(durand_kerner_c(&coeffs, iters))
+        };
+        Ok(roots.into_iter().map(|r| r.scale(s)).collect())
+    }
+
+    // -----------------------------------------------------------------
+    // Цикл O: эрмитово сопряжение, тензорное произведение, унитарность
+    // -----------------------------------------------------------------
+
+    /// Эрмитово сопряжение A† = (Ā)ᵀ (цикл O: квантовая механика).
+    pub fn dagger(&self) -> Matrix {
+        let mut t = Matrix::zeros(self.cols, self.rows);
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                t.set(j, i, self.get(i, j).conj());
+            }
+        }
+        t
+    }
+
+    /// Тензорное (кронекерово) произведение A⊗B (цикл O: многокупитные
+    /// состояния, H⊗I, CNOT-схемы).
+    pub fn kron(&self, o: &Matrix) -> Matrix {
+        let (m, n, p, q) = (self.rows, self.cols, o.rows, o.cols);
+        let mut r = Matrix::zeros(m * p, n * q);
+        for i in 0..m {
+            for j in 0..n {
+                let a = self.get(i, j);
+                if a == Complex::ZERO {
+                    continue;
+                }
+                for k in 0..p {
+                    for l in 0..q {
+                        r.set(i * p + k, j * q + l, a.mul(o.get(k, l)));
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// Проверка унитарности: U†U = I (в пределах tol).
+    pub fn is_unitary(&self, tol: f64) -> Result<bool, String> {
+        if !self.is_square() {
+            return Err("унитарность — свойство квадратных матриц".into());
+        }
+        let p = self.dagger().mul(self)?;
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                let want = if i == j { Complex::ONE } else { Complex::ZERO };
+                if p.get(i, j).sub(want).abs() > tol {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     // -----------------------------------------------------------------
@@ -400,8 +523,8 @@ impl Matrix {
             return Err("нужны два разных индекса 0..n".into());
         }
         let mut g = Matrix::zeros(n, n);
-        g.set(i, j, -1.0);
-        g.set(j, i, 1.0);
+        g.set(i, j, Complex::new(-1.0, 0.0));
+        g.set(j, i, Complex::new(1.0, 0.0));
         Ok(g)
     }
 
@@ -412,10 +535,10 @@ impl Matrix {
             return Err("нужны два разных индекса 0..n".into());
         }
         let mut r = Matrix::identity(n);
-        r.set(i, i, theta.cos());
-        r.set(j, j, theta.cos());
-        r.set(i, j, -theta.sin());
-        r.set(j, i, theta.sin());
+        r.set(i, i, Complex::new(theta.cos(), 0.0));
+        r.set(j, j, Complex::new(theta.cos(), 0.0));
+        r.set(i, j, Complex::new(-theta.sin(), 0.0));
+        r.set(j, i, Complex::new(theta.sin(), 0.0));
         Ok(r)
     }
 
@@ -460,7 +583,7 @@ impl Matrix {
 }
 
 /// Перестановка строк r1 ↔ r2 в плотном n×n буфере (row-major).
-fn swap_rows_vec(v: &mut [f64], n: usize, r1: usize, r2: usize) {
+fn swap_rows_vec(v: &mut [Complex], n: usize, r1: usize, r2: usize) {
     for j in 0..n {
         v.swap(r1 * n + j, r2 * n + j);
     }
@@ -470,8 +593,25 @@ fn swap_rows_vec(v: &mut [f64], n: usize, r1: usize, r2: usize) {
 mod tests {
     use super::*;
 
-    fn close(a: f64, b: f64, tol: f64) -> bool {
-        (a - b).abs() <= tol * (1.0 + a.abs() + b.abs())
+    /// Универсальное сравнение: f64 или Complex (цикл O) — мнимая часть
+    /// вещественных результатов проверяется на нуль.
+    trait ToC {
+        fn to_c(self) -> Complex;
+    }
+    impl ToC for f64 {
+        fn to_c(self) -> Complex {
+            Complex::new(self, 0.0)
+        }
+    }
+    impl ToC for Complex {
+        fn to_c(self) -> Complex {
+            self
+        }
+    }
+    fn close(a: impl ToC + Copy, b: impl ToC + Copy, tol: f64) -> bool {
+        let (a, b) = (a.to_c(), b.to_c());
+        (a.re - b.re).abs() <= tol * (1.0 + a.re.abs() + b.re.abs())
+            && (a.im - b.im).abs() <= tol * (1.0 + a.im.abs() + b.im.abs())
     }
 
     fn m22(a: f64, b: f64, c: f64, d: f64) -> Matrix {
@@ -656,7 +796,7 @@ mod tests {
         }
         // det(expm(A)) = e^tr(A) — фундаментальное тождество
         let tr = a.trace().unwrap();
-        assert!(close(e.det().unwrap(), tr.exp(), 1e-10));
+        assert!(close(e.det().unwrap(), tr.re.exp(), 1e-10));
     }
 
     // ================================================================
@@ -708,7 +848,7 @@ mod tests {
             for _ in 0..power {
                 term = term.mul(&m4).unwrap();
             }
-            pa = pa.add(&term.scale(*coef)).unwrap();
+            pa = pa.add(&term.scale_c(*coef)).unwrap();
             let _ = ak;
         }
         for v in pa.data.iter() {
@@ -785,5 +925,172 @@ mod tests {
     fn norm_inf() {
         let a = m22(1.0, -2.0, 3.0, 0.5);
         assert!((a.norm_inf() - 3.5).abs() < 1e-15);
+    }
+
+    // ================================================================
+    // Цикл O: комплексные матрицы, Шрёдингер, тензорное произведение
+    // ================================================================
+    fn sigma_y() -> Matrix {
+        Matrix::from_complex_rows(&[
+            vec![Complex::ZERO, Complex::new(0.0, -1.0)],
+            vec![Complex::new(0.0, 1.0), Complex::ZERO],
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn complex_matrix_core_sigma_y() {
+        let sy = sigma_y();
+        // эрмитовость: σ_y† = σ_y
+        assert_eq!(sy.dagger(), sy);
+        // унитарность: σ_y†·σ_y = I
+        assert!(sy.is_unitary(1e-12).unwrap());
+        // det(σ_y) = −1 (произведение спектра ±1), tr = 0
+        assert!(close(sy.det().unwrap(), -1.0, 1e-12));
+        assert!(close(sy.trace().unwrap(), 0.0, 1e-12));
+        // собственные значения ±1 (комплексная матрица, вещественный спектр)
+        let ev = sy.eigenvalues().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert!(close(ev[0], -1.0, 1e-9), "{:?}", ev);
+        assert!(close(ev[1], 1.0, 1e-9), "{:?}", ev);
+        // pinv унитарной = эрмитово сопряжённая = сама σ_y
+        let p = sy.pinv().unwrap();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(close(p.get(i, j), sy.get(i, j), 1e-12));
+            }
+        }
+        // inv тоже: σ_y⁻¹ = σ_y
+        let iv = sy.inv().unwrap();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(close(iv.get(i, j), sy.get(i, j), 1e-12));
+            }
+        }
+    }
+
+    #[test]
+    fn complex_expm_unitary_evolution() {
+        // U = expm(−i·σ_y·π/2) = cos(π/2)·I − i·sin(π/2)·σ_y = [0, −1; 1, 0]
+        let sy = sigma_y();
+        let u = sy
+            .scale_c(Complex::new(0.0, -std::f64::consts::FRAC_PI_2))
+            .expm()
+            .unwrap();
+        assert!(close(u.get(0, 0), 0.0, 1e-10), "{:?}", u.data);
+        assert!(close(u.get(0, 1), -1.0, 1e-10), "{:?}", u.data);
+        assert!(close(u.get(1, 0), 1.0, 1e-10), "{:?}", u.data);
+        assert!(close(u.get(1, 1), 0.0, 1e-10), "{:?}", u.data);
+        // унитарность эволюции: U†U = I (фундаментальный закон)
+        assert!(u.is_unitary(1e-10).unwrap());
+        // |det U| = 1
+        let d = u.det().unwrap();
+        assert!((d.abs() - 1.0).abs() < 1e-10, "det = {d}");
+        // U·|↑⟩ = |↓⟩ — переворот спина за время π/2
+        let up = Matrix::from_rows(&[vec![1.0], vec![0.0]]).unwrap();
+        let psi = u.mul(&up).unwrap();
+        assert!(close(psi.get(0, 0), 0.0, 1e-10));
+        assert!(close(psi.get(1, 0), 1.0, 1e-10));
+    }
+
+    #[test]
+    fn complex_eigenvalues_pure_imaginary() {
+        // i·I₂: спектр {i, i} — комплексный путь Дюрана–Кернера.
+        // Кратный корень: |ошибка| ~ ε^(1/2) ≈ 1e-8 — честный предел ДК
+        let a = Matrix::identity(2).scale_c(Complex::I);
+        let ev = a.eigenvalues().unwrap();
+        assert_eq!(ev.len(), 2);
+        for e in &ev {
+            assert!(close(*e, Complex::I, 1e-6), "{:?}", ev);
+        }
+    }
+
+    #[test]
+    fn pinv_complex_scaling() {
+        // pinv(i·I) = −i·I: (iI)⁺ = ((iI)†(iI))⁻¹(iI)† = I⁻¹·(−iI)
+        let a = Matrix::identity(2).scale_c(Complex::I);
+        let p = a.pinv().unwrap();
+        assert!(close(p.get(0, 0), Complex::new(0.0, -1.0), 1e-12));
+        assert!(close(p.get(1, 1), Complex::new(0.0, -1.0), 1e-12));
+        assert!(close(p.get(0, 1), 0.0, 1e-12));
+        assert!(close(p.get(1, 0), 0.0, 1e-12));
+    }
+
+    #[test]
+    fn dagger_and_kron_laws() {
+        let a = Matrix::from_complex_rows(&[
+            vec![Complex::new(1.0, 2.0), Complex::new(3.0, -1.0)],
+            vec![Complex::new(0.5, 0.0), Complex::new(-2.0, 4.0)],
+        ])
+        .unwrap();
+        let b = Matrix::from_complex_rows(&[
+            vec![Complex::new(0.0, 1.0), Complex::new(2.0, 0.0)],
+            vec![Complex::new(-1.0, -1.0), Complex::new(0.5, 0.5)],
+        ])
+        .unwrap();
+        // (A†)† = A
+        assert_eq!(a.dagger().dagger(), a);
+        // (AB)† = B†A†
+        let abd = a.mul(&b).unwrap().dagger();
+        let bad = b.dagger().mul(&a.dagger()).unwrap();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(close(abd.get(i, j), bad.get(i, j), 1e-12));
+            }
+        }
+        // kron: [1,2]⊗[3,4] = [3,4,6,8] — строка 1×4 (блочное покомпонентное)
+        let r1 = Matrix::from_rows(&[vec![1.0, 2.0]]).unwrap();
+        let r2 = Matrix::from_rows(&[vec![3.0, 4.0]]).unwrap();
+        let k = r1.kron(&r2);
+        assert_eq!((k.rows, k.cols), (1, 4));
+        assert!(close(k.get(0, 0), 3.0, 1e-15));
+        assert!(close(k.get(0, 1), 4.0, 1e-15));
+        assert!(close(k.get(0, 2), 6.0, 1e-15));
+        assert!(close(k.get(0, 3), 8.0, 1e-15));
+        // σ_z⊗I₂ = diag(1,1,−1,−1)
+        let sz = m22(1.0, 0.0, 0.0, -1.0);
+        let d = sz.kron(&Matrix::identity(2));
+        assert!(close(d.get(0, 0), 1.0, 1e-15));
+        assert!(close(d.get(1, 1), 1.0, 1e-15));
+        assert!(close(d.get(2, 2), -1.0, 1e-15));
+        assert!(close(d.get(3, 3), -1.0, 1e-15));
+        // смешанный закон: (A⊗B)(C⊗D) = (AC)⊗(BD)
+        let x = m22(0.0, 1.0, 1.0, 0.0);
+        let lhs = sz.kron(&x).mul(&x.kron(&Matrix::identity(2))).unwrap();
+        let rhs = sz.mul(&x).unwrap().kron(&x);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(close(lhs.get(i, j), rhs.get(i, j), 1e-12));
+            }
+        }
+    }
+
+    #[test]
+    fn infinite_square_well_spectrum() {
+        // УРАВНЕНИЕ ШРЁДИНГЕРА НА СЕТКЕ: H = −½·d²/dx² на [0,1] с
+        // дырчатыми краями. Дискретный спектр λ_k = (1/h²)(1−cos(πkh)).
+        // Для n = 16: λ₁ ≈ 4.937 (непрерывный предел (π/2)·π ≈ 4.9348)
+        let n = 16usize;
+        let h = 1.0 / (n as f64 + 1.0);
+        let diag = 1.0 / (h * h);
+        let off = -0.5 / (h * h);
+        let mut hh = Matrix::zeros(n, n);
+        for i in 0..n {
+            hh.set(i, i, Complex::new(diag, 0.0));
+        }
+        for i in 0..n - 1 {
+            hh.set(i, i + 1, Complex::new(off, 0.0));
+            hh.set(i + 1, i, Complex::new(off, 0.0));
+        }
+        let ev = hh.eigenvalues().unwrap();
+        // точные дискретные уровни
+        let lam = |k: usize| (1.0 / (h * h)) * (1.0 - (std::f64::consts::PI * k as f64 * h).cos());
+        assert!(close(ev[0].re, lam(1), 1e-6), "E1 = {:?} vs {}", ev[0], lam(1));
+        assert!(close(ev[1].re, lam(2), 1e-6), "E2 = {:?} vs {}", ev[1], lam(2));
+        assert!(close(ev[2].re, lam(3), 1e-5), "E3 = {:?} vs {}", ev[2], lam(3));
+        // и они же ≈ (πk)²/2 непрерывного предела (погрешность сетки
+        // h²·(πk)⁴/24: для k=2 на n=16 это ~0.22)
+        assert!((ev[0].re - std::f64::consts::PI.powi(2) / 2.0).abs() < 0.03);
+        assert!((ev[1].re - (2.0 * std::f64::consts::PI).powi(2) / 2.0).abs() < 0.25);
     }
 }

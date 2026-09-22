@@ -460,6 +460,11 @@ pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String
             if let Some(v) = vars.get(name) {
                 return Ok(v.clone());
             }
+            // цикл O: мнимая единица — встроенный идентификатор (2i, [0, −i; i, 0]);
+            // переменная пользователя имеет приоритет (calc i = 5 работает)
+            if name == "i" {
+                return Ok(Value::Complex(Complex::I));
+            }
             if let Some((v, unit)) = constants::lookup(name) {
                 return Ok(if unit.is_dimensionless() && unit.factor == 1.0 {
                     Value::Scalar(v)
@@ -492,23 +497,35 @@ pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String
             factorial(&v)
         }
         Expr::MatrixLit(rows) => {
-            let mut data: Vec<Vec<f64>> = Vec::with_capacity(rows.len());
+            // цикл O: элементы — числа ИЛИ комплексные (σ_y = [0, −i; i, 0])
+            let mut data: Vec<Vec<Complex>> = Vec::with_capacity(rows.len());
             for r in rows {
                 let mut row = Vec::with_capacity(r.len());
                 for c in r {
                     let v = eval(c, vars)?;
                     match v {
-                        Value::Scalar(x) => row.push(x),
+                        Value::Scalar(x) => row.push(Complex::new(x, 0.0)),
+                        Value::Complex(z) => row.push(z),
+                        Value::BigInt(s) => {
+                            // точное целое → f64 (с потерей точности за пределами 2⁵³)
+                            let x = s
+                                .parse::<f64>()
+                                .map_err(|_| format!("элемент матрицы не число: {s}"))?;
+                            if !x.is_finite() {
+                                return Err(format!("элемент матрицы слишком велик: {s}"));
+                            }
+                            row.push(Complex::new(x, 0.0));
+                        }
                         other => {
                             return Err(format!(
-                                "элементы матрицы должны быть числами, получено {other:?}"
+                                "элементы матрицы должны быть числами или комплексными, получено {other:?}"
                             ))
                         }
                     }
                 }
                 data.push(row);
             }
-            Ok(Value::Matrix(Matrix::from_rows(&data)?))
+            Ok(Value::Matrix(Matrix::from_complex_rows(&data)?))
         }
         Expr::Assign { name, expr } => {
             let v = eval(expr, vars)?;
@@ -702,9 +719,17 @@ pub fn binary_op(op: BinOp, a: &Value, b: &Value) -> Result<Value, String> {
         (Value::Complex(_), Value::Quantity(_, _)) | (Value::Quantity(_, _), Value::Complex(_)) => {
             Err("комплексные величины с единицами не поддерживаются".into())
         }
-        (Value::Complex(_), Value::Matrix(_)) | (Value::Matrix(_), Value::Complex(_)) => {
-            Err("комплексные и матрицы не смешиваются".into())
-        }
+        // цикл O: комплексный скаляр × матрица — унитарные генераторы i·A,
+        // гамильтонианы с фазами
+        (Value::Complex(c), Value::Matrix(m)) => match op {
+            Mul => Ok(Value::Matrix(m.scale_c(*c))),
+            _ => Err("комплексное с матрицей: определено только умножение (c·A)".into()),
+        },
+        (Value::Matrix(m), Value::Complex(c)) => match op {
+            Mul => Ok(Value::Matrix(m.scale_c(*c))),
+            Div => Ok(Value::Matrix(m.scale_c(Complex::ONE.div(*c)))),
+            _ => Err("матрица с комплексным: определены · и / (A·c, A/c)".into()),
+        },
 
         (Value::Str(_), _) | (_, Value::Str(_)) => {
             Err("арифметика со строками не определена".into())

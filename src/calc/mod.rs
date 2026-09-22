@@ -120,6 +120,10 @@ impl fmt::Display for Value {
                 }
             }
             Value::Matrix(m) => {
+                // вещественная матрица — канонический вид [a, b; c, d]
+                // (нулевая регрессия); комплексная — поэлементный ℂ-вид
+                // (цикл O: [0, -i; i, 0])
+                let all_real = m.data.iter().all(|c| c.im == 0.0);
                 write!(f, "[")?;
                 for i in 0..m.rows {
                     if i > 0 {
@@ -129,7 +133,11 @@ impl fmt::Display for Value {
                         if j > 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{}", py_float(m.get(i, j)))?;
+                        if all_real {
+                            write!(f, "{}", py_float(m.get(i, j).re))?;
+                        } else {
+                            write!(f, "{}", m.get(i, j))?;
+                        }
                     }
                 }
                 write!(f, "]")
@@ -657,6 +665,106 @@ mod tests {
         // ζ(1) — полюс на расширенной прямой, как у Γ в целых точках
         let r = calc("zeta(1)");
         assert!(r.contains("∞"), "{r}");
+    }
+
+    // ================================================================
+    // Цикл O «Шрёдингер»: невозможное → возможное
+    // ================================================================
+    #[test]
+    fn cycle_o_complex_literals_and_matrices() {
+        // мнимая единица — встроенный идентификатор (2i = 2·i)
+        assert_eq!(calc("i * i"), "-1.0");
+        assert_eq!(calc("1 + 2i"), "1.0 + 2.0i");
+        // ТОЖДЕСТВО ЭЙЛЕРА: exp(iπ) = −1 (мнимый шум 1e-16 — как в Python cmath)
+        let r = calc("exp(i * pi)");
+        assert!(r.starts_with("-1.0"), "{r}");
+        // модуль: |3+4i| = 5 — квантовые вероятности
+        assert_eq!(calc("abs(3 + 4i)"), "5.0");
+        // sin(i) = i·sinh(1) ≈ 1.1752i (комплексная тригонометрия)
+        let r = calc("sin(i)");
+        assert!(r.contains("1.175"), "{r}");
+        // σ_y литералом: эрмитова, det = −1, спектр ±1
+        assert_eq!(calc("dagger([0, -i; i, 0])"), "[0.0, -i; i, 0.0]");
+        let r = calc("det([0, -i; i, 0])");
+        assert!((r.parse::<f64>().unwrap() + 1.0).abs() < 1e-12, "{r}");
+        let r = calc("eigen([0, -i; i, 0])");
+        assert!(r.contains("-1.0") && r.contains("1.0"), "{r}");
+        // комплексное скалярное умножение: i·I
+        let r = calc("i * [1, 0; 0, 1]");
+        assert!(r.contains("i"), "{r}");
+        // expm комплексной матрицы: expm(σ_y) = cosh(1)·I + sinh(1)·σ_y
+        let r = calc("expm([0, -i; i, 0])");
+        assert!(r.contains("1.54"), "{r}"); // cosh(1) ≈ 1.5431
+        // переменная пользователя перекрывает i (приоритет vars)
+        let mut st = CalcState::new();
+        st.eval_line("i = 5").unwrap();
+        assert_eq!(st.eval_line("i * 2").unwrap(), "10.0");
+    }
+
+    #[test]
+    fn cycle_o_schrodinger_solver() {
+        // СПИН-ФЛИП: σ_y за время π/2 переводит |↑⟩ точно в |↓⟩
+        let r = calc("schrodinger(pauli_y(), [1; 0], pi/2)");
+        assert!(r.contains("1.0000000"), "{r}");
+        assert!(!r.contains('i'), "{r}");
+        // π-импульс σ_x: амплитуда на |↓⟩ = −i (фазовая структура Раби)
+        let r = calc("schrodinger(pauli_x(), [1; 0], pi/2)");
+        assert!(r.contains("-i"), "{r}");
+        // ħ-параметр: t/ħ сокращаются — эволюция совпадает
+        let r1 = calc("schrodinger(pauli_y(), [1; 0], pi/2, 1)");
+        let r2 = calc("schrodinger(pauli_y(), [1; 0], pi, 2)");
+        assert_eq!(r1, r2);
+        // СОХРАНЕНИЕ НОРМЫ (фундаментальный закон): ψ†ψ = 1 в любой момент
+        let mut st = CalcState::new();
+        st.eval_line("g1 = schrodinger([0, 1; 1, 0], [1; 0], 1.234)").unwrap();
+        let r = st.eval_line("dagger(g1) * g1").unwrap();
+        assert!(r.contains("1.0"), "{r}");
+        // Раби: ⟨1|ψ(π/4)⟩ = −0.707i → вероятность перехода 0.5
+        st.eval_line("g2 = schrodinger(pauli_x(), [1; 0], pi/4)").unwrap();
+        let r = st.eval_line("[0, 1] * g2").unwrap();
+        assert!(r.contains("-0.707"), "{r}");
+        // диагностика: psi0 обязан быть столбцом
+        let err = CalcState::new().eval_line("schrodinger(pauli_x(), [1, 0], 1)").unwrap_err();
+        assert!(err.contains("столбец"), "{err}");
+    }
+
+    #[test]
+    fn cycle_o_bell_and_grover() {
+        // ЗАПУТАННОСТЬ: CNOT·(H⊗I)|00⟩ = (|00⟩+|11⟩)/√2
+        let r = calc(
+            "[1, 0, 0, 0; 0, 1, 0, 0; 0, 0, 0, 1; 0, 0, 1, 0] * kron(hadamard(), eye(2)) * [1; 0; 0; 0]",
+        );
+        assert!(r.contains("0.707"), "{r}");
+        // амплитуды ровно две ненулевые: 0.707 и 0.707
+        assert_eq!(r.matches("0.707").count(), 2, "{r}");
+        // норма белла = 1
+        let mut st = CalcState::new();
+        st.eval_line("bell = [1, 0, 0, 0; 0, 1, 0, 0; 0, 0, 0, 1; 0, 0, 1, 0] * kron(hadamard(), eye(2)) * [1; 0; 0; 0]").unwrap();
+        let r = st.eval_line("dagger(bell) * bell").unwrap();
+        assert!(r.contains("1.0"), "{r}");
+
+        // ГРОУЕР 2 КУБИТА: ОДНА итерация находит |11⟩ с вероятностью 1
+        st.eval_line("gs = kron(hadamard(), hadamard()) * [1; 0; 0; 0]").unwrap();
+        st.eval_line("go = [1, 0, 0, 0; 0, 1, 0, 0; 0, 0, 1, 0; 0, 0, 0, -1]").unwrap();
+        st.eval_line("gd = 2 * gs * dagger(gs) - eye(4)").unwrap();
+        let r = st.eval_line("gd * go * gs").unwrap();
+        // [~0; ~0; ~0; 1]: три нуля машинного порядка и единица
+        assert!(r.contains("1.0000000"), "{r}");
+        assert!(r.matches("e-").count() >= 3, "{r}");
+    }
+
+    #[test]
+    fn cycle_o_infinite_well_tridiag() {
+        // УРАВНЕНИЕ ШРЁДИНГЕРА НА СЕТКЕ: H = −½·d²/dx² в яме [0,1],
+        // n = 16 узлов (h = 1/17): уровни λ_k = 289·(1−cos(πk/17))
+        let r = calc("eigen(tridiag(289, -144.5, 16))");
+        // λ₁ = 289·(1−cos(π/17)) ≈ 4.9215 (непрерывный предел π²/2 ≈ 4.9348)
+        assert!(r.starts_with("[4.92"), "{r}");
+        // λ₂ = 289·(1−cos(2π/17)) ≈ 19.5156
+        assert!(r.contains("19.5"), "{r}");
+        // тритовая диагностика лимита
+        let err = CalcState::new().eval_line("tridiag(1, 1, 100)").unwrap_err();
+        assert!(err.contains("2..=64"), "{err}");
     }
 
     #[test]
