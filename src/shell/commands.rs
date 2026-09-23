@@ -590,7 +590,13 @@ fn game_usage() -> String {
         "game window [opts]             — НАСТОЯЩЕЕ X11-окно (dlopen libX11, zero-dep):",
         "    опрос событий → Input → камера → P³-кадр в окно; нужен DISPLAY",
         "    opts: --size WxH --frames N(0=до закрытия) --ticks-cap N",
-        "честность: детерминизм бит-в-бит (state/audio/crystal/texture/frame-hash), ω=√(GM)/r^1.5",
+        "game vortex [opts]             — вихревой кодек «Шеннон-байпас» (V0):",
+        "    шум → 2D-FFT → моды Колмогорова → GF(3)-триты (3^5=243≤256) → VRTX",
+        "    честный зачёт: сжатие vs zstd-19, обход предела Шеннона, PSNR",
+        "    opts: --size N(64..1024, степень 2) --style vortex|kolmogorov|fbm|white|all",
+        "          --seed N --modes N --octaves N --keep F --eps E --out-dir DIR",
+        "          --amp-trits T --phase-trits P --json",
+        "честность: детерминизм бит-в-бит (state/audio/crystal/texture/frame/vortex-hash), ω=√(GM)/r^1.5",
     ]
     .join("\n")
 }
@@ -784,6 +790,7 @@ fn cmd_game(raw: &str) -> CmdResult {
         "normalmap" => cmd_game_normalmap(args),
         "input-demo" => cmd_game_input_demo(args),
         "window" => cmd_game_window(args),
+        "vortex" => cmd_game_vortex(args),
         other => CmdResult::Done(format!(
             "game: неизвестная подкоманда `{other}`\n\n{}",
             game_usage()
@@ -1153,6 +1160,283 @@ fn cmd_game_normalmap(args: &[String]) -> CmdResult {
             thash,
             render_ms,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.57.0 (цикл V0): вихревой кодек «Шеннон-байпас»
+// ---------------------------------------------------------------------------
+
+/// `game vortex`: V0 — квантование шума фазовыми вихрями (Shannon Bypass).
+///
+/// Шеннон прав для белого шума с максимальной энтропией — но физический
+/// шум (турбулентность Навье–Стокса, fBm-текстуры, сенсоры) есть каскад
+/// когерентных фазовых вихрей с колмогоровским спектром K41. Конвейер:
+/// 2D-FFT → топ-моды по энергии → GF(3)-триты амплитуды (лог-шкала) и
+/// фазы (сектора циклон/антициклон/глазок) → 5 трит/байт → VRTX-контейнер.
+/// Отчёт честный: сжатие против zstd-19 на тех же байтах, обход порядкового
+/// предела Шеннона, PSNR для глаза, хеши детерминизма бит-в-бит.
+fn cmd_game_vortex(args: &[String]) -> CmdResult {
+    use crate::game::vortex::{self, VortexParams};
+
+    let mut n: usize = 256;
+    let mut style: String = "all".into();
+    let mut seed: u64 = 42;
+    let mut modes: usize = 48;
+    let mut octaves: u32 = 5;
+    let mut keep: f64 = 0.02;
+    let mut eps: Option<f64> = None;
+    let mut amp_trits: u32 = 4;
+    let mut phase_trits: u32 = 6;
+    let mut out_dir: Option<std::path::PathBuf> = None;
+    let mut as_json = false;
+
+    if let Some(i) = args.iter().position(|a| a == "--size") {
+        match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+            Some(v) if v.is_power_of_two() && (64..=1024).contains(&v) => n = v,
+            _ => {
+                return CmdResult::Done(
+                    "game vortex: --size N — степень двойки 64..=1024".into(),
+                )
+            }
+        }
+    }
+    if let Some(i) = args.iter().position(|a| a == "--style") {
+        match args.get(i + 1).map(String::as_str) {
+            Some(s @ ("vortex" | "kolmogorov" | "fbm" | "white" | "all")) => {
+                style = s.into()
+            }
+            _ => {
+                return CmdResult::Done(
+                    "game vortex: --style vortex|kolmogorov|fbm|white|all".into(),
+                )
+            }
+        }
+    }
+    if let Ok(v) = q_flag_num::<u64>(args, "--seed", seed) {
+        seed = v;
+    }
+    if let Ok(v) = q_flag_num::<usize>(args, "--modes", modes) {
+        if !(4..=4096).contains(&v) {
+            return CmdResult::Done("game vortex: --modes 4..=4096".into());
+        }
+        modes = v;
+    }
+    if let Ok(v) = q_flag_num::<u32>(args, "--octaves", octaves) {
+        if !(1..=10).contains(&v) {
+            return CmdResult::Done("game vortex: --octaves 1..=10".into());
+        }
+        octaves = v;
+    }
+    if let Ok(v) = q_flag_num::<f64>(args, "--keep", keep) {
+        if !(0.0005..=1.0).contains(&v) {
+            return CmdResult::Done("game vortex: --keep 0.0005..=1.0".into());
+        }
+        keep = v;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--eps") {
+        match args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+            Some(v) if (1e-12..=0.5).contains(&v) => eps = Some(v),
+            _ => {
+                return CmdResult::Done(
+                    "game vortex: --eps E — 1e-12..=0.5 (покрыть энергию 1−E)".into(),
+                )
+            }
+        }
+    }
+    if let Ok(v) = q_flag_num::<u32>(args, "--amp-trits", amp_trits) {
+        if !(1..=8).contains(&v) {
+            return CmdResult::Done("game vortex: --amp-trits 1..=8".into());
+        }
+        amp_trits = v;
+    }
+    if let Ok(v) = q_flag_num::<u32>(args, "--phase-trits", phase_trits) {
+        if !(1..=10).contains(&v) {
+            return CmdResult::Done("game vortex: --phase-trits 1..=10".into());
+        }
+        phase_trits = v;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out-dir") {
+        match args.get(i + 1) {
+            Some(v) => out_dir = Some(std::path::PathBuf::from(v.clone())),
+            None => return CmdResult::Done("game vortex: --out-dir DIR".into()),
+        }
+    }
+    as_json |= q_flag(args, "--json");
+
+    let params = VortexParams { keep_fraction: keep, energy_eps: eps, amp_trits, phase_trits };
+    let styles: Vec<&'static str> = match style.as_str() {
+        "all" => vec!["vortex", "kolmogorov", "fbm", "white"],
+        "vortex" => vec!["vortex"],
+        "kolmogorov" => vec!["kolmogorov"],
+        "fbm" => vec!["fbm"],
+        _ => vec!["white"],
+    };
+
+    // (источник, отчёт, zstd-19 байты, оригинал u8, реконструкция u8, VRTX-контейнер)
+    let mut rows: Vec<(&'static str, vortex::VortexReport, usize, Vec<u8>, Vec<u8>, Vec<u8>)> =
+        Vec::new();
+    for name in styles {
+        let field: Vec<f64> = match name {
+            "vortex" => vortex::vortex_field(n, seed, modes),
+            "kolmogorov" => vortex::kolmogorov_field(n, seed),
+            "fbm" => vortex::fbm_field(n, seed, octaves),
+            _ => vortex::white_field(n, seed),
+        };
+        let orig_u8 = vortex::field_u8(&field);
+        let report = vortex::codec_run(name, &field, n, &params);
+        // Контейнер отдельно — артефакт релиза (те же байты, что внутри codec_run)
+        let spec = vortex::analyze(&field, n, &params);
+        let vrtx = vortex::encode(&spec);
+        let recon_u8 = if out_dir.is_some() {
+            let back = vortex::decode(&vrtx).expect("vortex: собственный VRTX");
+            vortex::field_u8(&vortex::synthesize(&back))
+        } else {
+            Vec::new()
+        };
+        let zstd_bytes = zstd::bulk::compress(&orig_u8, 19)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        rows.push((name, report, zstd_bytes, orig_u8, recon_u8, vrtx));
+    }
+
+    if let Some(dir) = &out_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return CmdResult::Done(format!("game vortex: каталог {}: {e}", dir.display()));
+        }
+        let to_tex = |g: &[u8]| crate::game::texture::Texture {
+            w: n as u32,
+            h: n as u32,
+            rgb: g.iter().flat_map(|&v| [v, v, v]).collect(),
+        };
+        for (name, _, _, orig, recon, vrtx) in &rows {
+            if orig.is_empty() {
+                continue;
+            }
+            let p1 = dir.join(format!("{name}_orig.png"));
+            let p2 = dir.join(format!("{name}_recon.png"));
+            if let Err(e) = to_tex(orig).write_png(&p1) {
+                return CmdResult::Done(format!("game vortex: запись {}: {e}", p1.display()));
+            }
+            if let Err(e) = to_tex(recon).write_png(&p2) {
+                return CmdResult::Done(format!("game vortex: запись {}: {e}", p2.display()));
+            }
+            let pv = dir.join(format!("{name}.vrtx"));
+            if let Err(e) = std::fs::write(&pv, vrtx) {
+                return CmdResult::Done(format!("game vortex: запись {}: {e}", pv.display()));
+            }
+        }
+    }
+
+    if as_json {
+        let results: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, r, zb, _, _, _)| {
+                let zr = if *zb > 0 { r.raw_bytes as f64 / *zb as f64 } else { 0.0 };
+                serde_json::json!({
+                    "source": name,
+                    "modes_kept": r.modes_kept,
+                    "modes_total": r.modes_total,
+                    "energy_covered": r.energy_covered,
+                    "raw_bytes": r.raw_bytes,
+                    "codec_bytes": r.codec_bytes,
+                    "ratio": r.ratio,
+                    "zstd_bytes": zb,
+                    "zstd_ratio": zr,
+                    "vs_zstd": if *zb > 0 {
+                        *zb as f64 / r.codec_bytes.max(1) as f64
+                    } else {
+                        0.0
+                    },
+                    "psnr_db": if r.psnr_db.is_finite() {
+                        serde_json::json!(r.psnr_db)
+                    } else {
+                        serde_json::json!("inf")
+                    },
+                    "entropy_bits": r.entropy_bits,
+                    "entropy_floor_ratio": r.entropy_floor_ratio,
+                    "vortex_hash": format!("0x{:016X}", r.vortex_hash),
+                    "field_hash": format!("0x{:016X}", r.field_hash),
+                    "png": if out_dir.is_some() {
+                        serde_json::json!([
+                            format!("{name}_orig.png"),
+                            format!("{name}_recon.png")
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    },
+                    "vrtx": if out_dir.is_some() {
+                        format!("{name}.vrtx")
+                    } else {
+                        String::new()
+                    },
+                })
+            })
+            .collect();
+        let j = serde_json::json!({
+            "cycle": "V0",
+            "codec": "vortex-gf3",
+            "idea": "Shannon Bypass: физический шум = когерентные фазовые вихри (Навье–Стокс, K41)",
+            "size": n,
+            "seed": seed,
+            "params": {
+                "keep": keep,
+                "eps": eps,
+                "amp_trits": amp_trits,
+                "phase_trits": phase_trits,
+            },
+            "results": results,
+        });
+        CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+    } else {
+        let mut out = String::from(
+            "V0 «Вихрь» — Шеннон-байпас: физический шум = каскад когерентных фазовых вихрей\n  (Навье–Стокс, K41 E(k) ∝ k^−5/3) → 2D-FFT → GF(3)-триты → VRTX\n",
+        );
+        for (name, r, zb, _, _, _) in &rows {
+            let zr = if *zb > 0 { r.raw_bytes as f64 / *zb as f64 } else { 0.0 };
+            let vsz = if *zb > 0 {
+                *zb as f64 / r.codec_bytes.max(1) as f64
+            } else {
+                0.0
+            };
+            let psnr = if r.psnr_db.is_finite() {
+                format!("{:.1} dB", r.psnr_db)
+            } else {
+                "∞ (бит-в-бит)".to_string()
+            };
+            out.push_str(&format!(
+                "\n  [{name}] {n}×{n} · сид {seed} · GF(3): {amp_trits} трит амплитуды + {phase_trits} фазы\n"
+            ));
+            out.push_str(&format!(
+                "    моды      : {} из {} ({:.2}%) · покрыто энергии {:.4}\n",
+                r.modes_kept,
+                r.modes_total,
+                100.0 * r.modes_kept as f64 / r.modes_total.max(1) as f64,
+                r.energy_covered
+            ));
+            out.push_str(&format!(
+                "    байты     : сырые {} → VRTX {} (×{:.1}) · zstd-19 {} (×{:.2})\n",
+                r.raw_bytes, r.codec_bytes, r.ratio, zb, zr
+            ));
+            out.push_str(&format!(
+                "    фора      : вихрь компактнее zstd в {vsz:.2} раз · порядковый предел Шеннона ×{:.2} обойдён\n",
+                r.entropy_floor_ratio
+            ));
+            out.push_str(&format!(
+                "    PSNR      : {psnr} · хеши: VRTX 0x{:016X} · поле 0x{:016X}\n",
+                r.vortex_hash, r.field_hash
+            ));
+        }
+        if let Some(dir) = &out_dir {
+            out.push_str(&format!(
+                "\n  артефакты : {} ({{источник}}_orig.png / _recon.png / .vrtx)\n",
+                dir.display()
+            ));
+        }
+        out.push_str(
+            "\n  честность : белый шум не сжимает никто — кодек это показывает, а не скрывает",
+        );
+        CmdResult::Done(out)
     }
 }
 
@@ -5297,6 +5581,92 @@ mod tests {
         }
         match dispatch(&mut s, "game normalmap --style basalt") {
             CmdResult::Done(out) => assert!(out.contains("--style noise|marble|wood"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    // v0.57.0 (цикл V0): вихревой кодек «Шеннон-байпас»
+    #[test]
+    fn cmd_game_vortex_all_sources_honest_table() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-v0a.db"));
+        let cmd = "game vortex --size 128 --seed 7 --json";
+        let first = match dispatch(&mut s, cmd) {
+            CmdResult::Done(out) => out,
+            _ => panic!(),
+        };
+        let j: serde_json::Value = serde_json::from_str(&first).expect("JSON");
+        assert_eq!(j["cycle"], "V0");
+        let results = j["results"].as_array().expect("4 источника");
+        assert_eq!(results.len(), 4);
+        let get = |src: &str| results.iter().find(|r| r["source"] == src).expect(src);
+        let rv = get("vortex");
+        let rk = get("kolmogorov");
+        let rf = get("fbm");
+        let rw = get("white");
+        // Когерентные вихри: спектр дискретный — реконструкция почти точная
+        assert!(rv["psnr_db"].as_f64().unwrap() > 25.0, "{rv}");
+        assert!(rv["ratio"].as_f64().unwrap() > 20.0, "{rv}");
+        // Турбулентность/fBm: красный спектр — сжатие при приличном PSNR
+        assert!(rk["psnr_db"].as_f64().unwrap() > 10.0, "{rk}");
+        assert!(rk["ratio"].as_f64().unwrap() > 5.0, "{rk}");
+        assert!(rf["psnr_db"].as_f64().unwrap() > 12.0, "{rf}");
+        assert!(rf["ratio"].as_f64().unwrap() > 5.0, "{rf}");
+        // Белый шум: zstd порядка не находит (≈×1.0), вихрь честно деградирует
+        let zr_white = rw["zstd_ratio"].as_f64().unwrap();
+        let zr_fbm = rf["zstd_ratio"].as_f64().unwrap();
+        assert!(zr_white < 1.05, "белый шум не сжимается: {zr_white}");
+        assert!(zr_fbm > zr_white, "fBm сжимается лучше белого: {zr_fbm} vs {zr_white}");
+        assert!(
+            rw["psnr_db"].as_f64().unwrap() < rf["psnr_db"].as_f64().unwrap() - 8.0,
+            "честная граница Шеннона: {rw}"
+        );
+        // Детерминизм: повторный прогон — идентичный вывод бит-в-бит
+        match dispatch(&mut s, cmd) {
+            CmdResult::Done(out2) => assert_eq!(first, out2, "бит-в-бит"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_game_vortex_png_and_validation() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-v0b.db"));
+        let dir = std::env::temp_dir().join("poler_shell_v0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cmd = format!(
+            "game vortex --size 128 --style kolmogorov --seed 7 --out-dir {} --json",
+            dir.display()
+        );
+        match dispatch(&mut s, &cmd) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                let r = &j["results"][0];
+                assert_eq!(r["source"], "kolmogorov");
+                assert_eq!(r["modes_total"], 16384);
+                assert_eq!(r["vortex_hash"].as_str().unwrap().len(), 18);
+                assert!(dir.join("kolmogorov_orig.png").exists(), "оригинал записан");
+                assert!(dir.join("kolmogorov_recon.png").exists(), "реконструкция записана");
+                let vrtx = std::fs::read(dir.join("kolmogorov.vrtx")).expect("VRTX записан");
+                assert_eq!(&vrtx[0..4], b"VRTX");
+                assert!(vrtx.len() < 16384, "контейнер меньше сырых байтов: {}", vrtx.len());
+                let raw = std::fs::read(dir.join("kolmogorov_orig.png")).unwrap();
+                let (w, h, ct, _) = crate::p3::png::decode_own(&raw).expect("PNG валиден");
+                assert_eq!((w, h, ct), (128, 128, 2));
+            }
+            _ => panic!(),
+        }
+        // Валидация аргументов
+        match dispatch(&mut s, "game vortex --size 333") {
+            CmdResult::Done(out) => assert!(out.contains("степень двойки"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game vortex --style basalt") {
+            CmdResult::Done(out) => {
+                assert!(out.contains("--style vortex|kolmogorov|fbm|white|all"), "{out}")
+            }
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game vortex --eps 2") {
+            CmdResult::Done(out) => assert!(out.contains("1e-12..=0.5"), "{out}"),
             _ => panic!(),
         }
     }

@@ -725,7 +725,7 @@ mod tests {
 /// v0.54.0 (цикл S): полная справка Ядра Игры.
 fn game_help_topic() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.56.0) ───");
+    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.57.0) ───");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
@@ -752,9 +752,13 @@ fn game_help_topic() -> String {
     let _ = writeln!(s, "    frames_hash — детерминизм всей цепочки бит-в-бит");
     let _ = writeln!(s, "  game window [opts]         — НАСТОЯЩЕЕ X11-окно (dlopen, zero-dep):");
     let _ = writeln!(s, "    ЛКМ+движение — орбита · колесо — зум · WASD/QE · нужен DISPLAY");
+    let _ = writeln!(s, "  game vortex [opts]        — вихревой кодек «Шеннон-байпас» (V0):");
+    let _ = writeln!(s, "    шум = когерентные фазовые вихри (Навье–Стокс, K41): 2D-FFT →");
+    let _ = writeln!(s, "    топ-моды → GF(3)-триты (5 трит/байт, 3^5=243≤256) → VRTX;");
+    let _ = writeln!(s, "    зачёт против zstd-19 и предела Шеннона, PSNR, хеши");
     let _ = writeln!(s);
     let _ = writeln!(s, "Честность ядра:");
-    let _ = writeln!(s, "  детерминизм: state/audio/crystal/texture/frames-hash бит-в-бит");
+    let _ = writeln!(s, "  детерминизм: state/audio/crystal/texture/frames/vortex-hash бит-в-бит");
     let _ = writeln!(s, "  (одинаковая история → одинаковый мир: replay и lockstep бесплатны);");
     let _ = writeln!(s, "  физика: угловые скорости выводятся из масс (третий закон Кеплера);");
     let _ = writeln!(s, "  рендер: тройной буфер RGB + depth (d_FS) + seg (ID объектов);");
@@ -766,6 +770,7 @@ fn game_help_topic() -> String {
     let _ = writeln!(s, "  poler> game sound --ticks 900 --out eteryya.wav");
     let _ = writeln!(s, "  poler> game normalmap --style marble --amplitude 0.1");
     let _ = writeln!(s, "  poler> game input-demo --frames 300 --every 30 --json");
+    let _ = writeln!(s, "  poler> game vortex --style all --size 256 --out-dir ./vortex");
     let _ = writeln!(s, "  poler-engine --exec \"game demo --json\" --json");
     s
 }
