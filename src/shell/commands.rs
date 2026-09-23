@@ -791,6 +791,7 @@ fn cmd_game(raw: &str) -> CmdResult {
         "input-demo" => cmd_game_input_demo(args),
         "window" => cmd_game_window(args),
         "vortex" => cmd_game_vortex(args),
+        "water" => cmd_game_water(args),
         other => CmdResult::Done(format!(
             "game: неизвестная подкоманда `{other}`\n\n{}",
             game_usage()
@@ -1435,6 +1436,307 @@ fn cmd_game_vortex(args: &[String]) -> CmdResult {
         }
         out.push_str(
             "\n  честность : белый шум не сжимает никто — кодек это показывает, а не скрывает",
+        );
+        CmdResult::Done(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.58.0 (цикл V1): вода — спектральная гидродинамика
+// ---------------------------------------------------------------------------
+
+/// `game water` — море как спектр волн: генерация → целочисленная эволюция →
+/// честный зачёт против f64-эталона + артефакты (PNG-кадры, шейдинг, VRTX).
+fn cmd_game_water(args: &[String]) -> CmdResult {
+    use crate::game::vortex;
+    use crate::game::water::{self, WaterParams};
+    use std::time::Instant;
+
+    let mut n: usize = 256;
+    let mut seed: u64 = 42;
+    let mut modes: usize = 192;
+    let mut wind: f64 = 8.0;
+    let mut viscosity: f64 = 1e-6;
+    let mut tau_wind: f64 = 30.0;
+    let mut steps: usize = 240;
+    let mut dt: f64 = 1.0 / 60.0;
+    let mut amp_trits: u32 = 6;
+    let mut phase_trits: u32 = 6;
+    let mut out_dir: Option<std::path::PathBuf> = None;
+    let mut as_json = false;
+
+    if let Some(i) = args.iter().position(|a| a == "--size") {
+        match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+            Some(v) if v.is_power_of_two() && (16..=1024).contains(&v) => n = v,
+            _ => {
+                return CmdResult::Done(
+                    "game water: --size N — степень двойки 16..=1024".into(),
+                )
+            }
+        }
+    }
+    if let Ok(v) = q_flag_num::<u64>(args, "--seed", seed) {
+        seed = v;
+    }
+    if let Ok(v) = q_flag_num::<usize>(args, "--modes", modes) {
+        if !(1..=16384).contains(&v) {
+            return CmdResult::Done("game water: --modes 1..=16384".into());
+        }
+        modes = v;
+    }
+    if let Ok(v) = q_flag_num::<f64>(args, "--wind", wind) {
+        if !(0.5..=60.0).contains(&v) {
+            return CmdResult::Done("game water: --wind V — 0.5..=60 м/с".into());
+        }
+        wind = v;
+    }
+    if let Ok(v) = q_flag_num::<f64>(args, "--viscosity", viscosity) {
+        if !(1e-8..=1e-1).contains(&v) {
+            return CmdResult::Done("game water: --viscosity NU — 1e-8..=1e-1 м²/с".into());
+        }
+        viscosity = v;
+    }
+    if let Ok(v) = q_flag_num::<f64>(args, "--tau-wind", tau_wind) {
+        if !(0.5..=3600.0).contains(&v) {
+            return CmdResult::Done("game water: --tau-wind T — 0.5..=3600 с".into());
+        }
+        tau_wind = v;
+    }
+    if let Ok(v) = q_flag_num::<usize>(args, "--steps", steps) {
+        if !(0..=1_000_000).contains(&v) {
+            return CmdResult::Done("game water: --steps 0..=1000000".into());
+        }
+        steps = v;
+    }
+    if let Ok(v) = q_flag_num::<f64>(args, "--dt", dt) {
+        if !(0.001..=1.0).contains(&v) {
+            return CmdResult::Done("game water: --dt T — 0.001..=1.0 с".into());
+        }
+        dt = v;
+    }
+    if let Ok(v) = q_flag_num::<u32>(args, "--amp-trits", amp_trits) {
+        if !(2..=8).contains(&v) {
+            return CmdResult::Done("game water: --amp-trits 2..=8".into());
+        }
+        amp_trits = v;
+    }
+    if let Ok(v) = q_flag_num::<u32>(args, "--phase-trits", phase_trits) {
+        if !(2..=10).contains(&v) {
+            return CmdResult::Done("game water: --phase-trits 2..=10".into());
+        }
+        phase_trits = v;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out-dir") {
+        match args.get(i + 1) {
+            Some(v) => out_dir = Some(std::path::PathBuf::from(v.clone())),
+            None => return CmdResult::Done("game water: --out-dir DIR".into()),
+        }
+    }
+    as_json |= q_flag(args, "--json");
+
+    let p = WaterParams {
+        n,
+        modes,
+        seed,
+        wind,
+        tau_wind,
+        viscosity,
+        amp_trits,
+        phase_trits,
+        ..Default::default()
+    };
+    if let Err(e) = p.validate() {
+        return CmdResult::Done(format!("game water: {e}"));
+    }
+
+    let mut w = water::generate(&p);
+    let mut reference = water::WaterF64::from(&w);
+
+    let t0_field = if out_dir.is_some() { Some(w.height_field()) } else { None };
+    let mut mid_field = None;
+    let t_step = Instant::now();
+    for i in 1..=steps {
+        w.step(dt);
+        reference.step(dt);
+        if out_dir.is_some() && steps >= 2 && i == steps / 2 {
+            mid_field = Some(w.height_field());
+        }
+    }
+    let step_ns = t_step.elapsed().as_nanos() / steps.max(1) as u128;
+    let t_synth = Instant::now();
+    let field = w.height_field();
+    let synth_ns = t_synth.elapsed().as_nanos();
+    let ref_field = reference.height_field();
+
+    let sigma = w.variance_target.sqrt();
+    let u8f = water::field_to_u8(&field, sigma);
+    let psnr = vortex::psnr_u8(&u8f, &water::field_to_u8(&ref_field, sigma));
+    let vrtx = vortex::encode(&w.to_vortex());
+    let grid_bytes = n * n * 4;
+    let mem_ratio = grid_bytes as f64 / vrtx.len().max(1) as f64;
+    let variance = w.variance();
+    let hs = w.significant_height();
+    let hs_pm = 0.21 * wind * wind / p.gravity;
+    let water_hash = vortex::fnv1a_u8(&vrtx);
+    let field_hash = vortex::fnv1a_u8(&u8f);
+
+    // Артефакты: кадры эволюции, шейдинг с аналитическими нормалями, VRTX.
+    if let Some(dir) = &out_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return CmdResult::Done(format!("game water: каталог {}: {e}", dir.display()));
+        }
+        let to_tex = |g: &[u8]| crate::game::texture::Texture {
+            w: n as u32,
+            h: n as u32,
+            rgb: g.iter().flat_map(|&v| [v, v, v]).collect(),
+        };
+        let write_frame = |name: &str, f: &[f64]| -> Result<(), String> {
+            let path = dir.join(name);
+            to_tex(&water::field_to_u8(f, sigma))
+                .write_png(&path)
+                .map_err(|e| format!("game water: запись {}: {e}", path.display()))
+        };
+        if let Some(f0) = &t0_field {
+            if let Err(e) = write_frame("water_t0.png", f0) {
+                return CmdResult::Done(e);
+            }
+        }
+        if let Some(fm) = &mid_field {
+            if let Err(e) = write_frame("water_mid.png", fm) {
+                return CmdResult::Done(e);
+            }
+        }
+        if let Err(e) = write_frame("water_end.png", &field) {
+            return CmdResult::Done(e);
+        }
+        // Шейдинг: нормали из аналитических градиентов (не из разностей!),
+        // ламберт + блик + пена на гребнях — глазу настоящее море.
+        let cell = p.domain / n as f64;
+        let mut rgb = vec![0u8; n * n * 3];
+        for y in 0..n {
+            for x in 0..n {
+                let (h, gx, gy) = w.surface_at(x as f64 * cell, y as f64 * cell);
+                let (nx, ny, nz) = (-gx, 1.0, -gy);
+                let inv = 1.0 / (nx * nx + ny * ny + nz * nz).sqrt();
+                let (lx, ly, lz): (f64, f64, f64) = (0.35, 0.75, 0.55);
+                let linv = 1.0 / (lx * lx + ly * ly + lz * lz).sqrt();
+                let diff =
+                    ((nx * lx + ny * ly + nz * lz) * inv * linv).max(0.0);
+                let (hx, hy, hz) = (lx, ly + 1.0, lz);
+                let hinv = 1.0 / (hx * hx + hy * hy + hz * hz).sqrt();
+                let spec =
+                    ((nx * hx + ny * hy + nz * hz) * inv * hinv).max(0.0).powi(60);
+                let foam = ((h / sigma - 1.6) / 1.2).clamp(0.0, 1.0);
+                let deep = (12.0f64, 44.0, 92.0);
+                let sky = (116.0, 174.0, 216.0);
+                let i3 = 3 * (y * n + x);
+                rgb[i3] = (deep.0 + diff * (sky.0 - deep.0) + 230.0 * spec + 150.0 * foam)
+                    .clamp(0.0, 255.0) as u8;
+                rgb[i3 + 1] = (deep.1 + diff * (sky.1 - deep.1) + 235.0 * spec + 155.0 * foam)
+                    .clamp(0.0, 255.0) as u8;
+                rgb[i3 + 2] = (deep.2 + diff * (sky.2 - deep.2) + 245.0 * spec + 160.0 * foam)
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+        let shaded = dir.join("water_shaded.png");
+        if let Err(e) = (crate::game::texture::Texture { w: n as u32, h: n as u32, rgb })
+            .write_png(&shaded)
+        {
+            return CmdResult::Done(format!("game water: запись {}: {e}", shaded.display()));
+        }
+        let pv = dir.join("water.vrtx");
+        if let Err(e) = std::fs::write(&pv, &vrtx) {
+            return CmdResult::Done(format!("game water: запись {}: {e}", pv.display()));
+        }
+    }
+
+    if as_json {
+        let mut frames: Vec<String> = Vec::new();
+        if out_dir.is_some() {
+            frames.push("water_t0.png".into());
+            if steps >= 2 {
+                frames.push("water_mid.png".into());
+            }
+            frames.push("water_end.png".into());
+            frames.push("water_shaded.png".into());
+        }
+        let j = serde_json::json!({
+            "cycle": "V1",
+            "model": "spectral-water-gf3",
+            "idea": "вода = когерентный фазовый спектр (K41); эволюция — целочисленные триты, синтез по требованию",
+            "physics": {
+                "gravity_m_s2": p.gravity,
+                "capillary_m3_s2": p.capillary,
+                "viscosity_m2_s": viscosity,
+                "wind_m_s": wind,
+                "tau_wind_s": tau_wind,
+                "domain_m": p.domain,
+            },
+            "params": {
+                "n": n,
+                "modes": modes,
+                "seed": seed,
+                "amp_trits": amp_trits,
+                "phase_trits": phase_trits,
+                "micro_trits": 3,
+                "steps": steps,
+                "dt": dt,
+            },
+            "results": {
+                "state_bytes": vrtx.len(),
+                "grid_f32_bytes": grid_bytes,
+                "mem_ratio": mem_ratio,
+                "step_ns": step_ns,
+                "synth_ns": synth_ns,
+                "psnr_db": psnr,
+                "variance_m2": variance,
+                "variance_target_m2": w.variance_target,
+                "hs_m": hs,
+                "hs_pm_m": hs_pm,
+                "water_hash": format!("0x{:016X}", water_hash),
+                "field_hash": format!("0x{:016X}", field_hash),
+                "frames": frames,
+                "vrtx": if out_dir.is_some() { "water.vrtx" } else { "" },
+            },
+        });
+        CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+    } else {
+        let mut out = String::from(
+            "V1 «Вода» — спектральная гидродинамика: состояние = спектр волн, эволюция = триты на кремнии\n  (разбор «OpenAI решила задачу»: без плотных f32-сеток Re^(9/4) и без brute force)\n",
+        );
+        out.push_str(&format!(
+            "  физика   : ω(k)=√(g·k+γ·k³) · K41 A(k)∝k^(−5/6) · Ламб e^(−2νk²t) · окно ветра k_p=g/v²\n"
+        ));
+        out.push_str(&format!(
+            "  море     : {n}×{n} ({domain:.0} м) · {modes} мод · ветер {wind} м/с · H_s {hs:.2} м (PM {hs_pm:.2})\n",
+            domain = p.domain
+        ));
+        out.push_str(&format!(
+            "  шаг      : {steps} × {dt:.4} с → {step_ns} нс/шаг ({modes} целочисленных операций; фаза — фикс-точка без дрейфа)\n"
+        ));
+        out.push_str(&format!(
+            "  память   : состояние {} Б (VRTX) против {} Б f32-сетки — ×{mem_ratio:.0}\n",
+            vrtx.len(),
+            grid_bytes
+        ));
+        out.push_str(&format!(
+            "  синтез   : {synth_ns} нс FFT {n}² · запросы геймплея O(K): height_at / flow_at / surface_at\n"
+        ));
+        out.push_str(&format!(
+            "  верность : PSNR {psnr:.1} dB против f64-эталона (те же уравнения, без квантования)\n"
+        ));
+        out.push_str(&format!(
+            "  энергия  : дисперсия {variance:.4} м² (цель {vt:.4}) · хеши: вода 0x{water_hash:016X} · поле 0x{field_hash:016X}\n",
+            vt = w.variance_target
+        ));
+        if let Some(dir) = &out_dir {
+            out.push_str(&format!(
+                "\n  артефакты : {} (water_t0/mid/end.png, water_shaded.png, water.vrtx)\n",
+                dir.display()
+            ));
+        }
+        out.push_str(
+            "  честность : линейный режим — обрушения гребней и вихревое растяжение не моделируются",
         );
         CmdResult::Done(out)
     }
@@ -5667,6 +5969,108 @@ mod tests {
         }
         match dispatch(&mut s, "game vortex --eps 2") {
             CmdResult::Done(out) => assert!(out.contains("1e-12..=0.5"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    // v0.58.0 (цикл V1): спектральная вода
+    #[test]
+    fn cmd_game_water_json_determinism_and_validation() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-v1a.db"));
+        let cmd = "game water --size 64 --modes 24 --steps 60 --seed 7 --json";
+        let first = match dispatch(&mut s, cmd) {
+            CmdResult::Done(out) => out,
+            _ => panic!(),
+        };
+        let j: serde_json::Value = serde_json::from_str(&first).expect("JSON");
+        assert_eq!(j["cycle"], "V1");
+        assert_eq!(j["model"], "spectral-water-gf3");
+        assert_eq!(j["params"]["n"], 64);
+        assert_eq!(j["params"]["micro_trits"], 3);
+        let r = &j["results"];
+        // Честная верность квантования и компактность состояния.
+        assert!(r["psnr_db"].as_f64().unwrap() > 25.0, "{r}");
+        assert!(r["state_bytes"].as_u64().unwrap() > 31, "{r}");
+        assert!(r["mem_ratio"].as_f64().unwrap() > 20.0, "{r}");
+        assert_eq!(r["water_hash"].as_str().unwrap().len(), 18);
+        // Физика: дисперсия в полосе цели, H_s согласован с Пирсоном–Московицем.
+        let var = r["variance_m2"].as_f64().unwrap();
+        let vt = r["variance_target_m2"].as_f64().unwrap();
+        assert!((0.5..=1.5).contains(&(var / vt)), "дисперсия {var} против цели {vt}");
+        let hs = r["hs_m"].as_f64().unwrap();
+        let hs_pm = r["hs_pm_m"].as_f64().unwrap();
+        assert!((0.6..=1.4).contains(&(hs / hs_pm)), "H_s {hs} против PM {hs_pm}");
+        // Детерминизм: физика бит-в-бит (тайминги не сравниваем).
+        let second = match dispatch(&mut s, cmd) {
+            CmdResult::Done(out) => out,
+            _ => panic!(),
+        };
+        let j2: serde_json::Value = serde_json::from_str(&second).unwrap();
+        for key in [
+            "psnr_db",
+            "state_bytes",
+            "mem_ratio",
+            "variance_m2",
+            "hs_m",
+            "water_hash",
+            "field_hash",
+        ] {
+            assert_eq!(j["results"][key], j2["results"][key], "недетерминизм в {key}");
+        }
+        // Валидация аргументов.
+        match dispatch(&mut s, "game water --size 333") {
+            CmdResult::Done(out) => assert!(out.contains("степень двойки"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game water --wind 0.1") {
+            CmdResult::Done(out) => assert!(out.contains("0.5..=60"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game water --viscosity 99") {
+            CmdResult::Done(out) => assert!(out.contains("1e-8..=1e-1"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game water --dt 5") {
+            CmdResult::Done(out) => assert!(out.contains("0.001..=1.0"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game water --phase-trits 42") {
+            CmdResult::Done(out) => assert!(out.contains("2..=10"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_game_water_artifacts() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-v1b.db"));
+        let dir = std::env::temp_dir().join("poler_shell_v1");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cmd = format!(
+            "game water --size 64 --modes 24 --steps 40 --seed 7 --out-dir {} --json",
+            dir.display()
+        );
+        match dispatch(&mut s, &cmd) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                let frames = j["results"]["frames"].as_array().expect("кадры");
+                assert!(frames.len() >= 3, "кадров мало: {frames:?}");
+                assert!(dir.join("water_t0.png").exists(), "стартовый кадр");
+                assert!(dir.join("water_mid.png").exists(), "средний кадр");
+                assert!(dir.join("water_end.png").exists(), "финальный кадр");
+                assert!(dir.join("water_shaded.png").exists(), "шейдинг");
+                let vrtx = std::fs::read(dir.join("water.vrtx")).expect("VRTX записан");
+                assert_eq!(&vrtx[0..4], b"VRTX");
+                // Состояние меньше f32-сетки того же разрешения.
+                assert!((vrtx.len() as f64) < 0.05 * (64 * 64 * 4) as f64, "{}", vrtx.len());
+                let raw = std::fs::read(dir.join("water_end.png")).unwrap();
+                let (w, h, ct, _) = crate::p3::png::decode_own(&raw).expect("PNG валиден");
+                assert_eq!((w, h, ct), (64, 64, 2));
+                let raw2 = std::fs::read(dir.join("water_shaded.png")).unwrap();
+                let (w2, h2, ct2, _) = crate::p3::png::decode_own(&raw2).expect("шейдинг валиден");
+                assert_eq!((w2, h2, ct2), (64, 64, 2));
+                // Шейдинг — настоящее цветное море, не серая шкала.
+                assert_ne!(raw2, raw, "шейдинг совпал с серым кадром?");
+            }
             _ => panic!(),
         }
     }
