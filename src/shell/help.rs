@@ -725,11 +725,11 @@ mod tests {
 /// v0.54.0 (цикл S): полная справка Ядра Игры.
 fn game_help_topic() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.54.0) ───");
+    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.56.0) ───");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
-        "Фундамент игрового движка, построенный на разборе недостатков\nUE/Unity/Godot (docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md): сущности\nс поколениями вместо GC/UObject, фиксированный тик вместо плавающего\nвремени, кеплеровская физика вместо подобранных скоростей, рендер\nчерез P³-мост с честной глубиной d_FS."
+        "Фундамент игрового движка, построенный на разборе недостатков\nUE/Unity/Godot (docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md): сущности\nс поколениями вместо GC/UObject, фиксированный тик вместо плавающего\nвремени, кеплеровская физика вместо подобранных скоростей, рендер\nчерез P³-мост с честной глубиной d_FS, звук из физики мира (T1),\nтекстуры-функции со спектральным сжатием (T2), события/ввод/окно (U)."
     );
     let _ = writeln!(s);
     let _ = writeln!(s, "Команды:");
@@ -741,16 +741,31 @@ fn game_help_topic() -> String {
     let _ = writeln!(s, "    тела (id/class/mass/radius), иерархия parent, орбиты");
     let _ = writeln!(s, "    (orbit_radius/inclination → ω=√(GM)/r^1.5), камера, цвета");
     let _ = writeln!(s, "  game write-demo <file>     — выгрузить демо-сцену как редактируемый JSON");
+    let _ = writeln!(s, "  game sound [opts]          — озвучить мир (T1): ω→высота, X→панорама → WAV");
+    let _ = writeln!(s, "  game texture [opts]        — процедурная текстура (T2): тайл-функция → PNG");
+    let _ = writeln!(s, "    + SVD rank-k кодек (--svd-rank K --rank-curve)");
+    let _ = writeln!(s, "  game normalmap [opts]      — normal map из той же функции шума (U0):");
+    let _ = writeln!(s, "    --amplitude A(0..1.5) — глубина рельефа в долях тайла");
+    let _ = writeln!(s, "  game input-demo [opts]     — ввод→камера→кадры без окна (U1–U4):");
+    let _ = writeln!(s, "    скрипт JSON (--script) или встроенный демо-сценарий;");
+    let _ = writeln!(s, "    каждый кадр: события → Input → орбит-камера → P³-кадр;");
+    let _ = writeln!(s, "    frames_hash — детерминизм всей цепочки бит-в-бит");
+    let _ = writeln!(s, "  game window [opts]         — НАСТОЯЩЕЕ X11-окно (dlopen, zero-dep):");
+    let _ = writeln!(s, "    ЛКМ+движение — орбита · колесо — зум · WASD/QE · нужен DISPLAY");
     let _ = writeln!(s);
     let _ = writeln!(s, "Честность ядра:");
-    let _ = writeln!(s, "  детерминизм: state-hash после тиков бит-в-бит воспроизводим");
+    let _ = writeln!(s, "  детерминизм: state/audio/crystal/texture/frames-hash бит-в-бит");
     let _ = writeln!(s, "  (одинаковая история → одинаковый мир: replay и lockstep бесплатны);");
     let _ = writeln!(s, "  физика: угловые скорости выводятся из масс (третий закон Кеплера);");
-    let _ = writeln!(s, "  рендер: тройной буфер RGB + depth (d_FS) + seg (ID объектов).");
+    let _ = writeln!(s, "  рендер: тройной буфер RGB + depth (d_FS) + seg (ID объектов);");
+    let _ = writeln!(s, "  ввод: события коалесцируются (MouseMove — суммированием),");
+    let _ = writeln!(s, "  рёбра just_pressed живут ровно один кадр, replay = хеш ввода.");
     let _ = writeln!(s);
     let _ = writeln!(s, "Примеры:");
     let _ = writeln!(s, "  poler> game demo --ticks 900 --size 960x540 --out ./demo");
-    let _ = writeln!(s, "  poler> game write-demo my.json && game scene my.json --ticks 60");
+    let _ = writeln!(s, "  poler> game sound --ticks 900 --out eteryya.wav");
+    let _ = writeln!(s, "  poler> game normalmap --style marble --amplitude 0.1");
+    let _ = writeln!(s, "  poler> game input-demo --frames 300 --every 30 --json");
     let _ = writeln!(s, "  poler-engine --exec \"game demo --json\" --json");
     s
 }

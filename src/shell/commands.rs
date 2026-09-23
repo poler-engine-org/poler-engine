@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use crate::game::KeyCode;
 use crate::notes;
 use crate::sources;
 use crate::vcs::VcsAdapter;
@@ -578,7 +579,18 @@ fn game_usage() -> String {
         "    opts: --size WxH --style noise|marble|wood --palette gray|copper|ice|jade",
         "          --seed N --freq F --octaves N --zoom F --out F.png",
         "          --svd-rank K --rank-curve --json",
-        "честность: детерминизм бит-в-бит (state/audio/crystal/texture-hash), ω=√(GM)/r^1.5",
+        "game normalmap [opts]          — normal map из той же функции шума (U0):",
+        "    честная производная dh/du → тангентные нормали, беск. зум",
+        "    opts: --size WxH --style noise|marble|wood --seed N --freq F",
+        "          --octaves N --zoom F --amplitude A(0..1.5) --out F.png --json",
+        "game input-demo [opts]         — ввод→камера→рендер без окна (U1–U4):",
+        "    скрипт событий → очередь → Input → орбит-камера → кадры+хеши",
+        "    opts: --frames N(10..10000) --every N --size WxH --out DIR",
+        "          --script F.json --json",
+        "game window [opts]             — НАСТОЯЩЕЕ X11-окно (dlopen libX11, zero-dep):",
+        "    опрос событий → Input → камера → P³-кадр в окно; нужен DISPLAY",
+        "    opts: --size WxH --frames N(0=до закрытия) --ticks-cap N",
+        "честность: детерминизм бит-в-бит (state/audio/crystal/texture/frame-hash), ω=√(GM)/r^1.5",
     ]
     .join("\n")
 }
@@ -769,6 +781,9 @@ fn cmd_game(raw: &str) -> CmdResult {
         }
         "sound" => cmd_game_sound(args),
         "texture" => cmd_game_texture(args),
+        "normalmap" => cmd_game_normalmap(args),
+        "input-demo" => cmd_game_input_demo(args),
+        "window" => cmd_game_window(args),
         other => CmdResult::Done(format!(
             "game: неизвестная подкоманда `{other}`\n\n{}",
             game_usage()
@@ -1039,6 +1054,540 @@ fn cmd_game_texture(args: &[String]) -> CmdResult {
     }
 }
 
+/// `game normalmap`: U0 — normal map из той же аналитической функции.
+fn cmd_game_normalmap(args: &[String]) -> CmdResult {
+    use crate::game::texture::TextureSpec;
+
+    let mut w: u32 = 512;
+    let mut h: u32 = 512;
+    let mut spec = TextureSpec::default();
+    let mut zoom: f64 = 1.0;
+    let mut amplitude: f64 = 0.08;
+    let mut out = std::path::PathBuf::from("poler_normalmap.png");
+    let mut as_json = false;
+
+    if let Some(r) = game_parse_size(args) {
+        let (sw, sh) = match r {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("game normalmap: {e}")),
+        };
+        w = sw;
+        h = sh;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--style") {
+        match args.get(i + 1).and_then(|v| crate::game::texture::TexStyle::parse(v)) {
+            Some(s) => spec.style = s,
+            None => return CmdResult::Done("game normalmap: --style noise|marble|wood".into()),
+        }
+    }
+    if let Ok(s) = q_flag_num::<u64>(args, "--seed", spec.seed) {
+        spec.seed = s;
+    }
+    if let Ok(f) = q_flag_num::<f64>(args, "--freq", spec.freq) {
+        if !(0.5..=64.0).contains(&f) {
+            return CmdResult::Done("game normalmap: --freq 0.5..=64".into());
+        }
+        spec.freq = f;
+    }
+    if let Ok(o) = q_flag_num::<u32>(args, "--octaves", spec.octaves) {
+        if !(1..=12).contains(&o) {
+            return CmdResult::Done("game normalmap: --octaves 1..=12".into());
+        }
+        spec.octaves = o;
+    }
+    if let Ok(z) = q_flag_num::<f64>(args, "--zoom", zoom) {
+        if !(1.0..=64.0).contains(&z) {
+            return CmdResult::Done("game normalmap: --zoom 1..=64".into());
+        }
+        zoom = z;
+    }
+    if let Ok(a) = q_flag_num::<f64>(args, "--amplitude", amplitude) {
+        if !(0.0..=1.5).contains(&a) {
+            return CmdResult::Done("game normalmap: --amplitude 0..=1.5".into());
+        }
+        amplitude = a;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out") {
+        match args.get(i + 1) {
+            Some(v) => out = std::path::PathBuf::from(v.clone()),
+            None => return CmdResult::Done("game normalmap: --out FILE.png".into()),
+        }
+    }
+    as_json |= q_flag(args, "--json");
+
+    let t0 = std::time::Instant::now();
+    let tex = spec.render_normal(w, h, zoom, amplitude);
+    let render_ms = t0.elapsed().as_millis();
+    let thash = tex.texture_hash();
+    match tex.write_png(&out) {
+        Ok(()) => {}
+        Err(e) => return CmdResult::Done(format!("game normalmap: запись {}: {e}", out.display())),
+    }
+
+    if as_json {
+        let j = serde_json::json!({
+            "png": out.display().to_string(),
+            "size": [w, h],
+            "style": spec.style.as_str(),
+            "seed": spec.seed,
+            "freq": spec.freq,
+            "octaves": spec.octaves,
+            "zoom": zoom,
+            "amplitude": amplitude,
+            "normal_hash": format!("0x{:016X}", thash),
+            "render_ms": render_ms,
+        });
+        CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+    } else {
+        CmdResult::Done(format!(
+            "U0 «Normal map»: {} {}x{} (zoom {zoom})\n  материал  : {} · зерно {} · {} октав (freq {})\n  амплитуда : {amplitude} ({:.0}% глубины тайла) — честная dh/du\n  PNG       : {} · хеш нормалей 0x{:016X} (бит-в-бит)\n  рендер    : {} мс (разрешение- и зум-инвариантно)",
+            spec.style.as_str(),
+            w,
+            h,
+            spec.style.as_str(),
+            spec.seed,
+            spec.octaves,
+            spec.freq,
+            amplitude * 100.0,
+            out.display(),
+            thash,
+            render_ms,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.56.0 (цикл U): ввод → камера → окно
+// ---------------------------------------------------------------------------
+
+/// Событие JSON-скрипта `game input-demo --script`.
+#[derive(Debug, serde::Deserialize)]
+struct ScriptEvent {
+    frame: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    dx: Option<f64>,
+    #[serde(default)]
+    dy: Option<f64>,
+    #[serde(default)]
+    delta: Option<f64>,
+    #[serde(default)]
+    ch: Option<String>,
+    #[serde(default)]
+    w: Option<u32>,
+    #[serde(default)]
+    h: Option<u32>,
+    #[serde(default)]
+    v: Option<u64>,
+}
+
+/// Файл сценария ввода.
+#[derive(Debug, serde::Deserialize)]
+struct InputScript {
+    #[serde(default = "default_script_frames")]
+    frames: u32,
+    #[serde(default)]
+    events: Vec<ScriptEvent>,
+}
+
+fn default_script_frames() -> u32 {
+    180
+}
+
+fn parse_script_button(s: &str) -> Option<crate::game::MouseButton> {
+    use crate::game::MouseButton::*;
+    Some(match s.to_ascii_lowercase().as_str() {
+        "left" | "l" => Left,
+        "middle" | "m" => Middle,
+        "right" | "r" => Right,
+        _ => return None,
+    })
+}
+
+/// Сконвертировать JSON-события в типизированные (сортировка по кадрам).
+fn script_to_events(script: &InputScript) -> Result<Vec<(u64, crate::game::Event)>, String> {
+    use crate::game::events::{Event, KeyPhase};
+    let mut out = Vec::with_capacity(script.events.len());
+    for (i, e) in script.events.iter().enumerate() {
+        let ev = match e.kind.as_str() {
+            "key_down" => Event::Key {
+                code: KeyCode::parse(e.code.as_deref().unwrap_or(""))
+                    .ok_or_else(|| format!("событие #{i}: неизвестная клавиша {:?}", e.code))?,
+                phase: KeyPhase::Pressed,
+            },
+            "key_up" => Event::Key {
+                code: KeyCode::parse(e.code.as_deref().unwrap_or(""))
+                    .ok_or_else(|| format!("событие #{i}: неизвестная клавиша {:?}", e.code))?,
+                phase: KeyPhase::Released,
+            },
+            "mouse_down" => Event::MouseButton {
+                button: parse_script_button(e.button.as_deref().unwrap_or("left"))
+                    .ok_or_else(|| format!("событие #{i}: кнопка {:?}", e.button))?,
+                phase: KeyPhase::Pressed,
+            },
+            "mouse_up" => Event::MouseButton {
+                button: parse_script_button(e.button.as_deref().unwrap_or("left"))
+                    .ok_or_else(|| format!("событие #{i}: кнопка {:?}", e.button))?,
+                phase: KeyPhase::Released,
+            },
+            "mouse_move" => Event::MouseMove {
+                dx: e.dx.unwrap_or(0.0),
+                dy: e.dy.unwrap_or(0.0),
+            },
+            "wheel" => Event::MouseWheel { delta: e.delta.unwrap_or(0.0) },
+            "text" => {
+                let ch = e.ch.as_deref().and_then(|s| s.chars().next())
+                    .ok_or_else(|| format!("событие #{i}: text без ch"))?;
+                Event::Text(ch)
+            }
+            "resize" => Event::WindowResize {
+                w: e.w.unwrap_or(64).max(1),
+                h: e.h.unwrap_or(64).max(1),
+            },
+            "focus_lost" => Event::WindowFocus { gained: false },
+            "focus_gained" => Event::WindowFocus { gained: true },
+            "close" => Event::WindowClose,
+            "user" => Event::User(e.v.unwrap_or(0)),
+            other => return Err(format!("событие #{i}: неизвестный тип `{other}`")),
+        };
+        out.push((e.frame, ev));
+    }
+    out.sort_by_key(|(f, _)| *f);
+    Ok(out)
+}
+
+/// Встроенный демо-сценарий: полный обход орбиты мышью, зум колесом,
+/// клавиатурная орбита — все три источника ввода камеры.
+fn default_script_events() -> Vec<(u64, crate::game::Event)> {
+    use crate::game::events::{Event, KeyPhase, MouseButton};
+    let mut evs = Vec::new();
+    // Фаза 1: драг ЛКМ — облёт по горизонтали с лёгким наклоном
+    evs.push((5, Event::MouseButton { button: MouseButton::Left, phase: KeyPhase::Pressed }));
+    for i in 0..60u64 {
+        let f = 8 + i * 2;
+        let dx = 6.0 + (i as f64 * 0.35).sin() * 4.0;
+        let dy = (i as f64 * 0.22).cos() * 3.0;
+        evs.push((f, Event::MouseMove { dx, dy }));
+    }
+    evs.push((130, Event::MouseButton { button: MouseButton::Left, phase: KeyPhase::Released }));
+    // Фаза 2: колесо — зум-ин и обратно
+    evs.push((150, Event::MouseWheel { delta: 2.0 }));
+    evs.push((170, Event::MouseWheel { delta: 2.0 }));
+    evs.push((190, Event::MouseWheel { delta: -3.0 }));
+    // Фаза 3: клавиатура — доворот вверх и влево
+    evs.push((210, Event::Key { code: KeyCode::W, phase: KeyPhase::Pressed }));
+    evs.push((240, Event::Key { code: KeyCode::W, phase: KeyPhase::Released }));
+    evs.push((245, Event::Key { code: KeyCode::Left, phase: KeyPhase::Pressed }));
+    evs.push((270, Event::Key { code: KeyCode::Left, phase: KeyPhase::Released }));
+    // Побочно: фокус и текст проходят через очередь (полнота контракта)
+    evs.push((10, Event::WindowFocus { gained: false }));
+    evs.push((12, Event::WindowFocus { gained: true }));
+    evs.push((100, Event::Text('U')));
+    evs
+}
+
+/// Итог прогона игрового цикла.
+struct GameLoopSummary {
+    frames: u64,
+    ticks: u64,
+    camera: crate::game::OrbitCamera,
+    state_hash: u64,
+    elapsed_s: f64,
+    closed: bool,
+}
+
+/// Единый игровой цикл: события → Input → тики мира+камеры → рендер → present.
+///
+/// Один и тот же код крутит и офлайн-replay (детерминированный эталон),
+/// и настоящее X11-окно (realtime): источник dt и источник событий —
+/// параметры, логика неизменна.
+#[allow(clippy::too_many_arguments)]
+fn game_window_loop(
+    backend: &mut dyn crate::game::WindowBackend,
+    scene: &crate::game::SceneFile,
+    max_frames: Option<u64>,
+    mut dt_source: impl FnMut() -> f64,
+    mut feed: impl FnMut(u64, &mut crate::game::EventQueue),
+    ticks_cap: usize,
+) -> Result<GameLoopSummary, String> {
+    use crate::game::events::Event;
+    use crate::game::{EventQueue, Input, OrbitCamera, FIXED_DT};
+
+    let mut queue = EventQueue::new(512);
+    let mut input = Input::default();
+    let mut camera = OrbitCamera::from_spec(&scene.camera);
+    let mut world = scene
+        .build_world()
+        .map_err(|e| format!("сцена `{}`: {e}", scene.name))?;
+    let mut clock = crate::game::GameClock::new(FIXED_DT);
+    let mut frames: u64 = 0;
+    let t0 = std::time::Instant::now();
+    let mut closed = false;
+
+    loop {
+        if let Some(n) = max_frames {
+            if frames >= n {
+                break;
+            }
+        }
+        if closed {
+            break;
+        }
+        // 1. События: скрипт кадра + бэкенд (окно)
+        feed(frames, &mut queue);
+        while let Some(ev) = backend.poll_event() {
+            queue.push(ev);
+        }
+        // 2. Свёртка в состояние ввода
+        while let Some(ev) = queue.pop() {
+            if matches!(ev, Event::WindowClose) {
+                closed = true;
+            }
+            input.on_event(&ev);
+        }
+        // 3. Симуляция: целые тики фиксированного шага
+        let dt = dt_source();
+        let n_ticks = clock.advance(dt, ticks_cap);
+        for _ in 0..n_ticks {
+            world.tick(FIXED_DT);
+            camera.tick(&input, FIXED_DT);
+        }
+        // 4. Рендер текущего состояния + показ
+        let (w, h) = backend.size();
+        let cfg = crate::game::FrameConfig {
+            width: w,
+            height: h,
+            camera: camera.spec(),
+            render_orbits: true,
+            render_box: true,
+            scene_name: scene.name.clone(),
+            out_dir: std::path::PathBuf::from("."),
+        };
+        let raw = crate::game::render_raw(&world, &cfg)?;
+        backend.present(&raw.rgb, w, h)?;
+        input.end_frame();
+        frames += 1;
+    }
+
+    Ok(GameLoopSummary {
+        frames,
+        ticks: clock.tick,
+        camera,
+        state_hash: world.state_hash(),
+        elapsed_s: t0.elapsed().as_secs_f64(),
+        closed,
+    })
+}
+
+/// `game input-demo`: U1–U4 — скрипт событий → кадры + хеши (без окна).
+fn cmd_game_input_demo(args: &[String]) -> CmdResult {
+    use crate::game::events::Event;
+    use crate::game::{EventQueue, OffscreenWindow, WindowBackend};
+
+    let mut frames: u32 = 300;
+    let mut every: u32 = 30;
+    let mut w: u32 = 640;
+    let mut h: u32 = 360;
+    let mut out_dir = std::path::PathBuf::from("poler_input_demo");
+    let mut script_path: Option<std::path::PathBuf> = None;
+    let mut as_json = false;
+
+    if let Ok(f) = q_flag_num::<u32>(args, "--frames", frames) {
+        if !(10..=10_000).contains(&f) {
+            return CmdResult::Done("game input-demo: --frames 10..=10000".into());
+        }
+        frames = f;
+    }
+    if let Ok(e) = q_flag_num::<u32>(args, "--every", every) {
+        if !(1..=1000).contains(&e) {
+            return CmdResult::Done("game input-demo: --every 1..=1000".into());
+        }
+        every = e;
+    }
+    if let Some(r) = game_parse_size(args) {
+        let (sw, sh) = match r {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("game input-demo: {e}")),
+        };
+        w = sw;
+        h = sh;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--out-dir") {
+        match args.get(i + 1) {
+            Some(v) => out_dir = std::path::PathBuf::from(v.clone()),
+            None => return CmdResult::Done("game input-demo: --out-dir DIR".into()),
+        }
+    }
+    if let Some(i) = args.iter().position(|a| a == "--script") {
+        match args.get(i + 1) {
+            Some(v) => script_path = Some(std::path::PathBuf::from(v.clone())),
+            None => return CmdResult::Done("game input-demo: --script FILE.json".into()),
+        }
+    }
+    as_json |= q_flag(args, "--json");
+
+    // Сценарий: файл или встроенный
+    let events: Vec<(u64, Event)> = if let Some(p) = &script_path {
+        let raw = match std::fs::read_to_string(p) {
+            Ok(r) => r,
+            Err(e) => return CmdResult::Done(format!("game input-demo: чтение {}: {e}", p.display())),
+        };
+        let script: InputScript = match serde_json::from_str(&raw) {
+            Ok(s) => s,
+            Err(e) => return CmdResult::Done(format!("game input-demo: парсинг {}: {e}", p.display())),
+        };
+        frames = script.frames.clamp(10, 10_000);
+        match script_to_events(&script) {
+            Ok(e) => e,
+            Err(e) => return CmdResult::Done(format!("game input-demo: {e}")),
+        }
+    } else {
+        default_script_events()
+    };
+
+    let scene = crate::game::demo_scene();
+    let t0 = std::time::Instant::now();
+    let mut window = OffscreenWindow::new(Vec::new(), w, h, &out_dir, every);
+    // Источник событий: скрипт выдаёт события, запланированные на кадр
+    let mut cursor = 0usize;
+    let summary = {
+        let feed = |frame: u64, q: &mut EventQueue| {
+            while cursor < events.len() && events[cursor].0 <= frame {
+                q.push(events[cursor].1.clone());
+                cursor += 1;
+            }
+        };
+        // офлайн-детерминизм: ровно один тик на кадр
+        match game_window_loop(&mut window, &scene, Some(frames as u64), || {
+            crate::game::FIXED_DT
+        }, feed, 4)
+        {
+            Ok(s) => s,
+            Err(e) => return CmdResult::Done(format!("game input-demo: {e}")),
+        }
+    };
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let frames_hash = window.frames_hash();
+    let n_png = window.frames().iter().filter(|f| f.path.is_some()).count();
+
+    if as_json {
+        let j = serde_json::json!({
+            "backend": window.backend_name(),
+            "frames": summary.frames,
+            "ticks": summary.ticks,
+            "png_written": n_png,
+            "out_dir": out_dir.display().to_string(),
+            "size": [w, h],
+            "every": every,
+            "script": script_path.map(|p| p.display().to_string()),
+            "frames_hash": format!("0x{:016X}", frames_hash),
+            "camera": {
+                "yaw": summary.camera.yaw,
+                "pitch": summary.camera.pitch,
+                "dist": summary.camera.dist,
+                "camera_hash": format!("0x{:016X}", summary.camera.camera_hash()),
+            },
+            "state_hash": format!("0x{:016X}", summary.state_hash),
+            "closed": summary.closed,
+            "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0,
+        });
+        CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+    } else {
+        CmdResult::Done(format!(
+            "U1–U4 «ввод → камера → кадр»: офлайн-replay\n  бэкенд   : {} (событий в скрипте: {}, кадров: {})\n  симуляция: {} тиков · мир 0x{:016X}\n  камера   : yaw {:.3} · pitch {:.3} · dist {:.3} · hash 0x{:016X}\n  кадры    : {} presented · PNG {} (каждый {}) → {}\n  frames_hash: 0x{:016X} (детерминизм бит-в-бит)\n  время    : {:.1} мс",
+            window.backend_name(),
+            events.len(),
+            summary.frames,
+            summary.ticks,
+            summary.state_hash,
+            summary.camera.yaw,
+            summary.camera.pitch,
+            summary.camera.dist,
+            summary.camera.camera_hash(),
+            summary.frames,
+            n_png,
+            every,
+            out_dir.display(),
+            frames_hash,
+            elapsed_ms,
+        ))
+    }
+}
+
+/// `game window`: U3 — настоящее X11-окно (dlopen libX11, zero-dep).
+fn cmd_game_window(args: &[String]) -> CmdResult {
+    let mut w: u32 = 960;
+    let mut h: u32 = 540;
+    let mut max_frames: Option<u64> = None;
+    let mut ticks_cap: usize = 5;
+
+    if let Some(r) = game_parse_size(args) {
+        let (sw, sh) = match r {
+            Ok(v) => v,
+            Err(e) => return CmdResult::Done(format!("game window: {e}")),
+        };
+        w = sw;
+        h = sh;
+    }
+    if let Ok(f) = q_flag_num::<u64>(args, "--frames", 0) {
+        if f > 0 {
+            max_frames = Some(f.min(1_000_000));
+        }
+    }
+    if let Ok(c) = q_flag_num::<usize>(args, "--ticks-cap", ticks_cap) {
+        if !(1..=60).contains(&c) {
+            return CmdResult::Done("game window: --ticks-cap 1..=60".into());
+        }
+        ticks_cap = c;
+    }
+
+    let mut window = match crate::game::X11Window::open(w, h, "POLER ENGINE — game window (Esc = выход)") {
+        Ok(win) => win,
+        Err(e) => {
+            return CmdResult::Done(format!(
+                "game window: не удалось открыть X11-окно: {e}\n  (headless-окружение? для детерминированного прогона без X-сервера — game input-demo)"
+            ))
+        }
+    };
+    let scene = crate::game::demo_scene();
+    // Realtime-источник dt с пейсингом 60 Гц
+    let mut last = std::time::Instant::now();
+    let dt_source = || {
+        let target = crate::game::FIXED_DT;
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last).as_secs_f64();
+        if dt < target {
+            std::thread::sleep(std::time::Duration::from_secs_f64(target - dt));
+        }
+        let now2 = std::time::Instant::now();
+        let real = now2.duration_since(last).as_secs_f64();
+        last = now2;
+        real
+    };
+    let feed = |_frame: u64, _q: &mut crate::game::EventQueue| {};
+    let t0 = std::time::Instant::now();
+    match game_window_loop(&mut window, &scene, max_frames, dt_source, feed, ticks_cap) {
+        Ok(s) => CmdResult::Done(format!(
+            "game window: {} кадров за {:.1} с ({:.0} fps) · {} тиков · закрыто: {}\n  камера: yaw {:.3} · pitch {:.3} · dist {:.3}\n  управление: ЛКМ+движение — орбита · колесо — зум · WASD/стрелки — орбита · Q/E — дистанция · крантик/Esc — выход",
+            s.frames,
+            t0.elapsed().as_secs_f64(),
+            s.frames as f64 / t0.elapsed().as_secs_f64().max(1e-9),
+            s.ticks,
+            s.closed,
+            s.camera.yaw,
+            s.camera.pitch,
+            s.camera.dist,
+        )),
+        Err(e) => CmdResult::Done(format!("game window: {e}")),
+    }
+}
+
+/// `game info`: статус ядра игры.
 fn cmd_game_info() -> CmdResult {
     let scene = crate::game::demo_scene();
     let world = scene.build_world().expect("демо-сцена валидна (проверена тестами)");
@@ -4703,6 +5252,150 @@ mod tests {
         }
         match dispatch(&mut s, "game scene /nonexistent.json") {
             CmdResult::Done(out) => assert!(out.contains("чтение"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v0.56.0 (цикл U): normalmap / input-demo / window
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cmd_game_normalmap_writes_png() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-u1.db"));
+        let dir = std::env::temp_dir().join("poler_shell_u1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("nm.png");
+        let cmd = format!(
+            "game normalmap --size 128x128 --style marble --amplitude 0.1 --out {} --json",
+            png.display()
+        );
+        match dispatch(&mut s, &cmd) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).expect("валидный JSON");
+                assert_eq!(j["normal_hash"].as_str().unwrap().len(), 18);
+                assert_eq!(j["amplitude"], 0.1);
+                assert!(png.exists(), "PNG записан");
+                let raw = std::fs::read(&png).unwrap();
+                let (w, h, ct, _) = crate::p3::png::decode_own(&raw).expect("PNG валиден");
+                assert_eq!((w, h, ct), (128, 128, 2));
+                // Детерминизм: второй прогон — тот же хеш
+                match dispatch(&mut s, &cmd) {
+                    CmdResult::Done(out2) => {
+                        let j2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+                        assert_eq!(j["normal_hash"], j2["normal_hash"], "бит-в-бит");
+                    }
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+        // Валидация
+        match dispatch(&mut s, "game normalmap --amplitude 5") {
+            CmdResult::Done(out) => assert!(out.contains("--amplitude 0..=1.5"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game normalmap --style basalt") {
+            CmdResult::Done(out) => assert!(out.contains("--style noise|marble|wood"), "{out}"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_game_input_demo_replay_and_script() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-u2.db"));
+        let dir = std::env::temp_dir().join("poler_shell_u2");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Встроенный сценарий: короткий прогон
+        let cmd = format!(
+            "game input-demo --frames 40 --every 20 --size 160x120 --out-dir {} --json",
+            dir.display()
+        );
+        let (fh1, cam1) = match dispatch(&mut s, &cmd) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                assert_eq!(j["frames"], 40, "кадров ровно сколько просили");
+                assert_eq!(j["ticks"], 40, "офлайн: 1 тик на кадр");
+                assert!(j["png_written"].as_u64().unwrap() >= 2, "PNG прорежены");
+                assert_eq!(j["closed"], false, "закрытия не было");
+                (
+                    j["frames_hash"].as_str().unwrap().to_string(),
+                    j["camera"]["camera_hash"].as_str().unwrap().to_string(),
+                )
+            }
+            _ => panic!(),
+        };
+        // Детерминизм: тот же прогон — те же хеши
+        match dispatch(&mut s, &cmd) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(j["frames_hash"].as_str().unwrap(), fh1, "frames_hash бит-в-бит");
+                assert_eq!(j["camera"]["camera_hash"].as_str().unwrap(), cam1);
+            }
+            _ => panic!(),
+        }
+        // Пользовательский сценарий: колесо на 20-м кадре меняет камеру
+        let script = dir.join("script.json");
+        std::fs::write(
+            &script,
+            r#"{"frames": 40, "events": [
+                {"frame": 10, "type": "wheel", "delta": 3.0},
+                {"frame": 15, "type": "key_down", "code": "w"},
+                {"frame": 30, "type": "key_up", "code": "w"}
+            ]}"#,
+        )
+        .unwrap();
+        let cmd2 = format!(
+            "game input-demo --script {} --every 100 --size 160x120 --out-dir {} --json",
+            script.display(),
+            dir.display()
+        );
+        match dispatch(&mut s, &cmd2) {
+            CmdResult::Done(out) => {
+                let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(j["frames"], 40, "frames из сценария");
+                // колесо + клавиша реально сдвинули камеру от дефолта
+                assert_ne!(
+                    j["camera"]["camera_hash"].as_str().unwrap(),
+                    cam1,
+                    "другой сценарий — другая камера"
+                );
+            }
+            _ => panic!(),
+        }
+        // Битый сценарий — понятная ошибка
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, r#"{"frames": 40, "events": [{"frame": 1, "type": "nonsense"}]}"#).unwrap();
+        match dispatch(&mut s, &game_format_script(&bad)) {
+            CmdResult::Done(out) => assert!(out.contains("неизвестный тип"), "{out}"),
+            _ => panic!(),
+        }
+        // Валидация флагов
+        match dispatch(&mut s, "game input-demo --frames 3") {
+            CmdResult::Done(out) => assert!(out.contains("--frames 10..=10000"), "{out}"),
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn game_format_script(p: &std::path::Path) -> String {
+        format!("game input-demo --script {}", p.display())
+    }
+
+    #[test]
+    fn cmd_game_window_graceful_headless() {
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-u3.db"));
+        // В headless-CI нет DISPLAY: ожидаем внятный отказ, не панику.
+        if std::env::var("DISPLAY").map(|d| !d.is_empty()).unwrap_or(false) {
+            return; // живой X-сервер: открытие реально, тут не тестируем
+        }
+        match dispatch(&mut s, "game window --frames 5") {
+            CmdResult::Done(out) => {
+                assert!(
+                    out.contains("X11") || out.contains("DISPLAY") || out.contains("input-demo"),
+                    "понятная ошибка: {out}"
+                );
+            }
             _ => panic!(),
         }
     }

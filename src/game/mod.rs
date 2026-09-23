@@ -36,19 +36,33 @@
 //!
 //! Рендер headless-first: кадр = тройка PNG (RGB/depth/seg) через
 //! C-ABI в ядро P³ — тот же путь, что у «кадра из гамильтониана».
+//!
+//! Цикл U (v0.56.0): события → ввод → камера → окно. Очередь с
+//! коалесцингом (`events`), свёрнутое состояние (`input`), орбит-камера
+//! с детерминированным демпфированием (`camera`), оконные бэкенды
+//! (`window`): Offscreen (replay-эталон, PNG+хеши) и X11 (dlopen,
+//! zero-dep). Один и тот же код получает и CI-эталон, и настоящее окно.
 
 pub mod audio;
+pub mod camera;
+pub mod events;
+pub mod input;
 pub mod loop_;
 pub mod orbit;
 pub mod render;
 pub mod scene;
 pub mod texture;
 pub mod transform;
+pub mod window;
 pub mod world;
 
+pub use camera::OrbitCamera;
+pub use events::{Event, EventQueue, KeyPhase, MouseButton};
+pub use input::{ActionMap, Bind, Input, KeyCode};
 pub use loop_::{GameClock, FIXED_DT};
 pub use orbit::Orbit;
-pub use render::{render_frame, FrameConfig, FrameOutput};
+pub use render::{render_frame, render_raw, FrameConfig, FrameOutput, RawFrame};
 pub use scene::{demo_scene, BodySpec, CameraSpec, SceneFile};
 pub use transform::Transform;
+pub use window::{FrameRecord, OffscreenWindow, WindowBackend, X11Window};
 pub use world::{Body, BodyClass, Entity, World};

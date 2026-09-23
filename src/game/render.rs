@@ -302,17 +302,30 @@ struct FrameStatsForAnnotation {
     height_for_panel: usize,
 }
 
-/// Отрендерить мир (текущее состояние, после тика) в тройку PNG.
-pub fn render_frame(world: &World, cfg: &FrameConfig) -> Result<FrameOutput, String> {
-    let t0 = Instant::now();
+/// Сырой кадр: RGB + глубина + сегментация (без записи на диск).
+/// Сырьё для `render_frame` (PNG) и для `WindowBackend::present`.
+#[derive(Clone, Debug)]
+pub struct RawFrame {
+    /// Аннотированный RGB8 (3 байта/пиксель).
+    pub rgb: Vec<u8>,
+    /// Честная глубина d_FS (f32, 1e29 = пусто).
+    pub depth: Vec<f32>,
+    /// Сегментация (классы тел).
+    pub seg: Vec<u8>,
+    pub n_points: usize,
+    pub n_edges: usize,
+    pub painted_px: usize,
+    pub max_fs_depth: f64,
+}
+
+/// Ядро рендера: извлечение → P³ → аннотация. Без диска.
+pub fn render_raw(world: &World, cfg: &FrameConfig) -> Result<RawFrame, String> {
     if cfg.width < 64 || cfg.height < 64 || cfg.width > 4096 || cfg.height > 4096 {
         return Err("размер кадра: 64..=4096 по каждой стороне".into());
     }
     if world.is_empty() {
         return Err("мир пуст — нечего рендерить".into());
     }
-    std::fs::create_dir_all(&cfg.out_dir)
-        .map_err(|e| format!("out_dir {}: {e}", cfg.out_dir.display()))?;
 
     // --- 1. Извлечение геометрии ---
     let scene = extract(world, cfg.render_orbits);
@@ -370,6 +383,19 @@ pub fn render_frame(world: &World, cfg: &FrameConfig) -> Result<FrameOutput, Str
         },
     );
 
+    let n_edges = scene.pairs.len() / 2;
+    Ok(RawFrame { rgb, depth, seg, n_points, n_edges, painted_px, max_fs_depth })
+}
+
+/// Отрендерить мир (текущее состояние, после тика) в тройку PNG.
+pub fn render_frame(world: &World, cfg: &FrameConfig) -> Result<FrameOutput, String> {
+    let t0 = Instant::now();
+    std::fs::create_dir_all(&cfg.out_dir)
+        .map_err(|e| format!("out_dir {}: {e}", cfg.out_dir.display()))?;
+
+    let raw = render_raw(world, cfg)?;
+    let npix = cfg.width as usize * cfg.height as usize;
+
     // --- 4. PNG: RGB / depth (grayscale d_FS) / seg (палитра) ---
     let stem = format!("game_{}_t{}", cfg.scene_name, world.tick);
     let rgb_png = cfg.out_dir.join(format!("{stem}_rgb.png"));
@@ -378,7 +404,7 @@ pub fn render_frame(world: &World, cfg: &FrameConfig) -> Result<FrameOutput, Str
 
     let mut gray = vec![0u8; npix];
     let scale = 255.0 / std::f64::consts::FRAC_PI_2;
-    for (g, &d) in gray.iter_mut().zip(depth.iter()) {
+    for (g, &d) in gray.iter_mut().zip(raw.depth.iter()) {
         *g = if d >= 1e29 {
             0
         } else {
@@ -399,12 +425,12 @@ pub fn render_frame(world: &World, cfg: &FrameConfig) -> Result<FrameOutput, Str
         [140, 180, 255],
     ];
     let mut seg_rgb = vec![0u8; npix * 3];
-    for (dst, &s) in seg_rgb.chunks_exact_mut(3).zip(seg.iter()) {
+    for (dst, &s) in seg_rgb.chunks_exact_mut(3).zip(raw.seg.iter()) {
         let c = seg_palette[(s as usize) % seg_palette.len()];
         dst.copy_from_slice(&c);
     }
 
-    crate::p3::png::encode_rgb(&rgb_png, cfg.width, cfg.height, &rgb)
+    crate::p3::png::encode_rgb(&rgb_png, cfg.width, cfg.height, &raw.rgb)
         .map_err(|e| format!("PNG rgb: {e}"))?;
     crate::p3::png::encode_gray(&depth_png, cfg.width, cfg.height, &gray)
         .map_err(|e| format!("PNG depth: {e}"))?;
@@ -415,10 +441,10 @@ pub fn render_frame(world: &World, cfg: &FrameConfig) -> Result<FrameOutput, Str
         rgb_png,
         depth_png,
         seg_png,
-        n_points,
-        n_edges: scene.pairs.len() / 2,
-        painted_px,
-        max_fs_depth,
+        n_points: raw.n_points,
+        n_edges: raw.n_edges,
+        painted_px: raw.painted_px,
+        max_fs_depth: raw.max_fs_depth,
         tick: world.tick,
         state_hash: world.state_hash(),
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,

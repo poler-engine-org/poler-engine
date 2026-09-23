@@ -515,6 +515,71 @@ pub fn rank_curve(gray: &[u8], w: usize, h: usize, tile: usize, ranks: &[usize])
     ranks.iter().map(|&k| svd_encode_gray(gray, w, h, tile, k).1).collect()
 }
 
+// ---------------------------------------------------------------------------
+// U0: Normal maps — рельеф из той же аналитической функции (цикл U)
+// ---------------------------------------------------------------------------
+
+/// Нормаль касательного пространства из height-функции в точке (u, v).
+///
+/// Честная производная центральными разностями: dh/du ≈ (h⁺−h⁻)/(2·du)
+/// — оценка **не зависит от разрешения** (du→0 сходится к h′(u)).
+/// Рельеф — физическая высота: амплитуда `amplitude` — доля от размера
+/// тайла (0.08 = «8% глубины»), поэтому зум и разрешение меняют картинку
+/// только за счёт новых деталей функции, а не за счёт пересчёта наклона.
+///
+/// Плоская высота даёт чистый Z (128, 128, 255 в 8-битном коде).
+pub fn height_normal(
+    f: impl Fn(f64, f64) -> f64,
+    u: f64,
+    v: f64,
+    du: f64,
+    dv: f64,
+    amplitude: f64,
+) -> [f64; 3] {
+    let dhx = (f(u + du, v) - f(u - du, v)) / (2.0 * du.max(1e-12));
+    let dhy = (f(u, v + dv) - f(u, v - dv)) / (2.0 * dv.max(1e-12));
+    let mut n = [-dhx * amplitude, -dhy * amplitude, 1.0];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len > 1e-15 {
+        for x in &mut n {
+            *x /= len;
+        }
+    }
+    n
+}
+
+impl TextureSpec {
+    /// Нормаль из **собственной** height-функции (тот же `sample`,
+    /// что красит цвет) в точке (u, v) при шаге численной производной
+    /// (du, dv).
+    pub fn normal_at(&self, u: f64, v: f64, du: f64, dv: f64, amplitude: f64) -> [f64; 3] {
+        height_normal(|x, y| self.sample(x, y), u, v, du, dv, amplitude)
+    }
+
+    /// Normal map WxH: RGB = n·0.5+0.5. Бесконечный зум — тот же
+    /// принцип, что у [`TextureSpec::render`]: честный ресэмпл функции.
+    /// `amplitude` — глубина рельефа в долях тайла (0.05..0.3 — рабочие
+    /// значения для marble/wood/noise).
+    pub fn render_normal(&self, w: u32, h: u32, zoom: f64, amplitude: f64) -> Texture {
+        let zoom = zoom.max(1e-6);
+        let amplitude = amplitude.clamp(0.0, 1.5);
+        let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+        for py in 0..h {
+            let v = (py as f64 + 0.5) / h as f64 / zoom;
+            let dv = 1.0 / h as f64 / zoom;
+            for px in 0..w {
+                let u = (px as f64 + 0.5) / w as f64 / zoom;
+                let du = 1.0 / w as f64 / zoom;
+                let n = self.normal_at(u, v, du, dv, amplitude);
+                rgb.push(((n[0] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8);
+                rgb.push(((n[1] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8);
+                rgb.push(((n[2] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+        Texture { w, h, rgb }
+    }
+}
+
 // ============================================================================
 // ТЕСТЫ
 // ============================================================================
@@ -681,5 +746,90 @@ mod tests {
         assert!(Palette::parse("no-such").is_none());
         assert!(TexStyle::parse("marble").is_some());
         assert!(TexStyle::parse("bogus").is_none());
+    }
+
+    // ── U0: normal maps ────────────────────────────────────────────────────
+
+    #[test]
+    fn normal_flat_height_is_pure_z() {
+        // Плоская высота → нормаль строго (0,0,1)
+        let n = height_normal(|_, _| 0.5, 0.3, 0.7, 1e-3, 1e-3, 3.0);
+        assert!((n[0].abs()) < 1e-12 && (n[1].abs()) < 1e-12, "{n:?}");
+        assert!((n[2] - 1.0).abs() < 1e-12);
+        // Амплитуда 0 — тоже плоскость при любом рельефе
+        let n0 = height_normal(|x, y| x * y * 9.0, 0.4, 0.4, 1e-3, 1e-3, 0.0);
+        assert!((n0[2] - 1.0).abs() < 1e-12, "amplitude=0 → плоскость");
+    }
+
+    #[test]
+    fn normal_plane_has_constant_tilt_and_unit_length() {
+        // h = 2u + 4v: наклон постоянен → одна и та же нормаль везде
+        let d = 1e-3;
+        let a = height_normal(|x, y| 2.0 * x + 4.0 * y, 0.1, 0.2, d, d, 1.0);
+        let b = height_normal(|x, y| 2.0 * x + 4.0 * y, 0.8, 0.6, d, d, 1.0);
+        for i in 0..3 {
+            assert!((a[i] - b[i]).abs() < 1e-9, "наклон постоянен: {a:?} vs {b:?}");
+        }
+        // Единичная длина и корректный знак: h растёт по u → нормаль смотрит в −u
+        let len = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-12);
+        assert!(a[0] < 0.0, "градиент +u → нормаль −u");
+        assert!(a[1] < 0.0, "градиент +v → нормаль −v");
+        assert!(a[2] > 0.0);
+        // Точная пропорция: n ∝ (−2A, −4A, 1)
+        let expected = [-2.0f64, -4.0, 1.0];
+        let elen = (4.0 + 16.0 + 1.0f64).sqrt();
+        for i in 0..3 {
+            assert!((a[i] - expected[i] / elen).abs() < 1e-9, "пропорция плоскости: {a:?}");
+        }
+    }
+
+    #[test]
+    fn normal_map_units_and_blue_dominance() {
+        let spec = TextureSpec { style: TexStyle::Marble, seed: 11, ..Default::default() };
+        let t = spec.render_normal(64, 64, 1.0, 0.08);
+        assert_eq!(t.rgb.len(), 64 * 64 * 3);
+        let mut z_min = 255u8;
+        for c in t.rgb.chunks_exact(3) {
+            // Декодируем нормаль и проверяем |n| ≈ 1
+            let nx = c[0] as f64 / 127.5 - 1.0;
+            let ny = c[1] as f64 / 127.5 - 1.0;
+            let nz = c[2] as f64 / 127.5 - 1.0;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            assert!((len - 1.0).abs() < 0.03, "не единичная: {len}");
+            z_min = z_min.min(c[2]);
+        }
+        assert!(z_min > 100, "z-компонента доминирует: {z_min}");
+        // Синусоидальные жилы гарантируют наклоны в обе стороны:
+        // x-канал обязан иметь тексели и меньше, и больше нейтрали 128
+        let (mut x_lo, mut x_hi) = (0usize, 0usize);
+        for c in t.rgb.chunks_exact(3) {
+            if c[0] < 128 {
+                x_lo += 1;
+            }
+            if c[0] > 128 {
+                x_hi += 1;
+            }
+        }
+        assert!(x_lo > 16 && x_hi > 16, "наклоны в обе стороны: lo={x_lo} hi={x_hi}");
+        // Детерминизм и чувствительность к амплитуде
+        let t2 = spec.render_normal(64, 64, 1.0, 0.08);
+        assert_eq!(t.texture_hash(), t2.texture_hash(), "бит-в-бит");
+        let t3 = spec.render_normal(64, 64, 1.0, 0.16);
+        assert_ne!(t.texture_hash(), t3.texture_hash(), "амплитуда меняет рельеф");
+        // Разрешение-инвариантность: численная производная сходится к
+        // аналитической при измельчении шага. Спек с 2 октавами: самый
+        // тонкий признак ~1/16 тайла — шаг 1/64 уже заведомо ниже
+        // Найквиста, обе оценки в региме сходимости.
+        let smooth_spec =
+            TextureSpec { style: TexStyle::Marble, seed: 11, octaves: 2, ..Default::default() };
+        let lo = smooth_spec.normal_at(0.5, 0.5, 1.0 / 64.0, 1.0 / 64.0, 0.08);
+        let hi = smooth_spec.normal_at(0.5, 0.5, 1.0 / 256.0, 1.0 / 256.0, 0.08);
+        for i in 0..3 {
+            assert!(
+                (lo[i] - hi[i]).abs() < 0.02,
+                "производная не сходится: {lo:?} vs {hi:?}"
+            );
+        }
     }
 }

@@ -460,6 +460,23 @@ docs/research-archive/ue_reference.poler (ArchiveKind::Poler —
 внутри архива). Бенчмарк docs/benchmarks/GAME_CYCLE_T_v0.55.0.md;
 VLM: marble 8.5/10, noise 7.5/10, wood 7/10 — все SHIP.
 
+**v0.56.0 (цикл U) Окно — события/ввод/камера/окно:** `game normalmap
+[opts]` (U0: тангентные нормали из той же height-функции — честная
+производная dh/du центральной разностью, амплитуда рельефа в долях
+тайла --amplitude 0..1.5, разрешение/зум-инвариантно, normal_hash
+бит-в-бит), `game input-demo [opts]` (U1–U4: JSON-скрипт событий
+--script {frame,type:key_down|mouse_move|wheel|…} или встроенный
+сценарий → EventQueue с коалесцингом → Input (рёбра just_pressed ровно
+кадр) → орбит-камера с экспоненциальным демпфированием → P³-кадры;
+frames_hash/camera_hash/state_hash — детерминизм всей цепочки
+бит-в-бит; 2.5 мс/кадр 640×360 ≈ 400 fps офлайн) и `game window`
+(U3: НАСТОЯЩЕЕ X11-окно через dlopen libX11.so.6 без зависимостей —
+ЛКМ-драг орбита, колесо зум, WASD/QE; в headless — внятный отказ).
+Архитектура: WindowBackend-трейт, OffscreenWindow = replay-эталон,
+единый game_window_loop для офлайн и realtime. Бенчмарк
+docs/benchmarks/GAME_CYCLE_U_v0.56.0.md; VLM: normal maps 8/8/7.5,
+кадры орбиты 9/10 — все SHIP.
+
 **C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/
 eject коннектома в RAM), `poler_fly_node` (паспорт), `poler_fly_edge`
 (ребро + ротор J), `poler_fly_khop` (BFS фронтов), `poler_fly_path`
