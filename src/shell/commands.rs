@@ -590,6 +590,10 @@ fn game_usage() -> String {
         "game window [opts]             — НАСТОЯЩЕЕ X11-окно (dlopen libX11, zero-dep):",
         "    опрос событий → Input → камера → P³-кадр в окно; нужен DISPLAY",
         "    opts: --size WxH --frames N(0=до закрытия) --ticks-cap N",
+        "game asset absorb|emit [opts]   — Y «Эхо»: готовый ассет → нейроны → PQW →",
+        "    с нуля: absorb --in F.wav|F.png --out F.pqw; emit --in F.pqw",
+        "    --out F.wav|F.png [--seconds S] [--width W --height H]",
+        "          [--seed N] [--burst 0..8] [--compare ORIGINAL] --json",
         "game vortex [opts]             — вихревой кодек «Шеннон-байпас» (V0):",
         "    шум → 2D-FFT → моды Колмогорова → GF(3)-триты (3^5=243≤256) → VRTX",
         "    честный зачёт: сжатие vs zstd-19, обход предела Шеннона, PSNR",
@@ -792,6 +796,7 @@ fn cmd_game(raw: &str) -> CmdResult {
         "window" => cmd_game_window(args),
         "vortex" => cmd_game_vortex(args),
         "water" => cmd_game_water(args),
+        "asset" => cmd_game_asset(args),
         other => CmdResult::Done(format!(
             "game: неизвестная подкоманда `{other}`\n\n{}",
             game_usage()
@@ -1771,6 +1776,397 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
             );
         }
         CmdResult::Done(out)
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// v0.61.0 (цикл Y): готовые ассеты → нейроны → PQW → генерация с нуля
+// ---------------------------------------------------------------------------
+
+/// `game asset absorb|emit`: Y «Эхо» — готовый ассет (WAV/PNG/PGM/PPM)
+/// впитывается нейронами и квантуется в триты PQW; emit рождает его с нуля.
+fn cmd_game_asset(args: &[String]) -> CmdResult {
+    use crate::game::asset as ya;
+
+    let sub = match args.first().map(String::as_str) {
+        Some(s @ ("absorb" | "emit")) => s.to_string(),
+        _ => {
+            return CmdResult::Done(
+                "game asset: подкоманда absorb|emit\n\
+                 \x20 absorb --in F.(wav|png|pgm|ppm) --out F.pqw   — впитать в нейроны\n\
+                 \x20 emit   --in F.pqw --out F.(wav|png)            — сгенерировать с нуля"
+                    .to_string(),
+            )
+        }
+    };
+    let mut in_path: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut seconds: f64 = 30.0;
+    let mut width: u32 = 0;
+    let mut height: u32 = 0;
+    let mut seed: Option<u64> = None;
+    let mut burst: f64 = 2.0;
+    let mut compare: Option<String> = None;
+    let mut as_json = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--in" => match args.get(i + 1) {
+                Some(v) => {
+                    in_path = Some(v.clone());
+                    i += 2;
+                }
+                None => return CmdResult::Done("game asset: --in FILE".into()),
+            },
+            "--out" => match args.get(i + 1) {
+                Some(v) => {
+                    out_path = Some(v.clone());
+                    i += 2;
+                }
+                None => return CmdResult::Done("game asset: --out FILE".into()),
+            },
+            "--seconds" => match args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if (0.5..=600.0).contains(&v) => {
+                    seconds = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game asset: --seconds 0.5..=600".into()),
+            },
+            "--width" => match args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+                Some(v) if v <= 8192 => {
+                    width = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game asset: --width 0..=8192 (0 = как вход)".into()),
+            },
+            "--height" => match args.get(i + 1).and_then(|v| v.parse::<u32>().ok()) {
+                Some(v) if v <= 8192 => {
+                    height = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game asset: --height 0..=8192 (0 = как вход)".into()),
+            },
+            "--seed" => match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => {
+                    seed = Some(v);
+                    i += 2;
+                }
+                None => return CmdResult::Done("game asset: --seed N".into()),
+            },
+            "--burst" => match args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if (0.0..=8.0).contains(&v) => {
+                    burst = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game asset: --burst 0..=8 (усиление лавин)".into()),
+            },
+            "--compare" => match args.get(i + 1) {
+                Some(v) => {
+                    compare = Some(v.clone());
+                    i += 2;
+                }
+                None => return CmdResult::Done("game asset: --compare ORIGINAL".into()),
+            },
+            "--json" => {
+                as_json = true;
+                i += 1;
+            }
+            other => return CmdResult::Done(format!("game asset: неизвестный флаг {other:?}")),
+        }
+    }
+    let in_path = match in_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => return CmdResult::Done("game asset: обязателен --in".into()),
+    };
+    let t0 = std::time::Instant::now();
+
+    if sub == "absorb" {
+        let in_bytes = std::fs::metadata(&in_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let head = std::fs::read(&in_path)
+            .ok()
+            .and_then(|b| if b.len() >= 12 { Some(b) } else { None });
+        let is_wav = head
+            .as_ref()
+            .map(|b| b.starts_with(b"RIFF") && b[8..12] == *b"WAVE")
+            .unwrap_or(false);
+        let out_path = match out_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return CmdResult::Done("game asset absorb: --out FILE.pqw".into()),
+        };
+        if is_wav {
+            let wav = match ya::read_wav(&in_path) {
+                Ok(w) => w,
+                Err(e) => return CmdResult::Done(format!("game asset absorb: {e}")),
+            };
+            let echo = match ya::absorb_audio(&wav) {
+                Ok(e) => e,
+                Err(e) => return CmdResult::Done(format!("game asset absorb: {e}")),
+            };
+            let synapses = echo.graph.iter().filter(|g| g.abs() >= 0.04).count();
+            let (si, sj, sv) = echo.strongest_synapse();
+            let loudest = echo
+                .mean_db
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let bytes = match ya::audio_to_pqw(&echo) {
+                Ok(b) => b,
+                Err(e) => return CmdResult::Done(format!("game asset absorb: {e}")),
+            };
+            if let Err(e) = std::fs::write(&out_path, &bytes) {
+                return CmdResult::Done(format!("game asset absorb: запись {}: {e}", out_path.display()));
+            }
+            let ratio = if in_bytes > 0 { in_bytes as f64 / bytes.len() as f64 } else { 0.0 };
+            let elapsed = t0.elapsed().as_millis();
+            if as_json {
+                let j = serde_json::json!({
+                    "cycle": "Y",
+                    "model": "neural-asset-echo-pqw",
+                    "op": "absorb",
+                    "kind": "audio",
+                    "in": in_path.display().to_string(),
+                    "out": out_path.display().to_string(),
+                    "in_bytes": in_bytes,
+                    "container_bytes": bytes.len(),
+                    "ratio": (ratio * 100.0).round() / 100.0,
+                    "fs": wav.fs,
+                    "channels": wav.channels,
+                    "duration_s": (wav.duration_s() * 100.0).round() / 100.0,
+                    "bands": ya::B,
+                    "synapses": synapses,
+                    "strongest_synapse": {"from": si, "to": sj, "g": (sv * 1000.0).round() / 1000.0},
+                    "stereo_corr": (echo.stereo_corr * 1000.0).round() / 1000.0,
+                    "level_db": (echo.level_db * 100.0).round() / 100.0,
+                    "cadence_hz": (echo.mod_hz[loudest] * 100.0).round() / 100.0,
+                    "elapsed_ms": elapsed,
+                });
+                CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+            } else {
+                CmdResult::Done(format!(
+                    "Y «Эхо»: звук впитан нейронами → PQW\n  вход      : {} (PCM {}, {} Гц, {:.2} с, {} Б)\n  нейроны   : {} полосных (STFT {}/{}), каденс {:.2} Гц\n  синапсы   : {} STDP-дуг (лаг-1 корреляции полос)\n  физика    : доминанта полоса{si}→полоса{sj} (G={sv:+.2}), стерео ρ={:+.2}, уровень {:.1} dB\n  контейнер : {} ({} Б — ×{:.0} против PCM)\n  время     : {} мс",
+                    in_path.display(),
+                    if wav.channels >= 2 { "stereo" } else { "mono" },
+                    wav.fs,
+                    wav.duration_s(),
+                    in_bytes,
+                    ya::B,
+                    ya::STFT_N,
+                    ya::STFT_HOP,
+                    echo.mod_hz[loudest],
+                    synapses,
+                    echo.stereo_corr,
+                    echo.level_db,
+                    out_path.display(),
+                    bytes.len(),
+                    ratio,
+                    elapsed,
+                ))
+            }
+        } else {
+            let img = match ya::read_image(&in_path) {
+                Ok(im) => im,
+                Err(e) => return CmdResult::Done(format!("game asset absorb: {e}")),
+            };
+            let echo = match ya::absorb_texture(&img) {
+                Ok(e) => e,
+                Err(e) => return CmdResult::Done(format!("game asset absorb: {e}")),
+            };
+            let bytes = match ya::texture_to_pqw(&echo) {
+                Ok(b) => b,
+                Err(e) => return CmdResult::Done(format!("game asset absorb: {e}")),
+            };
+            if let Err(e) = std::fs::write(&out_path, &bytes) {
+                return CmdResult::Done(format!("game asset absorb: запись {}: {e}", out_path.display()));
+            }
+            let tiles = (img.w as usize / ya::TILE) * (img.h as usize / ya::TILE);
+            let synapses: usize = echo
+                .graph_right
+                .iter()
+                .chain(echo.graph_down.iter())
+                .map(|row| row.iter().filter(|&&p| p > 0.02).count())
+                .sum();
+            let ratio = if in_bytes > 0 { in_bytes as f64 / bytes.len() as f64 } else { 0.0 };
+            let elapsed = t0.elapsed().as_millis();
+            if as_json {
+                let j = serde_json::json!({
+                    "cycle": "Y",
+                    "model": "neural-asset-echo-pqw",
+                    "op": "absorb",
+                    "kind": "texture",
+                    "in": in_path.display().to_string(),
+                    "out": out_path.display().to_string(),
+                    "in_bytes": in_bytes,
+                    "container_bytes": bytes.len(),
+                    "ratio": (ratio * 100.0).round() / 100.0,
+                    "w": img.w,
+                    "h": img.h,
+                    "tiles": tiles,
+                    "protos": ya::M_PROTOS,
+                    "svd_rank": ya::SVD_RANK,
+                    "synapses": synapses,
+                    "elapsed_ms": elapsed,
+                });
+                CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+            } else {
+                CmdResult::Done(format!(
+                    "Y «Эхо»: текстура впитана нейронами → PQW\n  вход      : {} ({}×{}, {} Б)\n  нейроны   : {} прототипов тайлов {}×{} ({} тайлов, WTA онлайн)\n  синапсы   : {} дуг смежности (вправо/вниз, Хебб по растру)\n  кодбук    : SVD ранга {} в базисе сингулярных векторов\n  контейнер : {} ({} Б — ×{:.0} против файла)\n  время     : {} мс",
+                    in_path.display(),
+                    img.w,
+                    img.h,
+                    in_bytes,
+                    ya::M_PROTOS,
+                    ya::TILE,
+                    ya::TILE,
+                    tiles,
+                    synapses,
+                    ya::SVD_RANK,
+                    out_path.display(),
+                    bytes.len(),
+                    ratio,
+                    elapsed,
+                ))
+            }
+        }
+    } else {
+        // emit: регенерация с нуля
+        let pqw = match std::fs::read(&in_path) {
+            Ok(b) => b,
+            Err(e) => return CmdResult::Done(format!("game asset emit: {e}")),
+        };
+        let out_path = match out_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return CmdResult::Done("game asset emit: --out FILE.wav|FILE.png".into()),
+        };
+        let is_audio = ya::audio_from_pqw(&pqw).is_ok();
+        if is_audio {
+            let (wav, rep) = match ya::emit_audio(&pqw, seconds, seed, burst) {
+                Ok(r) => r,
+                Err(e) => return CmdResult::Done(format!("game asset emit: {e}")),
+            };
+            let out_bytes = match ya::write_wav(&out_path, wav.fs, wav.channels, &wav.samples) {
+                Ok(n) => n,
+                Err(e) => return CmdResult::Done(format!("game asset emit: {e}")),
+            };
+            let mut psd = serde_json::Value::Null;
+            let mut psd_txt = String::new();
+            if let Some(cmp) = &compare {
+                match ya::read_wav(std::path::Path::new(cmp))
+                    .map_err(|e| e.to_string())
+                    .and_then(|orig| ya::psd_band_distance(&orig, &wav))
+                {
+                    Ok(d) => {
+                        psd_txt = format!("\n  PSD-дист  : {d:.2} дБ (24 полосы, против входа)", d = d);
+                        psd = serde_json::json!((d * 100.0).round() / 100.0);
+                    }
+                    Err(e) => psd_txt = format!("\n  сравнение : пропущено ({e})"),
+                }
+            }
+            let elapsed = t0.elapsed().as_millis();
+            if as_json {
+                let j = serde_json::json!({
+                    "cycle": "Y",
+                    "model": "neural-asset-echo-pqw",
+                    "op": "emit",
+                    "kind": "audio",
+                    "in": in_path.display().to_string(),
+                    "out": out_path.display().to_string(),
+                    "out_bytes": out_bytes,
+                    "seconds": seconds,
+                    "fs": wav.fs,
+                    "seed": rep.seed,
+                    "vortex_neurons": 600,
+                    "vortex_steps": rep.vortex_steps,
+                    "bursts": rep.bursts,
+                    "vortex_activity": (rep.vortex_activity * 10000.0).round() / 10000.0,
+                    "vortex_criticality": (rep.vortex_criticality * 10000.0).round() / 10000.0,
+                    "audio_hash": format!("0x{:016X}", wav.audio_hash()),
+                    "psd_distance_db": psd,
+                    "elapsed_ms": elapsed,
+                });
+                CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+            } else {
+                CmdResult::Done(format!(
+                    "Y «Эхо»: океан сгенерирован с нуля (движок, не таймлайн)\n  звук      : {} ({:.1} с, {} Гц, PCM16 stereo, {} Б)\n  мозг      : SSN-вихрь 600 нейронов · {} шагов · {} лавин\n             активность {:.1}% · критичность {:.2} (край хаоса)\n  хеш       : 0x{:016X} (бит-в-бит при повторе, seed 0x{:X}){psd_txt}\n  время     : {} мс",
+                    out_path.display(),
+                    wav.duration_s(),
+                    wav.fs,
+                    out_bytes,
+                    rep.vortex_steps,
+                    rep.bursts,
+                    rep.vortex_activity * 100.0,
+                    rep.vortex_criticality,
+                    wav.audio_hash(),
+                    rep.seed,
+                    elapsed,
+                ))
+            }
+        } else {
+            let (img, rep) = match ya::emit_texture(&pqw, width, height, seed) {
+                Ok(r) => r,
+                Err(e) => return CmdResult::Done(format!("game asset emit: {e}")),
+            };
+            if let Err(e) = crate::p3::png::encode_gray(&out_path, img.w, img.h, &img.gray) {
+                return CmdResult::Done(format!("game asset emit: запись {}: {e}", out_path.display()));
+            }
+            let out_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            let mut psnr_v = serde_json::Value::Null;
+            let mut hist_v = serde_json::Value::Null;
+            let mut cmp_txt = String::new();
+            if let Some(cmp) = &compare {
+                match ya::read_image(std::path::Path::new(cmp)) {
+                    Ok(orig) => {
+                        let recon: Vec<f64> = img.gray.iter().map(|&v| v as f64).collect();
+                        let p = crate::game::texture::psnr(&orig.gray, &recon);
+                        let hd = ya::histogram_distance(&orig, &img);
+                        cmp_txt = format!(
+                            "\n  метрики   : PSNR {p:.1} dB против входа · гистограммы {hd:.3}"
+                        );
+                        psnr_v = serde_json::json!((p * 100.0).round() / 100.0);
+                        hist_v = serde_json::json!((hd * 1000.0).round() / 1000.0);
+                    }
+                    Err(e) => cmp_txt = format!("\n  сравнение : пропущено ({e})"),
+                }
+            }
+            let elapsed = t0.elapsed().as_millis();
+            if as_json {
+                let j = serde_json::json!({
+                    "cycle": "Y",
+                    "model": "neural-asset-echo-pqw",
+                    "op": "emit",
+                    "kind": "texture",
+                    "in": in_path.display().to_string(),
+                    "out": out_path.display().to_string(),
+                    "out_bytes": out_bytes,
+                    "w": img.w,
+                    "h": img.h,
+                    "tiles": rep.tiles,
+                    "start_proto": rep.start_proto,
+                    "seed": rep.seed,
+                    "psnr_db": psnr_v,
+                    "histogram_distance": hist_v,
+                    "elapsed_ms": elapsed,
+                });
+                CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
+            } else {
+                CmdResult::Done(format!(
+                    "Y «Эхо»: текстура сгенерирована с нуля (блуждание по синапсам)\n  текстура  : {} ({}×{}, {}×{} тайлов, {} Б)\n  граф      : старт-прототип {} · seed 0x{:X} (бит-в-бит при повторе){cmp_txt}\n  время     : {} мс",
+                    out_path.display(),
+                    img.w,
+                    img.h,
+                    rep.tiles.0,
+                    rep.tiles.1,
+                    out_bytes,
+                    rep.start_proto,
+                    rep.seed,
+                    elapsed,
+                ))
+            }
+        }
     }
 }
 
@@ -6755,4 +7151,158 @@ mod tests {
             _ => panic!(),
         }
     }
+
+    #[test]
+    fn cmd_game_asset_audio_absorb_emit() {
+        use crate::game::asset as ya;
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-ya1.db"));
+        // Готовый звук: две несущие + шум (3 с, стерео).
+        let mut rng = crate::ssn::rng::Rng::new(42);
+        let mut samples = Vec::new();
+        for i in 0..22050 * 3 {
+            let t = i as f64 / 22050.0;
+            let v = 0.30 * (2.0 * std::f64::consts::PI * 220.0 * t).sin()
+                + 0.20 * (2.0 * std::f64::consts::PI * 1500.0 * t).sin()
+                + 0.10 * (rng.f64() * 2.0 - 1.0);
+            let v = (v * 0.5) as f32;
+            samples.push(v);
+            samples.push(v);
+        }
+        let wav_path = "/tmp/poler_y_shell_in.wav";
+        ya::write_wav(std::path::Path::new(wav_path), 22050, 2, &samples).unwrap();
+        let pqw_path = "/tmp/poler_y_shell_in.pqw";
+        let gen_path = "/tmp/poler_y_shell_out.wav";
+        // ABSORB: впитать в нейроны.
+        let cmd = format!("game asset absorb --in {wav_path} --out {pqw_path} --json");
+        let out = match dispatch(&mut s, &cmd) {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        let j: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(j["cycle"], "Y");
+        assert_eq!(j["model"], "neural-asset-echo-pqw");
+        assert_eq!(j["kind"], "audio");
+        assert_eq!(j["fs"], 22050);
+        assert!(j["synapses"].as_u64().unwrap() > 50, "{j}");
+        assert!(j["container_bytes"].as_u64().unwrap() < 8192, "{j}");
+        assert!(j["ratio"].as_f64().unwrap() > 50.0, "{j}");
+        // EMIT: сгенерировать с нуля + сравнение с входом.
+        let cmd2 = format!(
+            "game asset emit --in {pqw_path} --out {gen_path} --seconds 2 --compare {wav_path} --json"
+        );
+        let out2 = match dispatch(&mut s, &cmd2) {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        let j2: serde_json::Value = serde_json::from_str(&out2).expect("JSON");
+        assert_eq!(j2["kind"], "audio");
+        assert_eq!(j2["fs"], 22050);
+        assert_eq!(j2["vortex_neurons"], 600);
+        assert!(j2["vortex_steps"].as_u64().unwrap() > 80, "{j2}");
+        assert!(j2["bursts"].as_u64().unwrap() > 0, "{j2}");
+        assert!(j2["psd_distance_db"].as_f64().unwrap() < 6.0, "{j2}");
+        let hash = j2["audio_hash"].as_str().unwrap().to_string();
+        // Детерминизм: seed из содержимого PQW — хеш тот же.
+        let out3 = match dispatch(&mut s, &cmd2) {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        let j3: serde_json::Value = serde_json::from_str(&out3).unwrap();
+        assert_eq!(j3["audio_hash"].as_str().unwrap(), hash, "недетерминизм emit");
+        // Валидация аргументов и входов.
+        match dispatch(&mut s, "game asset") {
+            CmdResult::Done(o) => assert!(o.contains("absorb|emit"), "{o}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game asset absorb --in /nope.wav --out /nope.pqw") {
+            CmdResult::Done(o) => assert!(o.contains("absorb:"), "{o}"),
+            _ => panic!(),
+        }
+        match dispatch(
+            &mut s,
+            &format!("game asset emit --in {pqw_path} --out /tmp/x.wav --seconds 900"),
+        ) {
+            CmdResult::Done(o) => assert!(o.contains("0.5..=600"), "{o}"),
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(wav_path);
+        let _ = std::fs::remove_file(pqw_path);
+        let _ = std::fs::remove_file(gen_path);
+    }
+
+    #[test]
+    fn cmd_game_asset_texture_absorb_emit() {
+        use crate::game::asset as ya;
+        let mut s = ShellState::new(PathBuf::from("/tmp/test-ya2.db"));
+        // Готовая текстура: fBm-мрамор 64×64 (наш PNG-энкодер, stored-блоки).
+        let mut gray = vec![0u8; 64 * 64];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                gray[y * 64 + x] = (crate::game::texture::fbm(
+                    x as f64 / 8.0,
+                    y as f64 / 8.0,
+                    42,
+                    3,
+                    0.5,
+                ) * 255.0)
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+        let in_path = "/tmp/poler_y_shell_tex.png";
+        crate::p3::png::encode_gray(std::path::Path::new(in_path), 64, 64, &gray).unwrap();
+        let pqw_path = "/tmp/poler_y_shell_tex.pqw";
+        let gen_path = "/tmp/poler_y_shell_tex_out.png";
+        let cmd = format!("game asset absorb --in {in_path} --out {pqw_path} --json");
+        let out = match dispatch(&mut s, &cmd) {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        let j: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(j["kind"], "texture");
+        assert_eq!(j["protos"], 32);
+        assert_eq!(j["svd_rank"], 12);
+        assert_eq!(j["tiles"], 16);
+        assert!(j["synapses"].as_u64().unwrap() > 0, "{j}");
+        // EMIT: блуждание по графу + сравнение с входом.
+        let cmd2 = format!(
+            "game asset emit --in {pqw_path} --out {gen_path} --width 64 --height 64 --compare {in_path} --json"
+        );
+        let out2 = match dispatch(&mut s, &cmd2) {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        let j2: serde_json::Value = serde_json::from_str(&out2).expect("JSON");
+        assert_eq!(j2["kind"], "texture");
+        assert_eq!(j2["w"], 64);
+        assert_eq!(j2["h"], 64);
+        assert_eq!(j2["tiles"][0], 4);
+        assert!(j2["psnr_db"].as_f64().unwrap() > 8.0, "{j2}");
+        assert!(j2["histogram_distance"].as_f64().unwrap() < 0.3, "{j2}");
+        // Детерминизм: файлы бит-в-бит.
+        let out3 = match dispatch(&mut s, &cmd2) {
+            CmdResult::Done(o) => o,
+            _ => panic!(),
+        };
+        let j3: serde_json::Value = serde_json::from_str(&out3).unwrap();
+        assert_eq!(j2["seed"], j3["seed"]);
+        let first = std::fs::read(gen_path).unwrap();
+        let second = std::fs::read(gen_path).unwrap();
+        assert_eq!(first, second);
+        // Апскейл: ×2 без нового контейнера.
+        let cmd4 = format!(
+            "game asset emit --in {pqw_path} --out {gen_path} --width 128 --height 128 --json"
+        );
+        match dispatch(&mut s, &cmd4) {
+            CmdResult::Done(o) => {
+                let j4: serde_json::Value = serde_json::from_str(&o).expect("JSON");
+                assert_eq!(j4["w"], 128);
+                assert_eq!(j4["h"], 128);
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(in_path);
+        let _ = std::fs::remove_file(pqw_path);
+        let _ = std::fs::remove_file(gen_path);
+    }
+
 }

@@ -725,7 +725,7 @@ mod tests {
 /// v0.54.0 (цикл S): полная справка Ядра Игры.
 fn game_help_topic() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.60.0) ───");
+    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.61.0) ───");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
@@ -752,6 +752,11 @@ fn game_help_topic() -> String {
     let _ = writeln!(s, "    frames_hash — детерминизм всей цепочки бит-в-бит");
     let _ = writeln!(s, "  game window [opts]         — НАСТОЯЩЕЕ X11-окно (dlopen, zero-dep):");
     let _ = writeln!(s, "    ЛКМ+движение — орбита · колесо — зум · WASD/QE · нужен DISPLAY");
+    let _ = writeln!(s, "  game asset absorb|emit   — Y «Эхо»: готовое → нейроны → PQW → с нуля:");
+    let _ = writeln!(s, "    absorb --in F.(wav|png|pgm|ppm) --out F.pqw");
+    let _ = writeln!(s, "    emit --in F.pqw --out F.(wav|png) [--seconds|--width|--height|");
+    let _ = writeln!(s, "         --seed|--burst|--compare] — SSN-вихрь даёт тайминг,");
+    let _ = writeln!(s, "    синапты — связность; PSD/PSNR/гистограммы — честно");
     let _ = writeln!(s, "  game vortex [opts]        — вихревой кодек «Шеннон-байпас» (V0):");
     let _ = writeln!(s, "    шум = когерентные фазовые вихри (Навье–Стокс, K41): 2D-FFT →");
     let _ = writeln!(s, "    топ-моды → GF(3)-триты (5 трит/байт, 3^5=243≤256) → VRTX;");
