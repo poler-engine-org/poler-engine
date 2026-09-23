@@ -399,4 +399,104 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!((0.0..=std::f64::consts::FRAC_PI_2 as f32 + 1e-4).contains(&maxd));
     }
+
+    /// Цикл W: попиксельное соглашение растеризаторов — Zig-ядро (C-ABI)
+    /// против Rust-близнеца на общих живых фикстурах. Допуски честные:
+    /// libm acos/cos/sin могут отличаться последним ulp, что на границах
+    /// округления пикселей даёт единичные расхождения — но не 1%.
+    #[test]
+    fn ffi_vs_native_render_agreement() {
+        let lib = P3Lib::open().expect("libp3ffi");
+        let mut rng = FixtureRng::new(0x5EED_C0DE);
+        for scene_i in 0..4usize {
+            // Сцена: 8 точек, замкнутый контур + хорды, разные сегменты
+            let n = 8usize;
+            let mut pts = Vec::with_capacity(n * 4);
+            let mut segs = Vec::with_capacity(n);
+            for i in 0..n {
+                pts.extend_from_slice(&[
+                    rng.next_f64(1.0),
+                    rng.next_f64(1.0),
+                    rng.next_f64(0.6),
+                    1.0,
+                ]);
+                segs.push(((i % 9) + 1) as u8);
+            }
+            let mut pairs = Vec::new();
+            for i in 0..n {
+                pairs.push(i as u32);
+                pairs.push(((i + 1) % n) as u32);
+            }
+            pairs.extend_from_slice(&[0u32, 4, 2, 6]); // хорды
+            let (w, h) = (144u32, 108u32);
+            let camera = crate::p3::ffi::Camera {
+                focal: 0.0,
+                cam_dist: 3.4,
+                yaw: -0.62 + 0.41 * scene_i as f64,
+                pitch: 0.34 - 0.17 * scene_i as f64,
+            };
+            let mut z_rgb = vec![0u8; (w * h * 3) as usize];
+            let mut z_depth = vec![0f32; (w * h) as usize];
+            let mut z_seg = vec![0u8; (w * h) as usize];
+            let mut n_rgb = vec![0u8; (w * h * 3) as usize];
+            let mut n_depth = vec![0f32; (w * h) as usize];
+            let mut n_seg = vec![0u8; (w * h) as usize];
+
+            lib.render_frame(&pts, &segs, &pairs, w, h, camera, 2, &mut z_rgb, &mut z_depth, &mut z_seg)
+                .unwrap();
+            native::render_frame_native(
+                &pts,
+                &segs,
+                &pairs,
+                w,
+                h,
+                native::NativeRenderCamera {
+                    focal: camera.focal,
+                    cam_dist: camera.cam_dist,
+                    yaw: camera.yaw,
+                    pitch: camera.pitch,
+                },
+                2,
+                &mut n_rgb,
+                &mut n_depth,
+                &mut n_seg,
+            );
+
+            let pz = z_seg.iter().filter(|&&s| s != 0).count();
+            let pn = n_seg.iter().filter(|&&s| s != 0).count();
+            let tolerance = 4 + ((pz.max(pn) as f64) * 0.02).ceil() as i64;
+            assert!(
+                (pz as i64 - pn as i64).abs() <= tolerance,
+                "scene {scene_i}: painted zig={pz} native={pn} (допуск {tolerance})"
+            );
+
+            let mut both = 0usize;
+            let mut worst_depth = 0.0f32;
+            let mut worst_rgb = 0i32;
+            let mut seg_mismatch = 0usize;
+            for k in 0..(w * h) as usize {
+                if z_seg[k] != 0 && n_seg[k] != 0 {
+                    both += 1;
+                    worst_depth = worst_depth.max((z_depth[k] - n_depth[k]).abs());
+                    for c in 0..3 {
+                        worst_rgb =
+                            worst_rgb.max((z_rgb[k * 3 + c] as i32 - n_rgb[k * 3 + c] as i32).abs());
+                    }
+                    if z_seg[k] != n_seg[k] {
+                        seg_mismatch += 1;
+                    }
+                }
+            }
+            assert!(both > 100, "scene {scene_i}: сцена не нарисована (both={both})");
+            assert!(
+                worst_depth <= 1e-9,
+                "scene {scene_i}: |Δdepth| = {worst_depth:e}"
+            );
+            assert!(worst_rgb <= 2, "scene {scene_i}: |Δrgb| = {worst_rgb}");
+            assert!(
+                seg_mismatch * 100 <= both,
+                "scene {scene_i}: seg-расхождения {seg_mismatch}/{both} > 1%"
+            );
+        }
+    }
 }

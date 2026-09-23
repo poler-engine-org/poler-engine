@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "poler-engine"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "aho-corasick",
  "arboard",
@@ -2535,6 +2535,13 @@ dependencies = [
  "whatlang",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "poler-ffi"
+version = "0.59.0"
+dependencies = [
+ "poler-engine",
 ]
 
 [[package]]

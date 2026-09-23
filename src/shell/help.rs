@@ -725,7 +725,7 @@ mod tests {
 /// v0.54.0 (цикл S): полная справка Ядра Игры.
 fn game_help_topic() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.58.0) ───");
+    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.59.0) ───");
     let _ = writeln!(s);
     let _ = writeln!(
         s,
@@ -761,6 +761,10 @@ fn game_help_topic() -> String {
     let _ = writeln!(s, "    эволюция — целочисленные триты (фикс-точка, без f32-дрейфа),");
     let _ = writeln!(s, "    синтез FFT по требованию, течения — аналитические;");
     let _ = writeln!(s, "    PSNR против f64-эталона, кадры PNG + шейдинг + VRTX");
+    let _ = writeln!(s, "  game panda — мост к Panda3D (W): вода POLER в чужом рендере;");
+    let _ = writeln!(s, "    panda-bridge/ (Python): demo_ocean.py — океан с оптикой GLSL");
+    let _ = writeln!(s, "    (Френель/пена/блик/Беер–Ламберт); libpoler_ffi.so — C-ABI:");
+    let _ = writeln!(s, "    polerf_water_* (тик+FFT+нормали одним вызовом); selftest.py");
     let _ = writeln!(s);
     let _ = writeln!(s, "Честность ядра:");
     let _ = writeln!(s, "  детерминизм: state/audio/crystal/texture/frames/vortex/water-hash бит-в-бит");
@@ -777,6 +781,8 @@ fn game_help_topic() -> String {
     let _ = writeln!(s, "  poler> game input-demo --frames 300 --every 30 --json");
     let _ = writeln!(s, "  poler> game vortex --style all --size 256 --out-dir ./vortex");
     let _ = writeln!(s, "  poler> game water --wind 12 --steps 600 --out-dir ./sea");
+    let _ = writeln!(s, "  полигон Panda3D: pip install panda3d numpy &&");
+    let _ = writeln!(s, "    python3 panda-bridge/demo_ocean.py 10 128");
     let _ = writeln!(s, "  poler-engine --exec \"game demo --json\" --json");
     s
 }

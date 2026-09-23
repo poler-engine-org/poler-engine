@@ -365,3 +365,66 @@ impl Default for Camera {
         }
     }
 }
+
+// =============================================================================
+// АВТО-ВЫБОР КРЕМНИЯ (цикл W): FFI-ядро Zig → Rust-близнец
+// =============================================================================
+
+/// Рендер тройного буфера с честным фолбэком: сначала C-ABI ядро P³ (Zig),
+/// если библиотека не загрузилась (нет файла, чужая архитектура, битая) —
+/// Rust-близнец `native::render_frame_native` (тот же алгоритм, зеркало
+/// p3-engine/src/p3_ffi.zig). Возвращает `true`, если рисовал Zig.
+///
+/// Гарантия: `game demo` / `p3 render` / `game window` больше НЕ падают
+/// из-за проблем с .so — нативный путь всегда доступен в самом бинарнике.
+#[allow(clippy::too_many_arguments)]
+pub fn render_frame_auto(
+    pts: &[f64],
+    seg_ids: &[u8],
+    pairs: &[u32],
+    width: u32,
+    height: u32,
+    camera: Camera,
+    thickness: u32,
+    rgb: &mut [u8],
+    depth: &mut [f32],
+    seg: &mut [u8],
+) -> Result<bool, String> {
+    let n_pts = seg_ids.len();
+    if pts.len() != n_pts * 4 {
+        return Err(format!("pts: нужно {} f64, есть {}", n_pts * 4, pts.len()));
+    }
+    if n_pts == 0 {
+        return Err("рендер: 0 точек".into());
+    }
+    let npix = (width as usize) * (height as usize);
+    if rgb.len() != npix * 3 || depth.len() != npix || seg.len() != npix {
+        return Err("буферы не соответствуют width×height".into());
+    }
+    match P3Lib::open() {
+        Ok(lib) => {
+            lib.render_frame(pts, seg_ids, pairs, width, height, camera, thickness, rgb, depth, seg)?;
+            Ok(true)
+        }
+        Err(_) => {
+            super::native::render_frame_native(
+                pts,
+                seg_ids,
+                pairs,
+                width,
+                height,
+                super::native::NativeRenderCamera {
+                    focal: camera.focal,
+                    cam_dist: camera.cam_dist,
+                    yaw: camera.yaw,
+                    pitch: camera.pitch,
+                },
+                thickness,
+                rgb,
+                depth,
+                seg,
+            );
+            Ok(false)
+        }
+    }
+}

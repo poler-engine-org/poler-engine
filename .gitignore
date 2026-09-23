@@ -20,3 +20,7 @@ os/core/.zig-cache/
 # FlyWire v783: сырые исходники Zenodo (1.1 ГБ) — вне git, см. docs/flywire-connectome/README.md
 docs/flywire-connectome/raw/
 scripts/shannon_bypass/native_pc_scripts/litgraph_eteryya/results/
+
+# P³ Engine (vendored): артефакты сборки Zig
+/p3-engine/zig-out/
+/p3-engine/.zig-cache/

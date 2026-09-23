@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use super::scene::CameraSpec;
 use super::world::{BodyClass, World};
-use crate::p3::ffi::{Camera, P3Lib};
+use crate::p3::ffi::Camera;
 
 /// Параметры кадра игрового мира.
 #[derive(Clone, Debug)]
@@ -331,8 +331,7 @@ pub fn render_raw(world: &World, cfg: &FrameConfig) -> Result<RawFrame, String> 
     let scene = extract(world, cfg.render_orbits);
     let n_points = scene.segs.len();
 
-    // --- 2. Рендер через C-ABI в ядро P³ ---
-    let lib = P3Lib::open()?;
+    // --- 2. Рендер: FFI-ядро Zig → (фолбэк) Rust-близнец ---
     let npix = cfg.width as usize * cfg.height as usize;
     let mut rgb = vec![0u8; npix * 3];
     let mut depth = vec![0f32; npix];
@@ -345,7 +344,7 @@ pub fn render_raw(world: &World, cfg: &FrameConfig) -> Result<RawFrame, String> 
         yaw: cfg.camera.yaw,
         pitch: cfg.camera.pitch,
     };
-    lib.render_frame(
+    crate::p3::ffi::render_frame_auto(
         &scene.pts,
         &scene.segs,
         &scene.pairs,

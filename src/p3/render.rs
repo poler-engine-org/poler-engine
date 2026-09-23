@@ -398,13 +398,12 @@ pub fn render_hamiltonian_frame(cfg: &FrameConfig) -> Result<FrameOutput, String
     let scene = build_scene(cfg.n_qubits, cfg.cloud_top, &states);
     let n_points = scene.segs.len();
 
-    // --- 4. Рендер через C-ABI в ядро P³ (Zig) ---
-    let lib = P3Lib::open()?;
+    // --- 4. Рендер: FFI-ядро Zig → (фолбэк) Rust-близнец ---
     let npix = cfg.width as usize * cfg.height as usize;
     let mut rgb = vec![0u8; npix * 3];
     let mut depth = vec![0f32; npix];
     let mut seg = vec![0u8; npix];
-    lib.render_frame(
+    crate::p3::ffi::render_frame_auto(
         &scene.pts,
         &scene.segs,
         &scene.pairs,

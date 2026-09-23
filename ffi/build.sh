@@ -2,18 +2,15 @@
 # =============================================================================
 # build.sh — пересборка libp3ffi.so (C-ABI мост P³ → POLER ENGINE)
 # =============================================================================
-# Цикл R (v0.53.0). Требования: Zig 0.14.0 (https://ziglang.org/download/0.14.0),
-# исходники P³ Engine (git clone …; см. P3_FFI_SRC ниже).
+# Цикл W (v0.59.0). Исходники P³ Engine ВЕНДОРЕНЫ в репозиторий:
+#   p3-engine/src/p3_ffi.zig  — C-ABI слой (цикл W, восстановлен)
+#   p3-engine/src/*.zig       — ядро P³ (59 модулей, апстрим Kotokvit/P3_Engine)
+#
+# СБОРКА ЦЕЛИ БАЗОВЫЙ x86-64 (SSE2) — никакой AVX2/SIGILL на Ivy Bridge.
 #
 # Использование:
-#   ./ffi/build.sh [путь_к_P3_Engine]          # сборка ReleaseFast + копия сюда
-#   P3_FFI_SRC=/path/to/P3_Engine ./ffi/build.sh
-#
-# Что делает:
-#   1. zig build p3-ffi -Doptimize=ReleaseFast  (в P3_Engine)
-#   2. Копирует zig-out/lib/libp3ffi.so → ffi/libp3ffi-linux-x86_64.so
-#      (эта копия коммитится: Rust-тесты и `p3 conformance` работают
-#      без локального P3_Engine)
+#   ./ffi/build.sh                          # vendored p3-engine/ (по умолчанию)
+#   ZIG=/путь/zig ./ffi/build.sh            # свой тулчейн Zig 0.14.0
 #
 # Результат проверяется живым рукопожатием:
 #   poler-engine --exec "p3 info"
@@ -22,7 +19,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-P3_SRC="${1:-${P3_FFI_SRC:-/home/z/my-project/P3_Engine}}"
+P3_SRC="${1:-${P3_FFI_SRC:-$HERE/../p3-engine}}"
 ZIG="${ZIG:-zig}"
 
 if ! command -v "$ZIG" >/dev/null 2>&1; then
@@ -37,12 +34,12 @@ if [ "$ZIG_VER" != "0.14.0" ]; then
 fi
 
 if [ ! -f "$P3_SRC/src/p3_ffi.zig" ]; then
-    echo "❌ $P3_SRC/src/p3_ffi.zig не найден. Передайте путь к P3_Engine:" >&2
+    echo "❌ $P3_SRC/src/p3_ffi.zig не найден. Передайте путь:" >&2
     echo "   ./ffi/build.sh /путь/к/P3_Engine" >&2
     exit 1
 fi
 
-echo "▸ Сборка libp3ffi.so (ReleaseFast) из $P3_SRC"
+echo "▸ Сборка libp3ffi.so (ReleaseFast, x86-64 baseline SSE2) из $P3_SRC"
 ( cd "$P3_SRC" && "$ZIG" build p3-ffi -Doptimize=ReleaseFast )
 
 echo "▸ Самопроверка FFI (zig build test-ffi)"
@@ -51,5 +48,10 @@ echo "▸ Самопроверка FFI (zig build test-ffi)"
 echo "▸ Копирование в $HERE/libp3ffi-linux-x86_64.so"
 cp "$P3_SRC/zig-out/lib/libp3ffi.so" "$HERE/libp3ffi-linux-x86_64.so"
 
-echo "✅ Готово. Проверка из poler-engine:"
+echo "▸ Проверка: ни одной AVX2-инструкции (ymm)"
+if objdump -d "$HERE/libp3ffi-linux-x86_64.so" 2>/dev/null | grep -q 'ymm'; then
+    echo "❌ НАЙДЕНЫ ymm-инструкции — .so упадёт SIGILL на старых CPU!" >&2
+    exit 1
+fi
+echo "✅ Чисто: базовый x86-64. Проверка из poler-engine:"
 echo "   poler-engine --exec 'p3 info'"
