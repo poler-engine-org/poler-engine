@@ -32,6 +32,7 @@ use std::f64::consts::{PI, TAU};
 // Детерминированный RNG (SplitMix64) — свой, суверенный
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
 pub struct Rng(u64);
 
 impl Rng {
@@ -57,6 +58,11 @@ impl Rng {
         let u1 = self.next_f64().max(1e-300);
         let u2 = self.next_f64();
         (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
+    }
+
+    /// Текущее состояние (для хэшей детерминизма и сайдкаров).
+    pub fn state(&self) -> u64 {
+        self.0
     }
 }
 

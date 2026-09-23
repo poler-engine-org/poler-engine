@@ -1442,11 +1442,13 @@ fn cmd_game_vortex(args: &[String]) -> CmdResult {
 }
 
 // ---------------------------------------------------------------------------
-// v0.58.0 (цикл V1): вода — спектральная гидродинамика
+// v0.60.0 (цикл X): обрушение — нелинейная спектральная гидродинамика
 // ---------------------------------------------------------------------------
 
 /// `game water` — море как спектр волн: генерация → целочисленная эволюция →
 /// честный зачёт против f64-эталона + артефакты (PNG-кадры, шейдинг, VRTX).
+/// Цикл X: 2-я гармоника Стокса, снос гребней (Мичелл), белые барашки
+/// (Бофорт) и вихри Ламб–Озеена — первое ротационное поле движка.
 fn cmd_game_water(args: &[String]) -> CmdResult {
     use crate::game::vortex;
     use crate::game::water::{self, WaterParams};
@@ -1462,6 +1464,8 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
     let mut dt: f64 = 1.0 / 60.0;
     let mut amp_trits: u32 = 6;
     let mut phase_trits: u32 = 6;
+    let mut nonlinear: bool = true;
+    let mut steepness_break: f64 = 0.32;
     let mut out_dir: Option<std::path::PathBuf> = None;
     let mut as_json = false;
 
@@ -1526,6 +1530,13 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
         }
         phase_trits = v;
     }
+    if let Ok(v) = q_flag_num::<f64>(args, "--steepness", steepness_break) {
+        if !(0.05..=0.60).contains(&v) {
+            return CmdResult::Done("game water: --steepness S — 0.05..=0.60 (лимит Мичелла)".into());
+        }
+        steepness_break = v;
+    }
+    nonlinear &= !q_flag(args, "--linear");
     if let Some(i) = args.iter().position(|a| a == "--out-dir") {
         match args.get(i + 1) {
             Some(v) => out_dir = Some(std::path::PathBuf::from(v.clone())),
@@ -1543,6 +1554,8 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
         viscosity,
         amp_trits,
         phase_trits,
+        nonlinear,
+        steepness_break,
         ..Default::default()
     };
     if let Err(e) = p.validate() {
@@ -1661,9 +1674,9 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
             frames.push("water_shaded.png".into());
         }
         let j = serde_json::json!({
-            "cycle": "V1",
-            "model": "spectral-water-gf3",
-            "idea": "вода = когерентный фазовый спектр (K41); эволюция — целочисленные триты, синтез по требованию",
+            "cycle": "X",
+            "model": "spectral-water-gf3-nonlinear",
+            "idea": "вода = когерентный фазовый спектр (K41); эволюция — целочисленные триты; обрушение гребней — Стокс/Мичелл/Бофорт/Ламб–Озеен",
             "physics": {
                 "gravity_m_s2": p.gravity,
                 "capillary_m3_s2": p.capillary,
@@ -1671,6 +1684,9 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
                 "wind_m_s": wind,
                 "tau_wind_s": tau_wind,
                 "domain_m": p.domain,
+                "nonlinear": nonlinear,
+                "steepness_break": p.steepness_break,
+                "whitecap_onset_m_s": p.whitecap_onset,
             },
             "params": {
                 "n": n,
@@ -1695,6 +1711,9 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
                 "hs_pm_m": hs_pm,
                 "water_hash": format!("0x{:016X}", water_hash),
                 "field_hash": format!("0x{:016X}", field_hash),
+                "breakers_spawned": w.spawned_total,
+                "breakers_alive": w.breakers.len(),
+                "heat_dissipated": w.heat_fp as f64 / 4294967296.0,
                 "frames": frames,
                 "vrtx": if out_dir.is_some() { "water.vrtx" } else { "" },
             },
@@ -1702,17 +1721,18 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
         CmdResult::Done(serde_json::to_string_pretty(&j).unwrap_or_default())
     } else {
         let mut out = String::from(
-            "V1 «Вода» — спектральная гидродинамика: состояние = спектр волн, эволюция = триты на кремнии\n  (разбор «OpenAI решила задачу»: без плотных f32-сеток Re^(9/4) и без brute force)\n",
+            "X «Обрушение» — нелинейная спектральная гидродинамика: Стокс 2-го порядка, Мичелл, Бофорт, Ламб–Озеен\n  (то, что OpenAI решала тераваттами брут-форсом — здесь целочисленный спектр)\n",
         );
         out.push_str(&format!(
-            "  физика   : ω(k)=√(g·k+γ·k³) · K41 A(k)∝k^(−5/6) · Ламб e^(−2νk²t) · окно ветра k_p=g/v²\n"
+            "  физика   : ω(k)=√(g·k+γ·k³)·(1+(kA)²/2) · K41 · Ламб e^(−2νk²t) · h₂=(kA²/2)cos2θ · s_b={steepness_break:.2}\n"
         ));
         out.push_str(&format!(
             "  море     : {n}×{n} ({domain:.0} м) · {modes} мод · ветер {wind} м/с · H_s {hs:.2} м (PM {hs_pm:.2})\n",
             domain = p.domain
         ));
         out.push_str(&format!(
-            "  шаг      : {steps} × {dt:.4} с → {step_ns} нс/шаг ({modes} целочисленных операций; фаза — фикс-точка без дрейфа)\n"
+            "  шаг      : {steps} × {dt:.4} с → {step_ns} нс/шаг (фаза — фикс-точка без дрейфа; нелинейность: {})\n",
+            if nonlinear { "вкл" } else { "выкл (--linear)" }
         ));
         out.push_str(&format!(
             "  память   : состояние {} Б (VRTX) против {} Б f32-сетки — ×{mem_ratio:.0}\n",
@@ -1720,10 +1740,16 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
             grid_bytes
         ));
         out.push_str(&format!(
-            "  синтез   : {synth_ns} нс FFT {n}² · запросы геймплея O(K): height_at / flow_at / surface_at\n"
+            "  синтез   : {synth_ns} нс FFT {n}² + 2-е гармоники + штампы барашков · surface_at O(K)\n"
         ));
         out.push_str(&format!(
             "  верность : PSNR {psnr:.1} dB против f64-эталона (те же уравнения, без квантования)\n"
+        ));
+        out.push_str(&format!(
+            "  обрушение: событий {} · живых вихрей {} · тепло {heat:.4} Дж/м² (бухгалтерия закрыта)\n",
+            w.spawned_total,
+            w.breakers.len(),
+            heat = w.heat_fp as f64 / 4294967296.0
         ));
         out.push_str(&format!(
             "  энергия  : дисперсия {variance:.4} м² (цель {vt:.4}) · хеши: вода 0x{water_hash:016X} · поле 0x{field_hash:016X}\n",
@@ -1735,9 +1761,15 @@ fn cmd_game_water(args: &[String]) -> CmdResult {
                 dir.display()
             ));
         }
-        out.push_str(
-            "  честность : линейный режим — обрушения гребней и вихревое растяжение не моделируются",
-        );
+        if nonlinear {
+            out.push_str(
+                "  честность : барашки — наблюдательный триггер Бофорта; вихрь и след — честная физика (тесты: циркуляция, дрейф Стокса, Ламб–Озеен)",
+            );
+        } else {
+            out.push_str(
+                "  честность : линейный режим (--linear) — обрушения и вихри выключены",
+            );
+        }
         CmdResult::Done(out)
     }
 }
@@ -5973,7 +6005,7 @@ mod tests {
         }
     }
 
-    // v0.58.0 (цикл V1): спектральная вода
+    // v0.60.0 (цикл X): нелинейная вода — Стокс/Мичелл/Бофорт/Ламб–Озеен
     #[test]
     fn cmd_game_water_json_determinism_and_validation() {
         let mut s = ShellState::new(PathBuf::from("/tmp/test-v1a.db"));
@@ -5983,11 +6015,15 @@ mod tests {
             _ => panic!(),
         };
         let j: serde_json::Value = serde_json::from_str(&first).expect("JSON");
-        assert_eq!(j["cycle"], "V1");
-        assert_eq!(j["model"], "spectral-water-gf3");
+        assert_eq!(j["cycle"], "X");
+        assert_eq!(j["model"], "spectral-water-gf3-nonlinear");
         assert_eq!(j["params"]["n"], 64);
         assert_eq!(j["params"]["micro_trits"], 3);
+        // Цикл X: нелинейность в конфиге и отчёт об обрушении.
+        assert_eq!(j["physics"]["nonlinear"], true);
         let r = &j["results"];
+        assert!(r["breakers_spawned"].as_u64().is_some(), "{r}");
+        assert!(r["heat_dissipated"].as_f64().unwrap() >= 0.0, "{r}");
         // Честная верность квантования и компактность состояния.
         assert!(r["psnr_db"].as_f64().unwrap() > 25.0, "{r}");
         assert!(r["state_bytes"].as_u64().unwrap() > 31, "{r}");
@@ -6028,6 +6064,18 @@ mod tests {
         }
         match dispatch(&mut s, "game water --viscosity 99") {
             CmdResult::Done(out) => assert!(out.contains("1e-8..=1e-1"), "{out}"),
+            _ => panic!(),
+        }
+        match dispatch(&mut s, "game water --steepness 9") {
+            CmdResult::Done(out) => assert!(out.contains("0.05..=0.60"), "{out}"),
+            _ => panic!(),
+        }
+        // Линейный режим: флаг выключает нелинейность.
+        match dispatch(&mut s, "game water --size 64 --modes 8 --steps 5 --linear --json") {
+            CmdResult::Done(out) => {
+                let jl: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                assert_eq!(jl["physics"]["nonlinear"], false);
+            }
             _ => panic!(),
         }
         match dispatch(&mut s, "game water --dt 5") {

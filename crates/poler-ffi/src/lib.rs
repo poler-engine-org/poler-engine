@@ -1,6 +1,6 @@
 //! # poler-ffi — C-ABI слой POLER ENGINE для внешних рендереров
 //!
-//! Цикл W «Симбиоз» (v0.59.0). Это КРЕМНИЙ ФИЗИКИ для Panda3D / Godot /
+//! Цикл W «Симбиоз» (v0.59.0) → X «Обрушение» (v0.60.0): 2-е гармоники Стокса в осцилляторе нормалей.. Это КРЕМНИЙ ФИЗИКИ для Panda3D / Godot /
 //! O3DE / любого движка, умеющего ctypes/cffi/C-линковку:
 //!
 //! ```text
@@ -54,7 +54,7 @@ fn version_cstr() -> &'static std::ffi::CString {
 // 1. РУКОПОЖАТИЕ
 // =============================================================================
 
-/// Строка версии и ABI: "poler-ffi 0.59.0 (water GF(3)/Panda3D bridge, abi 1)".
+/// Строка версии и ABI: "poler-ffi 0.60.0 (water GF(3)/Panda3D bridge, abi 1)".
 #[no_mangle]
 pub extern "C" fn polerf_version() -> *const c_char {
     version_cstr().as_ptr()
@@ -255,7 +255,9 @@ pub unsafe extern "C" fn polerf_water_geometries_f32(
     }
 
     // --- нормали: спектральный осциллятор ---
-    // прекомпьют мод: (a, ph, a·kx, a·ky, ky, cd, sd) — один powf на моду
+    // прекомпьют мод: (a, ph, a·kx, a·ky, ky, cd, sd) — один powf на моду;
+    // цикл X: + 2-я гармоника Стокса (a₂, 2φ, двойной угол поворота) —
+    // тот же вклад, что в surface_at (окно вторых гармоник движка).
     struct MO {
         ph: f64,
         ky: f64,
@@ -263,16 +265,31 @@ pub unsafe extern "C" fn polerf_water_geometries_f32(
         aky: f64,
         cd: f64,
         sd: f64,
+        // 2-я гармоника: th2 = 2·k·x + 2·ky·y + 2φ.
+        has2: bool,
+        ph2: f64,
+        ky2: f64,
+        akx2: f64,
+        aky2: f64,
+        cd2: f64,
+        sd2: f64,
     }
     let step = w.domain / n as f64;
+    let win = w.sea.second_window();
     let modes: Vec<MO> = w
         .sea
         .modes
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(i, m)| {
             let a = w.sea.amplitude(m);
             // sin_cos() → (sin, cos): sd — синус шага, cd — косинус шага
             let (sd, cd) = (m.kx_phys * step).sin_cos();
+            let (a2, phi2) = win
+                .and_then(|win| w.sea.second_of(i, win))
+                .unwrap_or((0.0, 0.0));
+            let has2 = a2 != 0.0;
+            let (sd2, cd2) = (2.0 * m.kx_phys * step).sin_cos();
             MO {
                 ph: w.sea.phase(m),
                 ky: m.ky_phys,
@@ -280,6 +297,13 @@ pub unsafe extern "C" fn polerf_water_geometries_f32(
                 aky: a * m.ky_phys,
                 cd,
                 sd,
+                has2,
+                ph2: phi2,
+                ky2: 2.0 * m.ky_phys,
+                akx2: 2.0 * a2 * m.kx_phys,
+                aky2: 2.0 * a2 * m.ky_phys,
+                cd2,
+                sd2,
             }
         })
         .collect();
@@ -295,12 +319,26 @@ pub unsafe extern "C" fn polerf_water_geometries_f32(
         for m in &modes {
             // sin_cos() → (sin, cos): s — синус, c — косинус!
             let (mut s, mut c) = (m.ph + m.ky * y).sin_cos();
+            let (mut s2, mut c2) = if m.has2 {
+                (m.ph2 + m.ky2 * y).sin_cos()
+            } else {
+                (0.0, 1.0)
+            };
             for i in 0..n {
                 gx[i] -= m.akx * s;
                 gy[i] -= m.aky * s;
-                let c2 = c * m.cd - s * m.sd;
+                if m.has2 {
+                    gx[i] -= m.akx2 * s2;
+                    gy[i] -= m.aky2 * s2;
+                }
+                let c2r = c * m.cd - s * m.sd;
                 s = s * m.cd + c * m.sd;
-                c = c2;
+                c = c2r;
+                if m.has2 {
+                    let c2n = c2 * m.cd2 - s2 * m.sd2;
+                    s2 = s2 * m.cd2 + c2 * m.sd2;
+                    c2 = c2n;
+                }
             }
         }
         for i in 0..n {
