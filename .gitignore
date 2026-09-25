@@ -24,3 +24,15 @@ scripts/shannon_bypass/native_pc_scripts/litgraph_eteryya/results/
 # P³ Engine (vendored): артефакты сборки Zig
 /p3-engine/zig-out/
 /p3-engine/.zig-cache/
+
+.local/
+node_modules/
+scripts/node_modules/
+build/
+integrations/*/build/
+chatglm3-6b-int4-parts/
+corpus_extracted/
+*.t5c
+*.poler
+
+docs/FULL_CHAT_SESSION.md

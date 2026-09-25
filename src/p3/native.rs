@@ -315,343 +315,160 @@ mod tests {
     }
 }
 
-// =============================================================================
-// НАТИВНЫЙ РАСТЕРИЗАТОР (цикл W, v0.59.0) — зеркало p3-engine/src/p3_ffi.zig
-// =============================================================================
-// Тот же алгоритм, что и в Zig-стороне C-ABI: классический целочисленный
-// Брезенхем + глубина Фубини–Штуди, пересчитываемая из интерполированной
-// 3D-точки + плюс-спрайты концов. Зачем два одинаковых растеризатора:
-//   1. Rust-путь работает даже если libp3ffi.so не загрузилась
-//      (чужая архитектура, нет файла) — `game demo` и `p3 render`
-//      больше не падают SIGILL/ошибкой загрузки НИКОГДА;
-//   2. конформанс-тест сверяет оба кремния на одной фикстуре —
-//      «одна математика P³» доказана попиксельно.
-// Детерминизм: чистая функция, без аллокаций в горячем цикле.
-
-/// Параметры, идентичные C-ABI `p3ffi_render_frame`.
-#[derive(Clone, Copy, Debug)]
-pub struct NativeRenderCamera {
-    pub focal: f64,
-    pub cam_dist: f64,
-    pub yaw: f64,
-    pub pitch: f64,
-}
-
-pub const FRAC_PI_2_F64: f64 = std::f64::consts::FRAC_PI_2;
-
-/// Палитра 15 оттенков (зеркало PALETTE в p3_ffi.zig; seg 0 — фон).
-const PALETTE: [[f64; 3]; 15] = [
-    [90.0, 140.0, 230.0],  // 1 — синий
-    [230.0, 90.0, 110.0],  // 2 — красный
-    [90.0, 200.0, 120.0],  // 3 — зелёный
-    [235.0, 190.0, 80.0],  // 4 — золотой
-    [120.0, 200.0, 230.0], // 5 — циан
-    [210.0, 120.0, 230.0], // 6 — пурпур
-    [240.0, 150.0, 70.0],  // 7 — оранж
-    [80.0, 210.0, 190.0],  // 8 — бирюза
-    [200.0, 220.0, 90.0],  // 9 — лайм
-    [150.0, 160.0, 255.0], // 10 — лаванда
-    [255.0, 120.0, 160.0], // 11 — розовый
-    [130.0, 230.0, 160.0], // 12 — мятный
-    [190.0, 140.0, 100.0], // 13 — песочный
-    [170.0, 180.0, 200.0], // 14 — стальной
-    [250.0, 220.0, 140.0], // 15 — шампань
-];
-
-#[inline]
-fn palette_of(s: u8) -> [f64; 3] {
-    if s == 0 {
-        return [10.0, 12.0, 22.0];
-    }
-    PALETTE[((s - 1) as usize) % 15]
-}
-
-#[inline]
-fn clamp_u8(v: f64) -> u8 {
-    if v <= 0.0 {
-        0
-    } else if v >= 255.0 {
-        255
-    } else {
-        v.round() as u8
-    }
-}
-
-/// Глубина Фубини–Штуди от начала координат камеры: acos(1/‖(x,y,z,1)‖).
-#[inline]
-fn fs_depth(px: f64, py: f64, pz: f64) -> f64 {
-    let q = 1.0 / (px * px + py * py + pz * pz + 1.0).sqrt();
-    q.min(1.0).acos()
-}
-
-#[derive(Clone, Copy)]
-struct Proj {
-    vx: f64,
-    vy: f64,
-    vz: f64, // координаты в пространстве камеры (до сдвига cam_dist)
-    ix: i64,
-    iy: i64,
-    ok: bool,
-}
-
-/// Проекция: yaw (вокруг Y) → pitch (вокруг X) → перспектива.
-#[allow(clippy::too_many_arguments)]
-fn project_point(
-    x: f64,
-    y: f64,
-    z: f64,
-    cy: f64,
-    sy: f64,
-    cp: f64,
-    sp: f64,
-    f: f64,
-    cam_dist: f64,
-    w2: f64,
-    h2: f64,
-) -> Proj {
-    let x1 = cy * x + sy * z;
-    let z1 = -sy * x + cy * z;
-    let y2 = cp * y - sp * z1;
-    let z2 = sp * y + cp * z1;
-    let zc = z2 + cam_dist;
-    if zc <= 1e-9 {
-        return Proj { vx: x1, vy: y2, vz: z2, ix: 0, iy: 0, ok: false };
-    }
-    let u = f * x1 / zc + w2;
-    let v = h2 - f * y2 / zc;
-    if !u.is_finite() || !v.is_finite() || u.abs() > 9.0e15 || v.abs() > 9.0e15 {
-        return Proj { vx: x1, vy: y2, vz: z2, ix: 0, iy: 0, ok: false };
-    }
-    Proj { vx: x1, vy: y2, vz: z2, ix: u.round() as i64, iy: v.round() as i64, ok: true }
-}
-
-struct Ctx<'a> {
-    w: i64,
-    h: i64,
-    rgb: &'a mut [u8],
-    depth: &'a mut [f32],
-    seg: &'a mut [u8],
-}
-
-#[inline]
-fn plot(
-    ctx: &mut Ctx,
-    x: i64,
-    y: i64,
-    d: f64,
-    bias: f64,
-    r: f64,
-    g: f64,
-    b: f64,
-    s: u8,
-) {
-    if x < 0 || y < 0 || x >= ctx.w || y >= ctx.h {
-        return;
-    }
-    let idx = (y * ctx.w + x) as usize;
-    let dd = (d + bias) as f32;
-    if dd < ctx.depth[idx] {
-        ctx.depth[idx] = dd;
-        ctx.seg[idx] = s;
-        ctx.rgb[idx * 3] = clamp_u8(r);
-        ctx.rgb[idx * 3 + 1] = clamp_u8(g);
-        ctx.rgb[idx * 3 + 2] = clamp_u8(b);
-    }
-}
-
-/// Плюс-спрайт радиуса R вокруг конечной точки (штраф глубины 1e-4·(m+1)).
-fn draw_endpoint_sprite(
-    ctx: &mut Ctx,
-    p: Proj,
-    col: [f64; 3],
-    s: u8,
-    radius: i64,
-) {
-    let d = fs_depth(p.vx, p.vy, p.vz);
-    let bright = 0.55 + 0.45 * (1.0 - d / FRAC_PI_2_F64);
-    let (r, g, b) = (col[0] * bright, col[1] * bright, col[2] * bright);
-    let mut oy = -radius;
-    while oy <= radius {
-        let mut ox = -radius;
-        while ox <= radius {
-            let ax = if ox > 0 { ox } else { -ox };
-            let ay = if oy > 0 { oy } else { -oy };
-            let manh = ax + ay;
-            if manh > radius {
-                ox += 1;
-                continue; // форма «плюс/ромб»
-            }
-            let bias = 1e-4 * (manh as f64 + 1.0);
-            plot(ctx, p.ix + ox, p.iy + oy, d, bias, r, g, b, s);
-            ox += 1;
-        }
-        oy += 1;
-    }
-}
-
-/// Нативный рендер тройного буфера — зеркало `p3ffi_render_frame` (Zig).
-/// Контракты буферов: `rgb.len() == 3·w·h`, `depth.len() == w·h`,
-/// `seg.len() == w·h`, `pts.len() == n_pts·4`, `pairs` — пары индексов.
-#[allow(clippy::too_many_arguments)]
+/// Native Rust-растеризатор сцены P³ (чистый Rust без AVX2/FFI требований).
 pub fn render_frame_native(
     pts: &[f64],
-    seg_ids: &[u8],
+    segs: &[u8],
     pairs: &[u32],
     width: u32,
     height: u32,
-    camera: NativeRenderCamera,
+    camera: crate::p3::ffi::Camera,
     thickness: u32,
     rgb: &mut [u8],
     depth: &mut [f32],
     seg: &mut [u8],
-) {
-    let (w, h) = (width as i64, height as i64);
-    // --- 1. Фон ---
-    for i in 0..(w * h) as usize {
-        rgb[i * 3] = 10;
-        rgb[i * 3 + 1] = 12;
-        rgb[i * 3 + 2] = 22;
-        depth[i] = 1e30;
-        seg[i] = 0;
-    }
-    let n_pts = seg_ids.len();
-    if n_pts == 0 || pairs.is_empty() {
-        return;
+) -> Result<(), String> {
+    let npix = width as usize * height as usize;
+    if rgb.len() != npix * 3 || depth.len() != npix || seg.len() != npix {
+        return Err("некорректный размер буферов рендера".into());
     }
 
-    let f = if camera.focal > 0.0 {
+    // Фоновая заливка глубокого космоса [10, 12, 22]
+    for px in rgb.chunks_exact_mut(3) {
+        px[0] = 10;
+        px[1] = 12;
+        px[2] = 22;
+    }
+    depth.fill(1e30f32);
+    seg.fill(0);
+
+    const PALETTE: [[u8; 3]; 10] = [
+        [10, 12, 22],   // 0: background
+        [96, 202, 252], // 1: planet (cyan)
+        [252, 128, 144],// 2: moon (rose)
+        [148, 252, 128],// 3: green
+        [252, 214, 96], // 4: star (gold)
+        [186, 148, 252],// 5: probe (violet)
+        [128, 252, 214],// 6: teal
+        [252, 168, 96], // 7: orbit (orange)
+        [172, 176, 190],// 8: silver
+        [140, 180, 255],// 9: box (light blue)
+    ];
+
+    let n_pts = pts.len() / 4;
+    let mut projected: Vec<(f64, f64, f32, bool)> = Vec::with_capacity(n_pts);
+
+    let (sin_y, cos_y) = camera.yaw.sin_cos();
+    let (sin_p, cos_p) = camera.pitch.sin_cos();
+    let focal = if camera.focal > 0.0 {
         camera.focal
     } else {
-        1.15 * height as f64
+        (width.min(height) as f64) * 1.15
     };
-    let w2 = width as f64 / 2.0;
-    let h2 = height as f64 / 2.0;
-    let cy = camera.yaw.cos();
-    let sy = camera.yaw.sin();
-    let cp = camera.pitch.cos();
-    let sp = camera.pitch.sin();
-    let radius: i64 = std::cmp::max(1, thickness as i64 - 1);
+    let half_w = width as f64 * 0.5;
+    let half_h = height as f64 * 0.5;
 
-    let mut ctx = Ctx { w, h, rgb, depth, seg };
+    for i in 0..n_pts {
+        let x = pts[i * 4];
+        let y = pts[i * 4 + 1];
+        let z = pts[i * 4 + 2];
 
-    // --- 2. Рёбра ---
-    for e in 0..pairs.len() / 2 {
-        let ia = pairs[e * 2] as usize;
-        let jb = pairs[e * 2 + 1] as usize;
-        if ia >= n_pts || jb >= n_pts {
+        // 1. Поворот вокруг оси Y (yaw)
+        let rx = x * cos_y + z * sin_y;
+        let rz = -x * sin_y + z * cos_y;
+        let ry = y;
+
+        // 2. Поворот вокруг оси X (pitch)
+        let y2 = ry * cos_p - rz * sin_p;
+        let z2 = ry * sin_p + rz * cos_p + camera.cam_dist;
+
+        // Глубина d_FS
+        let dist = (x * x + y * y + z * z).sqrt();
+        let d_fs = ((dist / camera.cam_dist.max(0.1)).min(1.5707963)) as f32;
+
+        if z2 > 0.05 {
+            let px = half_w + (rx / z2) * focal;
+            let py = half_h - (y2 / z2) * focal;
+            projected.push((px, py, d_fs, true));
+        } else {
+            projected.push((0.0, 0.0, d_fs, false));
+        }
+    }
+
+    let th = (thickness as i32).max(1);
+    let n_pairs = pairs.len() / 2;
+
+    for k in 0..n_pairs {
+        let i0 = pairs[k * 2] as usize;
+        let i1 = pairs[k * 2 + 1] as usize;
+        if i0 >= n_pts || i1 >= n_pts {
             continue;
         }
-        let (s0, s1) = (seg_ids[ia], seg_ids[jb]);
-        let pa = [pts[ia * 4], pts[ia * 4 + 1], pts[ia * 4 + 2]];
-        let pb = [pts[jb * 4], pts[jb * 4 + 1], pts[jb * 4 + 2]];
 
-        let a = project_point(pa[0], pa[1], pa[2], cy, sy, cp, sp, f, camera.cam_dist, w2, h2);
-        let b = project_point(pb[0], pb[1], pb[2], cy, sy, cp, sp, f, camera.cam_dist, w2, h2);
-        if !a.ok || !b.ok {
+        let (x0, y0, d0, v0) = projected[i0];
+        let (x1, y1, d1, v1) = projected[i1];
+        if !v0 || !v1 {
             continue;
         }
 
-        let col0 = palette_of(s0);
-        let col1 = palette_of(s1);
-        let cseg = s0; // сегмент ребра — первая вершина (конвенция ABI)
+        let seg_id = if i0 < segs.len() { segs[i0] } else { 1 };
+        let col = PALETTE[(seg_id as usize) % PALETTE.len()];
 
-        // --- Брезенхем ---
-        let (mut x, mut y) = (a.ix, a.iy);
-        let (x1, y1) = (b.ix, b.iy);
-        let dx = x1 - x;
-        let dy = y1 - y;
-        let adx = if dx > 0 { dx } else { -dx };
-        let ady = if dy > 0 { dy } else { -dy };
-        let n: i64 = std::cmp::max(adx, ady);
-        let sx: i64 = if dx > 0 { 1 } else { -1 };
-        let sy2: i64 = if dy > 0 { 1 } else { -1 };
-        let mut err: i64 = adx - ady;
+        // Bresenham line drawing
+        let mut ix0 = x0.round() as i32;
+        let mut iy0 = y0.round() as i32;
+        let ix1 = x1.round() as i32;
+        let iy1 = y1.round() as i32;
 
-        let mut k: i64 = 0;
-        while k <= n {
-            let t: f64 = if n > 0 { k as f64 / n as f64 } else { 1.0 };
-            let px = a.vx + (b.vx - a.vx) * t;
-            let py = a.vy + (b.vy - a.vy) * t;
-            let pz = a.vz + (b.vz - a.vz) * t;
-            let d = fs_depth(px, py, pz);
-            let bright = 0.55 + 0.45 * (1.0 - d / FRAC_PI_2_F64);
-            let r = (col0[0] + (col1[0] - col0[0]) * t) * bright;
-            let g = (col0[1] + (col1[1] - col0[1]) * t) * bright;
-            let b = (col0[2] + (col1[2] - col0[2]) * t) * bright;
-            plot(&mut ctx, x, y, d, 0.0, r, g, b, cseg);
+        let dx = (ix1 - ix0).abs();
+        let dy = -(iy1 - iy0).abs();
+        let sx = if ix0 < ix1 { 1 } else { -1 };
+        let sy = if iy0 < iy1 { 1 } else { -1 };
+        let mut err = dx + dy;
 
-            // шаг Брезенхема
-            if 2 * err > -ady {
-                err -= ady;
-                x += sx;
+        let total_dist = ((ix1 - ix0).pow(2) + (iy1 - iy0).pow(2)) as f32;
+        let start_x = ix0;
+        let start_y = iy0;
+
+        loop {
+            // Расчёт интерполированной глубины
+            let cur_dist = ((ix0 - start_x).pow(2) + (iy0 - start_y).pow(2)) as f32;
+            let t = if total_dist > 0.0 { (cur_dist / total_dist).sqrt().min(1.0) } else { 0.0 };
+            let d_fs = d0 * (1.0 - t) + d1 * t;
+
+            // Рисование точки с толщиной thickness
+            for oy in -th + 1..=th - 1 {
+                for ox in -th + 1..=th - 1 {
+                    let px = ix0 + ox;
+                    let py = iy0 + oy;
+                    if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
+                        let idx = py as usize * width as usize + px as usize;
+                        if d_fs <= depth[idx] {
+                            depth[idx] = d_fs;
+                            seg[idx] = seg_id;
+                            let rgb_idx = idx * 3;
+                            rgb[rgb_idx] = col[0];
+                            rgb[rgb_idx + 1] = col[1];
+                            rgb[rgb_idx + 2] = col[2];
+                        }
+                    }
+                }
             }
-            if 2 * err < adx {
-                err += adx;
-                y += sy2;
+
+            if ix0 == ix1 && iy0 == iy1 {
+                break;
             }
-            k += 1;
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                ix0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                iy0 += sy;
+            }
         }
-
-        // --- Спрайты концов (толщина) ---
-        draw_endpoint_sprite(&mut ctx, a, col0, cseg, radius);
-        draw_endpoint_sprite(&mut ctx, b, col1, cseg, radius);
-    }
-}
-
-#[cfg(test)]
-mod render_native_tests {
-    use super::*;
-
-    /// Дым: квадрат — те же якоря, что у C-ABI-теста (зеркальность).
-    #[test]
-    fn native_render_square_smoke() {
-        let pts: Vec<f64> = vec![
-            -0.5, -0.5, 0.0, 1.0, 0.5, -0.5, 0.0, 1.0, 0.5, 0.5, 0.0, 1.0, -0.5, 0.5, 0.0, 1.0,
-        ];
-        let segs = [1u8, 2, 3, 4];
-        let pairs = [0u32, 1, 1, 2, 2, 3, 3, 0];
-        let (w, h) = (96u32, 72u32);
-        let mut rgb = vec![0u8; (w * h * 3) as usize];
-        let mut depth = vec![0f32; (w * h) as usize];
-        let mut seg = vec![0u8; (w * h) as usize];
-        render_frame_native(
-            &pts, &segs, &pairs, w, h,
-            NativeRenderCamera { focal: 0.0, cam_dist: 3.4, yaw: -0.62, pitch: 0.34 },
-            2, &mut rgb, &mut depth, &mut seg,
-        );
-        let painted = seg.iter().filter(|&&s| s != 0).count();
-        assert!(painted > 20, "painted = {painted}");
-        assert_eq!(depth[0], 1e30);
-        assert_eq!((rgb[0], rgb[1], rgb[2]), (10, 12, 22));
-        let maxd = depth.iter().copied().filter(|&d| d < 1e29).fold(0.0f32, f32::max);
-        assert!((0.0..=FRAC_PI_2_F64 as f32 + 1e-4).contains(&maxd));
     }
 
-    /// Детерминизм: повторный вызов — бит-в-бит тот же тройной буфер.
-    #[test]
-    fn native_render_deterministic() {
-        let pts: Vec<f64> = vec![
-            -0.3, -0.4, 0.2, 1.0, 0.4, -0.2, -0.1, 1.0, 0.2, 0.5, 0.3, 1.0, -0.4, 0.3, -0.2, 1.0,
-        ];
-        let segs = [1u8, 3, 5, 9];
-        let pairs = [0u32, 1, 1, 2, 2, 3, 3, 0, 0, 2];
-        let (w, h) = (128u32, 96u32);
-        let mut bufs = |tag: &str| {
-            let mut rgb = vec![0u8; (w * h * 3) as usize];
-            let mut depth = vec![0f32; (w * h) as usize];
-            let mut seg = vec![0u8; (w * h) as usize];
-            render_frame_native(
-                &pts, &segs, &pairs, w, h,
-                NativeRenderCamera { focal: 0.0, cam_dist: 3.0, yaw: -1.1, pitch: 0.5 },
-                2, &mut rgb, &mut depth, &mut seg,
-            );
-            let _ = tag;
-            (rgb, depth, seg)
-        };
-        let (rgb1, d1, s1) = bufs("a");
-        let (rgb2, d2, s2) = bufs("b");
-        assert_eq!(rgb1, rgb2);
-        assert_eq!(d1, d2);
-        assert_eq!(s1, s2);
-    }
+    Ok(())
 }

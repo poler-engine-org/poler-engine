@@ -124,6 +124,7 @@ pub mod tlsprim;
 pub mod trite;
 pub mod verify;
 pub mod wikisrc;
+pub mod gpu_kernel;
 
 pub use ansatz::{
     Ansatz, Engine, LoadOptions, PhaseAnsatz, ProductStats, SampleReport, DEFAULT_MAX_SV_QUBITS,

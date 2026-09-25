@@ -3133,18 +3133,26 @@ impl McpServer {
     // -----------------------------------------------------------------
     fn tool_chunk(&self, args: &Value) -> Result<String, String> {
         use crate::retrieval as nr;
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or("аргумент path (файл) обязателен")?;
-        // Аудит-фикс: ограждение локальных путей (анти-экфильтрация)
-        guard_path(path)?;
-        let target = PathBuf::from(path);
-        if !target.is_file() {
-            return Err(format!("не файл или не найден: {path}"));
-        }
-        let text = std::fs::read_to_string(&target)
-            .map_err(|e| format!("прочитать {path}: {e}"))?;
+        let (text, label, format) = if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
+            let label = args.get("title").and_then(|v| v.as_str())
+                .or_else(|| args.get("url").and_then(|v| v.as_str()))
+                .unwrap_or("weblens_capture.md");
+            (content.to_string(), label.to_string(), nr::ChunkFormat::Markdown)
+        } else if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            // Аудит-фикс: ограждение локальных путей (анти-экфильтрация)
+            guard_path(path)?;
+            let target = PathBuf::from(path);
+            if !target.is_file() {
+                return Err(format!("не файл или не найден: {path}"));
+            }
+            let text = std::fs::read_to_string(&target)
+                .map_err(|e| format!("прочитать {path}: {e}"))?;
+            let fmt = nr::ChunkFormat::detect(&target);
+            (text, path.to_string(), fmt)
+        } else {
+            return Err("аргумент path (файл) или content (текст) обязателен".to_string());
+        };
+
         let config = nr::ChunkConfig {
             target_tokens: args
                 .get("target_tokens")
@@ -3156,13 +3164,12 @@ impl McpServer {
                 .unwrap_or(nr::DEFAULT_OVERLAP_TOKENS as u64) as usize,
             ..Default::default()
         };
-        let format = nr::ChunkFormat::detect(&target);
         let report = nr::chunk_document(&text, format, &config);
         if args.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
             return serde_json::to_string_pretty(&report)
                 .map_err(|e| format!("сериализация: {e}"));
         }
-        Ok(nr::render_chunks_text(&report, path))
+        Ok(nr::render_chunks_text(&report, &label))
     }
 
     // -----------------------------------------------------------------

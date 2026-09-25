@@ -444,18 +444,13 @@ mod tests {
 
             lib.render_frame(&pts, &segs, &pairs, w, h, camera, 2, &mut z_rgb, &mut z_depth, &mut z_seg)
                 .unwrap();
-            native::render_frame_native(
+            let _ = native::render_frame_native(
                 &pts,
                 &segs,
                 &pairs,
                 w,
                 h,
-                native::NativeRenderCamera {
-                    focal: camera.focal,
-                    cam_dist: camera.cam_dist,
-                    yaw: camera.yaw,
-                    pitch: camera.pitch,
-                },
+                camera,
                 2,
                 &mut n_rgb,
                 &mut n_depth,

@@ -9,6 +9,7 @@
 
 Полный рендер с оптикой — на машине с GPU: python3 demo_ocean.py
 """
+import os
 import sys
 import time
 
@@ -73,8 +74,8 @@ print(f"геометрия : {vdata.getNumRows()} вершин, {n_prims} Geom, 
 assert vdata.getNumRows() == GRID * GRID
 assert tris.getNumVertices() == (GRID - 1) * (GRID - 1) * 6
 
-# --- 3. шейдер демо парсится ---
-spec = importlib.util.spec_from_file_location("demo_ocean", "demo_ocean.py")
+demo_path = os.path.join(os.path.dirname(__file__), "demo_ocean.py")
+spec = importlib.util.spec_from_file_location("demo_ocean", demo_path)
 demo = importlib.util.module_from_spec(spec)
 sys.modules["demo_ocean"] = demo
 spec.loader.exec_module(demo)

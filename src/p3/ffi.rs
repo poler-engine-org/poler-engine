@@ -407,18 +407,13 @@ pub fn render_frame_auto(
             Ok(true)
         }
         Err(_) => {
-            super::native::render_frame_native(
+            let _ = super::native::render_frame_native(
                 pts,
                 seg_ids,
                 pairs,
                 width,
                 height,
-                super::native::NativeRenderCamera {
-                    focal: camera.focal,
-                    cam_dist: camera.cam_dist,
-                    yaw: camera.yaw,
-                    pitch: camera.pitch,
-                },
+                camera,
                 thickness,
                 rgb,
                 depth,

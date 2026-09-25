@@ -75,60 +75,86 @@ in vec3 p3d_Normal;
 
 out vec3 v_normal_w;
 out vec3 v_pos_w;
+out vec2 v_uv;
 out float v_steep;
 
 void main() {
-    v_normal_w = p3d_Normal;          // аналитическая нормаль спектра (CPU→GPU)
+    v_normal_w = p3d_Normal;
     v_pos_w = p3d_Vertex.xyz;
-    v_steep = length(p3d_Normal.xz);  // 0 (плоско) .. ~1 (отвесный гребень)
+    v_uv = p3d_Vertex.xy * 0.12;
+    v_steep = length(p3d_Normal.xz);
     gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
 }
 """
 
 WATER_FRAGMENT = """
 #version 130
-uniform vec3 sun_dir;    // НА солнце, world space
-uniform vec3 cam_pos;    // позиция камеры, world space
+uniform vec3 sun_dir;
+uniform vec3 cam_pos;
 uniform vec3 sky_color;
 uniform vec3 deep_color;
+uniform sampler2D normal_map;
+uniform sampler2D foam_tex;
+uniform sampler2D sky_tex;
+uniform float os_time;
 
 in vec3 v_normal_w;
 in vec3 v_pos_w;
+in vec2 v_uv;
 in float v_steep;
 
 out vec4 frag;
 
 void main() {
-    vec3 N = normalize(v_normal_w);
+    // --- 1. Двухскоростной каскад нормалей микро-волн (PBR) ---
+    vec2 uv1 = v_uv * 1.8 + vec2(os_time * 0.035, os_time * 0.015);
+    vec2 uv2 = v_uv * 3.7 - vec2(os_time * 0.025, -os_time * 0.045);
+    vec3 n1 = texture2D(normal_map, uv1).xyz * 2.0 - 1.0;
+    vec3 n2 = texture2D(normal_map, uv2).xyz * 2.0 - 1.0;
+    vec3 micro_n = normalize(n1 + n2);
+
+    // Смешивание спектральной макро-нормали (GF(3) кремний) с PBR-рябью
+    vec3 N = normalize(v_normal_w + micro_n * 0.35);
     vec3 V = normalize(cam_pos - v_pos_w);
     if (dot(N, V) < 0.0) N = -N;
 
-    // --- Френель (Шлик) ---
-    float fres = pow(1.0 - max(dot(N, V), 0.0), 5.0);
-    float kr = mix(0.02, 1.0, fres);
+    // --- 2. Честный Френель (Schlick) ---
+    float cos_theta = max(dot(N, V), 0.0);
+    float fres = pow(1.0 - cos_theta, 5.0);
+    float kr = mix(0.035, 0.98, fres);
 
-    // --- небо в отражении ---
+    // --- 3. Отражение неба (HDR Panorama Lookup) ---
     vec3 R = reflect(-V, N);
-    vec3 sky = mix(sky_color, vec3(1.0), pow(max(R.y, 0.0), 4.0) * 0.35);
+    float sky_pitch = clamp(R.z * 0.5 + 0.5, 0.01, 0.99);
+    vec3 sky_pbr = texture2D(sky_tex, vec2(0.5, sky_pitch)).rgb;
+    vec3 sky = mix(sky_color, sky_pbr * 1.25, 0.85);
 
-    // --- солнечный блик (Binn-Phong, два лепестка) ---
+    // --- 4. Солнечный блик Blinn-Phong (анизотропный двойной лепесток) ---
     vec3 H = normalize(V + sun_dir);
     float ndh = max(dot(N, H), 0.0);
-    float spec = pow(ndh, 260.0) * 2.4 + pow(ndh, 36.0) * 0.16;
+    float spec = pow(ndh, 380.0) * 3.5 + pow(ndh, 45.0) * 0.45;
+    vec3 sun_spec = vec3(1.0, 0.97, 0.88) * spec;
 
-    // --- глубинный цвет (Беер–Ламберт: гребень мелее — светлее) ---
-    vec3 water = mix(deep_color, deep_color * 1.8 + vec3(0.02, 0.10, 0.11),
-                     clamp(v_steep * 1.3, 0.0, 1.0));
+    // --- 5. Подповерхностное рассеивание (Subsurface Scattering / Тонкий гребень) ---
+    float sss = pow(clamp(dot(V, -sun_dir), 0.0, 1.0), 3.0) * clamp(v_steep * 1.8, 0.0, 1.0);
+    vec3 sss_color = vec3(0.0, 0.65, 0.55) * sss * 0.8;
 
-    // --- пена на самых крутых гребнях ---
-    float foam = smoothstep(0.38, 0.72, v_steep);
+    // --- 6. Глубинный цвет Беера–Ламберта ---
+    vec3 water_deep = mix(deep_color, vec3(0.01, 0.22, 0.32), clamp(v_steep * 1.4, 0.0, 1.0));
+    vec3 water = water_deep + sss_color;
 
-    vec3 col = water * (1.0 - kr) + sky * kr + vec3(1.0, 0.97, 0.90) * spec;
-    col = mix(col, vec3(0.96, 0.98, 1.0), foam * 0.85);
+    // --- 7. Органическая пена на гребнях (PBR Foam Layering) ---
+    vec4 foam_map = texture2D(foam_tex, v_uv * 1.2 + vec2(os_time * 0.01, 0.0));
+    float foam_mask = smoothstep(0.25, 0.55, v_steep + foam_map.r * 0.15);
+    vec3 foam_color = vec3(0.96, 0.98, 1.0) * (0.85 + 0.15 * foam_map.r);
 
-    // --- туман к горизонту ---
-    float fog = clamp(length(cam_pos - v_pos_w) / 900.0, 0.0, 0.75);
-    col = mix(col, sky_color * 0.9, fog);
+    // Финальный композитинг
+    vec3 col = mix(water, sky, kr) + sun_spec;
+    col = mix(col, foam_color, foam_mask * 0.92);
+
+    // --- 8. Атмосферный туман горизонта ---
+    float fog = clamp(length(cam_pos - v_pos_w) / 480.0, 0.0, 0.88);
+    col = mix(col, sky_pbr, fog);
 
     frag = vec4(col, 1.0);
 }
@@ -161,7 +187,7 @@ class OceanApp(ShowBase):
         self._geom = np.zeros((GRID * GRID, 6), dtype=np.float32)
         self._geom[:, 0] = (idx % GRID) * self.cell - DOMAIN / 2
         self._geom[:, 1] = (idx // GRID) * self.cell - DOMAIN / 2
-        self.vdata.modifyArray(0).setData(self._geom.tobytes())
+        self.vdata.modifyArray(0).modifyHandle().setData(self._geom.tobytes())
 
         tris = GeomTriangles(Geom.UHStatic)
         quads = np.arange(GRID * GRID, dtype=np.uint32).reshape(GRID, GRID)[:-1, :-1]
@@ -188,18 +214,59 @@ class OceanApp(ShowBase):
         self.ocean = self.render.attachNewNode(node)
 
         # --- шейдер оптики ---
-        from panda3d.core import Shader
+        import os
+        from panda3d.core import Shader, Texture, SamplerState
 
         shader = Shader.make(Shader.SL_GLSL, vertex=WATER_VERTEX, fragment=WATER_FRAGMENT)
+        self.setBackgroundColor(0.36, 0.55, 0.78, 1.0)
         self.ocean.setShader(shader)
-        self.ocean.setShaderInput("sun_dir", Vec3(0.45, 0.5, 0.74))
+        self.ocean.setShaderInput("sun_dir", Vec3(0.45, 0.5, 0.74).normalized())
         self.ocean.setShaderInput("sky_color", Vec3(0.36, 0.55, 0.78))
-        self.ocean.setShaderInput("deep_color", Vec3(0.012, 0.09, 0.14))
+        self.ocean.setShaderInput("deep_color", Vec3(0.015, 0.08, 0.16))
+        self.ocean.setShaderInput("os_time", 0.0)
+
+        # --- текстуры PBR (микро-нормали, пена и HDR-небо) ---
+        assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+        pbr_dir = os.path.join(assets_dir, "pbr")
+        normal_tex_path = os.path.join(pbr_dir, "water_micro_normal.png")
+        foam_tex_path = os.path.join(pbr_dir, "foam_realistic.png")
+        sky_tex_path = os.path.join(pbr_dir, "sky_hdr.png")
+
+        if os.path.exists(normal_tex_path):
+            tex_n = self.loader.loadTexture(normal_tex_path)
+            tex_n.setWrapU(SamplerState.WM_repeat)
+            tex_n.setWrapV(SamplerState.WM_repeat)
+            self.ocean.setShaderInput("normal_map", tex_n)
+
+        if os.path.exists(foam_tex_path):
+            tex_f = self.loader.loadTexture(foam_tex_path)
+            tex_f.setWrapU(SamplerState.WM_repeat)
+            tex_f.setWrapV(SamplerState.WM_repeat)
+            self.ocean.setShaderInput("foam_tex", tex_f)
+
+        if os.path.exists(sky_tex_path):
+            tex_s = self.loader.loadTexture(sky_tex_path)
+            tex_s.setWrapU(SamplerState.WM_clamp)
+            tex_s.setWrapV(SamplerState.WM_clamp)
+            self.ocean.setShaderInput("sky_tex", tex_s)
+
+        # --- звук (настоящий прибой + резонанс) ---
+        sound_path = os.path.join(assets_dir, "ocean_real.ogg")
+        if not os.path.exists(sound_path):
+            sound_path = os.path.join(assets_dir, "ocean_ambient.wav")
+        if os.path.exists(sound_path):
+            try:
+                self.ambient_sound = self.loader.loadSfx(sound_path)
+                self.ambient_sound.setLoop(True)
+                self.ambient_sound.setVolume(0.85)
+                self.ambient_sound.play()
+            except Exception as e:
+                print(f"Звук: {e}")
 
         # --- камера и свет ---
         self.camera.setPos(0, -55, 18)
         self.camera.setHpr(-8, -12, 0)
-        self.cam_lens.setFov(62)
+        self.camLens.setFov(62)
         self.orbit = {"h": -8.0, "p": -12.0, "r": 60.0}
         self.accept("escape", sys.exit)
         self.accept("wheel_up", self._zoom, [-6])
@@ -220,7 +287,7 @@ class OceanApp(ShowBase):
         self.hud.node().setText("POLER × Panda3D")
         self.hud.node().setTextScale(0.045)
         self.hud.setScale(1.4)
-        self.hud.setPos(0.05, 0.12)
+        self.hud.setPos(0.05, 0, 0.12)
 
         self.frames = 0
         self.t0 = time.perf_counter()
@@ -260,6 +327,7 @@ class OceanApp(ShowBase):
         n = self.sea.n
         self._geom[:, 2] = np.frombuffer(heights, dtype=np.float32)
         self._geom[:, 3:] = np.frombuffer(normals, dtype=np.float32).reshape(n * n, 3)
+        self.ocean.setShaderInput("os_time", task.time)
         self.vdata.modifyArray(0).modifyHandle().setData(self._geom.tobytes())
 
         self.frames += 1
