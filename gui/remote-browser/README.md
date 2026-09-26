@@ -76,3 +76,19 @@ OAuth-диалоги) и возвращает первый не-null ответ.
 Так настраиваются Colab-блокноты и Takeout-экспорты без ручной прокрутки:
 страницы открываются в живой сессии пользователя, кнопки нажимаются
 скриптом, кадр можно снять и проанализировать (VLM).
+
+### Траблшутинг: Turbopack падает с OOM на маленькой машине (4 ГБ RAM)
+
+Симптом: `Failed to write app endpoint /page` → `PostCssTransformedAsset::process`
+→ `unexpected end of file`, а в dmesg — oom-kill. Tailwind v4 по умолчанию
+сканирует источники классов по ВСЕМУ корню проекта — если рядом лежат большие
+деревья (репозитории, зеркала Диска), oxide-сканер съедает гигабайты.
+
+Лечение (в `src/app/globals.css`):
+
+```css
+@import "tailwindcss" source(none);
+@source "../**/*.{ts,tsx}";   /* только код приложения */
+```
+
+и продакшн-запуск вместо dev: `bun run build && bun .next/standalone/server.js`.
