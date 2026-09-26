@@ -539,6 +539,47 @@ io.on('connection', (s: any) => {
     }
   })
 
+  // --- автоматизация из локальных скриптов (eval с токеном из окружения) ---
+  s.on('eval', async (d: any, ack?: any) => {
+    const reply = (payload: any) => {
+      try {
+        if (typeof ack === 'function') ack(payload)
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      if (!page) return reply({ ok: false, e: 'no page' })
+      const wantTok = String((d && d.t) || '')
+      if (!process.env.AUTOMATE_TOKEN || wantTok !== process.env.AUTOMATE_TOKEN)
+        return reply({ ok: false, e: 'auth' })
+      const code = String((d && d.code) || 'null')
+      if (d && d.frames) {
+        // выполнить в первом фрейме, где код вернёт не-null (кросс-доменные iframe)
+        let out: any = null
+        let src = ''
+        for (const f of page.frames()) {
+          try {
+            const r = await f.evaluate(code)
+            if (r !== null && r !== undefined) {
+              out = r
+              src = f.url()
+              break
+            }
+          } catch {
+            /* этот фрейм не подходит */
+          }
+        }
+        return reply({ ok: true, frame: src, r: out === undefined ? null : out })
+      }
+      const r = await page.evaluate(code)
+      reply({ ok: true, r: r === undefined ? null : r })
+    } catch (e: any) {
+      reply({ ok: false, e: String(e && e.message ? e.message : e).slice(0, 600) })
+    }
+    setTimeout(pushFrame, 160)
+  })
+
   s.on('drive_auth', () => startDriveAuth())
   s.on('gemini_harvest', () => {
     harvestGemini().catch((e) =>
