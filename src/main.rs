@@ -6529,17 +6529,9 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
             }
         } else {
             let p = std::path::Path::new(path);
-            match std::fs::File::open(p) {
-                Ok(f) => {
-                    eprintln!("stream-file: {} → {}", p.display(), out.display());
-                    match write_stream(f, &out, cfg, &p.display().to_string()) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("stream-file: {e}");
-                            return 2;
-                        }
-                    }
-                }
+            eprintln!("stream-file (ingest): {} → {}", p.display(), out.display());
+            match poler_engine::archive::ingest_file(p, &out, cfg, poler_engine::archive::IngestMode::Auto) {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("stream-file: {path}: {e}");
                     return 2;

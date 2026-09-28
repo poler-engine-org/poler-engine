@@ -70,10 +70,12 @@
 //!   `.poler`-контейнеров.
 
 pub mod dedup;
+pub mod ingest;
 pub mod patcher;
 pub mod reader;
 pub mod stream_writer;
 
+pub use ingest::{ingest_file, IngestKind, IngestMode};
 pub use reader::{ExtractReport, PolerFile, PolerInfo, PolerReader, VerifyReport};
 pub use stream_writer::{
     fmt_bytes, peak_rss_kb, write_stream, CompressTier, StreamWriteConfig, StreamWriteStats,
