@@ -19,3 +19,11 @@ path = "src/bin/pqc.rs"
 [[bin]]
 name = "pqc-parity"
 path = "src/bin/pqc-parity.rs"
+
+[[bin]]
+name = "poler-bio"
+path = "src/bin/poler-bio.rs"
+
+[[bin]]
+name = "poler-unicode-compress"
+path = "src/bin/poler-unicode-compress.rs"

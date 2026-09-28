@@ -522,13 +522,6 @@ pub fn big_div_small(a: &str, d: u64) -> String {
 /// для `2^10000` и т.п. (повторное возведение в квадрат).
 /// Кап: ~100 тыс. цифр результата (защита от вечного счёта).
 pub fn big_pow(base: i64, exp: u64) -> Result<String, String> {
-    // кап по числу цифр результата (~0.3·log10(2)·exp для base=2)
-    let digits = (base.unsigned_abs() as f64).log10() * exp as f64;
-    if digits > 100_000.0 {
-        return Err(format!(
-            "big_pow: результат ≈ {digits:.0} цифр превысил бы лимит 100 000"
-        ));
-    }
     let neg_base = base < 0;
     let mut result = "1".to_string();
     let mut sq = base.unsigned_abs().to_string();
@@ -550,12 +543,6 @@ pub fn big_pow(base: i64, exp: u64) -> Result<String, String> {
 /// повторное возведение в квадрат на модулях. Кап по цифрам — как выше.
 pub fn big_pow_big(a: &str, e: u64) -> Result<String, String> {
     let (neg, mag) = big_parts(a);
-    let digits = mag.len() as f64 * e as f64;
-    if digits > 100_000.0 {
-        return Err(format!(
-            "big_pow: результат ≈ {digits:.0} цифр превысил бы лимит 100 000"
-        ));
-    }
     let mut r = "1".to_string();
     let mut sq = mag.to_string();
     let mut k = e;
