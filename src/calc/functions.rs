@@ -260,6 +260,7 @@ pub fn is_function(name: &str) -> bool {
         | "lorentz"
         // матрицы/квант
         | "transpose" | "det" | "inv" | "pinv" | "trace" | "expm" | "charpoly" | "eigen"
+        | "eigen_sturm"
         | "identity" | "rot2" | "rotx" | "roty" | "rotz" | "so_gen"
         // квант цикла O: Шрёдингер
         | "schrodinger" | "dagger" | "kron" | "tridiag" | "eye"
@@ -733,6 +734,12 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let ev = matrix_arg(args, 0)?.eigenvalues()?;
             Ok(Value::List(ev.into_iter().map(complex_to_value).collect()))
         }
+        "eigen_sturm" => {
+            // Штурм-бисекция: без charpoly — иммунен к взрыву Уилкинсона (n>=28);
+            // симметричные вещественные, машинная точность при n=256+
+            let ev = matrix_arg(args, 0)?.eigenvalues_sturm()?;
+            Ok(Value::List(ev.into_iter().map(complex_to_value).collect()))
+        }
         "identity" => {
             let n = one_arg(args, name)?;
             if n.fract() != 0.0 || !(1.0..=12.0).contains(&n) {
@@ -818,15 +825,19 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "tridiag" => {
             // трёхдиагональная матрица: d на диагонали, off на соседях —
-            // дискретизация лапласиана (яма, осциллятор на сетке)
+            // дискретизация лапласиана (яма, осциллятор на сетке).
+            // v0.62 (AI-API-реформа): лимит поднят 64 -> 512 — безопасно для
+            // det (LU, O(n^3)) и eigen_sturm (Штурм, машинная точность при
+            // n=256+); eigen/charpoly ломаются на n>=28 ВСЕГДА (Уилкинсон),
+            // независимо от лимита билдера.
             need(args, 3, name)?;
             let (d, off, n) = (
                 scalar_arg(args, 0)?,
                 scalar_arg(args, 1)?,
                 scalar_arg(args, 2)?,
             );
-            if n.fract() != 0.0 || !(2.0..=64.0).contains(&n) {
-                return Err("tridiag(d, off, n): n — целое 2..=64".into());
+            if n.fract() != 0.0 || !(2.0..=512.0).contains(&n) {
+                return Err("tridiag(d, off, n): n — целое 2..=512".into());
             }
             let n = n as usize;
             let mut m = Matrix::zeros(n, n);
