@@ -31,13 +31,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: "Clippy (гейт: unused/dead_code + correctness; стилевые — предупреждения)"
-        run: cargo clippy --workspace --all-targets -- -D unused -D clippy::correctness
+        run: cargo clippy --workspace --all-targets --jobs 2 -- -D unused -D clippy::correctness
 
       - name: "Тесты (unit + integration, весь workspace: poler-engine + pqc + pqw)"
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --jobs 2
 
       - name: Release-сборка
-        run: cargo build --release --locked
+        run: cargo build --release --locked --jobs 2
 
       - name: Смоук-тест бинарника
         run: |
@@ -59,9 +59,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Установить Zig 0.14.0
-        run: |
-          curl -sL https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz | tar -xJ -C "$HOME"
-          echo "$HOME/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -72,11 +72,13 @@ jobs:
           zig build test
 
       - name: "Rust FFI (фича pnd-ffi): golden-связка Zig-Rust + крипто-слой данных"
-        run: cargo test --lib --features pnd-ffi
+        run: |
+          cd os/core && zig build -Doptimize=ReleaseFast && cd ../..
+          cargo test --lib --features pnd-ffi --jobs 2
 
       - name: "POLER Vault smoke: seal → verify → open → cmp (без ключа и с ключом)"
         run: |
-          cargo build --release --features pnd-ffi --bin poler-engine
+          cargo build --release --features pnd-ffi --bin poler-engine --jobs 2
           head -c 1048576 /dev/urandom > /tmp/vault-src.bin
           export POLER_VAULT_KEY="ci-smoke-key"
           ./target/release/poler-engine --memory-seal /tmp/vault-src.bin --memory-content-id
