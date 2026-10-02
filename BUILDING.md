@@ -107,31 +107,99 @@ rustc -O tools/ai-gateway/poler-api.rs -o ~/.local/bin/poler-api
 poler-api selftest   # 15/15 PASS = готово
 ```
 
-## 6. Запуск через poler-box (изоляция ядра, Zero-Disk)
+## 6. Архиватор `.poler` и poler-box (изоляция ядра, Zero-Disk)
 
-Канонический путь запуска собранного движка — в микро-контейнере без
-Docker и ОС. Утилиты контейнеризации живут в монорепозитории `poler`
-(`crates/poler-box`, `crates/poler-archive`):
+Собранный по §3 бинарник — это ещё и **архиватор** и **микро-контейнер**:
+никаких отдельных утилит ставить не надо, всё уже внутри `poler-engine`.
+
+**Зачем архиватор `.poler`.** Суверенное правило владельца: если для
+инструментов не хватает диска — они сжимаются архиватором и вызываются
+изнутри архива. Контейнер стримит данные (в т.ч. >100 GiB из сети) прямо
+в чанкованный формат **без промежуточной несжатой высадки на диск**:
+FastCDC content-defined чанкинг + Zstd + BLAKE3-дедупликация + sha256 на
+каждую запись. Поиск (`--grep --archives`), чтение и CoW-патчинг записей
+идут без распаковки (в логе разработки: 1.5 ГБ упакованы на 41.8 MB/s при
+11 МБ RAM; патч Blink внутри `chromium_full.poler` 1.49 ГБ — 27 с).
+
+**Зачем poler-box.** «Замена Docker без ОС» — циклическая обёртка
+исполнения поверх `.poler`: payload запускается **напрямую из архива**
+(zero-disk), нативное железо и память хоста, но изнутри коробка
+непробиваема — namespaces + pivot_root + seccomp, а губернатор обрывает
+пожирателей RSS/CPU без вреда хосту.
+
+### 6.1 Упаковка в `.poler`
 
 ```bash
-# 1) сборка poler-box
-cd poler && cargo build --release -p poler-box -j1
-cp -f target/release/poler-box ~/.local/bin/poler-box
+# один файл/стрим (статический бинарник, дамп, датасет):
+poler-engine --stream-file ./payload --output-archive payload.poler
 
-# 2) упаковка движка в защищённый .poler-контейнер (Zstd/FastCDC/BLAKE3)
-poler pack engine_container.poler ~/.local/bin/poler-engine
+# файловая таблица (rootfs с библиотеками) — tar.gz разворачивается
+# в таблицу записей автоматически (tar_mode):
+tar czf rootfs.tar.gz rootfs/
+poler-engine --stream-file rootfs.tar.gz --output-archive box.poler
 
-# 3) запуск расчёта внутри изоляции с жёсткими лимитами
-poler-box run --rss-mb 256 --cpu-s 30 --tmpfs-mb 128 \
-  engine_container.poler poler-engine \
-  --exec 'calc eigen_sturm(tridiag(2,-1,256))' --json
+# инспекция и контроль целостности:
+poler-engine --poler-list box.poler          # таблица записей + sha256
+poler-engine --poler-verify box.poler        # all_ok: true
+poler-engine --poler-extract box.poler --extract-dir out/   # с sha256-контролем
+poler-engine --poler-cat box.poler --cat-name rootfs/bin/hello | head -1
 ```
 
-Под капотом: `unshare -Ur` + namespaces (pid/mnt/net/ipc/uts) — движок
-получает PID 1; бинарник стримится из архива прямо в анонимную память
-(`memfd_create` + `execveat`) — на диск не пишется ни байта; seccomp —
-белый список системных вызовов; губернатор обрывает процесс при
-превышении RSS/CPU-бюджета без вреда хосту.
+Прочие операции: `--poler-patch <POLER> --manifest <JSON>` (in-place
+CoW-патч: replace/add/delete), `--poler-rollback <POLER>` (откат по
+`.polerbak`), `--poler-remux <POLER> --output-archive <OUT>` (tar.gz-блоб →
+файловая таблица), `--grep <PAT> --archives` (поиск внутри архивов
+без распаковки).
+
+### 6.2 Запуск в коробке
+
+```bash
+# А) статический payload — стримится в память и исполняется сразу:
+poler-engine --poler-box payload.poler --box-entry payload \
+  --box-rss-mb 64 --box-cpu-s 5 --box-tmpfs-mb 32
+
+# Б) динамический payload — нужен rootfs (ld-linux + libc + зависимости):
+#    записи с префиксом rootfs/ стримятся в tmpfs-корень коробки
+poler-engine --poler-box box.poler --box-entry rootfs/bin/hello \
+  --box-rss-mb 64 --box-cpu-s 5 --box-tmpfs-mb 32
+
+# В) движок внутри коробки (циклическая обёртка) считает спектр:
+poler-engine --poler-box engine_box.poler --box-entry rootfs/bin/poler-engine \
+  --box-arg=--exec --box-arg='calc eigen_sturm(tridiag(2,-1,256))' \
+  --box-arg=--json --box-rss-mb 512 --box-cpu-s 30 --box-tmpfs-mb 64
+```
+
+Правила интерфейса:
+
+* `--box-entry` — имя записи из `--poler-list`; аргументы payload — через
+  `--box-arg=...` (с `=`, иначе флаги payload съест clap);
+* маппинг по умолчанию `rootfs/` → `/`; свой — через
+  `--box-map PREFIX:DIR` (пустой префикс `":/dir"` = весь архив);
+* лимиты: `--box-rss-mb`, `--box-cpu-s`, `--box-tmpfs-mb`;
+  `--box-no-isolate` — запуск без namespaces (только для отладки);
+* после завершения печатается JSON-отчёт: exit_code, kill_reason,
+  peak_tree_rss_kb, isolation (namespaces/pivot_root/seccomp).
+
+Сборка `engine_box.poler` для случая (В): rootfs с бинарником движка и его
+библиотеками (`ldd target/release/poler-engine`): `rootfs/bin/poler-engine`,
+`rootfs/lib64/ld-linux-x86-64.so.2`, `rootfs/lib/x86_64-linux-gnu/{libc,libm,libgcc_s}.so*`
+— затем tar.gz → `--stream-file`, как в §6.1.
+
+### 6.3 Приёмка после настройки (проверено на v0.62.0)
+
+1. Статический payload в коробке: `exit_code: 0`, в отчёте —
+   `userns_via_helper: true`, `pivot_root: true`, seccomp whitelist.
+2. Губернатор: payload, выделяющий 384 МБ при `--box-rss-mb 64`, убит
+   на пике ~123 МБ — `kill_reason: "rss_limit"`, exit 137.
+3. Циклическая обёртка: движок из архива в коробке возвращает
+   `eigen_sturm(tridiag(2,-1,256))` `ok:true` за ~32 мс — λ 0.000149…3.999850,
+   как и на хосте.
+
+Под капотом: трёхпроцессная цепочка `poler-engine` (губернатор RSS/CPU
+дерева, опрос 50 мс, SIGKILL + JSON-отчёт) → `unshare -Ur` (userns+map,
+обход политики ядра) → stage2 (mnt/pid/net/ipc/uts-ns, tmpfs-rootfs
+**из архива**, pivot_root) → payload как PID 1: `execveat(memfd_create)`
+— на диск не пишется ни байта; seccomp — белый список системных вызовов.
 
 ## 7. Timings (реальный слабый хост: 2 vCPU, 4 ГБ RAM, `-j1`)
 
@@ -141,6 +209,11 @@ poler-box run --rss-mb 256 --cpu-s 30 --tmpfs-mb 128 \
 | `cargo test -p poler-engine --lib eigen_sturm` | 2 passed / 0 failed (0.30 с на прогоны) |
 | Release-сборка `-p poler-engine -j1` (тёплый `target/`) | **8 м 48 с** |
 | `rustc -O poler-api.rs` (шлюз) | ~10 с |
+| `--stream-file`: 19 МБ бинарник → `.poler` | 997 мс (ratio 0.44, 78 чанков, peak RSS 27 МБ) |
+| `--stream-file`: rootfs движка (5 файлов, 22 МБ) → `.poler` | 1.35 с (ratio 0.44) |
+| poler-box: статический payload (hello) | wall 32 мс, exit 0 |
+| poler-box: циклическая обёртка — движок из архива, `eigen_sturm(256)` | 32 мс расчёт, wall 141 мс |
+| poler-box: губернатор (hog 384 МБ при лимите 64 МБ) | убит на 123 МБ, `rss_limit` |
 
 Чек-лист на этом же хосте: `eigen_sturm(tridiag(2,-1,256))` — **36.5 мс**
 (лимит канона 60 мс), det(T₂₅₆) = 257.0, trace = 512.0, `--schema` — чистый
@@ -169,6 +242,7 @@ sudo mkswap /swapfile && sudo swapon /swapfile
 
 ---
 
-> Документ добавлен в v0.62.0 (AI-API реформа). Канон протокола сборки —
-> владельческий: `-j1`, профиль не трогать, чек-лист из трёх пунктов
-> обязателен после каждой пересборки.
+> Документ добавлен в v0.62.0 (AI-API реформа), §6 переписан под
+> испытанный интерфейс архиватора и poler-box (v0.62.0). Канон протокола
+> сборки — владельческий: `-j1`, профиль не трогать, чек-лист из трёх
+> пунктов обязателен после каждой пересборки.
