@@ -71,4 +71,8 @@ poler-api selftest   # 15/15 PASS = готово
 ```
 
 Требования: `poler-engine` в PATH (>= 0.61.0). Для MCP-клиентов
-(Claude Desktop, Cursor, …): `command: poler-api`, `args: ["mcp"]`.
+(Claude Desktop, Cursor, …): `command: poler-api`, `args: ["mcp"]` —
+готовые конфиги и смоук-скрипт: [`mcp-clients/`](mcp-clients/)
+(`claude_desktop_config.example.json`, `cursor_mcp.example.json`,
+`generic_stdio_smoke.sh`, `SETUP.txt` — пути конфигов по ОС и проверка
+связки за ~6 секунд до запуска GUI).
