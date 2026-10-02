@@ -38,6 +38,13 @@ COPY weblens ./weblens
 # ffi/libp3ffi-linux-x86_64.so — P3-конформанс (p3::conformance, render,
 # shell commands) dlopen-ит библиотеку из CARGO_MANIFEST_DIR/ffi
 COPY ffi ./ffi
+# Мост интентов исполняет git-команды (git status/log) из CWD: тесты
+# motor_bridge ждут репо (в ubuntu-джобе — checkout). Пустой коммит
+# даёт валидный репо без коммита гигабайт target/
+RUN git init -q . && \
+    git config user.email "ci@poler-engine" && \
+    git config user.name "ci" && \
+    git commit --allow-empty -qm "ci: окружение для motor_bridge-тестов"
 RUN touch src/lib.rs src/main.rs && \
     cargo build --release --locked -p poler-engine && \
     cargo test --release --quiet -p poler-engine
