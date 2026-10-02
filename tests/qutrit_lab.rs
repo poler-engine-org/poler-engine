@@ -75,6 +75,18 @@ fn zero_norm(st: &mut CalcState, expr: &str) -> f64 {
     re(st, &format!("trace(dagger({expr}) * ({expr}))"))
 }
 
+
+/// Вещественная часть комплексного вывода принтера («x + yi» → x).
+fn re_part(st: &mut CalcState, expr: &str) -> f64 {
+    let out = st
+        .eval_line(expr)
+        .unwrap_or_else(|e| panic!("{expr}: {e}"));
+    let s = out.trim();
+    let real = s.split(" + ").next().unwrap().split(" - ").next().unwrap();
+    real.parse::<f64>()
+        .unwrap_or_else(|_| panic!("{expr}: не число: '{out}'"))
+}
+
 fn near(x: f64, target: f64, tol: f64, what: &str) {
     assert!(
         (x - target).abs() < tol,
@@ -643,4 +655,251 @@ fn qutrit_qpe_and_trit_lattice() {
         1e-12,
         "round-trip: число → триты → фазы → QFT → число",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Блоки 12–15 (сессия 4): CGLMP-нарушение локального реализма, кутритный QAOA
+// на живом коннектоме (Max-3-Cut, 3^6=729), t5c-мост «кристалл→квант»,
+// квантовые прогулки с Loschmidt-эхом. Живые прогоны — download/experiments/.
+// ---------------------------------------------------------------------------
+
+/// Настройка CGLMP: |Φ₃⟩ + фазы (α₁=0, α₂=1/2, β₁=1/4, β₂=−1/4) + QFT с
+/// взаимно сопряжённых сторон (F⊗F†) + проекторы классов (A−B) mod 3.
+fn cglmp_setup(st: &mut CalcState) {
+    for line in [
+        "let psiB = (1/sqrt(3)) * [1;0;0;0;1;0;0;0;1]",
+        // фазы измерений статьи Collins et al. 2002 (d=3)
+        "let A2p = [1,0,0; 0,exp(pi/3*i),0; 0,0,exp(2*pi/3*i)]",
+        "let B1p = [1,0,0; 0,exp(pi/6*i),0; 0,0,exp(pi/3*i)]",
+        "let B2p = [1,0,0; 0,exp(-pi/6*i),0; 0,0,exp(-pi/3*i)]",
+        // ВАЖНО (грабли сессии 4): F⊗F†, НЕ F⊗F — иначе разностные корреляции
+        // состояния Белла размываются в плоские 1/3 и I3 = 0
+        "let FF = kron(F3, dagger(F3))",
+        "let s11 = FF * kron(eye(3), B1p) * psiB",
+        "let s12 = FF * kron(eye(3), B2p) * psiB",
+        "let s21 = FF * kron(A2p, B1p) * psiB",
+        "let s22 = FF * kron(A2p, B2p) * psiB",
+        // проекторы классов c = (A−B) mod 3
+        "let Pc0 = kron(e0,e0)*transpose(kron(e0,e0)) + kron(e1,e1)*transpose(kron(e1,e1)) + kron(e2,e2)*transpose(kron(e2,e2))",
+        "let Pcp = kron(e1,e0)*transpose(kron(e1,e0)) + kron(e2,e1)*transpose(kron(e2,e1)) + kron(e0,e2)*transpose(kron(e0,e2))",
+        "let Pcm = kron(e2,e0)*transpose(kron(e2,e0)) + kron(e0,e1)*transpose(kron(e0,e1)) + kron(e1,e2)*transpose(kron(e1,e2))",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+}
+
+#[test]
+fn cglmp_violation_of_local_realism() {
+    let mut st = lab();
+    cglmp_setup(&mut st);
+    // q0 = P(A1=B1) = (4+2√3)/9 — вероятность «согласия» оптимальной пары
+    near(
+        re(&mut st, "trace(dagger(s11)*Pc0*s11)"),
+        (4.0 + 2.0 * 3.0_f64.sqrt()) / 9.0,
+        1e-12,
+        "CGLMP q0 = (4+2√3)/9",
+    );
+    // q-1 = P(A1=B1−1) = 1/9
+    near(
+        re(&mut st, "trace(dagger(s11)*Pcm*s11)"),
+        1.0 / 9.0,
+        1e-12,
+        "CGLMP q-1 = 1/9",
+    );
+    // СИММЕТРИЯ correlP статьи: 4 равенства вероятностей
+    near(
+        re(&mut st, "trace(dagger(s21)*Pcm*s21) - trace(dagger(s11)*Pc0*s11)"),
+        0.0,
+        1e-12,
+        "P(B1=A2+1) = q0",
+    );
+    near(
+        re(&mut st, "trace(dagger(s12)*Pcp*s12) - trace(dagger(s11)*Pcm*s11)"),
+        0.0,
+        1e-12,
+        "P(B2=A1-1) = q-1",
+    );
+    // ГЛАВНОЕ: I3 = 4(q0 − q-1) = (4/9)(3+2√3) ≈ 2.872935 > 2 (локальный предел)
+    let i3 = re(
+        &mut st,
+        "trace(dagger(s11)*Pc0*s11) + trace(dagger(s21)*Pcm*s21) + trace(dagger(s22)*Pc0*s22) + trace(dagger(s12)*Pc0*s12) - trace(dagger(s11)*Pcm*s11) - trace(dagger(s21)*Pc0*s21) - trace(dagger(s22)*Pcm*s22) - trace(dagger(s12)*Pcp*s12)",
+    );
+    near(i3, (4.0 / 9.0) * (3.0 + 2.0 * 3.0_f64.sqrt()), 1e-12, "I3(QM)");
+    assert!(i3 > 2.0, "нарушение локального реализма: I3 = {i3} > 2");
+    // Шумовой порог: rho(eta*) = eta|Фи><Фи| + (1-eta)I/9, I3(eta*) = 2 ровно.
+    // Сторона сопряжения (грабли): trace(Pc*FF*r*FF†), НЕ trace(FF†*r*FF*Pc)
+    st.eval_line("let rho = psiB*transpose(psiB)").unwrap();
+    st.eval_line("let etas = 2/((4/9)*(3 + 2*sqrt(3)))").unwrap();
+    st.eval_line("let rho1 = etas*rho + (1-etas)*(1/9)*eye(9)").unwrap();
+    st.eval_line("let r11 = kron(eye(3),B1p)*rho1*dagger(kron(eye(3),B1p))").unwrap();
+    st.eval_line("let r21 = kron(A2p,B1p)*rho1*dagger(kron(A2p,B1p))").unwrap();
+    st.eval_line("let r22 = kron(A2p,B2p)*rho1*dagger(kron(A2p,B2p))").unwrap();
+    st.eval_line("let r12 = kron(eye(3),B2p)*rho1*dagger(kron(eye(3),B2p))").unwrap();
+    st.eval_line("let a11 = FF*r11*dagger(FF)").unwrap();
+    st.eval_line("let a21 = FF*r21*dagger(FF)").unwrap();
+    st.eval_line("let a22 = FF*r22*dagger(FF)").unwrap();
+    st.eval_line("let a12 = FF*r12*dagger(FF)").unwrap();
+    near(
+        re_part(
+            &mut st,
+            "trace(Pc0*a11) + trace(Pcm*a21) + trace(Pc0*a22) + trace(Pc0*a12) - trace(Pcm*a11) - trace(Pc0*a21) - trace(Pcm*a22) - trace(Pcp*a12)",
+        ),
+        2.0,
+        1e-10,
+        "I3(eta*) = 2 — критическая видимость шума",
+    );
+}
+
+/// Настройка QAOA: 6 кутритов K4-ядра коннектома мухи (реальные веса).
+fn qaoa_setup(st: &mut CalcState) {
+    for line in [
+        "let I81 = kron(eye(9), eye(9))",
+        "let flat = kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1],(1/sqrt(3))*[1;1;1])))))",
+        // проекторы равенства EQU_uv (след 243 = ранг 3 в 729-мерии)
+        "let EQU01 = kron(P0,kron(P0,I81)) + kron(P1,kron(P1,I81)) + kron(P2,kron(P2,I81))",
+        "let EQU02 = kron(P0,kron(eye(3),kron(P0,eye(27)))) + kron(P1,kron(eye(3),kron(P1,eye(27)))) + kron(P2,kron(eye(3),kron(P2,eye(27))))",
+        "let EQU04 = kron(P0,kron(eye(9),kron(P0,eye(9)))) + kron(P1,kron(eye(9),kron(P1,eye(9)))) + kron(P2,kron(eye(9),kron(P2,eye(9))))",
+        "let EQU05 = kron(P0,kron(eye(27),kron(P0,eye(3)))) + kron(P1,kron(eye(27),kron(P1,eye(3)))) + kron(P2,kron(eye(27),kron(P2,eye(3))))",
+        "let EQU12 = kron(eye(3),kron(P0,kron(P0,eye(27)))) + kron(eye(3),kron(P1,kron(P1,eye(27)))) + kron(eye(3),kron(P2,kron(P2,eye(27))))",
+        "let EQU13 = kron(eye(3),kron(P0,kron(eye(3),kron(P0,eye(9))))) + kron(eye(3),kron(P1,kron(eye(3),kron(P1,eye(9))))) + kron(eye(3),kron(P2,kron(eye(3),kron(P2,eye(9)))))",
+        "let EQU14 = kron(eye(3),kron(P0,kron(eye(9),kron(P0,eye(3))))) + kron(eye(3),kron(P1,kron(eye(9),kron(P1,eye(3))))) + kron(eye(3),kron(P2,kron(eye(9),kron(P2,eye(3)))))",
+        "let EQU15 = kron(eye(3),kron(P0,kron(eye(27),P0))) + kron(eye(3),kron(P1,kron(eye(27),P1))) + kron(eye(3),kron(P2,kron(eye(27),P2)))",
+        "let EQU24 = kron(eye(9),kron(P0,kron(eye(3),kron(P0,eye(3))))) + kron(eye(9),kron(P1,kron(eye(3),kron(P1,eye(3))))) + kron(eye(9),kron(P2,kron(eye(3),kron(P2,eye(3)))))",
+        "let EQU25 = kron(eye(9),kron(P0,kron(eye(9),P0))) + kron(eye(9),kron(P1,kron(eye(9),P1))) + kron(eye(9),kron(P2,kron(eye(9),P2)))",
+        "let EQU45 = kron(I81,kron(P0,P0)) + kron(I81,kron(P1,P1)) + kron(I81,kron(P2,P2))",
+        // эрмитов миксер: X3 + X3† (грабли сессии 3: X† ≠ X)
+        "let G3 = X3 + dagger(X3)",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+}
+
+#[test]
+fn qutrit_qaoa_max3cut_on_fly_connectome() {
+    let mut st = lab();
+    qaoa_setup(&mut st);
+    // (1) ранги проекторов: каждое EQU_uv — ранг 3 в 729-мерии (след 243)
+    for e in ["EQU01", "EQU24", "EQU45"] {
+        near(re(&mut st, &format!("trace({e})")), 243.0, 1e-9, "след EQU");
+    }
+    // (2) миксер унитарен: trace(M†M) = 3, det(M) = 1 (G3 бесследов)
+    st.eval_line("let M1 = expm(-0.9*i*G3)").unwrap();
+    near(re(&mut st, "trace(dagger(M1)*M1)"), 3.0, 1e-9, "миксер унитарен");
+    near(re_part(&mut st, "det(M1)"), 1.0, 1e-9, "det миксера");
+    // (3) оптимальное назначение x=16 (гаngи {3,4,5}|{0,2}|{1}) режет 4403 из 4435 —
+    // индикатор [c_u≠c_v] = ceil(|c_u−c_v|/2); sign(0)=1 в Калькуляторе (грабли!)
+    near(
+        re(&mut st, "735*ceil(abs(1-0)/2) + 24*ceil(abs(1-1)/2) + 1496*ceil(abs(1-0)/2) + 1222*ceil(abs(1-0)/2) + 251*ceil(abs(2-1)/2) + 231*ceil(abs(2-0)/2) + 206*ceil(abs(2-0)/2) + 194*ceil(abs(2-0)/2) + 40*ceil(abs(1-0)/2) + 28*ceil(abs(1-0)/2) + 8*ceil(abs(0-0)/2)"),
+        4403.0,
+        1e-9,
+        "Max-3-Cut оптимум 4403/4435 (x=16)",
+    );
+    // (4) QAOA p=1 при (γ,β)=(0.9,0.9): E[cut'] = 2.363073 (норм.), ~80% оптимума.
+    // Линейная цепочка переприсвоек s = ... — НЕ вложенные выражения (иначе 2^11)
+    st.eval_line("let s = flat").unwrap();
+    for (w, n) in [
+        (735.0 / 1496.0, "EQU01"), (24.0 / 1496.0, "EQU02"), (1.0, "EQU04"),
+        (1222.0 / 1496.0, "EQU05"), (251.0 / 1496.0, "EQU12"), (231.0 / 1496.0, "EQU13"),
+        (206.0 / 1496.0, "EQU14"), (194.0 / 1496.0, "EQU15"), (40.0 / 1496.0, "EQU24"),
+        (28.0 / 1496.0, "EQU25"), (8.0 / 1496.0, "EQU45"),
+    ] {
+        st.eval_line(&format!("let s = exp(0.9*{w}*i)*s + (1 - exp(0.9*{w}*i))*({n}*s)")).unwrap();
+    }
+    st.eval_line("let s = kron(expm(-0.9*i*G3), kron(expm(-0.9*i*G3), kron(expm(-0.9*i*G3), kron(expm(-0.9*i*G3), kron(expm(-0.9*i*G3), expm(-0.9*i*G3))))))*s").unwrap();
+    near(re(&mut st, "trace(dagger(s)*s)"), 1.0, 1e-9, "норма QAOA-состояния");
+    let ec = [
+        (735.0 / 1496.0, "EQU01"), (24.0 / 1496.0, "EQU02"), (1.0, "EQU04"),
+        (1222.0 / 1496.0, "EQU05"), (251.0 / 1496.0, "EQU12"), (231.0 / 1496.0, "EQU13"),
+        (206.0 / 1496.0, "EQU14"), (194.0 / 1496.0, "EQU15"), (40.0 / 1496.0, "EQU24"),
+        (28.0 / 1496.0, "EQU25"), (8.0 / 1496.0, "EQU45"),
+    ]
+    .iter()
+    .map(|(w, n)| format!("{w}*(1 - trace(dagger(s)*{n}*s))"))
+    .collect::<Vec<_>>()
+    .join(" + ");
+    near(re(&mut st, &ec), 2.363073, 1e-4, "E[cut] QAOA p=1 (γ=β=0.9)");
+}
+
+#[test]
+fn t5c_crystal_to_quantum_bridge() {
+    let mut st = lab();
+    // Живые триты строки «мысль» кристалла permanent_memory.t5c: [-1,1,-1,-1,-1,-1]
+    // (захардкожены для герметичности теста; парсер — scripts/t5c_bridge_session.sh)
+    for line in [
+        "let F729 = kron(F3, kron(F3, kron(F3, kron(F3, kron(F3, F3)))))",
+        "let flat6 = kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1],(1/sqrt(3))*[1;1;1])))))",
+        // t=−1 → diag(1, ω², ω⁴); t=+1 → diag(1, ω, ω²) (грабли: t=1 — фаза om, не 1!)
+        "let D1 = kron([1,0,0;0,om^2,0;0,0,om^4], kron([1,0,0;0,om,0;0,0,om^2], kron([1,0,0;0,om^2,0;0,0,om^4], kron([1,0,0;0,om^2,0;0,0,om^4], kron([1,0,0;0,om^2,0;0,0,om^4],[1,0,0;0,om^2,0;0,0,om^4])))))",
+        "let D2 = kron([1,0,0;0,om,0;0,0,om^2], kron([1,0,0;0,om,0;0,0,om^2], kron([1,0,0;0,om^2,0;0,0,om^4], kron([1,0,0;0,om^2,0;0,0,om^4], kron([1,0,0;0,om^2,0;0,0,om^4],[1,0,0;0,om^2,0;0,0,om^4])))))",
+        // декод: |−t mod 3⟩: «мысль» → |1,2,1,1,1,1⟩; «кристалл» → |2,2,1,1,1,1⟩
+        "let dec1 = kron(e1, kron(e2, kron(e1, kron(e1, kron(e1, e1)))))",
+        "let dec2 = kron(e2, kron(e2, kron(e1, kron(e1, kron(e1, e1)))))",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+    // Мост без потерь: F·D·flat = |−t⟩ с машинной точностью
+    near(
+        zero_norm(&mut st, "F729*D1*flat6 - dec1"),
+        0.0,
+        1e-24,
+        "t5c-мост «мысль»: F·D·flat = |−t⟩",
+    );
+    near(
+        zero_norm(&mut st, "F729*D2*flat6 - dec2"),
+        0.0,
+        1e-24,
+        "t5c-мост «кристалл»: F·D·flat = |−t⟩",
+    );
+    // Born-вероятность декода = 1
+    near(
+        modulus(&mut st, "trace(dagger(dec1)*(F729*D1*flat6))"),
+        1.0,
+        1e-10,
+        "P(декод «мысль») = 1",
+    );
+    // Ортогональность двух мыслей
+    near(
+        modulus(&mut st, "trace(dagger(F729*D1*flat6)*(F729*D2*flat6))"),
+        0.0,
+        1e-10,
+        "мысли ортогональны",
+    );
+    // Суперпозиция двух мыслей → Born-коллапс ровно 50/50
+    st.eval_line("let sup = F729 * (D1*flat6 + D2*flat6)/sqrt(2)").unwrap();
+    near(
+        modulus(&mut st, "trace(dagger(dec1)*sup)"),
+        1.0 / 2.0_f64.sqrt(),
+        1e-10,
+        "P(коллапс → «мысль») = 1/2",
+    );
+    near(
+        modulus(&mut st, "trace(dagger(dec2)*sup)"),
+        1.0 / 2.0_f64.sqrt(),
+        1e-10,
+        "P(коллапс → «кристалл») = 1/2",
+    );
+}
+
+#[test]
+fn quantum_walk_loschmidt_revival() {
+    let mut st = lab();
+    // K4-ядро коннектома мухи, взвешенная смежность /1496, ψ₀ = |хаб⟩
+    st.eval_line("let Hf = (1/1496)*[-0,735,24,0,1496,1222; 735,-0,251,231,206,194; 24,251,-0,0,40,28; 0,231,0,-0,0,0; 1496,206,40,0,-0,8; 1222,194,28,0,8,-0]").unwrap();
+    st.eval_line("let hub = [1;0;0;0;0;0]").unwrap();
+    // унитарность эволюции: норма сохраняется
+    for t in [0.5, 1.0, 2.5, 4.0] {
+        near(
+            re(&mut st, &format!("trace(dagger(schrodinger(Hf, hub, {t}))*schrodinger(Hf, hub, {t}))")),
+            1.0,
+            1e-9,
+            "унитарность прогулки",
+        );
+    }
+    // Сигнал ПОКИДАЕТ хаб (L(1.0) ≈ 0.038 < 0.1)…
+    let l1 = re(&mut st, "abs(trace(dagger(hub)*schrodinger(Hf, hub, 1.0)))^2");
+    assert!(l1 < 0.1, "L(1.0) = {l1} — сигнал должен почти уйти из хаба");
+    // …и РЕВАЙВИТ: L(2.5) ≈ 0.830 > 0.8 — квантовая память сигнала
+    let l25 = re(&mut st, "abs(trace(dagger(hub)*schrodinger(Hf, hub, 2.5)))^2");
+    assert!(l25 > 0.8, "L(2.5) = {l25} — квантовый ревайвал в хабе");
+    near(l25, 0.830, 0.01, "высота ревайвала");
 }
