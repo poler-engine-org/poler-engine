@@ -23,6 +23,9 @@ RUN mkdir -p src tests examples && \
 COPY src ./src
 COPY tests ./tests
 COPY examples ./examples
+# docs/flywire-connectome/*.csr.zst — артефакт коннектома для тестов
+# (graph/flyops/literary/mcp ищут его через CARGO_MANIFEST_DIR)
+COPY docs ./docs
 # weblens/: include_bytes! в src/web/weblens.rs требует файлы расширения
 # на этапе компиляции — без этого COPY сборка образа падает
 COPY weblens ./weblens

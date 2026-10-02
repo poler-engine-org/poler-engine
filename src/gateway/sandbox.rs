@@ -723,9 +723,7 @@ fn judge_find(args: &[String]) -> Policy {
             return false;
         }
         let e = expand_home(p);
-        // путь == собственный дом пользователя (HOME может быть /root,
-        // /srv/… — не только /home/*): удаление дома целиком — Block
-        e == home_prefix() || is_system_root(&e) || is_whole_home_dir(&e)
+        is_system_root(&e) || is_whole_home_dir(&e)
     });
     if sys_path {
         return Policy::Block(
@@ -1032,6 +1030,12 @@ fn is_system_root(p: &str) -> bool {
 /// вложенности) — Block при рекурсивных операциях; глубже — данные
 /// пользователя, Confirm.
 fn is_whole_home_dir(p: &str) -> bool {
+    // собственный дом пользователя: HOME бывает /root, /srv/… — не только
+    // /home/* или /Users/* (Docker-билдер живёт под root с HOME=/root);
+    // удаление дома целиком — Block независимо от его префикса
+    if p == home_prefix() {
+        return true;
+    }
     for root in ["/home", "/Users"] {
         if p == root {
             return true;
@@ -1808,7 +1812,9 @@ mod tests {
 
     #[test]
     fn expand_home_works() {
-        assert!(expand_home("~").starts_with("/home/") || expand_home("~").starts_with("/Users/"));
+        // HOME бывает /home/*, /Users/*, /root — сверяем с самим HOME
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
+        assert_eq!(expand_home("~"), home.trim_end_matches('/'));
         assert!(expand_home("~/x").contains("/x"));
         assert_eq!(expand_home("/abs"), "/abs");
     }
