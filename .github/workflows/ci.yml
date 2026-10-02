@@ -53,7 +53,7 @@ jobs:
   # macOS: портируемость кода (clippy-гейт + компиляция release).
   # Тесты Linux-специфики здесь не гоняются (см. комментарий выше).
   check-macos:
-    name: Портируемость (macos-latest): clippy + сборка
+    name: "Портируемость (macos-latest): clippy + сборка"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
