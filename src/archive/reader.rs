@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn incremental_writer_same_bytes() {
         let mut data = Vec::new();
-        for i in 0..(1_500_000u32) {
+        for i in 0..1_500_000u32 {
             data.push((i as u8).wrapping_mul(31).wrapping_add((i >> 9) as u8));
         }
         let p1 = tmp("i1.poler");

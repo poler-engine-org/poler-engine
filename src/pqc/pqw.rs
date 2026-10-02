@@ -319,7 +319,7 @@ impl PqwBuilder {
 
     /// Добавляет уже квантованный int4-тензор (упакованные nibble).
     pub fn add_i4(&mut self, name: &str, dims: Vec<usize>, packed: &[u8], scales: &[f32]) {
-        debug_assert_eq!(packed.len(), dims[0] * ((dims[1] + 1) / 2));
+        debug_assert_eq!(packed.len(), dims[0] * dims[1].div_ceil(2));
         debug_assert_eq!(scales.len(), dims[0]);
         self.tensors.push(BuilderTensor {
             name: name.into(),
@@ -334,7 +334,7 @@ impl PqwBuilder {
     pub fn add_trit5(&mut self, name: &str, dims: Vec<usize>, packed: &[u8], scales: &[f32]) {
         let cols = if dims.len() > 1 { dims[1] } else { dims[0] };
         let rows = if dims.len() > 1 { dims[0] } else { 1 };
-        debug_assert_eq!(packed.len(), rows * ((cols + 4) / 5));
+        debug_assert_eq!(packed.len(), rows * cols.div_ceil(5));
         self.tensors.push(BuilderTensor {
             name: name.into(),
             dtype: Dtype::Trit5,
@@ -358,19 +358,18 @@ impl PqwBuilder {
     /// Записывает файл: секции выравниваются на 4096, затем таблица,
     /// затем Sha256 по payload+таблице укладывается в заголовок.
     pub fn write_to(&self, path: &Path) -> Result<(), String> {
-        let mut buf: Vec<u8> = Vec::new();
-        buf.resize(HEADER, 0);
+        let mut buf: Vec<u8> = vec![0; HEADER];
         // Секции данных с выравниванием на страницу.
         let mut offsets: Vec<u64> = Vec::with_capacity(self.tensors.len());
         for t in &self.tensors {
             let here = buf.len();
-            let aligned = (here + PAGE - 1) / PAGE * PAGE;
+            let aligned = here.div_ceil(PAGE) * PAGE;
             buf.resize(aligned, 0);
             offsets.push(aligned as u64);
             buf.extend_from_slice(&t.data);
         }
         // Таблица (тоже на границе страницы).
-        let table_offset = (buf.len() + PAGE - 1) / PAGE * PAGE;
+        let table_offset = buf.len().div_ceil(PAGE) * PAGE;
         buf.resize(table_offset, 0);
         let table_start = buf.len();
         for (t, &off) in self.tensors.iter().zip(&offsets) {
@@ -564,11 +563,11 @@ impl QuantizedWeightsView {
                 Dtype::I8 => elems,
                 Dtype::I4 => {
                     dims.first().copied().unwrap_or(0)
-                        * ((dims.get(1).copied().unwrap_or(1) + 1) / 2)
+                        * dims.get(1).copied().unwrap_or(1).div_ceil(2)
                 }
                 Dtype::Trit5 => {
                     dims.first().copied().unwrap_or(0)
-                        * ((dims.get(1).copied().unwrap_or(1) + 4) / 5)
+                        * dims.get(1).copied().unwrap_or(1).div_ceil(5)
                 }
                 Dtype::Raw => elems,
             };
@@ -726,7 +725,7 @@ impl TensorView<'_> {
             return Err(format!("тензор {} не int4", self.name));
         }
         let cols = self.cols();
-        let packed = (cols + 1) / 2;
+        let packed = cols.div_ceil(2);
         let s = r * packed;
         Ok(&self.data[s..s + packed])
     }
@@ -737,7 +736,7 @@ impl TensorView<'_> {
             return Err(format!("тензор {} не trit5", self.name));
         }
         let cols = self.cols();
-        let packed = (cols + 4) / 5;
+        let packed = cols.div_ceil(5);
         let s = r * packed;
         Ok(&self.data[s..s + packed])
     }

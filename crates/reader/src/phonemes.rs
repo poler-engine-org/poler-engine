@@ -106,8 +106,8 @@ pub fn segments_for_word(
     rng: &mut crate::rng::Xorshift64,
 ) -> Vec<Segment> {
     let mut out = Vec::new();
-    let mut chars = word.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let chars = word.chars().peekable();
+    for ch in chars {
         let lower = ch.to_lowercase().next().unwrap_or(ch);
         if let Some(arch) = vowel_arch(lower) {
             *prev_arch = arch;

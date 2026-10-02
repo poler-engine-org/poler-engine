@@ -220,7 +220,7 @@ impl T5qMmapView {
                 .try_into()
                 .unwrap(),
         );
-        let piece = 4 + (block + 4) / 5;
+        let piece = 4 + block.div_ceil(5);
         let body = bytes.len() - TRAILER - HEADER;
         if body % piece != 0 || body / piece != blocks as usize {
             return Err(format!(
@@ -341,7 +341,7 @@ fn stream_verify(bytes: &[u8]) -> Result<usize, String> {
     if digest[..] != tail[32..64] {
         return Err("sha256 блоков не сходится (незакоммиченные мутации?)".into());
     }
-    let piece = 4 + (block + 4) / 5;
+    let piece = 4 + block.div_ceil(5);
     if body.len() % piece != 0 {
         return Err(format!("тело {} Б не бьётся на блоки по {piece} Б", body.len()));
     }
@@ -775,8 +775,8 @@ mod tests {
         // Ранг 4 → 16 значений в первом блоке. A асимметрична:
         // A[0][1]=1, A[1][0]=−1 → J[0][1]=2 (усилить +), J[1][0]=−2 (гасить).
         let mut a = vec![0.0f32; 16];
-        a[0 * 4 + 1] = 1.0;
-        a[1 * 4 + 0] = -1.0;
+        a[1] = 1.0;
+        a[4] = -1.0;
         let imps = cmp.phase_rotor_impulses(0, &a, 4).unwrap();
         assert!(!imps.is_empty());
         let find = |i: usize, j: usize| -> Option<TritDirection> {

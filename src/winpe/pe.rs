@@ -173,7 +173,11 @@ pub fn parse(image: &[u8]) -> Result<PeInfo, String> {
 }
 
 /// Застосовує BASE_RELOCATION (тип 10 = DIR64) до відображеного образу.
-pub fn apply_relocs(image: &[u8], info: &PeInfo, mapped: *mut u8, delta: i64) -> Result<u64, String> {
+/// # Safety
+/// `mapped` — валидный указатель на загруженный образ размером не меньше
+/// `info.size_of_image`; вызывающий отвечает за exclusive-доступ к памяти
+/// (релокации пишут по `mapped + rva`).
+pub unsafe fn apply_relocs(image: &[u8], info: &PeInfo, mapped: *mut u8, delta: i64) -> Result<u64, String> {
     if info.reloc_dir_rva == 0 || info.reloc_dir_size == 0 || delta == 0 {
         return Ok(0);
     }
@@ -260,7 +264,7 @@ impl PeInfo {
             }
             let iat_rva = u32_at(image, imp_off + 16)?;
             let name_rva = u32_at(image, imp_off + 12)?;
-            let int_rva = u32_at(image, imp_off + 0)?; // OriginalFirstThunk
+            let int_rva = u32_at(image, imp_off)?; // OriginalFirstThunk
             if iat_rva == 0 && name_rva == 0 && int_rva == 0 {
                 break; // кінець таблиці
             }

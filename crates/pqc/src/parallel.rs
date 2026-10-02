@@ -24,7 +24,7 @@ where
     F: Fn(&mut [T]) + Sync,
 {
     let len = v.len();
-    if block == 0 || len % block != 0 {
+    if block == 0 || !len.is_multiple_of(block) {
         f(v);
         return;
     }

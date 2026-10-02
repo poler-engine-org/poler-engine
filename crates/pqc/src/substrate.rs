@@ -83,7 +83,7 @@ impl CMat {
                     continue;
                 }
                 for j in 0..n {
-                    out.data[i * n + j] = out.data[i * n + j] + a * rhs.data[k * n + j];
+                    out.data[i * n + j] += a * rhs.data[k * n + j];
                 }
             }
         }

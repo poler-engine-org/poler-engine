@@ -81,7 +81,7 @@ fn probe_cpu(r: &mut HardwareReport) {
     let mut bogomips = String::new();
     let mut flags = String::new();
     let mut addr_sizes = String::new();
-    let clean = |v: &str| v.trim_start_matches(|c: char| c == ':' || c == '\t' || c == ' ').to_string();
+    let clean = |v: &str| v.trim_start_matches([':', '\t', ' ']).to_string();
     for line in cpuinfo.lines() {
         if let Some(v) = line.strip_prefix("model name") {
             model = clean(v);
@@ -156,7 +156,7 @@ fn probe_caches(r: &mut HardwareReport) {
         if let Some(cpuinfo) = read_file("/proc/cpuinfo") {
             for line in cpuinfo.lines() {
                 if let Some(v) = line.strip_prefix("cache size") {
-                    let v = v.trim_start_matches(|c: char| c == ':' || c == ' ');
+                    let v = v.trim_start_matches([':', ' ']);
                     r.push("Кеши", "L3 (cpuinfo)", v.to_string());
                     break;
                 }

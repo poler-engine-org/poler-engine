@@ -12,18 +12,15 @@ use super::stream_writer::{StreamWriter, StreamWriteConfig, StreamWriteStats};
 
 /// Режим инжеста входного потока.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum IngestMode {
     /// Автодетекция по сигнатурам (распаковка на лету при обнаружении контейнера).
+    #[default]
     Auto,
     /// Прямой слепой поток (без распаковки).
     Off,
 }
 
-impl Default for IngestMode {
-    fn default() -> Self {
-        IngestMode::Auto
-    }
-}
 
 /// Распознанный внутренний формат входного потока/файла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +42,7 @@ pub fn sniff_magic(magic: &[u8]) -> IngestKind {
     if magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
         return IngestKind::TarGz;
     }
-    if magic.len() >= 4 && &magic[0..4] == &[0x28, 0xb5, 0x2f, 0xfd] {
+    if magic.len() >= 4 && magic[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
         return IngestKind::TarZst;
     }
     if magic.len() >= 262 && &magic[257..262] == b"ustar" {

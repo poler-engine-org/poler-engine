@@ -253,10 +253,10 @@ fn zip_info(path: &Path) -> Result<Vec<EntryMeta>, String> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut ar = zip::ZipArchive::new(file)
         .map_err(|e| format!("{}: некорректный zip: {e}", path.display()))?;
-    let mut out = Vec::with_capacity(ar.len() as usize);
+    let mut out = Vec::with_capacity(ar.len());
     for i in 0..ar.len() {
         let zf = ar
-            .by_index_raw(i as usize)
+            .by_index_raw(i)
             .map_err(|e| format!("{}: запись {i}: {e}", path.display()))?;
         out.push(EntryMeta {
             name: zf.name().to_string(),
@@ -538,7 +538,7 @@ pub fn for_each_entry(
             let metas = poler_info(path)?;
             // Детерминизм вывода — по имени, как у zip-ветки.
             let mut metas = metas;
-            metas.sort_by(|a, b| norm_name(&a.name).cmp(&norm_name(&b.name)));
+            metas.sort_by_key(|a| norm_name(&a.name));
             for meta in &metas {
                 if meta.is_dir {
                     continue;
@@ -555,7 +555,7 @@ pub fn for_each_entry(
             let mut metas = zip_info(path)?;
             // Детерминизм вывода: записи сортируются по имени
             // (порядок центрального каталога — случайность упаковщика).
-            metas.sort_by(|a, b| norm_name(&a.name).cmp(&norm_name(&b.name)));
+            metas.sort_by_key(|a| norm_name(&a.name));
             for meta in &metas {
                 if meta.is_dir {
                     continue;
@@ -685,10 +685,10 @@ fn zip_read_by_name(
     let mut encrypted = false;
     for i in 0..ar.len() {
         let zf = ar
-            .by_index_raw(i as usize)
+            .by_index_raw(i)
             .map_err(|e| format!("{}: запись {i}: {e}", archive_path.display()))?;
         if norm_name(zf.name()) == want {
-            target = Some(i as usize);
+            target = Some(i);
             encrypted = zf.encrypted();
             break;
         }

@@ -577,7 +577,7 @@ impl KnowledgeEmbedder {
             Self::Pqw(p) => {
                 use rayon::prelude::*;
                 let hdr = p.model().view().header();
-                let cap = hdr.max_pos as usize
+                let cap = hdr.max_pos
                     - if hdr.xlmr_positions() { 2 } else { 0 };
                 let done = std::sync::atomic::AtomicUsize::new(0);
                 texts

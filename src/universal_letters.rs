@@ -82,7 +82,7 @@ impl Script {
             0x1000..=0x109F => Script::Myanmar,
             0x10A0..=0x10FF | 0x2D00..=0x2D2F => Script::Georgian,
             0x0530..=0x058F => Script::Armenian,
-            0x1200..=0x137F | 0x1380..=0x139F => Script::Ethiopic,
+            0x1200..=0x139F => Script::Ethiopic,
             0x13A0..=0x13FF => Script::Cherokee,
             0x1680..=0x169F => Script::Ogham,
             0x16A0..=0x16FF => Script::Runic,
@@ -283,8 +283,8 @@ mod tests {
         assert!(ya.phase >= 0.0 && ya.phase < 2.0 * PI);
 
         // Спін строго {-1, 0, 1}
-        assert!(matches!(a.spin, -1 | 0 | 1));
-        assert!(matches!(ya.spin, -1 | 0 | 1));
+        assert!(matches!(a.spin, -1..=1));
+        assert!(matches!(ya.spin, -1..=1));
     }
 
     #[test]
@@ -296,7 +296,7 @@ mod tests {
         let r_ba = b.resonance(&a);
 
         assert!((r_ab - r_ba).abs() < 1e-12, "Резонанс має бути симетричним");
-        assert!(r_ab >= 0.0 && r_ab <= 1.0, "Резонанс у межах [0, 1]");
+        assert!((0.0..=1.0).contains(&r_ab), "Резонанс у межах [0, 1]");
 
         // Авторезонанс символу з самим собою дорівнює 1.0
         let r_self = a.resonance(&a);

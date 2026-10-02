@@ -477,9 +477,9 @@ impl Input {
         }
         h ^= (self.mouse_down as u64) << 56;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        h ^= self.mouse_delta.0.to_bits() as u64 ^ ((self.mouse_delta.1.to_bits() as u64) << 1);
+        h ^= self.mouse_delta.0.to_bits() ^ (self.mouse_delta.1.to_bits() << 1);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        h ^= self.wheel.to_bits() as u64;
+        h ^= self.wheel.to_bits();
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
         h
     }

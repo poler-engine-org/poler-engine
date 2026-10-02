@@ -137,14 +137,14 @@ pub fn gamma_impl(x: f64) -> Result<f64, String> {
     }
     const G: f64 = 7.0;
     const C: [f64; 9] = [
-        0.99999999999980993,
+        0.999_999_999_999_809_9,
         676.5203681218851,
         -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
         12.507343278686905,
         -0.13857109526572012,
-        9.9843695780195716e-6,
+        9.984_369_578_019_572e-6,
         1.5056327351493116e-7,
     ];
     if x < 0.5 {
@@ -493,7 +493,7 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         "sqrt" => {
             // √ размерной величины: размерности обязаны быть чётными
             // (√(s²) = s, √(m²/s²) = m/s) — нужно законам Кеплера и др.
-            if let Some(Value::Quantity(q, u)) = args.get(0) {
+            if let Some(Value::Quantity(q, u)) = args.first() {
                 if u.dim.iter().all(|&dd| (dd as i32) % 2 == 0) {
                     let mut dim = [0i8; units::NDIM];
                     for (i, &dd) in u.dim.iter().enumerate() {
@@ -1320,7 +1320,7 @@ mod tests {
     fn catalog_lists() {
         assert!(catalog("").contains("gamma"));
         assert!(catalog("").contains("moon_illum"));
-        assert!(catalog("zeta").len() > 0);
+        assert!(!catalog("zeta").is_empty());
     }
 
 

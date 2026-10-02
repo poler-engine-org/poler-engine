@@ -839,7 +839,7 @@ fn cmd_game_sound(args: &[String]) -> CmdResult {
     }
     as_json |= q_flag(args, "--json");
 
-    let mut scene = crate::game::demo_scene();
+    let scene = crate::game::demo_scene();
     let mut world = match scene.build_world() {
         Ok(w) => w,
         Err(e) => return CmdResult::Done(format!("game sound: сцена: {e}")),
@@ -1887,7 +1887,7 @@ fn cmd_game_asset(args: &[String]) -> CmdResult {
             .unwrap_or(0);
         let head = std::fs::read(&in_path)
             .ok()
-            .and_then(|b| if b.len() >= 12 { Some(b) } else { None });
+            .filter(|b| b.len() >= 12);
         let is_wav = head
             .as_ref()
             .map(|b| b.starts_with(b"RIFF") && b[8..12] == *b"WAVE")
@@ -2311,6 +2311,9 @@ struct GameLoopSummary {
     ticks: u64,
     camera: crate::game::OrbitCamera,
     state_hash: u64,
+    /// Время цикла: заполняется отчётом цикла, читается внешним
+    /// мониторингом (API-полнота статистики; в lib не читается).
+    #[allow(dead_code)]
     elapsed_s: f64,
     closed: bool,
 }
@@ -2472,7 +2475,7 @@ fn cmd_game_input_demo(args: &[String]) -> CmdResult {
     let summary = {
         let feed = |frame: u64, q: &mut EventQueue| {
             while cursor < events.len() && events[cursor].0 <= frame {
-                q.push(events[cursor].1.clone());
+                q.push(events[cursor].1);
                 cursor += 1;
             }
         };
@@ -3459,9 +3462,7 @@ fn cmd_quantum_verify(args: &[String]) -> CmdResult {
     };
     let report: Result<VerificationReport, String> = match mode {
         "unitary" => match pos.get(1) {
-            Some(algo) => build_algo(algo)
-                .map_err(String::from)
-                .and_then(|c| pqc_core::verify::verify_unitary(&c).map_err(|e| format!("{e:?}"))),
+            Some(algo) => build_algo(algo).and_then(|c| pqc_core::verify::verify_unitary(&c).map_err(|e| format!("{e:?}"))),
             None => {
                 return CmdResult::Done(
                     "quantum verify unitary <algo> [--n K] — имя алгоритма обязательно".to_string(),
@@ -5024,7 +5025,7 @@ fn cmd_notes(state: &mut ShellState, args: &[String]) -> CmdResult {
                     if let Some(nb) = &n.notebook_id {
                         s.push_str(&format!("notebook: {}\n", nb));
                     }
-                    s.push_str("\n");
+                    s.push('\n');
                     s.push_str(&n.body);
                     state.set_output(s.clone());
                     CmdResult::Done(s)
@@ -7232,7 +7233,7 @@ mod tests {
 
     #[test]
     fn cmd_game_asset_texture_absorb_emit() {
-        use crate::game::asset as ya;
+        
         let mut s = ShellState::new(PathBuf::from("/tmp/test-ya2.db"));
         // Готовая текстура: fBm-мрамор 64×64 (наш PNG-энкодер, stored-блоки).
         let mut gray = vec![0u8; 64 * 64];

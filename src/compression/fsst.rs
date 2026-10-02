@@ -1301,7 +1301,7 @@ mod tests {
             b"", b"a", b"ab", b"abc", b"abcdefgh", b"abcdefghi", b"x",
             &[255u8, 254, 253], &[0u8, 1, 2], &[255u8; 64], &[7u8; 511], &[7u8; 600],
         ];
-        let t = FsstTable::train(&cases.iter().copied().collect::<Vec<_>>());
+        let t = FsstTable::train(&cases.to_vec());
         for c in &cases {
             let enc = t.encode(c);
             assert_eq!(t.decode(&enc), *c, "кейс {c:?}");

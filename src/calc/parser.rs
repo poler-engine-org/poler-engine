@@ -130,13 +130,12 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Expr, String> {
         // `let x = …` (сахар)
-        if matches!(self.peek(), Some(Tok::Ident(w)) if w == "let") {
-            if matches!(self.peek2(), Some(Tok::Ident(_)))
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w == "let")
+            && matches!(self.peek2(), Some(Tok::Ident(_)))
                 && matches!(self.toks.get(self.pos + 2), Some((Tok::Assign, _)))
             {
                 self.bump(); // let
             }
-        }
         // присваивание — ТОЛЬКО вне eq_mode (регрессия: `x = x` в solve)
         if !self.eq_mode {
             if let (Some(Tok::Ident(name)), Some(Tok::Assign)) =
@@ -1115,7 +1114,7 @@ mod tests {
     #[test]
     fn implicit_multiplication() {
         // 2pi, 2(3+4), (1+2)(3+4)
-        assert!((num("2 pi") - 6.283185307179586).abs() < 1e-15);
+        assert!((num("2 pi") - std::f64::consts::TAU).abs() < 1e-15);
         assert_eq!(num("2(3 + 4)"), 14.0);
         assert_eq!(num("(1 + 2)(3 + 4)"), 21.0);
         // РЕГРЕССИЯ: x(y+1) с переменной x — умножение, а не вызов
@@ -1162,10 +1161,10 @@ mod tests {
         // скаляр asin → to deg трактуется как радианы
         assert!((num("asin(0.5) to deg") - 30.0).abs() < 1e-9);
         // составные единицы
-        assert!((num("100 km/h to m/s") - 27.777777777777779).abs() < 1e-12);
+        assert!((num("100 km/h to m/s") - 27.777_777_777_777_78).abs() < 1e-12);
         // константа-единица (c) после юнита: в скобках — корректно
         match eval_str("(1e-3 kg) * c^2 to J").unwrap() {
-            Value::Scalar(v) => assert!((v - 8.9875517873681764e13).abs() < 1e3, "{v:e}"),
+            Value::Scalar(v) => assert!((v - 8.987_551_787_368_177e13).abs() < 1e3, "{v:e}"),
             other => panic!("{other:?}"),
         }
         // ошибка размерностей — с сообщением

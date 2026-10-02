@@ -645,6 +645,137 @@ fn swap_rows_vec(v: &mut [Complex], n: usize, r1: usize, r2: usize) {
     }
 }
 
+// =====================================================================
+// Штурм-ядро (AI-API-реформа v0.62): свободные функции для eigen_sturm.
+// Хаусхолдер-трёхдиагонализация + бисекция по последовательности Штурма.
+// Протокол 2026-10-01: tridiag(2,-1,256) → max_err 2.8e-14 против
+// аналитики; та же арифметика f64, что у eigen — меняется только алгоритм.
+// =====================================================================
+
+/// Хаусхолдер: симметричная A (row-major f64, длина n*n) → (d, e).
+/// Поддиагональ после отражения k равна alpha (Px = alpha·e1).
+fn householder_tridiag(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut d = vec![0.0f64; n];
+    let mut e = vec![0.0f64; n.max(1) - 1];
+    if n == 0 {
+        return (d, e);
+    }
+    if n == 1 {
+        d[0] = a[0];
+        return (d, e);
+    }
+    for k in 0..n.saturating_sub(2) {
+        let m = n - (k + 1); // размер хвостового блока
+        let mut v: Vec<f64> = (k + 1..n).map(|i| a[i * n + k]).collect();
+        let xnorm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if xnorm == 0.0 {
+            e[k] = 0.0;
+            continue;
+        }
+        let alpha = if v[0] >= 0.0 { -xnorm } else { xnorm };
+        v[0] -= alpha; // v = x - alpha*e1
+        let vnorm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if vnorm < f64::MIN_POSITIVE {
+            e[k] = alpha;
+            continue;
+        }
+        for vi in v.iter_mut() {
+            *vi /= vnorm;
+        }
+        // w = A_sub · v; s = v·w; A' = A - 2vw^T - 2wv^T + 4s·vv^T
+        let mut w = vec![0.0f64; m];
+        for (j, wj) in w.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for (i, &vi) in v.iter().enumerate() {
+                acc += a[(k + 1 + i) * n + (k + 1 + j)] * vi;
+            }
+            *wj = acc;
+        }
+        let s: f64 = v.iter().zip(w.iter()).map(|(a1, b1)| a1 * b1).sum();
+        for i in 0..m {
+            for j in 0..m {
+                a[(k + 1 + i) * n + (k + 1 + j)] +=
+                    -2.0 * v[i] * w[j] - 2.0 * w[i] * v[j] + 4.0 * s * v[i] * v[j];
+            }
+        }
+        e[k] = alpha;
+    }
+    for i in 0..n {
+        d[i] = a[i * n + i];
+    }
+    if n >= 2 {
+        e[n - 2] = a[(n - 1) * n + (n - 2)];
+    }
+    (d, e)
+}
+
+/// Счёт Штурма: число собственных значений трёхдиагональной T, строго
+/// меньших x (LDL^T-рекуррентность, счёт отрицательных опорных).
+/// С semantics LAPACK dstebz: квазинулевой опорный ЗАМЕНЯЕТСЯ на -pivmin
+/// ДО подсчёта знака — заменённый опорный отрицателен и считается.
+fn sturm_count(d: &[f64], e: &[f64], x: f64) -> usize {
+    let n = d.len();
+    let e2max = e.iter().map(|v| v * v).fold(0.0f64, f64::max).max(1.0);
+    let pivmin = f64::MIN_POSITIVE * e2max;
+    let mut count = 0usize;
+    let mut q = d[0] - x;
+    if q.abs() < pivmin {
+        q = -pivmin;
+    }
+    if q < 0.0 {
+        count += 1;
+    }
+    for i in 1..n {
+        q = d[i] - x - e[i - 1] * e[i - 1] / q;
+        if q.abs() < pivmin {
+            q = -pivmin;
+        }
+        if q < 0.0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Все собственные значения трёхдиагональной T — бисекцией по Гершгорину.
+fn sturm_bisect_all(d: &[f64], e: &[f64]) -> Vec<f64> {
+    let n = d.len();
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for i in 0..n {
+        let mut r = 0.0;
+        if i > 0 {
+            r += e[i - 1].abs();
+        }
+        if i + 1 < n {
+            r += e[i].abs();
+        }
+        lo = lo.min(d[i] - r);
+        hi = hi.max(d[i] + r);
+    }
+    let span = (hi - lo).abs().max(1e-300);
+    let tol = (2.0e-14 * span).max(f64::MIN_POSITIVE * 4.0);
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let (mut a, mut b) = (lo, hi);
+        // инвариант: count(a) <= k < count(b) => lambda_k in (a, b]
+        while b - a > tol {
+            let m = 0.5 * (a + b);
+            if m <= a || m >= b {
+                break; // исчерпано разрешение f64
+            }
+            if sturm_count(d, e, m) <= k {
+                a = m;
+            } else {
+                b = m;
+            }
+        }
+        out.push(0.5 * (a + b));
+    }
+    out.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,7 +1027,7 @@ mod tests {
         let c = m4.charpoly().unwrap();
         let n = 4;
         let mut pa = Matrix::zeros(n, n); // p(A) = 0·Aⁿ + c1·Aⁿ⁻¹ + … (старший при Aⁿ — c0=1)
-        let mut ak = Matrix::identity(n);
+        let ak = Matrix::identity(n);
         // идём от старшей степени вниз: c0·A⁴? нет: c[0]·A^4 + c[1]·A^3 + ... + c[4]·I
         for (k, coef) in c.iter().enumerate() {
             let power = n - k;
@@ -1191,135 +1322,4 @@ mod tests {
         let bad = Matrix::from_rows(&[vec![1.0, 2.0], vec![3.0, 4.0]]).expect("bad");
         assert!(bad.eigenvalues_sturm().is_err());
     }
-}
-
-// =====================================================================
-// Штурм-ядро (AI-API-реформа v0.62): свободные функции для eigen_sturm.
-// Хаусхолдер-трёхдиагонализация + бисекция по последовательности Штурма.
-// Протокол 2026-10-01: tridiag(2,-1,256) → max_err 2.8e-14 против
-// аналитики; та же арифметика f64, что у eigen — меняется только алгоритм.
-// =====================================================================
-
-/// Хаусхолдер: симметричная A (row-major f64, длина n*n) → (d, e).
-/// Поддиагональ после отражения k равна alpha (Px = alpha·e1).
-fn householder_tridiag(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut d = vec![0.0f64; n];
-    let mut e = vec![0.0f64; n.max(1) - 1];
-    if n == 0 {
-        return (d, e);
-    }
-    if n == 1 {
-        d[0] = a[0];
-        return (d, e);
-    }
-    for k in 0..n.saturating_sub(2) {
-        let m = n - (k + 1); // размер хвостового блока
-        let mut v: Vec<f64> = (k + 1..n).map(|i| a[i * n + k]).collect();
-        let xnorm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if xnorm == 0.0 {
-            e[k] = 0.0;
-            continue;
-        }
-        let alpha = if v[0] >= 0.0 { -xnorm } else { xnorm };
-        v[0] -= alpha; // v = x - alpha*e1
-        let vnorm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if vnorm < f64::MIN_POSITIVE {
-            e[k] = alpha;
-            continue;
-        }
-        for vi in v.iter_mut() {
-            *vi /= vnorm;
-        }
-        // w = A_sub · v; s = v·w; A' = A - 2vw^T - 2wv^T + 4s·vv^T
-        let mut w = vec![0.0f64; m];
-        for (j, wj) in w.iter_mut().enumerate() {
-            let mut acc = 0.0;
-            for (i, &vi) in v.iter().enumerate() {
-                acc += a[(k + 1 + i) * n + (k + 1 + j)] * vi;
-            }
-            *wj = acc;
-        }
-        let s: f64 = v.iter().zip(w.iter()).map(|(a1, b1)| a1 * b1).sum();
-        for i in 0..m {
-            for j in 0..m {
-                a[(k + 1 + i) * n + (k + 1 + j)] +=
-                    -2.0 * v[i] * w[j] - 2.0 * w[i] * v[j] + 4.0 * s * v[i] * v[j];
-            }
-        }
-        e[k] = alpha;
-    }
-    for i in 0..n {
-        d[i] = a[i * n + i];
-    }
-    if n >= 2 {
-        e[n - 2] = a[(n - 1) * n + (n - 2)];
-    }
-    (d, e)
-}
-
-/// Счёт Штурма: число собственных значений трёхдиагональной T, строго
-/// меньших x (LDL^T-рекуррентность, счёт отрицательных опорных).
-/// С semantics LAPACK dstebz: квазинулевой опорный ЗАМЕНЯЕТСЯ на -pivmin
-/// ДО подсчёта знака — заменённый опорный отрицателен и считается.
-fn sturm_count(d: &[f64], e: &[f64], x: f64) -> usize {
-    let n = d.len();
-    let e2max = e.iter().map(|v| v * v).fold(0.0f64, f64::max).max(1.0);
-    let pivmin = f64::MIN_POSITIVE * e2max;
-    let mut count = 0usize;
-    let mut q = d[0] - x;
-    if q.abs() < pivmin {
-        q = -pivmin;
-    }
-    if q < 0.0 {
-        count += 1;
-    }
-    for i in 1..n {
-        q = d[i] - x - e[i - 1] * e[i - 1] / q;
-        if q.abs() < pivmin {
-            q = -pivmin;
-        }
-        if q < 0.0 {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// Все собственные значения трёхдиагональной T — бисекцией по Гершгорину.
-fn sturm_bisect_all(d: &[f64], e: &[f64]) -> Vec<f64> {
-    let n = d.len();
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for i in 0..n {
-        let mut r = 0.0;
-        if i > 0 {
-            r += e[i - 1].abs();
-        }
-        if i + 1 < n {
-            r += e[i].abs();
-        }
-        lo = lo.min(d[i] - r);
-        hi = hi.max(d[i] + r);
-    }
-    let span = (hi - lo).abs().max(1e-300);
-    let tol = (2.0e-14 * span).max(f64::MIN_POSITIVE * 4.0);
-    let mut out = Vec::with_capacity(n);
-    for k in 0..n {
-        let (mut a, mut b) = (lo, hi);
-        // инвариант: count(a) <= k < count(b) => lambda_k in (a, b]
-        while b - a > tol {
-            let m = 0.5 * (a + b);
-            if m <= a || m >= b {
-                break; // исчерпано разрешение f64
-            }
-            if sturm_count(d, e, m) <= k {
-                a = m;
-            } else {
-                b = m;
-            }
-        }
-        out.push(0.5 * (a + b));
-    }
-    out.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
-    out
 }

@@ -26,7 +26,7 @@
 //! Контракт детерминизма: `vortex_hash` (по байтам VRTX-контейнера)
 //! и полевой хеш восстановленного растра бит-в-бит воспроизводимы.
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
 
 // ---------------------------------------------------------------------------
 // Детерминированный RNG (SplitMix64) — свой, суверенный
@@ -196,7 +196,7 @@ pub fn pack_trits(digits: &[u8]) -> Vec<u8> {
             v = v * 3 + (d & 3) as u32;
         }
         for _ in chunk.len()..5 {
-            v = v * 3; // добивка старших разрядов нулями
+            v *= 3; // добивка старших разрядов нулями
         }
         out.push(v as u8);
     }
@@ -889,6 +889,7 @@ pub fn add_noise(clean: &[f64], seed: u64, snr_db: f64) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
 
     #[test]
     fn fft2_roundtrip_identity() {

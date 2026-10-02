@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use super::scene::CameraSpec;
 use super::world::{BodyClass, World};
-use crate::p3::ffi::{Camera, P3Lib};
+use crate::p3::ffi::Camera;
 
 /// Параметры кадра игрового мира.
 #[derive(Clone, Debug)]

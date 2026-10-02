@@ -265,7 +265,7 @@ fn payload_bits(ev: &Event) -> u64 {
             (code.bits() as u64) << 3 | p
         }
         Text(c) => *c as u64,
-        MouseMove { dx, dy } => (dx.to_bits() as u64) ^ ((dy.to_bits() as u64) << 1),
+        MouseMove { dx, dy } => dx.to_bits() ^ (dy.to_bits() << 1),
         MouseButton { button, phase } => {
             let p = match phase {
                 KeyPhase::Pressed => 0u64,
@@ -274,8 +274,16 @@ fn payload_bits(ev: &Event) -> u64 {
             };
             (button.index() as u64) << 3 | p
         }
-        MouseWheel { delta } => delta.to_bits() as u64,
+        MouseWheel { delta } => delta.to_bits(),
         User(v) => *v,
+    }
+}
+
+#[cfg(test)]
+impl EventQueue {
+    /// Только для тестов: заглянуть в хвост не извлекая всё.
+    fn pop_back_for_test(&mut self) -> Option<Event> {
+        self.queue.back().copied()
     }
 }
 
@@ -411,13 +419,5 @@ mod tests {
         let mv = Event::MouseMove { dx: 0.0, dy: 0.0 }.priority();
         assert!(close < key && key < mv);
         assert!(Event::User(1).priority() >= mv);
-    }
-}
-
-#[cfg(test)]
-impl EventQueue {
-    /// Только для тестов: заглянуть в хвост не извлекая всё.
-    fn pop_back_for_test(&mut self) -> Option<Event> {
-        self.queue.back().copied()
     }
 }

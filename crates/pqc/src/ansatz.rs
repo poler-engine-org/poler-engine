@@ -636,7 +636,7 @@ impl PhaseAnsatz {
     /// Энтанглмент-сэмплирование: слова фона + биты дуг + префиксный XOR.
     fn sample_entangled(&self, rng: &mut Rng, shots: u64) -> ProductStats {
         let d = self.d_pol as usize;
-        let words_len = (d + 63) / 64;
+        let words_len = d.div_ceil(64);
         let tail = d % 64;
         let nodes: Vec<u32> = self.arcs.iter().map(|a| a.0).collect();
         let track_patterns = self.arcs.len() <= 64;

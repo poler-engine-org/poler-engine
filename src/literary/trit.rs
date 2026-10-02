@@ -45,7 +45,7 @@ pub fn quantize(p: &[f32], theta: f32) -> TritState {
         }
     }
     // Упаковка по 5 тритов в байт.
-    let packed_cols = (dims + 4) / 5;
+    let packed_cols = dims.div_ceil(5);
     let mut packed = vec![0u8; packed_cols];
     for (chunk_idx, chunk) in trits.chunks(5).enumerate() {
         let mut five = [0i8; 5];

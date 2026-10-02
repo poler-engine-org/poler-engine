@@ -90,7 +90,7 @@ pub fn slot_to_pair(slot: u64) -> (u32, u32) {
     while (x + 1) * (x + 1) <= disc {
         x += 1;
     }
-    let j = ((1 + x) / 2) as u64;
+    let j = x.div_ceil(2) as u64;
     let i = slot - j * (j - 1) / 2;
     (i as u32, j as u32)
 }
@@ -167,7 +167,7 @@ impl GyroData {
         d_pol: u32,
     ) -> Result<GyroData> {
         pairs.retain(|&(_, _, w)| w.is_finite() && w != 0.0);
-        pairs.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        pairs.sort_unstable_by_key(|a| (a.0, a.1));
         for w in pairs.windows(2) {
             if (w[0].0, w[0].1) == (w[1].0, w[1].1) {
                 return Err(PqwError::DuplicateIndex(w[1].0));
@@ -475,7 +475,7 @@ impl GyroSection {
             }
             slot = slot
                 .checked_add(delta)
-                .ok_or_else(|| PqwError::Layout("gyro section v2: slot overflow"))?;
+                .ok_or(PqwError::Layout("gyro section v2: slot overflow"))?;
             let (i, j) = slot_to_pair(slot);
             if i >= j || j >= d_pol {
                 return Err(PqwError::BadIndex { index: j, d_pol });
@@ -495,7 +495,7 @@ impl GyroSection {
             ));
         }
         // Канонизация: порядок слотов (j-строки) → лексикографический (i, j).
-        pairs.sort_unstable_by(|a, b| (a.i, a.j).cmp(&(b.i, b.j)));
+        pairs.sort_unstable_by_key(|a| (a.i, a.j));
         Ok((pairs, false))
     }
 

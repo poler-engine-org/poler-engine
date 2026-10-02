@@ -114,7 +114,7 @@ impl GraphMachineCompiler {
             graph.edges.len(), graph.sparsity_ratio() * 100.0));
         asm.push_str("global ");
         asm.push_str(func_name);
-        asm.push_str("\n");
+        asm.push('\n');
         asm.push_str(func_name);
         asm.push_str(":\n");
 

@@ -419,7 +419,7 @@ impl<'a> Parser<'a> {
                     let len = utf8_len(b);
                     let start = self.pos;
                     self.pos += len;
-                    let s = core::str::from_utf8(&self.bytes.get(start..self.pos).unwrap_or(&[]))
+                    let s = core::str::from_utf8(self.bytes.get(start..self.pos).unwrap_or(&[]))
                         .map_err(|_| self.err("invalid utf8"))?;
                     out.push_str(s);
                 }

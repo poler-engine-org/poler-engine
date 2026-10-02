@@ -151,6 +151,8 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 
 [dev-dependencies]
 tempfile = "3.10"
+# benches/poler_pure_ablation.rs (ablation-исследование v0.3.5, 26e04aa)
+nalgebra = "0.33"
 
 # Максимальная оптимизация: LTO по всему крейту, один CGU, strip символов.
 # Тесты гоняются в debug-профиле (`cargo test`), поэтому panic="abort"

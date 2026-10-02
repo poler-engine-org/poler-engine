@@ -362,7 +362,7 @@ impl HnswIndex {
         visited: &mut Vec<u64>,
         out: &mut Vec<(f64, u32)>,
     ) {
-        let words = (store.len() + 63) / 64;
+        let words = store.len().div_ceil(64);
         visited.clear();
         visited.resize(words, 0);
         let dp = store.d_pad();
@@ -482,7 +482,7 @@ impl HnswIndex {
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        if buf.len() < 20 || &buf[0..8] != &MAGIC {
+        if buf.len() < 20 || buf[0..8] != MAGIC {
             return Err("чужая магия: не PHNSW-граф".into());
         }
         let u32_at = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());

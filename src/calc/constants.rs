@@ -165,7 +165,7 @@ pub fn py_short(v: f64) -> String {
         return "0".into();
     }
     let a = v.abs();
-    if a >= 1e-4 && a < 1e9 {
+    if (1e-4..1e9).contains(&a) {
         let s = format!("{v:.10}");
         let s = s.trim_end_matches('0').trim_end_matches('.');
         s.to_string()

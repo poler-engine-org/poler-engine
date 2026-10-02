@@ -200,7 +200,7 @@ pub fn confirm_mutating(action: &ResolvedAction) -> bool {
     #[cfg(test)]
     {
         let _ = action;
-        return false;
+        false
     }
 
     #[cfg(not(test))]
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn ring_buffer_head_tail_marker() {
-        let big: Vec<u8> = (0..100_000u32).map(|i| (b'0' + (i % 10) as u8)).collect();
+        let big: Vec<u8> = (0..100_000u32).map(|i| b'0' + (i % 10) as u8).collect();
         let (text, dropped) = ring_buffer(&big, 1_000);
         assert!(dropped == 99_000);
         assert!(text.starts_with("0123456789"));

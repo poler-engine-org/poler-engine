@@ -290,7 +290,7 @@ pub struct Encoder {
 impl Encoder {
     pub fn new(d: usize, rot_seed: u64) -> Self {
         assert!(
-            d >= 1 && d <= 1 << 20,
+            (1..=1 << 20).contains(&d),
             "Encoder: подозрительная размерность {d}"
         );
         let d_pad = next_pow2_dim(d);

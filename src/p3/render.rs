@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::ffi::{Camera, P3Lib};
+use super::ffi::Camera;
 use crate::calc::matrix::Matrix;
 use crate::calc::solve::Complex;
 
@@ -302,8 +302,8 @@ fn build_scene(n: usize, cloud_top: usize, states: &[Matrix]) -> Scene {
     }
     debug_assert_eq!(base_index as usize, pts.len() / 4);
     for axis_end in [origin + 1, origin + 2, origin + 3] {
-        pairs.push(origin as u32);
-        pairs.push(axis_end as u32);
+        pairs.push(origin);
+        pairs.push(axis_end);
     }
 
     // Бокс данных: 8 вершин ±0.92 + 12 рёбер (все с w = 1 < |coord| не
@@ -315,7 +315,6 @@ fn build_scene(n: usize, cloud_top: usize, states: &[Matrix]) -> Scene {
             for &sz in &[-c, c] {
                 pts.extend_from_slice(&[sx, sy, sz, 1.0]);
                 segs.push(9);
-                base_index += 1;
             }
         }
     }
@@ -384,7 +383,7 @@ pub fn render_hamiltonian_frame(cfg: &FrameConfig) -> Result<FrameOutput, String
         // за нормой как метрикой честности (без модификации вектора).
         states.push(psi.clone());
     }
-    let e_final = expectation(&h, &states.last().unwrap());
+    let e_final = expectation(&h, states.last().unwrap());
     let norm_final = states
         .last()
         .unwrap()
@@ -703,6 +702,7 @@ fn annotate_rgb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p3::ffi::P3Lib;
 
     #[test]
     fn ising_ground_state_energy_two_qubits() {

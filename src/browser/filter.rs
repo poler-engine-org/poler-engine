@@ -78,3 +78,9 @@ impl ContentFilter {
         stats
     }
 }
+
+impl Default for ContentFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}

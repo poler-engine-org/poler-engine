@@ -77,9 +77,7 @@ impl VerificationReport {
     /// Однострочный вердикт для CLI/логов.
     pub fn verdict_line(&self) -> String {
         match self.verdict {
-            Verdict::ProvedExact => format!(
-                "ДОКАЗАНО ТОЧНО (кольцо ℤ[1/√2, i], невязка — структурный нуль)"
-            ),
+            Verdict::ProvedExact => "ДОКАЗАНО ТОЧНО (кольцо ℤ[1/√2, i], невязка — структурный нуль)".to_string(),
             Verdict::VerifiedNumeric(tol) => format!(
                 "ПОДТВЕРЖДЕНО ЧИСЛЕННО (допуск {tol:.1e}, невязка {:.3e})",
                 self.max_deviation
@@ -105,7 +103,7 @@ pub fn lint(c: &Circuit) -> Vec<String> {
     let n = c.n_qubits();
     let mut warns = Vec::new();
     let mut used = vec![false; n];
-    let mut mark = |q: usize, used: &mut Vec<bool>| {
+    let mark = |q: usize, used: &mut Vec<bool>| {
         if q < n {
             used[q] = true;
         }
@@ -318,12 +316,6 @@ enum UniMatrix {
 }
 
 impl UniMatrix {
-    fn dim(&self) -> usize {
-        match self {
-            UniMatrix::Exact(rows) => rows.len(),
-            UniMatrix::F64(rows) => rows.len(),
-        }
-    }
     fn method(&self) -> &'static str {
         match self {
             UniMatrix::Exact(_) => "exact:Z[1/√2,i]",

@@ -23,6 +23,9 @@ RUN mkdir -p src tests examples && \
 COPY src ./src
 COPY tests ./tests
 COPY examples ./examples
+# weblens/: include_bytes! в src/web/weblens.rs требует файлы расширения
+# на этапе компиляции — без этого COPY сборка образа падает
+COPY weblens ./weblens
 RUN touch src/lib.rs src/main.rs && \
     cargo build --release --locked -p poler-engine && \
     cargo test --release --quiet -p poler-engine

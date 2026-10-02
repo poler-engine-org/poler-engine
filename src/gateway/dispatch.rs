@@ -3474,6 +3474,9 @@ mod tests {
     #[test]
     fn box_allow_sudo_interactive_only() {
         // scripted-агент НЕ может ослаблять рут-политику (вектор!)
+        // env-лок: ниже мутируем POLER_POLICY_HOME (env процесс-глобален,
+        // параллельные тесты гоняются за него — v0.62 фикс CI)
+        let _g = docker_env_lock();
         let (mut st, ws) = jailed_state("allowsudo");
         let out = run(&mut st, "box allow sudo cargo *").unwrap();
         assert!(
@@ -3660,6 +3663,8 @@ mod tests {
     #[test]
     fn box_sudo_passwd_scripted_agent_refused() {
         // ZSE-инвариант: scripted-агент НЕ может выдать себе рут-пароль
+        // env-лок: ниже мутируем POLER_POLICY_HOME (гонка параллельных тестов)
+        let _g = docker_env_lock();
         let (mut st, ws) = jailed_state("passwd");
         let dir = std::env::temp_dir().join(format!("poler-pwcmd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3685,6 +3690,9 @@ mod tests {
     #[test]
     fn box_sudo_passwd_clear_is_tightening_anytime() {
         // снятие пароля = ужесточение → доступно и неинтерактивно
+        // env-лок: ниже мутируем POLER_POLICY_HOME — без лока параллельный
+        // тест успевал снять env между set_password и clear → «не был задан»
+        let _g = docker_env_lock();
         let (mut st, ws) = jailed_state("pwclear");
         let dir = std::env::temp_dir().join(format!("poler-pwclr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

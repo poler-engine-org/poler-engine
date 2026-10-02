@@ -43,7 +43,7 @@ impl PostingsStore {
 
     /// Упаковать массив `usize` (LE-байты → lz4).
     pub fn from_usize(vals: &[usize]) -> Self {
-        let mut raw = Vec::with_capacity(vals.len() * std::mem::size_of::<usize>());
+        let mut raw = Vec::with_capacity(std::mem::size_of_val(vals));
         for v in vals {
             raw.extend_from_slice(&v.to_le_bytes());
         }

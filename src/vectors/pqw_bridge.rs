@@ -79,7 +79,7 @@ impl Embedder for PqwEmbedder {
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         // Энкодер ограничен max_pos (XLM-R: −2 на паддинг/сдвиг позиций).
-        let cap = self.model.view().header().max_pos as usize;
+        let cap = self.model.view().header().max_pos;
         let cap = cap.saturating_sub(if self.model.view().header().xlmr_positions() {
             2
         } else {

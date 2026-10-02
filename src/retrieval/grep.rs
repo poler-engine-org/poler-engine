@@ -348,7 +348,7 @@ fn scan_bytes(name: &str, bytes: &[u8], matcher: &Matcher, config: &GrepConfig) 
 
     let mut line_no = 0usize;
     let mut offset = 0usize;
-    for (start, end) in split_lines(&bytes[..]) {
+    for (start, end) in split_lines(bytes) {
         line_no += 1;
         let line_bytes = &bytes[start..end];
         let text = String::from_utf8_lossy(line_bytes)

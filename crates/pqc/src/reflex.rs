@@ -110,7 +110,7 @@ impl ContextReflex {
     /// Текст в след (токены в порядке появления).
     pub fn observe_text(&mut self, text: &str, d_pol: u32) {
         for token in tokenize(text) {
-            self.observe_token(&token, d_pol);
+            self.observe_token(token, d_pol);
         }
     }
 
@@ -152,7 +152,7 @@ impl ContextReflex {
         ReflexData::new(
             self.interlocutor.clone(),
             self.turns,
-            self.trail.iter().copied().collect(),
+            self.trail.to_vec(),
             d_pol,
         )
         .ok()

@@ -232,7 +232,7 @@ impl QuantizedStoreView {
         if mmap.len() < HEADER {
             return Err("хранилище обрезано: меньше заголовка".into());
         }
-        if &mmap[0..8] != &MAGIC {
+        if mmap[0..8] != MAGIC {
             return Err("чужая магия: не PRBQ-хранилище".into());
         }
         let u32_at = |off: usize| u32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());

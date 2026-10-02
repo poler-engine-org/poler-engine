@@ -99,8 +99,8 @@ pub fn build_cast(
             if let Some(edges) = con.out_edges(u) {
                 for e in edges {
                     let v = e.target as usize;
-                    if !hop_of.contains_key(&v) {
-                        hop_of.insert(v, step);
+                    if let std::collections::hash_map::Entry::Vacant(e) = hop_of.entry(v) {
+                        e.insert(step);
                         fresh.push(v);
                     }
                 }

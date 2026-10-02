@@ -135,7 +135,7 @@ mod tests {
         let mut r = Rng::new(123);
         for _ in 0..1000 {
             let x = r.exponential(0.3);
-            assert!(x >= 0.0 && x < 50.0);
+            assert!((0.0..50.0).contains(&x));
         }
     }
 }

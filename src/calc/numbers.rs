@@ -164,7 +164,7 @@ fn pollard_brent(n: u64) -> Option<u64> {
             x = (mul_mod(x, x, n) + c) % n;
             y = (mul_mod(y, y, n) + c) % n;
             y = (mul_mod(y, y, n) + c) % n;
-            let diff = if x > y { x - y } else { y - x };
+            let diff = x.abs_diff(y);
             d = gcd_u64(diff, n);
             iterations += 1;
         }
@@ -520,8 +520,9 @@ pub fn big_div_small(a: &str, d: u64) -> String {
 
 /// Возведение малого целого основания в большую степень — точный путь
 /// для `2^10000` и т.п. (повторное возведение в квадрат).
-/// Кап: ~100 тыс. цифр результата (защита от вечного счёта).
+/// Кап: ~100 тыс. цифр результата (защита от вечного счёта — O(n²)-умножение).
 pub fn big_pow(base: i64, exp: u64) -> Result<String, String> {
+    const MAX_DIGITS: usize = 100_000;
     let neg_base = base < 0;
     let mut result = "1".to_string();
     let mut sq = base.unsigned_abs().to_string();
@@ -534,6 +535,11 @@ pub fn big_pow(base: i64, exp: u64) -> Result<String, String> {
         if e > 0 {
             sq = mag_mul(&sq, &sq);
         }
+        if result.len() > MAX_DIGITS || sq.len() > MAX_DIGITS {
+            return Err(format!(
+                "big_pow({base}, {exp}): результат превышает {MAX_DIGITS} цифр (потолок O(n²)-умножения)"
+            ));
+        }
     }
     // знак: минус ⟺ основание отрицательно И показатель нечётен
     Ok(big_from(neg_base && exp % 2 == 1, &result))
@@ -542,6 +548,7 @@ pub fn big_pow(base: i64, exp: u64) -> Result<String, String> {
 /// Большое целое основание в малую целую степень (fib(100)^2):
 /// повторное возведение в квадрат на модулях. Кап по цифрам — как выше.
 pub fn big_pow_big(a: &str, e: u64) -> Result<String, String> {
+    const MAX_DIGITS: usize = 100_000;
     let (neg, mag) = big_parts(a);
     let mut r = "1".to_string();
     let mut sq = mag.to_string();
@@ -553,6 +560,11 @@ pub fn big_pow_big(a: &str, e: u64) -> Result<String, String> {
         k >>= 1;
         if k > 0 {
             sq = mag_mul(&sq, &sq);
+        }
+        if r.len() > MAX_DIGITS || sq.len() > MAX_DIGITS {
+            return Err(format!(
+                "big_pow_big(..., {e}): результат превышает {MAX_DIGITS} цифр (потолок O(n²)-умножения)"
+            ));
         }
     }
     Ok(big_from(neg && e % 2 == 1, &r))
@@ -655,11 +667,11 @@ mod tests {
         assert_eq!(next_prime(3.0).unwrap(), 5.0);
         assert_eq!(next_prime(7.0).unwrap(), 11.0);
         assert_eq!(next_prime(13.0).unwrap(), 17.0);
-        assert_eq!(next_prime(1e6 as f64).unwrap(), 1_000_003.0);
+        assert_eq!(next_prime(1e6_f64).unwrap(), 1_000_003.0);
         assert_eq!(prev_prime(3.0).unwrap(), 2.0);
         assert_eq!(prev_prime(10.0).unwrap(), 7.0);
-        assert_eq!(prev_prime(2.0).is_err(), true);
-        assert_eq!(prev_prime(1.0).is_err(), true);
+        assert!(prev_prime(2.0).is_err());
+        assert!(prev_prime(1.0).is_err());
     }
 
     #[test]
@@ -723,7 +735,7 @@ mod tests {
         assert_eq!(mul_mod(3, 4, 10), 2);
         // большие операнды не переполняют: 2^64 mod (10^9+7)
         let v = pow_mod(2, 64, 1_000_000_007);
-        let want = (2u128).pow(64) % (1_000_000_007 as u128);
+        let want = (2u128).pow(64) % 1_000_000_007_u128;
         assert_eq!(v as u128, want);
     }
 

@@ -20,10 +20,9 @@ path = "src/bin/pqc.rs"
 name = "pqc-parity"
 path = "src/bin/pqc-parity.rs"
 
-[[bin]]
-name = "poler-bio"
-path = "src/bin/poler-bio.rs"
-
-[[bin]]
-name = "poler-unicode-compress"
-path = "src/bin/poler-unicode-compress.rs"
+# ПРИМЕЧАНИЕ: таргеты poler-bio и poler-unicode-compress объявлялись
+# здесь ранее, но их исходники (src/bin/poler-bio.rs,
+# src/bin/poler-unicode-compress.rs) в этом репозитории никогда не
+# существовали — «can't find bin» валил ВСЕ cargo-джобы CI
+# (--workspace --all-targets). Убраны; при переносе бинов из монорепо
+# добавлять вместе с исходниками.

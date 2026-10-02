@@ -144,7 +144,7 @@ pub fn complete_prefix(prefix: &str) -> (usize, Vec<String>) {
     // v0.17.0: `sources add <value> --kind <TAB>` — завершаем kind
     if first == "sources" && tokens.len() >= 3 && tokens[1] == "add" {
         // ищем --kind в args
-        if tokens.iter().any(|t| *t == "--kind") && in_first_token {
+        if tokens.contains(&"--kind") && in_first_token {
             let last = tokens[tokens.len() - 1];
             let cands: Vec<String> = ShellState::source_kinds()
                 .iter()
@@ -328,7 +328,7 @@ impl rustyline::Helper for PolerCompleter {}
 #[cfg(test)]
 fn _poler_completer_implements_helper() {
     fn assert_helper<H: rustyline::Helper>(_h: H) {}
-    assert_helper(PolerCompleter::default());
+    assert_helper(PolerCompleter);
 }
 
 #[cfg(test)]
@@ -377,7 +377,7 @@ mod tests {
     fn complete_notes_subcommands_v017() {
         let (start, cands) = complete_prefix("notes l");
         assert!(cands.iter().any(|c| c == "list"));
-        assert!(cands.iter().any(|c| c == "add") == false, "add doesn't start with 'l'");
+        assert!(!cands.iter().any(|c| c == "add"), "add doesn't start with 'l'");
         assert!(start >= 6);
     }
 
@@ -395,7 +395,7 @@ mod tests {
     fn complete_sources_subcommands_v017() {
         let (start, cands) = complete_prefix("sources ad");
         assert!(cands.iter().any(|c| c == "add"));
-        assert!(cands.iter().any(|c| c == "rm") == false, "rm doesn't start with 'ad'");
+        assert!(!cands.iter().any(|c| c == "rm"), "rm doesn't start with 'ad'");
         assert!(start >= 8);
     }
 

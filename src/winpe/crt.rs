@@ -8,7 +8,7 @@
 //!  * float-varargs: Win64-клієнт проливає XMM0-3 у shadow [rsp+8..0x28]
 
 use super::api::World;
-use super::runtime::{win_call, Handler};
+use super::runtime::Handler;
 
 pub unsafe fn cstr(p: u64) -> String {
     if p == 0 {
@@ -289,7 +289,7 @@ pub unsafe fn format(fmt: &str, va: &mut VarArgs, w: &mut String) {
                 out = format_args_num(v as i64, fl, width, prec, 10, false, false);
             }
             'o' => {
-                let v = va.next_u64() as u64;
+                let v = va.next_u64();
                 out = format_args_num(v as i64, fl, width, prec, 8, false, false);
             }
             'x' | 'X' => {
@@ -625,7 +625,7 @@ unsafe fn h___getmainargs(a0: u64, a1: u64, a2: u64, _3: u64, _4: u64, _5: u64, 
     let n = argv_copy.len();
     let arr = w.alloc_forever(((n + 1) * 8) as u32) as usize;
     let mut strs = Vec::new();
-    for (i, a) in argv_copy.iter().enumerate() {
+    for a in argv_copy.iter() {
         let p = w.alloc_forever(a.len() as u32 + 1) as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(a.as_ptr(), p as *mut u8, a.len());
@@ -779,7 +779,7 @@ unsafe fn h_bsearch(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _5: u64, _e: u6
     while lo <= hi {
         let mid = (lo + hi) / 2;
         let el = base + mid as u64 * width as u64;
-        let c = unsafe { super::runtime::win_call_here(compar, key, el, 0, 0) } as i64;
+        let c = super::runtime::win_call_here(compar, key, el, 0, 0) as i64;
         if c == 0 {
             return el;
         }
@@ -1018,7 +1018,7 @@ unsafe fn h_malloc(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u64
 }
 
 unsafe fn h_calloc(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u64, _c: u64, w: &World) -> u64 {
-    let n = (a0 as u64).saturating_mul(a1);
+    let n = a0.saturating_mul(a1);
     let p = w.heap_alloc(n as u32);
     if p != 0 && n > 0 {
         unsafe { std::ptr::write_bytes(p as *mut u8, 0, n as usize) };

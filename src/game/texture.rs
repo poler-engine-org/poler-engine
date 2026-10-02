@@ -643,7 +643,6 @@ mod tests {
         let t3 = spec2.render(64, 64, 1.0, &pal);
         assert_ne!(t1.texture_hash(), t3.texture_hash(), "другое зерно — другая текстура");
         assert_eq!(t1.rgb.len(), 64 * 64 * 3);
-        assert!(t1.rgb.iter().all(|b| *b <= 255));
         // Зум: другая глубина, но валидный растр
         let t4 = spec.render(64, 64, 4.0, &pal);
         assert_ne!(t1.texture_hash(), t4.texture_hash());

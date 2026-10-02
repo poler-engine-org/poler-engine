@@ -696,7 +696,7 @@ fn safe_join(staging: &Path, box_dir: &str, rest: &str) -> Result<PathBuf, Strin
 }
 
 fn is_exec_path(rest: &str) -> bool {
-    if Path::new(rest).extension().map_or(false, |e| e == "sh") {
+    if Path::new(rest).extension().is_some_and(|e| e == "sh") {
         return true;
     }
     // динамічний лінкер — виконуваний за призначенням (PT_INTERP потребує +x)
@@ -793,7 +793,7 @@ fn read_status_field(pid: i32, field: &str) -> Option<u64> {
         if let Some(rest) = line.strip_prefix(field) {
             // формат: "VmRSS:\t  2048 kB" — після префікса йдуть : \t і пробіли
             let num: String = rest
-                .trim_start_matches(|c| c == ':' || c == ' ' || c == '\t')
+                .trim_start_matches([':', ' ', '\t'])
                 .chars()
                 .take_while(|c| c.is_ascii_digit())
                 .collect();

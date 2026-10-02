@@ -174,7 +174,7 @@ pub fn precess_to_fixpoint(
         1
     };
     let push_trace = |trace: &mut Vec<TracePoint>, tick: u64, delta: f64, r: f64, t: f64| {
-        let sample = tick as usize <= fine || (tick as usize - fine) % stride == 0;
+        let sample = tick as usize <= fine || (tick as usize - fine).is_multiple_of(stride);
         if sample && trace.len() < TRACE_CAP {
             trace.push(TracePoint { tick, delta, r, torque: t });
         }

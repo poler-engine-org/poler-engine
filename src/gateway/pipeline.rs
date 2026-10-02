@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn lex_append_and_stderr_redirect() {
         let p = parse_line("echo hi >> log.txt").unwrap();
-        assert_eq!(p.redirect.unwrap().append, true);
+        assert!(p.redirect.unwrap().append);
         let p = parse_line("cmd 2> err.txt").unwrap();
         assert!(p.redirect.unwrap().stderr);
         // glued `2>`: слово «2» приклеено к `>`

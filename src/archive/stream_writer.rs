@@ -44,6 +44,7 @@ pub const METHOD_ZDEEP: u8 = 2; // zstd ~15
 
 /// Ярус сжатия.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompressTier {
     /// Только быстрый уровень (zstd-3): максимум скорости.
     Fast,
@@ -51,14 +52,10 @@ pub enum CompressTier {
     Deep,
     /// Авто: zstd-3; если чанк сжимается лучше 2:1 — пробуем zstd-15
     /// и берём меньший результат. Дефолт директивы.
+    #[default]
     Auto,
 }
 
-impl Default for CompressTier {
-    fn default() -> Self {
-        CompressTier::Auto
-    }
-}
 
 /// Конфигурация потоковой записи.
 #[derive(Debug, Clone)]
@@ -522,7 +519,7 @@ impl StreamWriter {
         let tar_mode = self.observer.is_tar();
         // Финализируем sha256 потока РОВНО ОДИН раз — после него
         // новых сырых байт не будет.
-        let stream_digest = std::mem::replace(&mut self.stream_hash, Sha256::new()).finalize();
+        let stream_digest = std::mem::take(&mut self.stream_hash).finalize();
         if !tar_mode {
             // одиночная запись: весь поток — один «файл»
             self.append_file_record(
@@ -795,7 +792,7 @@ fn sanitize_hint(hint: &str) -> String {
 
 fn zstd_compressor(level: i32) -> io::Result<zstd::bulk::Compressor<'static>> {
     zstd::bulk::Compressor::new(level)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))
+        .map_err(|e| io::Error::other(format!("zstd: {e}")))
 }
 
 pub fn fmt_bytes(b: u64) -> String {

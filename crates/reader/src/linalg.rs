@@ -152,7 +152,7 @@ pub fn expm(a: &Mat) -> Mat {
     let nrm = norm_inf(a);
     let mut s: u32 = 0;
     if nrm > 0.125 {
-        s = ((nrm / 0.125).log2().ceil() as u32).max(0);
+        s = (nrm / 0.125).log2().ceil() as u32;
     }
     let scale = 1.0 / (1u64 << s) as f64;
     let mut b = zeros();

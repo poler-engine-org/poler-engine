@@ -790,9 +790,10 @@ mod tests {
         assert!(r.starts_with("[4.92"), "{r}");
         // λ₂ = 289·(1−cos(2π/17)) ≈ 19.5156
         assert!(r.contains("19.5"), "{r}");
-        // тритовая диагностика лимита
-        let err = CalcState::new().eval_line("tridiag(1, 1, 100)").unwrap_err();
-        assert!(err.contains("2..=64"), "{err}");
+        // тритовая диагностика лимита (v0.62: граница поднята 64 → 512
+        // под Штурм-бисекцию; проверяем новую границу и сообщение)
+        let err = CalcState::new().eval_line("tridiag(1, 1, 600)").unwrap_err();
+        assert!(err.contains("2..=512"), "{err}");
     }
 
     #[test]

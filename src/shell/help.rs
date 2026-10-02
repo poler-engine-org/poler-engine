@@ -272,7 +272,7 @@ pub fn help_topic(name: &str) -> String {
             || name_lower
                 == g
                     .as_str()
-                    .split(|c: char| c == '/' || c == ' ')
+                    .split(['/', ' '])
                     .next()
                     .unwrap_or("")
                     .to_lowercase()
@@ -635,6 +635,78 @@ fn p3_help_topic() -> String {
     s
 }
 
+/// v0.54.0 (цикл S): полная справка Ядра Игры.
+fn game_help_topic() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.61.0) ───");
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "Фундамент игрового движка, построенный на разборе недостатков\nUE/Unity/Godot (docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md): сущности\nс поколениями вместо GC/UObject, фиксированный тик вместо плавающего\nвремени, кеплеровская физика вместо подобранных скоростей, рендер\nчерез P³-мост с честной глубиной d_FS, звук из физики мира (T1),\nтекстуры-функции со спектральным сжатием (T2), события/ввод/окно (U)."
+    );
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Команды:");
+    let _ = writeln!(s, "  game info                  — статус ядра: демо-сцена, физика, state-hash");
+    let _ = writeln!(s, "  game demo [opts]           — прогнать «Этерию» и отрендерить кадр:");
+    let _ = writeln!(s, "    opts: --ticks N(1..100000) --size WxH --out DIR --no-orbits");
+    let _ = writeln!(s, "    --no-box --json");
+    let _ = writeln!(s, "  game scene <file.json>     — своя сцена (JSON; формат — write-demo):");
+    let _ = writeln!(s, "    тела (id/class/mass/radius), иерархия parent, орбиты");
+    let _ = writeln!(s, "    (orbit_radius/inclination → ω=√(GM)/r^1.5), камера, цвета");
+    let _ = writeln!(s, "  game write-demo <file>     — выгрузить демо-сцену как редактируемый JSON");
+    let _ = writeln!(s, "  game sound [opts]          — озвучить мир (T1): ω→высота, X→панорама → WAV");
+    let _ = writeln!(s, "  game texture [opts]        — процедурная текстура (T2): тайл-функция → PNG");
+    let _ = writeln!(s, "    + SVD rank-k кодек (--svd-rank K --rank-curve)");
+    let _ = writeln!(s, "  game normalmap [opts]      — normal map из той же функции шума (U0):");
+    let _ = writeln!(s, "    --amplitude A(0..1.5) — глубина рельефа в долях тайла");
+    let _ = writeln!(s, "  game input-demo [opts]     — ввод→камера→кадры без окна (U1–U4):");
+    let _ = writeln!(s, "    скрипт JSON (--script) или встроенный демо-сценарий;");
+    let _ = writeln!(s, "    каждый кадр: события → Input → орбит-камера → P³-кадр;");
+    let _ = writeln!(s, "    frames_hash — детерминизм всей цепочки бит-в-бит");
+    let _ = writeln!(s, "  game window [opts]         — НАСТОЯЩЕЕ X11-окно (dlopen, zero-dep):");
+    let _ = writeln!(s, "    ЛКМ+движение — орбита · колесо — зум · WASD/QE · нужен DISPLAY");
+    let _ = writeln!(s, "  game asset absorb|emit   — Y «Эхо»: готовое → нейроны → PQW → с нуля:");
+    let _ = writeln!(s, "    absorb --in F.(wav|png|pgm|ppm) --out F.pqw");
+    let _ = writeln!(s, "    emit --in F.pqw --out F.(wav|png) [--seconds|--width|--height|");
+    let _ = writeln!(s, "         --seed|--burst|--compare] — SSN-вихрь даёт тайминг,");
+    let _ = writeln!(s, "    синапты — связность; PSD/PSNR/гистограммы — честно");
+    let _ = writeln!(s, "  game vortex [opts]        — вихревой кодек «Шеннон-байпас» (V0):");
+    let _ = writeln!(s, "    шум = когерентные фазовые вихри (Навье–Стокс, K41): 2D-FFT →");
+    let _ = writeln!(s, "    топ-моды → GF(3)-триты (5 трит/байт, 3^5=243≤256) → VRTX;");
+    let _ = writeln!(s, "    зачёт против zstd-19 и предела Шеннона, PSNR, хеши");
+    let _ = writeln!(s, "  game water [opts]         — нелинейная гидродинамика (X):");
+    let _ = writeln!(s, "    море = спектр волн (K41 + дисперсия √(gk+γk³)); эволюция —");
+    let _ = writeln!(s, "    целочисленные триты (фикс-точка, без f32-дрейфа); цикл X:");
+    let _ = writeln!(s, "    Стокс h₂=(kA²/2)cos2θ + сдвиг частоты, снос гребней (Мичелл),");
+    let _ = writeln!(s, "    белые барашки (Бофорт), вихри Ламб–Озеена (ротационное поле);");
+    let _ = writeln!(s, "    флаги: --linear (выключить нелинейность), --steepness S;");
+    let _ = writeln!(s, "    PSNR против f64-эталона, кадры PNG + шейдинг + VRTX");
+    let _ = writeln!(s, "  game panda — мост к Panda3D (W): вода POLER в чужом рендере;");
+    let _ = writeln!(s, "    panda-bridge/ (Python): demo_ocean.py — океан с оптикой GLSL");
+    let _ = writeln!(s, "    (Френель/пена/блик/Беер–Ламберт); libpoler_ffi.so — C-ABI:");
+    let _ = writeln!(s, "    polerf_water_* (тик+FFT+нормали одним вызовом); selftest.py");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Честность ядра:");
+    let _ = writeln!(s, "  детерминизм: state/audio/crystal/texture/frames/vortex/water-hash бит-в-бит");
+    let _ = writeln!(s, "  (одинаковая история → одинаковый мир: replay и lockstep бесплатны);");
+    let _ = writeln!(s, "  физика: угловые скорости выводятся из масс (третий закон Кеплера);");
+    let _ = writeln!(s, "  рендер: тройной буфер RGB + depth (d_FS) + seg (ID объектов);");
+    let _ = writeln!(s, "  ввод: события коалесцируются (MouseMove — суммированием),");
+    let _ = writeln!(s, "  рёбра just_pressed живут ровно один кадр, replay = хеш ввода.");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Примеры:");
+    let _ = writeln!(s, "  poler> game demo --ticks 900 --size 960x540 --out ./demo");
+    let _ = writeln!(s, "  poler> game sound --ticks 900 --out eteryya.wav");
+    let _ = writeln!(s, "  poler> game normalmap --style marble --amplitude 0.1");
+    let _ = writeln!(s, "  poler> game input-demo --frames 300 --every 30 --json");
+    let _ = writeln!(s, "  poler> game vortex --style all --size 256 --out-dir ./vortex");
+    let _ = writeln!(s, "  poler> game water --wind 20 --steps 900 --out-dir ./storm");
+    let _ = writeln!(s, "  полигон Panda3D: pip install panda3d numpy &&");
+    let _ = writeln!(s, "    python3 panda-bridge/demo_ocean.py 10 128");
+    let _ = writeln!(s, "  poler-engine --exec \"game demo --json\" --json");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,76 +792,4 @@ mod tests {
         let s = help_topic("nlm");
         assert!(s.contains("не знайдена"), "v2.0: темы nlm больше нет: {s}");
     }
-}
-
-/// v0.54.0 (цикл S): полная справка Ядра Игры.
-fn game_help_topic() -> String {
-    let mut s = String::new();
-    let _ = writeln!(s, "─── Ядро Игры: POLER как игровой движок (v0.61.0) ───");
-    let _ = writeln!(s);
-    let _ = writeln!(
-        s,
-        "Фундамент игрового движка, построенный на разборе недостатков\nUE/Unity/Godot (docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md): сущности\nс поколениями вместо GC/UObject, фиксированный тик вместо плавающего\nвремени, кеплеровская физика вместо подобранных скоростей, рендер\nчерез P³-мост с честной глубиной d_FS, звук из физики мира (T1),\nтекстуры-функции со спектральным сжатием (T2), события/ввод/окно (U)."
-    );
-    let _ = writeln!(s);
-    let _ = writeln!(s, "Команды:");
-    let _ = writeln!(s, "  game info                  — статус ядра: демо-сцена, физика, state-hash");
-    let _ = writeln!(s, "  game demo [opts]           — прогнать «Этерию» и отрендерить кадр:");
-    let _ = writeln!(s, "    opts: --ticks N(1..100000) --size WxH --out DIR --no-orbits");
-    let _ = writeln!(s, "    --no-box --json");
-    let _ = writeln!(s, "  game scene <file.json>     — своя сцена (JSON; формат — write-demo):");
-    let _ = writeln!(s, "    тела (id/class/mass/radius), иерархия parent, орбиты");
-    let _ = writeln!(s, "    (orbit_radius/inclination → ω=√(GM)/r^1.5), камера, цвета");
-    let _ = writeln!(s, "  game write-demo <file>     — выгрузить демо-сцену как редактируемый JSON");
-    let _ = writeln!(s, "  game sound [opts]          — озвучить мир (T1): ω→высота, X→панорама → WAV");
-    let _ = writeln!(s, "  game texture [opts]        — процедурная текстура (T2): тайл-функция → PNG");
-    let _ = writeln!(s, "    + SVD rank-k кодек (--svd-rank K --rank-curve)");
-    let _ = writeln!(s, "  game normalmap [opts]      — normal map из той же функции шума (U0):");
-    let _ = writeln!(s, "    --amplitude A(0..1.5) — глубина рельефа в долях тайла");
-    let _ = writeln!(s, "  game input-demo [opts]     — ввод→камера→кадры без окна (U1–U4):");
-    let _ = writeln!(s, "    скрипт JSON (--script) или встроенный демо-сценарий;");
-    let _ = writeln!(s, "    каждый кадр: события → Input → орбит-камера → P³-кадр;");
-    let _ = writeln!(s, "    frames_hash — детерминизм всей цепочки бит-в-бит");
-    let _ = writeln!(s, "  game window [opts]         — НАСТОЯЩЕЕ X11-окно (dlopen, zero-dep):");
-    let _ = writeln!(s, "    ЛКМ+движение — орбита · колесо — зум · WASD/QE · нужен DISPLAY");
-    let _ = writeln!(s, "  game asset absorb|emit   — Y «Эхо»: готовое → нейроны → PQW → с нуля:");
-    let _ = writeln!(s, "    absorb --in F.(wav|png|pgm|ppm) --out F.pqw");
-    let _ = writeln!(s, "    emit --in F.pqw --out F.(wav|png) [--seconds|--width|--height|");
-    let _ = writeln!(s, "         --seed|--burst|--compare] — SSN-вихрь даёт тайминг,");
-    let _ = writeln!(s, "    синапты — связность; PSD/PSNR/гистограммы — честно");
-    let _ = writeln!(s, "  game vortex [opts]        — вихревой кодек «Шеннон-байпас» (V0):");
-    let _ = writeln!(s, "    шум = когерентные фазовые вихри (Навье–Стокс, K41): 2D-FFT →");
-    let _ = writeln!(s, "    топ-моды → GF(3)-триты (5 трит/байт, 3^5=243≤256) → VRTX;");
-    let _ = writeln!(s, "    зачёт против zstd-19 и предела Шеннона, PSNR, хеши");
-    let _ = writeln!(s, "  game water [opts]         — нелинейная гидродинамика (X):");
-    let _ = writeln!(s, "    море = спектр волн (K41 + дисперсия √(gk+γk³)); эволюция —");
-    let _ = writeln!(s, "    целочисленные триты (фикс-точка, без f32-дрейфа); цикл X:");
-    let _ = writeln!(s, "    Стокс h₂=(kA²/2)cos2θ + сдвиг частоты, снос гребней (Мичелл),");
-    let _ = writeln!(s, "    белые барашки (Бофорт), вихри Ламб–Озеена (ротационное поле);");
-    let _ = writeln!(s, "    флаги: --linear (выключить нелинейность), --steepness S;");
-    let _ = writeln!(s, "    PSNR против f64-эталона, кадры PNG + шейдинг + VRTX");
-    let _ = writeln!(s, "  game panda — мост к Panda3D (W): вода POLER в чужом рендере;");
-    let _ = writeln!(s, "    panda-bridge/ (Python): demo_ocean.py — океан с оптикой GLSL");
-    let _ = writeln!(s, "    (Френель/пена/блик/Беер–Ламберт); libpoler_ffi.so — C-ABI:");
-    let _ = writeln!(s, "    polerf_water_* (тик+FFT+нормали одним вызовом); selftest.py");
-    let _ = writeln!(s);
-    let _ = writeln!(s, "Честность ядра:");
-    let _ = writeln!(s, "  детерминизм: state/audio/crystal/texture/frames/vortex/water-hash бит-в-бит");
-    let _ = writeln!(s, "  (одинаковая история → одинаковый мир: replay и lockstep бесплатны);");
-    let _ = writeln!(s, "  физика: угловые скорости выводятся из масс (третий закон Кеплера);");
-    let _ = writeln!(s, "  рендер: тройной буфер RGB + depth (d_FS) + seg (ID объектов);");
-    let _ = writeln!(s, "  ввод: события коалесцируются (MouseMove — суммированием),");
-    let _ = writeln!(s, "  рёбра just_pressed живут ровно один кадр, replay = хеш ввода.");
-    let _ = writeln!(s);
-    let _ = writeln!(s, "Примеры:");
-    let _ = writeln!(s, "  poler> game demo --ticks 900 --size 960x540 --out ./demo");
-    let _ = writeln!(s, "  poler> game sound --ticks 900 --out eteryya.wav");
-    let _ = writeln!(s, "  poler> game normalmap --style marble --amplitude 0.1");
-    let _ = writeln!(s, "  poler> game input-demo --frames 300 --every 30 --json");
-    let _ = writeln!(s, "  poler> game vortex --style all --size 256 --out-dir ./vortex");
-    let _ = writeln!(s, "  poler> game water --wind 20 --steps 900 --out-dir ./storm");
-    let _ = writeln!(s, "  полигон Panda3D: pip install panda3d numpy &&");
-    let _ = writeln!(s, "    python3 panda-bridge/demo_ocean.py 10 128");
-    let _ = writeln!(s, "  poler-engine --exec \"game demo --json\" --json");
-    s
 }

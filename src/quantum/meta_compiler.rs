@@ -275,7 +275,7 @@ fn compile_to_waves(
             std::mem::swap(&mut cl, &mut cr);
         }
         if matches!(cl, GateCoeff::One) && matches!(cr, GateCoeff::Zero) {
-            value_of[g.result as usize] = l;
+            value_of[g.result] = l;
             continue;
         }
         kept.push(IrGate {
@@ -684,7 +684,7 @@ impl CSEOptimizer {
                 std::mem::swap(&mut cl, &mut cr);
             }
             if matches!(cl, GateCoeff::One) && matches!(cr, GateCoeff::Zero) {
-                value_of[g.result as usize] = l;
+                value_of[g.result] = l;
                 continue;
             }
             kept.push(IrGate {
@@ -1099,7 +1099,7 @@ pub fn crystallize_to_flat_simd_rust(fn_name: &str, builder: &WeightCircuitBuild
         }
 
         // Маски только при неоднородных коэффициентах.
-        if w.absorb_l.iter().any(|&a| a == MASK_KILL) {
+        if w.absorb_l.contains(&MASK_KILL) {
             s.push_str(&format!(
                 "    let l{wi} = _mm256_and_ps(l{wi}, _mm256_set_ps({}));\n",
                 set_ps_mask_args(&w.absorb_l)
@@ -1111,7 +1111,7 @@ pub fn crystallize_to_flat_simd_rust(fn_name: &str, builder: &WeightCircuitBuild
                 set_ps_mask_args(&w.sign_l)
             ));
         }
-        if w.absorb_r.iter().any(|&a| a == MASK_KILL) {
+        if w.absorb_r.contains(&MASK_KILL) {
             s.push_str(&format!(
                 "    let k{wi} = _mm256_and_ps(k{wi}, _mm256_set_ps({}));\n",
                 set_ps_mask_args(&w.absorb_r)

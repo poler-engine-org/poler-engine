@@ -216,7 +216,7 @@ pub fn unpack_trit2(bits: u8) -> Result<Trit> {
 /// Упаковка четырёх тритов в байт v2: `t[0]` — младшая пара.
 #[inline]
 pub fn pack_quad(ts: [Trit; 4]) -> u8 {
-    (pack_trit2(ts[0]) << 0)
+    pack_trit2(ts[0])
         | (pack_trit2(ts[1]) << 2)
         | (pack_trit2(ts[2]) << 4)
         | (pack_trit2(ts[3]) << 6)

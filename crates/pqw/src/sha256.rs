@@ -140,7 +140,7 @@ impl Sha256 {
         tail[self.buflen] = 0x80;
         let len_at = if self.buflen < 56 { 56 } else { 120 };
         tail[len_at..len_at + 8].copy_from_slice(&bit_len.to_be_bytes());
-        for block in tail[..len_at + 8].chunks_exact(64) {
+        for block in tail[..len_at + 8].as_chunks::<64>().0 {
             compress(&mut self.state, block.try_into().unwrap());
         }
 

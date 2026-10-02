@@ -291,7 +291,7 @@ impl BornOptimizer {
         // Около полюсов ±1 полином 3λ²−2λ³ может перескочить границу
         // на ошибке округления (например, 1 + 4e−16) — возвращаем в [−1, 1].
         self.steps += 1;
-        let purified = self.purify_every > 0 && self.steps % self.purify_every == 0;
+        let purified = self.purify_every > 0 && self.steps.is_multiple_of(self.purify_every);
         if purified {
             for v in p_new.iter_mut() {
                 *v = purify_p(*v).clamp(-1.0, 1.0);
@@ -642,7 +642,7 @@ impl ActiveInference {
 
         // 7. McWeeny-пурификация каждые K шагов.
         self.steps += 1;
-        let purified = self.purify_every > 0 && self.steps % self.purify_every == 0;
+        let purified = self.purify_every > 0 && self.steps.is_multiple_of(self.purify_every);
         if purified {
             for v in p_new.iter_mut() {
                 *v = purify_p(*v).clamp(-1.0, 1.0);

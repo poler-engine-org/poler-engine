@@ -70,11 +70,13 @@ impl HybridChessSupercalculator {
         // Симуляція паралельного батчу GPU SIMD warp
         let mut checksum: u64 = 0;
         for core in 0..num_cuda_cores {
-            let core_seed = (self.white_occupancy ^ (core as u64)).wrapping_mul(6364136223846793005);
+            let core_seed = (self.white_occupancy ^ self.black_occupancy ^ (core as u64))
+                .wrapping_mul(6364136223846793005);
             checksum ^= core_seed;
         }
 
         let elapsed = start.elapsed();
+        println!("  GPU-каскад: checksum = {checksum:#018x}");
         (total_branches_simulated, elapsed.as_secs_f64())
     }
 }

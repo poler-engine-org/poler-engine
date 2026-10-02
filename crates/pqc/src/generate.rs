@@ -612,7 +612,7 @@ impl<'a> L5Generator<'a> {
         for token in tokenize(prompt) {
             // Алфавит речи (RQ21): таблица мостов следует за промптом.
             if self.script_cyrillic.is_none() {
-                self.script_cyrillic = Some(is_cyrillic_token(&token));
+                self.script_cyrillic = Some(is_cyrillic_token(token));
             }
             let coord =
                 (fnv1a64(token.as_bytes()) % self.qc.d_pol() as u64) as u32;

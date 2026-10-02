@@ -1228,7 +1228,7 @@ fn boundary_scan(tokens: &[String], ws: &WsGuard, all_args: bool) -> Option<Poli
         }
 
         let tok = unquote(tok);
-        if tok.is_empty() || is_url(&tok) {
+        if tok.is_empty() || is_url(tok) {
             continue;
         }
 
@@ -1245,11 +1245,11 @@ fn boundary_scan(tokens: &[String], ws: &WsGuard, all_args: bool) -> Option<Poli
         if explicit {
             candidates.push(tok.to_string());
         }
-        candidates.extend(extract_path_fragments(&tok));
+        candidates.extend(extract_path_fragments(tok));
 
         if candidates.is_empty() {
             // «голое» имя: симлинк внутри workspace, ведущий наружу
-            if let Some(escaped) = symlink_escape(&tok, ws) {
+            if let Some(escaped) = symlink_escape(tok, ws) {
                 return Some(Policy::Confirm(format!(
                     "доступ вне workspace: {escaped} (симлинк из workspace)"
                 )));

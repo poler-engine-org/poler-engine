@@ -1798,7 +1798,7 @@ mod tests {
     #[test]
     fn discover_host_agents_classifies() {
         let d = fake_agent_dir("disc");
-        let found = discover_host_agents(&[d.clone()]);
+        let found = discover_host_agents(std::slice::from_ref(&d));
         let agy = found.iter().find(|a| a.name == "agy").expect("agy найден");
         assert_eq!(agy.kind, AgentKind::Elf);
         assert!(agy.host_path.ends_with("agy"));
@@ -1812,10 +1812,10 @@ mod tests {
     #[test]
     fn plan_agent_mounts_shapes() {
         let d = fake_agent_dir("plan");
-        let found = discover_host_agents(&[d.clone()]);
+        let found = discover_host_agents(std::slice::from_ref(&d));
         let cfg_dir = d.join(".gemini");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        let (mounts, notes) = plan_agent_mounts(&found, true, &[cfg_dir.clone()]);
+        let (mounts, notes) = plan_agent_mounts(&found, true, std::slice::from_ref(&cfg_dir));
         let agy_m = mounts
             .iter()
             .find(|m| m.container == "/usr/local/bin/agy")

@@ -227,7 +227,7 @@ fn quantize_block(values: &[f32], theta: f32, keep: f32, block: usize) -> (f32, 
     }
     let zeros = values.len() - nonzero;
     // Упаковка 5 тритов в байт (блок фиксирован — паддинг нулями).
-    let cols = (block + 4) / 5;
+    let cols = block.div_ceil(5);
     let mut packed = vec![0u8; cols];
     for (c, chunk) in trits.chunks(5).enumerate() {
         let mut five = [0i8; 5];
@@ -342,7 +342,7 @@ pub fn verify_t5q(bytes: &[u8]) -> Result<StreamQuantStats, String> {
     if digest[..] != tail[32..64] {
         return Err("sha256 блоков не сходится".into());
     }
-    let cols = (block + 4) / 5;
+    let cols = block.div_ceil(5);
     let piece = 4 + cols;
     let blocks = rd_u64(bytes.len() - TRAILER + 8) as usize;
     if body.len() % piece != 0 || body.len() / piece != blocks {

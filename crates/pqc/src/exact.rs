@@ -575,7 +575,7 @@ impl ExactStatevector {
                             m += 1;
                         }
                     }
-                    let s = m.trailing_zeros() as u32;
+                    let s = m.trailing_zeros();
                     if m == 0 || (1usize << s) != m {
                         return Err(PqcError::NotExactGate {
                             gate: format!(
@@ -584,7 +584,7 @@ impl ExactStatevector {
                             ),
                         });
                     }
-                    let tooth = if s % 2 == 0 {
+                    let tooth = if s.is_multiple_of(2) {
                         // 1/2^{s/2}
                         ExactCx {
                             a: 1,
@@ -600,7 +600,7 @@ impl ExactStatevector {
                             b: 1,
                             c: 0,
                             d: 0,
-                            k: (s + 1) / 2,
+                            k: s.div_ceil(2),
                         }
                     };
                     for (x, v) in self.amps.iter_mut().enumerate() {

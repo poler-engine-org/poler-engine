@@ -225,7 +225,7 @@ pub fn detokenize_join(words: &[&str]) -> String {
         });
         let prev = words[i - 1];
         let no_space_after_prev =
-            prev.ends_with(|c: char| matches!(c, '(' | '[' | '{' | '«' | '“'));
+            prev.ends_with(['(', '[', '{', '«', '“']);
         if no_space_before || no_space_after_prev {
             out.push_str(w);
         } else {

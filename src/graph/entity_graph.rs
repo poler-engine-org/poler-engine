@@ -34,10 +34,12 @@ use crate::aidde::symbols::SymbolTable;
 /// Политика идентичности узлов графа (v0.21.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum IdentityPolicy {
     /// Текстовые сущности: ключ узла — `lowercase(name)`, повторное
     /// добавление с заглавной повышает отображаемое имя. Для заметок,
     /// нарратива, общих знаний.
+    #[default]
     Text,
     /// Символы кода: ключ узла — точное имя с учётом регистра,
     /// квалифицированное module path (`module::name`). Идентичность
@@ -47,11 +49,6 @@ pub enum IdentityPolicy {
     CodeSymbol,
 }
 
-impl Default for IdentityPolicy {
-    fn default() -> Self {
-        IdentityPolicy::Text
-    }
-}
 
 /// Узел знаний: сущность с temporal-слоем.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -11,7 +11,6 @@
 
 use super::pe::{self, PeInfo};
 use std::cell::Cell;
-use std::collections::HashMap;
 
 /// Повна сигнатура шима: win-аргументи + entry_rsp (varargs: warg6+ на [rsp+0x38..])
 /// + caller_rip (SEH: пошук кадру кидка).

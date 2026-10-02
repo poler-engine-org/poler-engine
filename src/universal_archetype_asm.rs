@@ -179,10 +179,10 @@ impl ArchetypeAsmGenerator {
                 emit!(format!("    ; Target Arch {target_arch} ({})", ARCHETYPE_NAMES[target_arch]));
                 emit!(format!("    cmp esi, {target_arch}"));
                 emit!(format!("    jne .skip_arch_{cp:04X}_{target_arch}"));
-                emit!(format!("    mov eax, 0x00010000"));
+                emit!("    mov eax, 0x00010000".to_string());
                 emit!(format!("    {instr}"));
-                emit!(format!("    mov [rdx], eax"));
-                emit!(format!("    ret"));
+                emit!("    mov [rdx], eax".to_string());
+                emit!("    ret".to_string());
                 emit!(format!(".skip_arch_{cp:04X}_{target_arch}:"));
             }
 
@@ -223,6 +223,12 @@ impl ArchetypeAsmGenerator {
             0x53, 0x41, 0x54, 0x41, 0x55, 0x89, 0xF8, 0x69, 0xC0, 0xB9, 0x79, 0x37, 0x9E, 0xC1,
             0xE8, 0x1C, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3,
         ]
+    }
+}
+
+impl Default for ArchetypeAsmGenerator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

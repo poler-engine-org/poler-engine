@@ -16,7 +16,6 @@
 //!  * FuncInfo v1 (0x19930520), RVA-базований, x64 IP-to-state map
 
 use super::api::{LoadedImage, World};
-use super::crt::read_u64;
 
 pub const SEH_DEBUG: bool = false; // увімкнути для повного дампу
 
@@ -147,6 +146,7 @@ unsafe fn find_rf(img: &LoadedImage, rip: u64) -> Option<super::pe::RuntimeFunct
 const UW_PUSH_NONVOL: u8 = 0;
 const UW_ALLOC_LARGE: u8 = 1;
 const UW_ALLOC_SMALL: u8 = 2;
+#[allow(dead_code)] // полная карта опкодов unwind-ABI x64 (документационная)
 const UW_SET_FPREG: u8 = 3;
 const UW_SAVE_NONVOL: u8 = 4;
 const UW_SAVE_NONVOL_FAR: u8 = 5;
@@ -154,16 +154,25 @@ const UW_SAVE_XMM128: u8 = 8;
 const UW_SAVE_XMM128_FAR: u8 = 9;
 const UW_PUSH_MACHFRAME: u8 = 7;
 
+// Полная карта регистров CONTEXT x64 (RAX..R15) — документационная
+// полнота unwind-ABI; в match используются только задействованные.
+#[allow(dead_code)]
 const REG_RAX: usize = 0;
+#[allow(dead_code)]
 const REG_RCX: usize = 1;
+#[allow(dead_code)]
 const REG_RDX: usize = 2;
 const REG_RBX: usize = 3;
+#[allow(dead_code)]
 const REG_RSP: usize = 4;
 const REG_RBP: usize = 5;
 const REG_RSI: usize = 6;
 const REG_RDI: usize = 7;
+#[allow(dead_code)]
 const REG_R8: usize = 8;
+#[allow(dead_code)]
 const REG_R12: usize = 12;
+#[allow(dead_code)]
 const REG_R15: usize = 15;
 
 fn get_reg(ctx: &Ctx, idx: usize) -> u64 {
@@ -610,17 +619,15 @@ pub unsafe fn cxx_throw(
                         write_seh_u64(ptrs, rec);
                         write_seh_u64(ptrs + 8, 0); // CONTEXT* = NULL
                     }
-                    let r = unsafe {
-                        super::runtime::win_call_on(
-                            img.base + filter as u64,
-                            scratch,
-                            ptrs,
-                            0,
-                            0,
-                            0,
-                            0,
-                        )
-                    };
+                    let r = super::runtime::win_call_on(
+                        img.base + filter as u64,
+                        scratch,
+                        ptrs,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
                     r as i32
                 };
                 dbg!("[seh] C-SEH вердикт: {verdict}");
@@ -655,13 +662,11 @@ pub unsafe fn cxx_throw(
                         "[seh] C-SEH: перехід у target {target:#x}, кадр {:#x}",
                         fr.established
                     );
-                    unsafe {
-                        super::runtime::win_continue(
-                            img.base + target as u64,
-                            fr.established,
-                            &regs,
-                        );
-                    }
+                    super::runtime::win_continue(
+                        img.base + target as u64,
+                        fr.established,
+                        &regs,
+                    );
                     unreachable!()
                 }
             }
@@ -732,9 +737,8 @@ unsafe fn transfer_to_catch(
         "[seh] catch-хендлер @ rva {catch_rva:#x}, база кадру {:#x}, obj={obj:#x}",
         catch_frame.established
     );
-    let continuation = unsafe {
-        super::runtime::win_call_on(target, scratch, obj, catch_frame.established, 0, 0, 0)
-    };
+    let continuation =
+        super::runtime::win_call_on(target, scratch, obj, catch_frame.established, 0, 0, 0);
     dbg!("[seh] продовження = {continuation:#x}");
 
     // 4) перехід: rsp = established кадру catch, регістри кадру живі
@@ -751,8 +755,6 @@ unsafe fn transfer_to_catch(
         "[seh] СТРИБАЙ: rip={continuation:#x} rsp={:#x}",
         catch_frame.established
     );
-    unsafe {
-        super::runtime::win_continue(continuation, catch_frame.established, &regs);
-    }
+    super::runtime::win_continue(continuation, catch_frame.established, &regs);
     unreachable!()
 }

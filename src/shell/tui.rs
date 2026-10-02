@@ -390,9 +390,9 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                         (KeyCode::Char('r'), _) => {
                             ts.reload(&mut state);
                         }
-                        (KeyCode::Char('d'), _) => {
+                        (KeyCode::Char('d'), _)
                             // Удалить выбранную пару из ленты.
-                            if ts.viewing.is_none() {
+                            if ts.viewing.is_none() => {
                                 if let Some(e) = ts.selected() {
                                     let id = e.id;
                                     match state.ensure_notes_conn() {
@@ -407,7 +407,6 @@ pub fn run_tui(db_path: PathBuf) -> std::process::ExitCode {
                                     }
                                 }
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -754,7 +753,7 @@ impl TranscriptState {
     }
 
     fn view_scroll_down(&mut self) {
-        self.view_scroll = self.view_scroll.saturating_add(1).min(65_535);
+        self.view_scroll = self.view_scroll.saturating_add(1);
     }
 
     fn view_page_up(&mut self) {
@@ -762,7 +761,7 @@ impl TranscriptState {
     }
 
     fn view_page_down(&mut self) {
-        self.view_scroll = self.view_scroll.saturating_add(VIEW_PAGE).min(65_535);
+        self.view_scroll = self.view_scroll.saturating_add(VIEW_PAGE);
     }
 }
 
@@ -894,7 +893,7 @@ fn wrapped_rows(line: &str, width: usize) -> usize {
     if len == 0 {
         return 1;
     }
-    (len + width - 1) / width
+    len.div_ceil(width)
 }
 
 /// Row-offset, при котором виден самый низ лога (с учётом Wrap и высоты панели).
@@ -2355,7 +2354,6 @@ fn handle_single_click(
     // Клик по Input panel → фокус
     if mouse::hit(&layout.input_area, col, row) {
         *focus = Focus::Input;
-        return;
     }
 }
 

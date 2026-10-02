@@ -268,9 +268,7 @@ pub fn read_local_document(path: &Path, max_bytes: usize) -> Result<String, Stri
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if is_binary(&bytes) {
-        return Err(format!(
-            "бинарный файл — просмотр в терминале недоступен (o — открыть внешне)"
-        ));
+        return Err("бинарный файл — просмотр в терминале недоступен (o — открыть внешне)".to_string());
     }
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }

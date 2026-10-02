@@ -552,10 +552,7 @@ fn translate_sort(args: &[String]) -> WinTranslation {
     for a in args {
         if is_win_flag(a) {
             let f = flag_name(a);
-            match f.as_str() {
-                "r" => out.push("-r".into()),
-                _ => {}
-            }
+            if f.as_str() == "r" { out.push("-r".into()) }
         } else if let Some(k) = a.strip_prefix("/+") {
             // /+n — начать сравнение с колонки n → key от n
             if let Ok(n) = k.parse::<usize>() {

@@ -37,19 +37,19 @@ pub fn encode_indices(indices: &[u32], index16: bool) -> Vec<u8> {
 /// (заимствование без копирования при допустимом выравнивании).
 pub fn decode_indices(bytes: &[u8], index16: bool) -> Result<Cow<'_, [u32]>> {
     let width = index_width(index16);
-    if bytes.len() % width != 0 {
+    if !bytes.len().is_multiple_of(width) {
         return Err(PqwError::Layout(
             "topology length is not a multiple of the index width",
         ));
     }
     if index16 {
         let v: Vec<u32> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         Ok(Cow::Owned(v))
     } else if cfg!(target_endian = "little")
-        && bytes.as_ptr() as usize % std::mem::align_of::<u32>() == 0
+        && (bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>())
     {
         let n = bytes.len() / 4;
         // SAFETY: длина кратна 4, выравнивание проверено выше; u32 — POD.
@@ -57,7 +57,7 @@ pub fn decode_indices(bytes: &[u8], index16: bool) -> Result<Cow<'_, [u32]>> {
         Ok(Cow::Borrowed(s))
     } else {
         let v: Vec<u32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Ok(Cow::Owned(v))

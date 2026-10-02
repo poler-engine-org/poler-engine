@@ -353,7 +353,7 @@ impl RealGlinerModel {
             if !overlaps {
                 taken.push((i, j));
                 entities.push(Entity {
-                    text: words[i..=j].iter().copied().collect::<Vec<_>>().join(" "),
+                    text: words[i..=j].to_vec().join(" "),
                     label: labels[c].to_string(),
                     score,
                     start: i,

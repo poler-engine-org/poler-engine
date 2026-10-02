@@ -568,7 +568,7 @@ fn pnm_luma(bytes: &[u8]) -> Result<GrayImage, String> {
     let ch = if six { 3 } else { 1 };
     let need = w as usize * h as usize * ch;
     let body = bytes.get(pos..pos + need).ok_or("PNM: тело короче w×h")?;
-    let scale = |v: u8| (v as u32 * 255 / maxval as u32).min(255) as u8;
+    let scale = |v: u8| (v as u32 * 255 / maxval).min(255) as u8;
     let gray = if six {
         body.chunks_exact(3)
             .map(|p| ((scale(p[0]) as u32 * 299 + scale(p[1]) as u32 * 587 + scale(p[2]) as u32 * 114) / 1000) as u8)
@@ -1032,13 +1032,13 @@ fn synth_stream(
     for (n, w) in hann.iter_mut().enumerate() {
         *w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n as f64 / STFT_N as f64).cos());
     }
-    let mut mod_phase = vec![0.0f64; B];
+    let mut mod_phase = [0.0f64; B];
     for p in mod_phase.iter_mut() {
         *p = rng.f64() * 2.0 * std::f64::consts::PI;
     }
     // Позитивные части строк графа (нормировки когерентности).
     let mut gpos = vec![0.0f64; B * B];
-    let mut gsum = vec![1e-9f64; B];
+    let mut gsum = [1e-9f64; B];
     for i in 0..B {
         for j in 0..B {
             let g = echo.graph[i * B + j].max(0.0) as f64;
@@ -1053,7 +1053,7 @@ fn synth_stream(
         vortex.step();
         let read = vortex.readout(48);
         *bursts += (read.len() >= 24) as usize;
-        let mut drive = vec![0.0f64; B];
+        let mut drive = [0.0f64; B];
         for &(idx, act) in &read {
             let b = idx % B;
             let a = act.max(0.0);
@@ -1262,7 +1262,7 @@ fn tiles_of(img: &GrayImage) -> Vec<Vec<f32>> {
         for c in 0..cols {
             let mut t = Vec::with_capacity(TILE * TILE);
             for y in 0..TILE {
-                let base = ((r * TILE + y) * img.w as usize + c * TILE) as usize;
+                let base = (r * TILE + y) * img.w as usize + c * TILE;
                 for x in 0..TILE {
                     t.push(img.gray[base + x] as f32);
                 }
@@ -1721,7 +1721,7 @@ mod tests {
         let mut s1 = 0.0;
         let mut s2 = 0.0;
         let mut s3 = 0.0;
-        let frame_rate = fs as f64 / STFT_HOP as f64;
+        let _frame_rate = fs as f64 / STFT_HOP as f64;
         let period = if lead_lag { 24.0 } else { 40.0 }; // кадров между обрушениями
         for i in 0..n {
             let t = i as f64 / fs as f64;

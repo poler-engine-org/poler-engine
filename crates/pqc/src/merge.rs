@@ -277,8 +277,8 @@ pub fn merge_channels(
 ) -> (Vec<(u32, u32, f64)>, ChannelMergeStats) {
     let mut pa: Vec<(u32, u32, f64)> = a.to_vec();
     let mut pb: Vec<(u32, u32, f64)> = b.to_vec();
-    pa.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
-    pb.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    pa.sort_unstable_by_key(|x| (x.0, x.1));
+    pb.sort_unstable_by_key(|x| (x.0, x.1));
 
     let mut out = Vec::with_capacity(pa.len() + pb.len());
     let mut st = ChannelMergeStats {
@@ -341,7 +341,7 @@ pub fn merge_channels(
             st.transparent_b += 1;
         }
     }
-    out.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    out.sort_unstable_by_key(|x| (x.0, x.1));
     st.out = out.len();
     (out, st)
 }
@@ -611,7 +611,7 @@ pub fn merge_brains(
         pqw::ReflexData::new(
             sec.interlocutor(),
             sec.turns(),
-            sec.events().iter().copied().collect(),
+            sec.events().to_vec(),
             d as u32,
         )
         .ok()

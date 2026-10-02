@@ -236,9 +236,9 @@ const RET: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 
 /// Збірка фільтра: чиста арифметика офсетів, без другого проходу.
 pub fn build_filter() -> Vec<libc::sock_filter> {
-    let ret_kill = libc::SECCOMP_RET_KILL_PROCESS as u32;
-    let ret_errno = (libc::SECCOMP_RET_ERRNO as u32) | (libc::EPERM as u32);
-    let ret_allow = libc::SECCOMP_RET_ALLOW as u32;
+    let ret_kill = libc::SECCOMP_RET_KILL_PROCESS;
+    let ret_errno = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+    let ret_allow = libc::SECCOMP_RET_ALLOW;
 
     let deadly = super::DEADLY;
     // довжини блоків
@@ -328,9 +328,9 @@ mod tests {
         assert_eq!(f[0].code, LD);
         assert_eq!(f[0].k, 4);
 
-        let ret_allow = libc::SECCOMP_RET_ALLOW as u32;
-        let ret_errno = (libc::SECCOMP_RET_ERRNO as u32) | (libc::EPERM as u32);
-        let ret_kill = libc::SECCOMP_RET_KILL_PROCESS as u32;
+        let ret_allow = libc::SECCOMP_RET_ALLOW;
+        let ret_errno = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+        let ret_kill = libc::SECCOMP_RET_KILL_PROCESS;
 
         assert!(f.iter().any(|i| i.code == RET && i.k == ret_allow));
         assert!(f.iter().any(|i| i.code == RET && i.k == ret_errno));

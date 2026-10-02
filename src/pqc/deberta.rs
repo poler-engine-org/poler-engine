@@ -385,7 +385,7 @@ mod tests {
         let b129 = rel_bucket(129);
         let b200 = rel_bucket(200);
         let b511 = rel_bucket(511);
-        assert!(b129 >= 128 && b129 <= 130);
+        assert!((128..=130).contains(&b129));
         assert!(b200 > b129);
         assert_eq!(b511, 255);
         // симметрия знака

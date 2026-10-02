@@ -720,6 +720,6 @@ mod tests {
         let s = solve_linear(&a, &b).unwrap();
         assert!(close(s[0], 1.0, 1e-12) && close(s[1], 2.0, 1e-12));
         // вырожденная
-        assert!(solve_linear(&vec![vec![1.0, 2.0], vec![2.0, 4.0]], &vec![1.0, 2.0]).is_none());
+        assert!(solve_linear(&[vec![1.0, 2.0], vec![2.0, 4.0]], &[1.0, 2.0]).is_none());
     }
 }

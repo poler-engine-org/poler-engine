@@ -54,7 +54,7 @@ fn bit_reverse_copy(input: &[Cplx], n: usize) -> Vec<Cplx> {
     // перестановка с обращением бит
     let bits = n.trailing_zeros();
     for i in 0..n {
-        let j = (i.reverse_bits() >> (usize::BITS - bits)) as usize;
+        let j = i.reverse_bits() >> (usize::BITS - bits);
         if j > i {
             a.swap(i, j);
         }

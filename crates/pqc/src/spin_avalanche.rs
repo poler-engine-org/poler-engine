@@ -280,7 +280,7 @@ pub fn measure_avalanche(
             .get(idx % cap)
             .copied()
             .unwrap_or(0) as usize;
-        transform_spread(&key.pairs(), ks, d, pos, key.ticks_v2())
+        transform_spread(key.pairs(), ks, d, pos, key.ticks_v2())
     };
     let spread_mean = if cap >= 4 {
         (spread_probe(0) + spread_probe(cap / 4) + spread_probe(cap / 2) + spread_probe(cap - 1))
@@ -319,7 +319,7 @@ fn spread_mean_fallback(key: &TritKey, ks: &[u8], d: usize) -> f64 {
     let n = 4.min(d);
     let mut sum = 0.0;
     for k in 0..n {
-        sum += transform_spread(&key.pairs(), ks, d, k * d / n.max(1), key.ticks_v2());
+        sum += transform_spread(key.pairs(), ks, d, k * d / n.max(1), key.ticks_v2());
     }
     sum / n as f64
 }

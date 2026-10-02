@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(t.find_iter(b"").count(), 0);
         // Кандидаты без матчей: 'z' ∈ S, но «zx» не совпадает.
         let t2 = Teddy::build(&[b"zx"]).unwrap();
-        assert_eq!(t2.find_iter(&vec![b'z'; 100]).count(), 0);
+        assert_eq!(t2.find_iter(&[b'z'; 100]).count(), 0);
     }
 
     #[test]

@@ -207,7 +207,7 @@ fn amplitude_damp(sv: &mut Statevector, q: usize, gamma: f64, rng: &mut Rng) -> 
         // прыжок K₁: |1⟩→|0⟩ на кубите q, ренормировка
         let dim = sv.amplitudes().len();
         let mut moved = vec![crate::complex::Cx::ZERO; dim];
-        let mut amps = sv.amplitudes_mut();
+        let amps = sv.amplitudes_mut();
         for i in 0..dim {
             if i & mask != 0 {
                 moved[i ^ mask] = amps[i];
@@ -360,8 +360,8 @@ pub fn run_noisy(
         // терминальный Борн-семпл (+ чтение с флипом)
         let outcome = if terminal_sampled || per_shot {
             let sampler = crate::born::BornSampler::new(&sv)?;
-            let o = sampler.sample(&mut rng);
-            o
+            
+            sampler.sample(&mut rng)
         } else {
             let sampler = crate::born::BornSampler::new(&sv)?;
             sampler.sample(&mut rng)

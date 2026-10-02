@@ -470,7 +470,7 @@ fn scan_parallel(cfg: &HarvestConfig, matcher: &Matcher) -> (ScanCounters, Vec<F
                 return WalkState::Continue;
             };
             if let Some(hit) =
-                scan_file(&e.path(), meta.len(), cfg, matcher, counters, &mut tiny_buf)
+                scan_file(e.path(), meta.len(), cfg, matcher, counters, &mut tiny_buf)
             {
                 if let Ok(mut guard) = hits.lock() {
                     guard.push(hit);

@@ -63,7 +63,7 @@ pub struct StabilizerState {
 
 #[inline]
 fn words_for(n: usize) -> usize {
-    (n + 63) / 64
+    n.div_ceil(64)
 }
 
 #[inline]
@@ -111,7 +111,7 @@ impl StabilizerState {
             });
         }
         let w = words_for(n);
-        let mut x = vec![0u64; n * w];
+        let x = vec![0u64; n * w];
         let mut z = vec![0u64; n * w];
         for j in 0..n {
             bit_set(&mut z[j * w..(j + 1) * w], j, true);
@@ -237,7 +237,7 @@ impl StabilizerState {
         for i in 0..self.n {
             let xr = &mut self.x[i * w..(i + 1) * w];
             let zr = &mut self.z[i * w..(i + 1) * w];
-            for (row) in [xr, zr] {
+            for row in [xr, zr] {
                 let ba = bit_get(row, a);
                 let bb = bit_get(row, b);
                 if ba != bb {
@@ -336,7 +336,8 @@ impl StabilizerState {
         let mut comb: Vec<u64> = vec![0u64; words_for(n)];
         for col in 0..2 * n {
             if bit_at(&t, col) {
-                if let Some(p) = pivot_row_of_col[col] {
+                {
+                    let p = pivot_row_of_col[col]?;
                     // прибавляем ведущую строку p: [X|Z] к цели, I-блок к c
                     let tw = words_for(2 * n);
                     for k in 0..tw {
@@ -348,8 +349,6 @@ impl StabilizerState {
                             comb[j >> 6] ^= 1u64 << (j & 63);
                         }
                     }
-                } else {
-                    return None; // компонент вне пространства строк
                 }
             }
         }

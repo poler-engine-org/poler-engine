@@ -59,6 +59,12 @@ impl Gate {
     }
 }
 
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ============================== Handles ==============================
 
 pub enum Handle {
@@ -648,7 +654,7 @@ unsafe fn h_CreateFileA(a0: u64, a1: u64, _2: u64, _3: u64, a4: u64, _5: u64, _e
 }
 
 fn h_create_file(path: String, access: u64, disp: u64, _w: &World) -> u64 {
-    use std::os::unix::fs::OpenOptionsExt;
+    
     let host = win_to_host(&path);
     let mut opts = std::fs::OpenOptions::new();
     let rd = access & GENERIC_READ != 0;
@@ -791,7 +797,7 @@ unsafe fn h_GetFileSizeEx(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5: u64, 
 
 unsafe fn h_GetFileType(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u64, _c: u64, w: &World) -> u64 {
     match a0 {
-        0xF001 | 0xF002 | 0xF003 => 2,
+        0xF001..=0xF003 => 2,
         _ => {
             let fd = file_fd(w, a0);
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1017,7 +1023,7 @@ unsafe fn h_GetCurrentDirectoryA(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5
         .unwrap_or_else(|_| "/".into());
     let win = host_to_win(&cwd);
     let bytes = win.as_bytes();
-    if a0 as usize >= bytes.len() + 1 && a1 != 0 {
+    if a0 as usize > bytes.len() && a1 != 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), a1 as *mut u8, bytes.len());
             write_u8(a1 + bytes.len() as u64, 0);
@@ -1033,7 +1039,7 @@ unsafe fn h_GetCurrentDirectoryW(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5
         .unwrap_or_else(|_| "/".into());
     let win = host_to_win(&cwd);
     let u: Vec<u16> = win.encode_utf16().collect();
-    if a0 as usize >= u.len() + 1 && a1 != 0 {
+    if a0 as usize > u.len() && a1 != 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(u.as_ptr(), a1 as *mut u16, u.len());
             write_u16(a1 + u.len() as u64 * 2, 0);
@@ -1163,7 +1169,7 @@ unsafe fn h_GlobalFree(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e:
 }
 
 unsafe fn h_VirtualAlloc(_a0: u64, a1: u64, _a2: u64, _a3: u64, _4: u64, _5: u64, _e: u64, _c: u64) -> u64 {
-    let size = ((a1 + 0xFFF) / 0x1000) * 0x1000;
+    let size = a1.div_ceil(0x1000) * 0x1000;
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1254,7 +1260,7 @@ unsafe fn h_GetSystemInfo(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, 
         .map(|n| n.get())
         .unwrap_or(2) as u64;
     unsafe {
-        write_u32(a0 + 0x00, 0);
+        write_u32(a0, 0);
         write_u64(a0 + 0x08, 0x10000);
         write_u64(a0 + 0x10, 0x7FFF_FFFF_FFFF);
         write_u64(a0 + 0x18, (1u64 << ncpu) - 1);
@@ -1342,7 +1348,7 @@ pub fn spawn_pe_thread(start: u64, param: u64) -> u64 {
         code: AtomicU32::new(0),
         join: std::sync::Mutex::new(None),
     }));
-    let pkt = packet;
+    let _pkt = packet;
     let pkt = packet as usize;
     let jh = std::thread::spawn(move || {
         let pkt = pkt as *mut ExitPacket;
@@ -1362,7 +1368,7 @@ pub fn spawn_pe_thread(start: u64, param: u64) -> u64 {
     if let Some(h) = World::get()
         .with_handle(handle, |hd| {
             if let Handle::Thread { done, .. } = hd {
-                Some(unsafe { *done } as *const ExitPacket)
+                Some(*done as *const ExitPacket)
             } else {
                 None
             }
@@ -1370,7 +1376,7 @@ pub fn spawn_pe_thread(start: u64, param: u64) -> u64 {
         .flatten()
     {
         let mut g = unsafe { (*h).join.lock() }.unwrap();
-        g.insert(jh);
+        let _ = g.insert(jh);
     }
     handle
 }
@@ -1380,7 +1386,7 @@ unsafe fn h_CreateThread(_a0: u64, _a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u6
 }
 
 unsafe fn h_ExitThread(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u64, _c: u64) -> u64 {
-    THREAD_EXIT_CODE.with(|c| c.set((a0 as u32) & 0xFFFF_FFFF));
+    THREAD_EXIT_CODE.with(|c| c.set(a0 as u32));
     // повертаємось: обгортка потоку збереже код і завершиться нормально
     0
 }
@@ -1390,7 +1396,7 @@ unsafe fn h_WaitForSingleObject(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5:
     let pkt = w
         .with_handle(a0, |hd| {
             if let Handle::Thread { done, .. } = hd {
-                Some(unsafe { *done } as *const ExitPacket)
+                Some(*done as *const ExitPacket)
             } else {
                 None
             }
@@ -1411,7 +1417,7 @@ unsafe fn h_WaitForSingleObject(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5:
     let ev = w
         .with_handle(a0, |hd| {
             if let Handle::Event { signaled, .. } = hd {
-                Some(unsafe { *signaled } as *const AtomicBool)
+                Some(*signaled as *const AtomicBool)
             } else {
                 None
             }
@@ -1667,10 +1673,8 @@ unsafe fn h_lstrlenA(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u
         return 0;
     }
     let mut n = 0u64;
-    unsafe {
-        while read_u8_pub(a0 + n) != 0 && n < (1 << 20) {
-            n += 1;
-        }
+    while read_u8_pub(a0 + n) != 0 && n < (1 << 20) {
+        n += 1;
     }
     n
 }

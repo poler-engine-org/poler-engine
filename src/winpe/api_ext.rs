@@ -96,7 +96,7 @@ unsafe fn h__getcwd(a0: u64, a1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _e: u6
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/".into());
     let b = cwd.as_bytes();
-    if a0 != 0 && a1 as usize >= b.len() + 1 {
+    if a0 != 0 && a1 as usize > b.len() {
         unsafe {
             std::ptr::copy_nonoverlapping(b.as_ptr(), a0 as *mut u8, b.len());
             write_u8(a0 + b.len() as u64, 0);
@@ -306,7 +306,7 @@ fn begin_thread(w: &World, start: u64, param: u64, _flags: u64) -> u64 {
         code: std::sync::atomic::AtomicU32::new(0),
         join: std::sync::Mutex::new(None),
     }));
-    let pkt = packet;
+    let _pkt = packet;
     {
         let pkt = packet as usize;
         let jh = std::thread::spawn(move || {
@@ -326,7 +326,7 @@ fn begin_thread(w: &World, start: u64, param: u64, _flags: u64) -> u64 {
         if let Some(h) = w
             .with_handle(handle, |hd| {
                 if let Handle::Thread { done, .. } = hd {
-                    Some(unsafe { *done } as *const super::api::ExitPacket)
+                    Some(*done as *const super::api::ExitPacket)
                 } else {
                     None
                 }
@@ -334,9 +334,9 @@ fn begin_thread(w: &World, start: u64, param: u64, _flags: u64) -> u64 {
             .flatten()
         {
             let mut g = unsafe { (*h).join.lock() }.unwrap();
-            g.insert(jh);
+            let _ = g.insert(jh);
         }
-        return handle;
+        handle
     }
 }
 
@@ -344,7 +344,7 @@ unsafe fn h__endthreadex(a0: u64, _1: u64, _2: u64, _3: u64, _4: u64, _5: u64, _
     thread_local! {
         static CODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
-    CODE.with(|c| c.set((a0 as u32) & 0xFFFFFFFF));
+    CODE.with(|c| c.set(a0 as u32));
     0
 }
 

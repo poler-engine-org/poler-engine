@@ -167,10 +167,22 @@ impl OrbitCamera {
     pub fn camera_hash(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for v in [self.yaw, self.pitch, self.dist, self.target_yaw, self.target_pitch, self.target_dist] {
-            h ^= v.to_bits() as u64;
+            h ^= v.to_bits();
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
         h
+    }
+}
+
+#[cfg(test)]
+impl OrbitCamera {
+    /// Только для тестов: цель по yaw.
+    fn target_yaw_for_test(&self) -> f64 {
+        self.target_yaw
+    }
+    /// Только для тестов: цель по dist.
+    fn target_dist_for_test(&self) -> f64 {
+        self.target_dist
     }
 }
 
@@ -337,17 +349,5 @@ mod tests {
         assert!((spec.yaw - d.yaw).abs() < 1e-12 && (spec.dist - d.dist).abs() < 1e-12);
         let cam2 = OrbitCamera::from_spec(&spec);
         assert_eq!(cam.camera_hash(), cam2.camera_hash(), "from_spec восстанавливает");
-    }
-}
-
-#[cfg(test)]
-impl OrbitCamera {
-    /// Только для тестов: цель по yaw.
-    fn target_yaw_for_test(&self) -> f64 {
-        self.target_yaw
-    }
-    /// Только для тестов: цель по dist.
-    fn target_dist_for_test(&self) -> f64 {
-        self.target_dist
     }
 }

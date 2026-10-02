@@ -1425,7 +1425,7 @@ impl McpServer {
             .expect("poler-mcp: отравленный fly-лок");
         // Тёплый артефакт: тот же путь (или запрос без csr) → reuse.
         if let Some(warm) = guard.as_ref() {
-            let same = csr.map(|p| PathBuf::from(p) == warm.csr_path).unwrap_or(true);
+            let same = csr.map(|p| *p == warm.csr_path).unwrap_or(true);
             if same {
                 if let Some(p) = nodes {
                     if warm.nodes.is_none() {
@@ -4140,10 +4140,10 @@ mod audit_tests {
         // внутри корня — можно
         assert!(path_allowed_under(
             inside.to_str().unwrap(),
-            &[dir.clone()]
+            std::slice::from_ref(&dir)
         ));
         // /etc/passwd — нельзя
-        assert!(!path_allowed_under("/etc/passwd", &[dir.clone()]));
+        assert!(!path_allowed_under("/etc/passwd", std::slice::from_ref(&dir)));
         // symlink-escape: ссылка внутри корня, цель снаружи — нельзя
         let link = dir.join("escape-link");
         let _ = std::fs::remove_file(&link);
@@ -4204,9 +4204,7 @@ mod box_broker_tests {
         let script = base.join("fake-docker");
         std::fs::write(
             &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POLER_FAKE_LOG\"\ncase \"$1\" in\n  version) echo '31.0.0-fake'; exit 0;;\n  inspect) echo 'true'; exit 0;;\n  exec) echo 'fake-exec-output'; exit 0;;\nesac\nexit 0\n"
-            ),
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POLER_FAKE_LOG\"\ncase \"$1\" in\n  version) echo '31.0.0-fake'; exit 0;;\n  inspect) echo 'true'; exit 0;;\n  exec) echo 'fake-exec-output'; exit 0;;\nesac\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4511,7 +4509,7 @@ mod knowledge_tool_tests {
         };
         let r1 = text_of(call(&srv, 1));
         assert!(
-            serde_json::to_value(&srv.resident_stats()).unwrap()["warm_knowledge_open"]
+            serde_json::to_value(srv.resident_stats()).unwrap()["warm_knowledge_open"]
                 == serde_json::json!(true),
             "хэндл Гиппокампа обязан быть тёплым после первого вызова"
         );

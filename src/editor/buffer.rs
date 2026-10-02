@@ -146,7 +146,7 @@ impl PolerBuffer {
             #[cfg(unix)]
             let _ = mmap.advise(memmap2::Advice::Random);
             let mut pieces =
-                Vec::with_capacity(((len + cap - 1) / cap + 1) as usize);
+                Vec::with_capacity((len.div_ceil(cap) + 1) as usize);
             let mut off = 0u64;
             while off < len {
                 let chunk = (len - off).min(cap) as u32;
@@ -881,7 +881,7 @@ impl PolerBuffer {
         builder.ascii_case_insensitive(!case_sensitive && needle.is_ascii());
         let ac = builder
             .build(pats.iter().map(|p| p.as_bytes()))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("aho: {e}")))?;
+            .map_err(|e| io::Error::other(format!("aho: {e}")))?;
 
         let mut raw: Vec<(u64, usize)> = Vec::new();
         // Перенос через границы кусков: хвост конкатенации длиной maxlen-1.
@@ -1143,7 +1143,7 @@ mod tests {
         b.save().unwrap();
         let on_disk2 = std::fs::read_to_string(&p).unwrap();
         assert_eq!(on_disk2, "hello world\nsecond line\n");
-        assert!(b.undo() == false);
+        assert!(!b.undo());
         drop(d);
     }
 
@@ -1327,7 +1327,7 @@ mod tests {
             let _ = done;
             assert_eq!(Some(lines), Some(naive_lines(&model)), "lines @step {step}");
 
-            for k in 0..6 {
+            for _k in 0..6 {
                 let off = rng.below(model.len() as u64 + 1);
                 let want = naive_line_of(&model, off.min(model.len() as u64));
                 let got_l = b.line_of_offset(off).unwrap();

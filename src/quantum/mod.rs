@@ -77,8 +77,8 @@ impl QuantumMind {
             let header = crystallizer::SafetensorsHeader::parse(&bytes)?;
             let d_pol = 4096u32;
             let mut mind = Self::new(d_pol, 42)?;
-            for (name, _) in &header.tensors {
-                let clean_name = name.replace('.', " ").replace('_', " ");
+            for name in header.tensors.keys() {
+                let clean_name = name.replace(['.', '_'], " ");
                 for word in clean_name.split_whitespace() {
                     if word.len() > 1 && word.len() <= 32 {
                         mind.curriculum.observe_lexicon(word);
@@ -182,7 +182,7 @@ impl QuantumMind {
         let _ = self.curriculum.set_momentum_thresholds(tau_ign, 1.0);
 
         // 2. Генерация потока мысли
-        let mut cfg = self.config.clone();
+        let mut cfg = self.config;
         cfg.max_tokens = max_tokens;
         let mut gen = L5Generator::new(&mut self.curriculum, cfg)
             .map_err(|e| format!("ошибка генератора L5: {e:?}"))?;

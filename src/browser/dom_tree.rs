@@ -194,3 +194,9 @@ impl DomDocument {
         }
     }
 }
+
+impl Default for DomDocument {
+    fn default() -> Self {
+        Self::new()
+    }
+}

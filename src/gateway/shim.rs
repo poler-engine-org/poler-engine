@@ -147,11 +147,9 @@ pub fn telemetry(log: &Path) -> String {
         }
     }
     if total == 0 {
-        return format!(
-            "⚠ Медиация: агент ни разу не вызвал shell через PATH — его команды\n\
+        return "⚠ Медиация: агент ни разу не вызвал shell через PATH — его команды\n\
               НЕ фильтровались (вызывает /bin/sh по абсолютному пути?). Медиация\n\
-             best-effort на PATH/$SHELL; детали и честные границы — docs §4.3.\n"
-        );
+             best-effort на PATH/$SHELL; детали и честные границы — docs §4.3.\n".to_string();
     }
     let deny = deny_boundary + deny_block + deny_sudo + deny_stream;
     format!(

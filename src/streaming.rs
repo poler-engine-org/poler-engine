@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(counts.get("beta"), Some(&2));
         assert_eq!(counts.get("gamma"), Some(&1));
         for (k, v) in &ft.counts {
-            assert_eq!(counts.get(k.as_ref()), Some(&(*v as u32)));
+            assert_eq!(counts.get(k.as_ref()), Some(&{ *v }));
         }
     }
 

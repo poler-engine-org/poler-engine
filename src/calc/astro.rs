@@ -85,8 +85,8 @@ pub fn sun_ecliptic_lon(year: i32, month: u32, day: u32, hour_utc: f64) -> f64 {
         * sind(s.m)
         * (1.0 + e * cosd(s.m));
     // истинная аномалия и долгота
-    let true_lon = norm(s.m + s.w + ecc);
-    true_lon
+    
+    norm(s.m + s.w + ecc)
 }
 
 /// Экваториальные координаты Солнца (Ra град [0,360), Dec град).

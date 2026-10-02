@@ -284,7 +284,7 @@ impl Circuit {
                 }
                 "prep" => {
                     let n = n_qubits
-                        .ok_or_else(|| bad("`qubits N` must come first".into()))? as usize;
+                        .ok_or_else(|| bad("`qubits N` must come first".into()))?;
                     let period = usize_arg(1, 1)?;
                     let offset = usize_arg(2, 0)?;
                     if offset >= period {

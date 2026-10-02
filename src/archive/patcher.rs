@@ -568,7 +568,7 @@ impl std::io::Read for EntryStreamReader<'_> {
             let want = ((self.end - self.off) as usize).min(256 * 1024);
             self.reader
                 .read_range(self.off, want, &mut self.buf)
-                .map_err(|e| std::io::Error::other(e))?;
+                .map_err(std::io::Error::other)?;
             self.pos = 0;
             self.off += want as u64;
         }

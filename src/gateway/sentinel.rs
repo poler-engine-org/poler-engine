@@ -981,6 +981,9 @@ mod tests {
 
     #[test]
     fn render_and_save_report() {
+        // env-лок: ниже мутируем POLER_HUNT_HOME — без лока параллельный
+        // kill_switch-тест терял свой hunt-каталог (incidents → NotFound)
+        let _g = super::super::containers::docker_env_test_lock();
         let state = HuntState {
             mode: HuntMode::Probe,
             box_name: "poler-box-rep".into(),

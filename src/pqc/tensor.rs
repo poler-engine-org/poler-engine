@@ -99,7 +99,7 @@ pub fn dot_i8_f32(q: &[i8], x: &[f32]) -> f32 {
 /// Распаковка в горячем цикле: `v = nibble − 8 ∈ [-8, 7]`.
 /// При наличии AVX1/AVX2 выполняется векторная распаковка и параллельное FMA/MUL+ADD.
 pub fn dot_i4_f32(packed: &[u8], x: &[f32], n: usize) -> f32 {
-    debug_assert_eq!(packed.len(), (n + 1) / 2, "dot_i4_f32: размер упаковки");
+    debug_assert_eq!(packed.len(), n.div_ceil(2), "dot_i4_f32: размер упаковки");
     #[cfg(target_arch = "x86_64")]
     {
         if avx() {
@@ -162,7 +162,7 @@ impl Trit5Codec {
         let mut mul: u16 = 1;
 
         for &t in trits.iter() {
-            if t < -1 || t > 1 {
+            if !(-1..=1).contains(&t) {
                 return None;
             }
             let u = (t + 1) as u16; // Map {-1, 0, +1} -> {0, 1, 2}
@@ -195,7 +195,7 @@ impl Trit5Codec {
 /// No-Mul исполнение: веса в {-1, 0, +1}, умножение заменяется на условное
 /// знаковое сложение / вычитание через маски знаков AVX2 или скалярную ветку.
 pub fn dot_trit5_f32(packed: &[u8], x: &[f32], n: usize) -> f32 {
-    debug_assert_eq!(packed.len(), (n + 4) / 5, "dot_trit5_f32: размер упаковки");
+    debug_assert_eq!(packed.len(), n.div_ceil(5), "dot_trit5_f32: размер упаковки");
     #[cfg(target_arch = "x86_64")]
     {
         if avx() {
@@ -525,7 +525,7 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     let s = _mm_add_ps(lo, hi);
     let mut arr = [0f32; 4];
     _mm_storeu_ps(arr.as_mut_ptr(), s);
-    ((arr[0] + arr[1]) + (arr[2] + arr[3])) as f32
+    (arr[0] + arr[1]) + (arr[2] + arr[3])
 }
 
 // ---------------------------------------------------------------------------
@@ -600,10 +600,10 @@ pub fn erf(x: f32) -> f32 {
     let ax = x.abs();
     let t = 1.0 / (1.0 + 0.327_591_1 * ax);
     let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t
-            - 0.284_496_736)
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t
+            - 0.284_496_72)
             * t
-            + 0.254_829_592)
+            + 0.254_829_6)
             * t
             * (-ax * ax).exp();
     sign * y
@@ -797,7 +797,7 @@ pub fn quant_i8_per_row(w: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f3
 /// nibble, нечётный — старший.
 pub fn quant_i4_per_row(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
     debug_assert_eq!(w.len(), rows * cols);
-    let packed_cols = (cols + 1) / 2;
+    let packed_cols = cols.div_ceil(2);
     let mut q = vec![0u8; rows * packed_cols];
     let mut scales = vec![1f32; rows];
     for r in 0..rows {
@@ -823,7 +823,7 @@ pub fn quant_i4_per_row(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<f3
 /// Код ∈ {-1, 0, +1}, упаковывается по 5 тритов в байт через `Trit5Codec`.
 pub fn quant_trit5_per_row(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
     debug_assert_eq!(w.len(), rows * cols);
-    let packed_cols = (cols + 4) / 5;
+    let packed_cols = cols.div_ceil(5);
     let mut packed = vec![0u8; rows * packed_cols];
     let mut scales = vec![1f32; rows];
     for r in 0..rows {

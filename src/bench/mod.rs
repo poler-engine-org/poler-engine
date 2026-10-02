@@ -532,7 +532,7 @@ pub fn bench_exact(root: &Path, opts: &BenchOpts) -> Result<ExactBench, String> 
     let mut poler_matched = 0usize;
     for r in 0..opts.runs.max(1) {
         let t = Instant::now();
-        let report = grep_run(&[dir.clone()], &config).map_err(|e| format!("grep_run: {e}"))?;
+        let report = grep_run(std::slice::from_ref(&dir), &config).map_err(|e| format!("grep_run: {e}"))?;
         times.push(ms(t));
         if r == 0 {
             poler_matched = report.files.iter().map(|f| f.count).sum();
@@ -855,9 +855,9 @@ pub fn read_proc_status() -> Option<ResourceBench> {
         let mut rss: Option<u64> = None;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmHWM:") {
-                hwm = rest.trim().split_whitespace().next().and_then(|v| v.parse().ok());
+                hwm = rest.split_whitespace().next().and_then(|v| v.parse().ok());
             } else if let Some(rest) = line.strip_prefix("VmRSS:") {
-                rss = rest.trim().split_whitespace().next().and_then(|v| v.parse().ok());
+                rss = rest.split_whitespace().next().and_then(|v| v.parse().ok());
             }
         }
         Some(ResourceBench {
@@ -1051,7 +1051,7 @@ pub fn bench_compression(opts: &BenchOpts) -> CompressionBench {
             let mut v = Vec::with_capacity(per_file_terms);
             for k in 0..per_file_terms {
                 let idx = (f * 31 + k * 7) % terms.len();
-                let id = arena.id_of(&terms[idx]).expect("терм проинтернирован") as u32;
+                let id = arena.id_of(&terms[idx]).expect("терм проинтернирован");
                 v.push((id, ((k % 13) + 1) as u32));
             }
             v
@@ -1375,7 +1375,7 @@ pub fn bench_vector(opts: &BenchOpts) -> VectorBench {
     for _ in 0..reps {
         for i in 0..n as u32 {
             let v = sym_ip(store.side(i), sym0, dp);
-            sink ^= v.to_bits() as u64;
+            sink ^= v.to_bits();
         }
     }
     let scan_s = t3.elapsed().as_secs_f64();
@@ -1401,6 +1401,172 @@ pub fn bench_vector(opts: &BenchOpts) -> VectorBench {
         p99_us: p99,
         scan_gbps,
     }
+}
+
+/// v0.22.0: текст бенчмарк-отчёта как String (общий для CLI --benchmark
+/// и команды `benchmark` в Terminal Gateway). Перенесён из main.rs.
+pub fn report_text(res: &BenchResults) -> String {
+    let mut s = String::new();
+    s.push_str("POLER Engine Benchmark Suite\n");
+    s.push_str("══════════════════════════════════════════════════\n");
+
+    s.push_str("[0] Literal Prefilter — Teddy SIMD vs Aho-Corasick (v2.0)\n");
+    s.push_str(&format!(
+        "    корпус: {:.1} MB, {} паттернов, полный скан без хитов\n",
+        res.prefilter.corpus_bytes as f64 / 1048576.0,
+        res.prefilter.patterns
+    ));
+    s.push_str(&format!(
+        "    Aho-Corasick:  {:8.2} мс  ({:.2} GB/s)\n",
+        res.prefilter.ac_fullscan_ms,
+        res.prefilter.corpus_bytes as f64 / 1e9 / (res.prefilter.ac_fullscan_ms / 1000.0).max(1e-9)
+    ));
+    s.push_str(&format!(
+        "    Teddy SIMD:    {:8.2} мс  ({:.2} GB/s) — ускорение {:.2}×{}\n",
+        res.prefilter.teddy_fullscan_ms,
+        res.prefilter.corpus_bytes as f64 / 1e9 / (res.prefilter.teddy_fullscan_ms / 1000.0).max(1e-9),
+        res.prefilter.speedup_x,
+        if res.prefilter.agree { " ✓ согласие" } else { " ✗ РАСХОЖДЕНИЕ" }
+    ));
+    s.push_str(&format!(
+        "    Кириллица: было {:8.2} мс (to_lowercase+N×contains) → стало {:8.2} мс (фолд+Teddy) — {:.2}×\n",
+        res.prefilter.cyr_old_ms, res.prefilter.cyr_teddy_ms, res.prefilter.cyr_speedup_x
+    ));
+
+    s.push('\n');
+    s.push_str("[1] Exact Retrieval — POLER Native Grep vs эталон\n");
+    s.push_str(&format!(
+        "    корпус: {} файлов × {} строк (шаблон {})\n",
+        res.exact.files, res.exact.lines, NEEDLE
+    ));
+    s.push_str(&format!(
+        "    POLER grep:  {:8.1} мс — {} совпавших строк (ожидалось {}){}\n",
+        res.exact.poler_ms,
+        res.exact.poler_matched_lines,
+        res.exact.expected_matched_lines,
+        if res.exact.completeness_ok { " ✓ полнота" } else { " ✗ ПОТЕРИ" }
+    ));
+    if let Some(r) = &res.exact.reference {
+        let parity = if res.exact.parity == Some(true) { "✓" } else { "✗" };
+        s.push_str(&format!(
+            "    {}: {:8.1} мс — {} совпавших строк → parity {}\n",
+            r.name, r.ms, r.matched_lines, parity
+        ));
+    } else {
+        s.push_str("    эталон (ripgrep/grep) недоступен — parity пропущен\n");
+    }
+
+    s.push('\n');
+    s.push_str("[2] Explainable Lexical — BM25 + WebRank + Semantic Bridge\n");
+    s.push_str(&format!(
+        "    индексация {} страниц: {:.1} мс\n",
+        res.lexical.pages, res.lexical.index_ms
+    ));
+    s.push_str(&format!(
+        "    {} golden-запросов: {:.2} мс среднее\n",
+        res.lexical.queries, res.lexical.query_avg_ms
+    ));
+    s.push_str(&format!(
+        "    golden «{}» → {} {} (мост: +{} терма)\n",
+        res.lexical.golden_query,
+        res.lexical.golden_top1.as_deref().unwrap_or("-"),
+        if res.lexical.golden_ok { "✓" } else { "✗" },
+        res.lexical.bridge_expanded_terms
+    ));
+
+    s.push('\n');
+    s.push_str("[3] Passage Retrieval — POLER Chunker vs naive splitter\n");
+    s.push_str(&format!("    документ: {} байт\n", res.passage.doc_bytes));
+    s.push_str(&format!(
+        "    POLER chunker:  {:8.2} мс — {} чанков, целостность предложений {:.1}%\n",
+        res.passage.poler_ms, res.passage.poler_chunks, res.passage.poler_integrity_pct
+    ));
+    s.push_str(&format!(
+        "    naive splitter: {:8.2} мс — {} чанков, целостность предложений {:.1}%\n",
+        res.passage.naive_ms, res.passage.naive_chunks, res.passage.naive_integrity_pct
+    ));
+
+    s.push('\n');
+    s.push_str("[4] Compression — плотность памяти индекса (v2.0, Приоритет 3)\n");
+    s.push_str(&format!(
+        "    словарь корпуса: {} термов ({} КБ сырья) → FSST-blob {} КБ — {:.2}× сжатие термов\n",
+        res.compression.vocab_terms,
+        res.compression.vocab_raw_bytes / 1024,
+        res.compression.vocab_fsst_bytes / 1024,
+        res.compression.vocab_raw_bytes as f64 / res.compression.vocab_fsst_bytes.max(1) as f64
+    ));
+    s.push_str(&format!(
+        "    глобальный словарь RAM: HashMap {:.1} МБ → арена {:.1} МБ — {:.1}× плотнее{}\n",
+        res.compression.vocab_hashmap_rss_kb as f64 / 1024.0,
+        res.compression.vocab_arena_rss_kb as f64 / 1024.0,
+        res.compression.vocab_ram_gain_x,
+        if res.compression.lookup_parity { " ✓ parity частот" } else { " ✗ PARITY НАРУШЕН" }
+    ));
+    s.push_str(&format!(
+        "    пер-файловые словари (500×300): HashMap {:.1} МБ → ID-пары {:.1} МБ — {:.1}× плотнее\n",
+        res.compression.file_dicts_hashmap_rss_kb as f64 / 1024.0,
+        res.compression.file_dicts_termid_rss_kb as f64 / 1024.0,
+        res.compression.file_dicts_ram_gain_x
+    ));
+    s.push_str(&format!(
+        "    постинги lz4: {} КБ → {} КБ ({:.2}×); doc store zstd: {} КБ → {} КБ ({:.2}×)\n",
+        res.compression.postings_raw_bytes / 1024,
+        res.compression.postings_lz4_bytes / 1024,
+        res.compression.postings_raw_bytes as f64 / res.compression.postings_lz4_bytes.max(1) as f64,
+        res.compression.docstore_raw_bytes / 1024,
+        res.compression.docstore_zstd_bytes / 1024,
+        res.compression.docstore_raw_bytes as f64 / res.compression.docstore_zstd_bytes.max(1) as f64
+    ));
+    s.push_str(&format!(
+        "    лукапы: HashMap {:.1} мкс/1000 → арена {:.1} мкс/1000 (compress-probe ×{:.1}){}\n",
+        res.compression.lookup_hashmap_us_per_k,
+        res.compression.lookup_arena_us_per_k,
+        res.compression.lookup_slowdown_x,
+        if res.compression.table_ser_bit_exact { ", сериализация таблицы побитова ✓" } else { ", СЕРИАЛИЗАЦИЯ НЕ ТОЧНА ✗" }
+    ));
+
+    s.push('\n');
+    s.push_str("[5] Vector Layer — RaBitQ 1-bit + poler-native HNSW (v2.0, Приоритет 4)\n");
+    let v = &res.vector;
+    s.push_str(&format!(
+        "    корпус: {} векторов × {}-d ({} кластеров): fp32 {:.1} МБ → коды {:.1} МБ + скаляры {:.1} МБ — {:.1}× по кодам, {:.1}× всего\n",
+        v.n,
+        v.dim,
+        (v.n / 25).max(4),
+        v.fp32_bytes as f64 / 1048576.0,
+        v.codes_bytes as f64 / 1048576.0,
+        v.scalars_bytes as f64 / 1048576.0,
+        v.density_codes_x,
+        v.density_total_x
+    ));
+    s.push_str(&format!(
+        "    сборка HNSW (M=16, efC=150): {:.1} с; латентность p50 {:.0} мкс / p99 {:.0} мкс (ef=96)\n",
+        v.build_ms / 1000.0,
+        v.p50_us,
+        v.p99_us
+    ));
+    s.push_str(&format!(
+        "    recall@10 против fp32: sym-скан {:.3} · ADC-скан {:.3} (потолок) · HNSW+ADC {:.3} — граф держит {:.0}% потолка\n",
+        v.recall_sym, v.recall_adc_brute, v.recall_hnsw, v.hnsw_vs_ceiling * 100.0
+    ));
+    s.push_str(&format!(
+        "    скан кодов (XOR+POPCNT): {:.1} ГБ/с — 1B×768-d ≈ 96 ГБ кодов сканируются ядром по касанию страниц mmap\n",
+        v.scan_gbps
+    ));
+
+    s.push('\n');
+    s.push_str("[6] Resources\n");
+    if let Some(r) = &res.resources {
+        s.push_str(&format!(
+            "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)\n",
+            r.vm_hwm_kb as f64 / 1024.0,
+            r.vm_rss_kb as f64 / 1024.0
+        ));
+    } else {
+        s.push_str("    RAM-снимок недоступен (не Linux)\n");
+    }
+
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,170 +1816,4 @@ mod tests {
         assert!(res.passage.poler_chunks > 1);
         assert!(res.resources.is_some());
     }
-}
-
-/// v0.22.0: текст бенчмарк-отчёта как String (общий для CLI --benchmark
-/// и команды `benchmark` в Terminal Gateway). Перенесён из main.rs.
-pub fn report_text(res: &BenchResults) -> String {
-    let mut s = String::new();
-    s.push_str("POLER Engine Benchmark Suite\n");
-    s.push_str("══════════════════════════════════════════════════\n");
-
-    s.push_str("[0] Literal Prefilter — Teddy SIMD vs Aho-Corasick (v2.0)\n");
-    s.push_str(&format!(
-        "    корпус: {:.1} MB, {} паттернов, полный скан без хитов\n",
-        res.prefilter.corpus_bytes as f64 / 1048576.0,
-        res.prefilter.patterns
-    ));
-    s.push_str(&format!(
-        "    Aho-Corasick:  {:8.2} мс  ({:.2} GB/s)\n",
-        res.prefilter.ac_fullscan_ms,
-        res.prefilter.corpus_bytes as f64 / 1e9 / (res.prefilter.ac_fullscan_ms / 1000.0).max(1e-9)
-    ));
-    s.push_str(&format!(
-        "    Teddy SIMD:    {:8.2} мс  ({:.2} GB/s) — ускорение {:.2}×{}\n",
-        res.prefilter.teddy_fullscan_ms,
-        res.prefilter.corpus_bytes as f64 / 1e9 / (res.prefilter.teddy_fullscan_ms / 1000.0).max(1e-9),
-        res.prefilter.speedup_x,
-        if res.prefilter.agree { " ✓ согласие" } else { " ✗ РАСХОЖДЕНИЕ" }
-    ));
-    s.push_str(&format!(
-        "    Кириллица: было {:8.2} мс (to_lowercase+N×contains) → стало {:8.2} мс (фолд+Teddy) — {:.2}×\n",
-        res.prefilter.cyr_old_ms, res.prefilter.cyr_teddy_ms, res.prefilter.cyr_speedup_x
-    ));
-
-    s.push('\n');
-    s.push_str("[1] Exact Retrieval — POLER Native Grep vs эталон\n");
-    s.push_str(&format!(
-        "    корпус: {} файлов × {} строк (шаблон {})\n",
-        res.exact.files, res.exact.lines, NEEDLE
-    ));
-    s.push_str(&format!(
-        "    POLER grep:  {:8.1} мс — {} совпавших строк (ожидалось {}){}\n",
-        res.exact.poler_ms,
-        res.exact.poler_matched_lines,
-        res.exact.expected_matched_lines,
-        if res.exact.completeness_ok { " ✓ полнота" } else { " ✗ ПОТЕРИ" }
-    ));
-    if let Some(r) = &res.exact.reference {
-        let parity = if res.exact.parity == Some(true) { "✓" } else { "✗" };
-        s.push_str(&format!(
-            "    {}: {:8.1} мс — {} совпавших строк → parity {}\n",
-            r.name, r.ms, r.matched_lines, parity
-        ));
-    } else {
-        s.push_str("    эталон (ripgrep/grep) недоступен — parity пропущен\n");
-    }
-
-    s.push('\n');
-    s.push_str("[2] Explainable Lexical — BM25 + WebRank + Semantic Bridge\n");
-    s.push_str(&format!(
-        "    индексация {} страниц: {:.1} мс\n",
-        res.lexical.pages, res.lexical.index_ms
-    ));
-    s.push_str(&format!(
-        "    {} golden-запросов: {:.2} мс среднее\n",
-        res.lexical.queries, res.lexical.query_avg_ms
-    ));
-    s.push_str(&format!(
-        "    golden «{}» → {} {} (мост: +{} терма)\n",
-        res.lexical.golden_query,
-        res.lexical.golden_top1.as_deref().unwrap_or("-"),
-        if res.lexical.golden_ok { "✓" } else { "✗" },
-        res.lexical.bridge_expanded_terms
-    ));
-
-    s.push('\n');
-    s.push_str("[3] Passage Retrieval — POLER Chunker vs naive splitter\n");
-    s.push_str(&format!("    документ: {} байт\n", res.passage.doc_bytes));
-    s.push_str(&format!(
-        "    POLER chunker:  {:8.2} мс — {} чанков, целостность предложений {:.1}%\n",
-        res.passage.poler_ms, res.passage.poler_chunks, res.passage.poler_integrity_pct
-    ));
-    s.push_str(&format!(
-        "    naive splitter: {:8.2} мс — {} чанков, целостность предложений {:.1}%\n",
-        res.passage.naive_ms, res.passage.naive_chunks, res.passage.naive_integrity_pct
-    ));
-
-    s.push('\n');
-    s.push_str("[4] Compression — плотность памяти индекса (v2.0, Приоритет 3)\n");
-    s.push_str(&format!(
-        "    словарь корпуса: {} термов ({} КБ сырья) → FSST-blob {} КБ — {:.2}× сжатие термов\n",
-        res.compression.vocab_terms,
-        res.compression.vocab_raw_bytes / 1024,
-        res.compression.vocab_fsst_bytes / 1024,
-        res.compression.vocab_raw_bytes as f64 / res.compression.vocab_fsst_bytes.max(1) as f64
-    ));
-    s.push_str(&format!(
-        "    глобальный словарь RAM: HashMap {:.1} МБ → арена {:.1} МБ — {:.1}× плотнее{}\n",
-        res.compression.vocab_hashmap_rss_kb as f64 / 1024.0,
-        res.compression.vocab_arena_rss_kb as f64 / 1024.0,
-        res.compression.vocab_ram_gain_x,
-        if res.compression.lookup_parity { " ✓ parity частот" } else { " ✗ PARITY НАРУШЕН" }
-    ));
-    s.push_str(&format!(
-        "    пер-файловые словари (500×300): HashMap {:.1} МБ → ID-пары {:.1} МБ — {:.1}× плотнее\n",
-        res.compression.file_dicts_hashmap_rss_kb as f64 / 1024.0,
-        res.compression.file_dicts_termid_rss_kb as f64 / 1024.0,
-        res.compression.file_dicts_ram_gain_x
-    ));
-    s.push_str(&format!(
-        "    постинги lz4: {} КБ → {} КБ ({:.2}×); doc store zstd: {} КБ → {} КБ ({:.2}×)\n",
-        res.compression.postings_raw_bytes / 1024,
-        res.compression.postings_lz4_bytes / 1024,
-        res.compression.postings_raw_bytes as f64 / res.compression.postings_lz4_bytes.max(1) as f64,
-        res.compression.docstore_raw_bytes / 1024,
-        res.compression.docstore_zstd_bytes / 1024,
-        res.compression.docstore_raw_bytes as f64 / res.compression.docstore_zstd_bytes.max(1) as f64
-    ));
-    s.push_str(&format!(
-        "    лукапы: HashMap {:.1} мкс/1000 → арена {:.1} мкс/1000 (compress-probe ×{:.1}){}\n",
-        res.compression.lookup_hashmap_us_per_k,
-        res.compression.lookup_arena_us_per_k,
-        res.compression.lookup_slowdown_x,
-        if res.compression.table_ser_bit_exact { ", сериализация таблицы побитова ✓" } else { ", СЕРИАЛИЗАЦИЯ НЕ ТОЧНА ✗" }
-    ));
-
-    s.push('\n');
-    s.push_str("[5] Vector Layer — RaBitQ 1-bit + poler-native HNSW (v2.0, Приоритет 4)\n");
-    let v = &res.vector;
-    s.push_str(&format!(
-        "    корпус: {} векторов × {}-d ({} кластеров): fp32 {:.1} МБ → коды {:.1} МБ + скаляры {:.1} МБ — {:.1}× по кодам, {:.1}× всего\n",
-        v.n,
-        v.dim,
-        (v.n / 25).max(4),
-        v.fp32_bytes as f64 / 1048576.0,
-        v.codes_bytes as f64 / 1048576.0,
-        v.scalars_bytes as f64 / 1048576.0,
-        v.density_codes_x,
-        v.density_total_x
-    ));
-    s.push_str(&format!(
-        "    сборка HNSW (M=16, efC=150): {:.1} с; латентность p50 {:.0} мкс / p99 {:.0} мкс (ef=96)\n",
-        v.build_ms / 1000.0,
-        v.p50_us,
-        v.p99_us
-    ));
-    s.push_str(&format!(
-        "    recall@10 против fp32: sym-скан {:.3} · ADC-скан {:.3} (потолок) · HNSW+ADC {:.3} — граф держит {:.0}% потолка\n",
-        v.recall_sym, v.recall_adc_brute, v.recall_hnsw, v.hnsw_vs_ceiling * 100.0
-    ));
-    s.push_str(&format!(
-        "    скан кодов (XOR+POPCNT): {:.1} ГБ/с — 1B×768-d ≈ 96 ГБ кодов сканируются ядром по касанию страниц mmap\n",
-        v.scan_gbps
-    ));
-
-    s.push('\n');
-    s.push_str("[6] Resources\n");
-    if let Some(r) = &res.resources {
-        s.push_str(&format!(
-            "    RAM: пик {:.1} MB (VmHWM), текущая {:.1} MB (VmRSS)\n",
-            r.vm_hwm_kb as f64 / 1024.0,
-            r.vm_rss_kb as f64 / 1024.0
-        ));
-    } else {
-        s.push_str("    RAM-снимок недоступен (не Linux)\n");
-    }
-
-    s
 }

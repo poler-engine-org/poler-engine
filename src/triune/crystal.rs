@@ -91,7 +91,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// Разбивка на предложения (граница: . ! ? ; : и перевод строки).
 fn sentences(text: &str) -> Vec<&str> {
-    text.split(|c: char| matches!(c, '.' | '!' | '?' | ';' | ':' | '\n'))
+    text.split(['.', '!', '?', ';', ':', '\n'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
@@ -195,7 +195,7 @@ impl Crystal {
                 *bi.entry((pair[0], pair[1])).or_insert(0) += 1;
             }
         }
-        let cols_packed = (vocab + 4) / 5;
+        let cols_packed = vocab.div_ceil(5);
         // ⚠ Байт 0x00 в Trit5 = пять тритов −1 (цифра 0 = трит −1).
         // Вакуум кодируется байтом 121 = pack_5([0,0,0,0,0]).
         let zero_byte = Trit5Codec::pack_5(&[0i8; 5]).unwrap_or(121);
@@ -494,7 +494,7 @@ impl Crystal {
         if pos != bigram_off && (flags & 1) == 1 {
             return Err("bigram_off не совпадает с концом таблицы токенов".into());
         }
-        let cols = (vocab + 4) / 5;
+        let cols = vocab.div_ceil(5);
         let bigram = if flags & 1 == 1 {
             let need = vocab * cols;
             if bigram_off + need != bytes.len() {
@@ -539,7 +539,7 @@ impl Crystal {
     /// независимо от ёмкости в памяти.
     pub fn to_bytes(&self) -> Vec<u8> {
         let vocab = self.tokens.len();
-        let cols = (vocab + 4) / 5;
+        let cols = vocab.div_ceil(5);
         let token_off = HEADER;
         let mut token_table = Vec::new();
         for t in &self.tokens {
@@ -697,7 +697,7 @@ impl Crystal {
         if vocab == 0 || vocab > 1_000_000 {
             return Err(format!("странный словарь: {vocab}"));
         }
-        let stride = (vocab + 4) / 5;
+        let stride = vocab.div_ceil(5);
         if bigram.len() != vocab * stride {
             return Err(format!(
                 "матрица биграмм {vocab}×{stride} ожидается, байт: {}",
@@ -791,7 +791,7 @@ mod tests {
         for i in 0..c.vocab() as u32 {
             let t = c.embed_trit(i);
             assert_eq!(t.dims, 64);
-            assert_eq!(t.packed_bytes().len(), (64 + 4) / 5);
+            assert_eq!(t.packed_bytes().len(), 64_usize.div_ceil(5));
             assert!(t.nonzeros > 0, "вложение токена не вакуум");
         }
     }
@@ -874,7 +874,7 @@ mod tests {
         for _ in 0..v {
             pos += 1 + tail[pos] as usize;
         }
-        assert_eq!(bytes.len(), 0x50 + pos + v * ((v + 4) / 5), "хвост — ровно матрица");
+        assert_eq!(bytes.len(), 0x50 + pos + v * v.div_ceil(5), "хвост — ровно матрица");
     }
 
     #[test]
@@ -902,7 +902,7 @@ mod tests {
     fn from_parts_rejects_bad_input() {
         let c = Crystal::build(CORPUS, 64, 64, 1.7, 0.5).unwrap();
         let v = c.vocab();
-        let stride = (v + 4) / 5;
+        let stride = v.div_ceil(5);
         // Матрица не того размера.
         assert!(Crystal::from_parts(
             c.tokens.clone(),

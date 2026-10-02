@@ -6,7 +6,7 @@
 //! 3. extract_verified is STRICT THRESHOLD ONLY (p_i = [x_i > 0.5]) — zero combo search, zero delta radius.
 //! 4. Test both WITH ROTOR (gamma > 0) and WITHOUT ROTOR (gamma = 0).
 
-use nalgebra::{DMatrix, DVector};
+use nalgebra::DMatrix;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -182,7 +182,7 @@ impl FactorizationTopology {
 
     pub fn compute_grad(&self, pq: &[f64], nbits: &[f64]) -> (Vec<f64>, f64) {
         let npq = self.n_bits_p + self.n_bits_q;
-        let (full, base_e) = self.forward_pass(pq, nbits);
+        let (_full, base_e) = self.forward_pass(pq, nbits);
         let mut g = vec![0.0f64; npq];
         let eps = 1e-6;
         let inv_eps = 1.0 / eps;
@@ -238,7 +238,7 @@ pub fn run_pure_solver(
 
         for it in 0..max_iter {
             total_iters += 1;
-            let (mut g, e) = topo.compute_grad(&pq, &nbits);
+            let (g, e) = topo.compute_grad(&pq, &nbits);
             if e < best_e_overall { best_e_overall = e; }
 
             // PURE STRICT EXTRACTION: No trial division, no ±3, no combination search

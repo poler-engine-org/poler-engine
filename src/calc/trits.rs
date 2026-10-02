@@ -248,7 +248,7 @@ mod tests {
         let big = (3i64.pow(12) - 1) / 2; // 265720
         assert_eq!(t(big).to_i64(), big);
         assert_eq!(t(-big).to_i64(), -big);
-        assert!(Trits::from_i64(3i64.pow(20)).is_err() == false);
+        assert!(!Trits::from_i64(3i64.pow(20)).is_err());
     }
 
     #[test]

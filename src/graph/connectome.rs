@@ -688,7 +688,7 @@ mod tests {
     fn rejects_bad_nt_or_core_weight() {
         let n = 4usize;
         let mut buf = synth(false, &[(0, 1, 5, 1)]);
-        let nt_pos = 16 + 4 * (n + 1) + 4 * 1 + 2 * 1;
+        let nt_pos = 16 + 4 * (n + 1) + 4 + 2;
         buf[nt_pos] = 6;
         assert!(Connectome::from_raw(&buf)
             .unwrap_err()

@@ -528,8 +528,8 @@ impl LiteraryEngine {
             let snap = &snapshots[a.min(snapshots.len().saturating_sub(1))];
             let mut ranked: Vec<(&'static str, f32)> = ARCHETYPES
                 .iter()
-                .enumerate()
-                .map(|(_i, a)| {
+                
+                .map(|a| {
                     let mut axis = vec![0.0f32; dims];
                     for kw in a.keywords {
                         axis[super::qualia::axis_of(kw, dims)] += 1.0;

@@ -5362,7 +5362,7 @@ fn run_t5q_compile(target: &str) -> i32 {
     // 2. Фазовый ротор J = A − Aᵀ: доминирующий поток ↔ встречный канал.
     let mut a = vec![0.0f32; 64];
     a[1 * 8 + 0] = 0.9;
-    a[0 * 8 + 1] = -0.4;
+    a[1] = -0.4; // a[0][1] row-major 8×8 — встречный канал
     match compiler.phase_rotor_impulses(0, &a, 8) {
         Ok(mut v) => impulses.append(&mut v),
         Err(e) => {
