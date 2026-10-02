@@ -2563,7 +2563,7 @@ fn cmd_game_window(args: &[String]) -> CmdResult {
         ticks_cap = c;
     }
 
-    let mut window = match crate::game::X11Window::open(w, h, "POLER ENGINE — game window (Esc = выход)") {
+    let mut window = match crate::game::open_game_window(w, h, "POLER ENGINE — game window (Esc = выход)") {
         Ok(win) => win,
         Err(e) => {
             return CmdResult::Done(format!(

@@ -122,5 +122,5 @@ pub use orbit::Orbit;
 pub use render::{render_frame, render_raw, FrameConfig, FrameOutput, RawFrame};
 pub use scene::{demo_scene, BodySpec, CameraSpec, SceneFile};
 pub use transform::Transform;
-pub use window::{FrameRecord, OffscreenWindow, WindowBackend, X11Window};
+pub use window::{FrameRecord, OffscreenWindow, WindowBackend, X11Window, open_game_window};
 pub use world::{Body, BodyClass, Entity, World};

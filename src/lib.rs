@@ -49,7 +49,72 @@
 pub mod aidde;
 pub mod archive;
 pub mod bench;
+// poler-box — Linux-only: namespaces/pivot_root/seccomp/memfd —
+// примитивы ядра Linux. На других ОС — заглушка с честной ошибкой
+// (архитектура — src/boxenv/mod.rs).
+#[cfg(target_os = "linux")]
 pub mod boxenv;
+#[cfg(not(target_os = "linux"))]
+pub mod boxenv {
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone)]
+    pub struct BoxSpec {
+        pub archive: PathBuf,
+        pub entry: String,
+        pub args: Vec<String>,
+        pub maps: Vec<(String, String)>,
+        pub rss_mb: u64,
+        pub cpu_s: u64,
+        pub tmpfs_mb: u64,
+        pub isolate: bool,
+    }
+
+    impl Default for BoxSpec {
+        fn default() -> Self {
+            Self {
+                archive: PathBuf::new(),
+                entry: String::new(),
+                args: Vec::new(),
+                maps: vec![("rootfs/".to_string(), "/".to_string())],
+                rss_mb: 512,
+                cpu_s: 60,
+                tmpfs_mb: 512,
+                isolate: true,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct BoxReport {
+        pub entry: String,
+        pub exit_code: Option<i32>,
+        pub signal: Option<i32>,
+        pub kill_reason: Option<&'static str>,
+        pub peak_tree_rss_kb: u64,
+        pub cpu_seconds: f64,
+        pub wall_seconds: f64,
+        pub isolation: IsolationSummary,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct IsolationSummary {
+        pub userns_via_helper: bool,
+        pub namespaces: &'static str,
+        pub pivot_root: bool,
+        pub seccomp: String,
+        pub notes: Vec<String>,
+    }
+
+    pub fn run_box(_spec: &BoxSpec) -> Result<BoxReport, String> {
+        Err("poler-box: только Linux — namespaces/pivot_root/seccomp/memfd — примитивы ядра Linux".into())
+    }
+
+    pub fn stage2_main() -> i32 {
+        // stage2-вход вызывается только Linux-хелпером unshare
+        125
+    }
+}
 pub mod browser;
 pub mod calc;
 pub mod compression;
@@ -57,7 +122,16 @@ pub mod crypto;
 pub mod editor;
 pub mod engine;
 pub mod universal_archetype_asm;
+// winpe — исполнение Windows PE: живёт НА Linux (memfd/ptrace/proc —
+// примитивы ядра Linux). На других ОС — заглушка с честной ошибкой.
+#[cfg(target_os = "linux")]
 pub mod winpe;
+#[cfg(not(target_os = "linux"))]
+pub mod winpe {
+    pub fn winexec_file(_path: &std::path::Path, _args: &[String]) -> Result<i32, String> {
+        Err("winpe: исполнение Windows PE — только на Linux (memfd/ptrace/proc — примитивы ядра Linux)".into())
+    }
+}
 pub mod universal_letters;
 
 /// E1/v0.31.0: идеальный исполнитель команд — Zig-ядро

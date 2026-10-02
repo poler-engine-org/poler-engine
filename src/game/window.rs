@@ -841,6 +841,20 @@ mod x11 {
 #[cfg(target_os = "linux")]
 pub use x11::X11Window;
 
+/// Открытие окна для `game window`: на Linux — настоящее X11-окно,
+/// на других ОС — честная ошибка (оконный бэкенд один, X11; тип
+/// возврата на не-Linux — OffscreenWindow: трейт уже реализован,
+/// путь Ok недостижим).
+#[cfg(target_os = "linux")]
+pub fn open_game_window(w: u32, h: u32, title: &str) -> Result<X11Window, String> {
+    X11Window::open(w, h, title)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_game_window(_w: u32, _h: u32, _title: &str) -> Result<OffscreenWindow, String> {
+    Err("game window: только Linux (X11-бэкенд); детерминированный прогон без окна — game input-demo".into())
+}
+
 #[cfg(not(target_os = "linux"))]
 /// Заглушка вне Linux: Win32 — цикл V (контракт трейта уже зафиксирован).
 pub struct X11Window;
