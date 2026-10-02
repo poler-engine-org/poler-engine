@@ -7,6 +7,12 @@
 FROM rust:1.98-slim-bookworm AS builder
 WORKDIR /build
 
+# Инструменты, присутствие которых проверяют тесты движка:
+# git (motor_bridge: git --version/status), procps (ps — WinCompat tasklist)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git procps && \
+    rm -rf /var/lib/apt/lists/*
+
 # M2: квантовые крейты pqc/pqw живут в самом репозитории (crates/,
 # единый Cargo Workspace) — контекст сборки больше не требует
 # соседнего клона POLER-Quantum-RS_repo (см. docs/MERGE_PLAN.md).
@@ -29,6 +35,9 @@ COPY docs ./docs
 # weblens/: include_bytes! в src/web/weblens.rs требует файлы расширения
 # на этапе компиляции — без этого COPY сборка образа падает
 COPY weblens ./weblens
+# ffi/libp3ffi-linux-x86_64.so — P3-конформанс (p3::conformance, render,
+# shell commands) dlopen-ит библиотеку из CARGO_MANIFEST_DIR/ffi
+COPY ffi ./ffi
 RUN touch src/lib.rs src/main.rs && \
     cargo build --release --locked -p poler-engine && \
     cargo test --release --quiet -p poler-engine
