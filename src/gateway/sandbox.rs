@@ -723,7 +723,9 @@ fn judge_find(args: &[String]) -> Policy {
             return false;
         }
         let e = expand_home(p);
-        is_system_root(&e) || is_whole_home_dir(&e)
+        // путь == собственный дом пользователя (HOME может быть /root,
+        // /srv/… — не только /home/*): удаление дома целиком — Block
+        e == home_prefix() || is_system_root(&e) || is_whole_home_dir(&e)
     });
     if sys_path {
         return Policy::Block(

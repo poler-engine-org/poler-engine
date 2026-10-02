@@ -1512,11 +1512,14 @@ mod tests {
         let ctx = ctx_for(&base, "poler-box-hn");
         let stop = AtomicBool::new(false);
         let report = run_battery(&ctx, &exec_local, &stop);
-        // 4 judge + 9 channel = 13 skipped
+        // 4 judge + 9 channel = 13 skipped; boundary-векторы (bnd:*) —
+        // отдельная забота (следующий ассерт допускает Safe|Skipped):
+        // под root их может пропустить сам харнес (uid-зависимость),
+        // поэтому в подсчёт канальных/судейских не включаем.
         let skipped = report
             .outcomes
             .iter()
-            .filter(|o| o.verdict == HV::Skipped)
+            .filter(|o| o.verdict == HV::Skipped && !o.id.starts_with("bnd:"))
             .count();
         assert_eq!(
             skipped,

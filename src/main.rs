@@ -792,18 +792,21 @@ struct Cli {
     /// всё до конца строки — команда и её аргументы (включая -флаги команды).
     #[cfg(feature = "pnd-ffi")]
     #[arg(
-        long = "exec",
+        long = "exec-raw",
         value_name = "CMD ARGS...",
         num_args = 1..,
         allow_hyphen_values = true,
         conflicts_with_all = [
-            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "tui",
             "impact", "grep", "chunk", "benchmark", "semantic", "license",
             "knowledge_ingest", "knowledge_search", "knowledge_stats",
             "memory_seal", "memory_open", "memory_verify", "memory_info"
         ]
     )]
-    exec: Vec<String>,
+    /// (v0.62: флаг переименован --exec → --exec-raw: в v0.47 каноном
+    /// стал полер-shell `--exec '<команда>'`; дубликат поля не собирался
+    /// с фичей pnd-ffi с v0.47 — CI не доходил до этой сборки.)
+    exec_raw: Vec<String>,
 
     /// Жёсткий таймаут команды --exec, мс [default: 30000].
     /// По истечении: SIGTERM группе → grace → SIGKILL.
@@ -1944,7 +1947,7 @@ fn run(cli: Cli) -> ExitCode {
 
     // ---------- E1/v0.31.0: полер-исполнитель команд ----------
     #[cfg(feature = "pnd-ffi")]
-    if !cli.exec.is_empty() {
+    if !cli.exec_raw.is_empty() {
         return ExitCode::from(run_exec(&cli) as u8);
     }
 
@@ -4801,7 +4804,7 @@ fn run_exec(cli: &Cli) -> i32 {
     use poler_engine::exec::{self, CaptureMode, ExecSpec};
     use std::io::Write;
 
-    let mut parts = cli.exec.iter();
+    let mut parts = cli.exec_raw.iter();
     let program = parts.next().unwrap().clone();
     let args: Vec<String> = parts.cloned().collect();
 
