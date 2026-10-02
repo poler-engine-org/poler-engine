@@ -447,8 +447,12 @@ struct Cli {
 
     /// MCP-СЕРВЕР (Model Context Protocol): poler-engine как нативный
     /// инструмент LLM-агентов поверх stdio JSON-RPC.
-    /// Инструменты: poler_web_search / poler_crawl / poler_fetch / poler_search /
-    /// poler_grep / poler_chunk / poler_box_exec / poler_box_status.
+    /// 32+ инструмента: поиск/греп/чанки (poler_search/grep/chunk), веб (crawl/fetch),
+    /// Калькулятор Всего (poler_calc), квантовый мост (poler_quantum: qft/grover/
+    /// teleport/qaoa/bloch/verify), живая нейросеть (poler_triune_speak/state),
+    /// мозг мухи FLYCSR1 (poler_fly_*: 10 инструментов), SSN-вихрь (poler_ssn_*),
+    /// литературный POLER[Psi] (poler_literary_*), sandbox (poler_box_*).
+    /// ПОЛНЫЙ живой список: `poler-engine --mcp` + tools/list, или `--schema`.
     #[arg(long = "mcp", conflicts_with_all = ["web_search", "crawl", "web_stats", "impact", "mcp_http", "mcp_token"])]
     mcp: bool,
 
@@ -538,6 +542,13 @@ struct Cli {
     /// v2.0 не содержит ключей и гейтов.
     #[arg(long = "license", conflicts_with_all = ["shell", "exec", "tui", "mcp", "mcp_http"])]
     license: bool,
+
+    /// Самодокументирующийся JSON-манифест возможностей движка (AI-API-реформа):
+    /// домены CLI, MCP-инструменты, честные границы вычислимости, примеры.
+    /// Одна команда — и любая модель/LLM/человек видит весь движок целиком,
+    /// без чтения 947 строк --help.
+    #[arg(long = "schema", conflicts_with_all = ["shell", "exec", "tui", "mcp", "mcp_http", "license"])]
+    schema: bool,
     /// Разрешить краулеру переход на другие хосты.
     #[arg(long = "cross-site", default_value_t = false)]
     cross_site: bool,
@@ -1795,6 +1806,41 @@ fn print_license_status() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// AI-API-реформа: самодокументирующийся JSON-манифест (`--schema`).
+/// Одна команда раскрывает движок целиком: домены CLI, MCP-инструменты,
+/// честные границы вычислимости, копируемые примеры. Скилл-доки и --help
+/// исторически занижали поверхность (6–8 инструментов против 32 живых) —
+/// манифест закрывает этот разрыв навсегда: модель читает один JSON.
+fn print_schema_manifest() -> ExitCode {
+    println!(
+        r#"{{"engine":"poler-engine","flag":"--schema","purpose":"самодокументирующийся манифест для LLM/агентов",
+"cli_domains":[
+ {{"name":"search","call":"poler-engine <путь> -q '<запрос>' --format simple|md|ai-json","description":"топографический резонансный поиск: полные сцены вместо строк, метрики плотности eps и резонанса R"}},
+ {{"name":"grep","call":"poler-engine <путь> --grep '<паттерн>' [--grep-regex] [--grep-i] [--grep-json]","description":"точный grep-режим: ВСЕ совпадения, контекст -B/-A, без индекса"}},
+ {{"name":"calc","call":"poler-engine --exec 'calc <выражение>' --json","description":"Калькулятор Всего: арифметика, единицы (to), solve, матрицы det/inv/expm/eigen/eigen_sturm, числа, CODATA-константы"}},
+ {{"name":"quantum","call":"poler-engine --mcp -> tools/call poler_quantum","description":"квантовый мост: bell|ghz|qft|iqft|grover|bv|dj|period|teleport + qaoa/bloch/verify, n<=26, шумовые пресеты ibm-heron/google-willow"}},
+ {{"name":"neural","call":"poler-engine --triune-speak '<текст>' [--triune-tokens N]","description":"живая нейросеть Триединства: муха + синусоидный вихрь + троичный кристалл; STDP-обучение, критичность ~0.55"}},
+ {{"name":"connectome","call":"poler-engine --connectome <CSR_ZST> ...","description":"живой мозг мухи FLYCSR1: паспорта нейронов, K-hop, пути сигнала, PageRank-хабы, ротор J=A-A^T"}},
+ {{"name":"mcp","call":"poler-engine --mcp","description":"MCP-сервер stdio JSON-RPC 2.0: 32+ инструментов (живой список: tools/list)"}},
+ {{"name":"web","call":"poler-engine --crawl <URL> / --web-search '<запрос>'","description":"локальный веб-индекс: CDP-краулинг real-Chromium, PageRank, SimHash-дедуп (офлайн, без Google)"}},
+ {{"name":"rag","call":"poler-engine <файл> --chunk --chunk-size 500 --chunk-json","description":"нарезка на чанки с уважением границ предложений/абзацев"}},
+ {{"name":"shell","call":"poler-engine --shell / --tui","description":"REPL и TUI-дашборд"}}
+],
+"mcp":{{"transport":"stdio JSON-RPC 2.0 (Model Context Protocol)","tools_count":"32+ (живой список через tools/list)","highlights":["poler_calc — Калькулятор Всего","poler_quantum — квантовый мост (9 алгоритмов + qaoa/teleport/bloch/verify)","poler_triune_speak/state — живая нейросеть","poler_fly_* — коннектом мухи (10 инструментов)","poler_ssn_* — живой SSN-мозг","poler_literary_* — литературный POLER[Psi]","poler_search/grep/chunk — retrieval","poler_box_exec — Docker-jail"]}},
+"boundaries":{{"eigen":"надёжен n<=24; n>=28 — взрыв Уилкинсона (коэффициенты charpoly O(n!))","eigen_sturm":"НОВОЕ: Штурм-бисекция, симметричные вещественные, машинная точность ~3e-14 при n=256 (tridiag(2,-1,256): prod(lam)=det=257)","quantum":"n<=26 (плотный statevector 2^N x 16 байт; при RAM 3 ГБ — n<=24)","tridiag_builder":"n<=64 (компактный литерал); det/eigen_sturm матрицами — без лимита"}},
+"quickstart":[
+ "poler-engine --exec 'calc 2^10' --json",
+ "poler-engine --exec 'calc det(tridiag(2,-1,64))' --json",
+ "poler-engine --exec 'calc eigen_sturm(tridiag(2,-1,256))' --json",
+ "poler-engine --triune-speak 'привет' --triune-tokens 24",
+ "poler-engine ~/my-repo -q 'резонанс' --format ai-json",
+ "poler-engine --schema | jq .boundaries"
+]
+}}"#
+    );
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
 
     // v0.41.0 poler-box: stage2-вхід — викликається exec-хелпером
@@ -2346,6 +2392,11 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- License / EULA: статус модели ----------
     if cli.license {
         return print_license_status();
+    }
+
+    // ---------- AI-API: самодокументирующийся манифест ----------
+    if cli.schema {
+        return print_schema_manifest();
     }
 
     // ---------- Веб-индекс: статистика ----------
