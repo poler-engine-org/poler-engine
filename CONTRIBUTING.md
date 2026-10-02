@@ -67,6 +67,92 @@ tmux-сессии `poler-engine-<задача>`; опрос без блокир�
 Ошибки — строки на русском с контекстом (формат исторически сложился):
 `"чужая магия: не PRBQ-хранилище"`. Новые — следовать образцу.
 
+### 3.5. Коммиты и PR: быстрая инструкция (v0.62)
+
+#### Разовая настройка
+
+```bash
+git config --global user.name  "Kotokvit"
+git config --global user.email "vitalijkotok18@gmail.com"
+git config --global credential.helper store   # токен в ~/.git-credentials
+chmod 600 ~/.git-credentials                   # токен читается только вами
+```
+
+Токен — только через credential-helper (§3.3). После рабочей сессии
+вычищается из `~/.git-credentials` и **отзывается** на
+github.com → Settings → Applications. Опубликованный токен считается
+скомпрометированным — независимо от того, как он «случайно» попал наружу.
+
+#### Формат сообщения коммита
+
+```
+type(scope): суть — деталь (контекст, если нужен)
+
+Тело: «почему», а не «что». Что — видно из diff.
+```
+
+Типы (conventional, сложились исторически):
+
+| Тип | Когда | Реальный пример из истории |
+|---|---|---|
+| `feat` | новая возможность | `feat(api): AI-API реформа — --schema манифест + eigen_sturm (Уилкинсон→Штурм) + poler-api шлюз` |
+| `fix` | багфикс | `fix(shell): REPL терял переменные между строками` |
+| `docs` | только документация | `docs: BUILDING — сборка на слабом железе (Core i5, 3–4 ГБ RAM)` |
+| `ci` | пайплайн CI | `ci: fix runner OOM with job limits and update zig action` |
+| `test` | только тесты | `test(calc): дифференциальный штурм-тест против аналитики` |
+| `refactor` | без смены поведения | `refactor(mcp): вынести tools_manifest в отдельную секцию` |
+| `perf` | производительность | `perf(grep): SIMD-скан 16 байт за такт` |
+
+Правила: атомарность (одно логическое изменение — один коммит); настоящее
+время; scope — домен (`api`, `calc`, `quantum`, `mcp`, `shell`, `ci`, `docs`).
+
+#### Пошаговый цикл работы
+
+```bash
+# 1) свежая main перед началом (fetch-before-work, AGENT.md п.2)
+git fetch origin && git checkout main && git pull origin main
+
+# 2) ветка задачи: feat|fix|docs/<домен>-<slug>
+git checkout -b feat/api-eigen-sturm origin/main
+
+# 3) работа → зелёные проверки ДО коммита (§2)
+cargo check
+cargo test --lib          # точечно: cargo test --lib eigen_sturm
+
+# 4) осмотреть diff по кускам и закоммитить
+git add -p
+git commit -m "feat(calc): eigen_sturm — Штурм-бисекция" \
+           -m "charpoly Фаддеева взрывается на n>=28 (Уилкинсон); бисекция по цепочке Штурма на той же арифметике даёт n=256 с err 2.8e-14. Дифф-тест против аналитики 2-2cos(k*pi/(n+1)) в lib-тестах."
+
+# 5) push и PR
+git push -u origin HEAD
+# PR через web-UI или: gh pr create --fill
+```
+
+#### Правила для PR
+
+1. `cargo build --release` + `cargo test` зелёные локально — CI лишь
+   подтверждает (§5).
+2. Менялся `Cargo.toml` (версия/зависимости) → в PR лежит обновлённый
+   `Cargo.lock` (CI собирает с `--locked`).
+3. Новая математика → дифференциальный тест против скучного эталона
+   (docs/TESTING.md §1.1) + инвариант-ворот (Σλ=trace, Πλ=det — образец
+   `eigen_sturm` в v0.62).
+4. Новый CLI-флаг или MCP-инструмент → в том же PR обновлены `--schema`
+   манифест, `--help` и docs/CLI.md. Урок v0.61: 32 живых MCP-инструмента,
+   о которых `--help` сообщал 8 — код обогнал документацию, и модели
+   месяцами не видели 75% возможностей движка.
+5. Слияние: merge-commit для содержательных PR (история сохраняется,
+   образец — PR #1) или squash для однострочных правок. Force-push в main
+   запрещён (§3.1).
+6. Релиз: после мержа — bump `Cargo.toml` `[package].version`, коммит с
+   обновлённым `Cargo.lock`, аннотированный тег и push тега:
+
+```bash
+git tag -a v0.62.0 -m "v0.62.0: AI-API реформа (schema, eigen_sturm, poler-api)"
+git push origin main --tags
+```
+
 ## 4. Что проверяется ревью (чек-лист мейнтейнера)
 
 1. Не нарушены ли 5 принципов §1?
