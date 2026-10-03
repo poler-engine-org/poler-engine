@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 652 676" font-family="monospace">
-<rect width="652" height="676" fill="#ffffff"/>
-<text x="326" y="22" font-size="14" font-weight="bold" fill="#111827" text-anchor="middle">Поле: изолинии marching squares</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 652 661" font-family="monospace">
+<rect width="652" height="661" fill="#ffffff"/>
+<text x="326" y="22" font-size="14.0" font-weight="bold" fill="#111827" text-anchor="middle">Поле: изолинии marching squares</text>
 <rect x="56.0" y="40.0" width="45.00" height="45.00" fill="#3b82f6" fill-opacity="0.280" stroke="#d1d5db" stroke-width="0.3"/>
 <rect x="101.0" y="40.0" width="45.00" height="45.00" fill="#3b82f6" fill-opacity="0.291" stroke="#d1d5db" stroke-width="0.3"/>
 <rect x="146.0" y="40.0" width="45.00" height="45.00" fill="#3b82f6" fill-opacity="0.311" stroke="#d1d5db" stroke-width="0.3"/>
@@ -157,6 +157,7 @@
 <polyline points="326.0,251.2 292.5,265.0 281.0,276.5 267.2,310.0 281.0,343.5 292.5,355.0 326.0,368.8 359.5,355.0 371.0,343.5 384.8,310.0 371.0,276.5 359.5,265.0 326.0,251.2" fill="none" stroke="#9f3a68" stroke-width="1.6" stroke-linejoin="round"/>
 <polyline points="326.0,263.5 322.3,265.0 281.0,306.3 279.5,310.0 281.0,313.7 322.3,355.0 326.0,356.5 329.7,355.0 371.0,313.7 372.5,310.0 371.0,306.3 329.7,265.0 326.0,263.5" fill="none" stroke="#be3047" stroke-width="1.6" stroke-linejoin="round"/>
 <polyline points="326.0,286.0 302.0,310.0 326.0,334.0 350.0,310.0 326.0,286.0" fill="none" stroke="#dc2626" stroke-width="1.6" stroke-linejoin="round"/>
-<text x="56" y="606.0" font-size="12" fill="#111827">сетка 13×13 · z ∈ [-0.443051, 1]</text>
-<text x="56" y="626.0" font-size="11" fill="#6b7280">изолинии: 7 уровней · полилиний 12 · суммарная длина ≈ 129.8 ед. сетки · marching squares (двусмысленные клетки — средним)</text>
+<text x="56" y="608.0" font-size="12" fill="#111827">сетка 13×13 · z ∈ [-0.443051, 1]</text>
+<text x="56" y="626.5" font-size="8" fill="#6b7280">изолинии: 7 уровней · полилиний 12 · суммарная длина ≈ 129.8 ед. сетки · marching squares (двусмысленные клетки —</text>
+<text x="56" y="638.0" font-size="8" fill="#6b7280">средним)</text>
 </svg>

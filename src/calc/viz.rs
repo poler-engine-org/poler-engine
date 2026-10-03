@@ -123,13 +123,450 @@ fn svg_open(w: u32, h: u32) -> String {
 }
 
 fn title(s: &str, w: u32) -> String {
+    // Грабля 23: заголовок ужимается кеглем, пока не влезет в холст.
+    let avail = w as f64 - 16.0;
+    let mut size = 14.0;
+    while size > 9.0 && text_w(s, size) > avail {
+        size -= 0.5;
+    }
     format!(
-        "<text x=\"{}\" y=\"22\" font-size=\"14\" font-weight=\"bold\" fill=\"{}\" \
+        "<text x=\"{}\" y=\"22\" font-size=\"{size:.1}\" font-weight=\"bold\" fill=\"{}\" \
          text-anchor=\"middle\">{}</text>\n",
         w / 2,
         C_TEXT,
         esc(s)
     )
+}
+
+// ---------------------------------------------------------------------
+// Сессия-10: ТИПОГРАФИКА — ни одна надпись не имеет права обрезаться
+// ---------------------------------------------------------------------
+// Полевой отчёт (slit.png, scale.svg): подписи выходили за холст и
+// налетали друг на друга. Грабля 23: SVG-текст не переносится и не
+// сжимается сам — холст, перенос и укладку подписей считает ДВИЖОК.
+//
+// Метрика: моноширинное семейство — продвижение глифа 0.60–0.6023 em
+// (DejaVu Sans Mono, Courier New; Consolas 0.55). Оценка 0.62 em —
+// верхняя граница: влезшее по оценке влезет и в реальном рендере.
+
+/// Консервативное продвижение глифа моноширинного шрифта (em).
+const MONO_EM: f64 = 0.62;
+
+/// Оценка ширины строки при кегле `size` (px).
+fn text_w(s: &str, size: f64) -> f64 {
+    s.chars().count() as f64 * MONO_EM * size
+}
+
+/// Перенос по словам под ширину `max_w`; слово длиннее строки режется
+/// по символам. Результат всегда непуст (пустая строка → одна пустая).
+fn wrap_text(s: &str, size: f64, max_w: f64) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split(' ').filter(|w| !w.is_empty()) {
+        if text_w(word, size) > max_w {
+            // Слово-гигант: закрываем текущую строку и режем по глифам.
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut piece = String::new();
+            for ch in word.chars() {
+                if !piece.is_empty() && text_w(&format!("{piece}{ch}"), size) > max_w {
+                    lines.push(std::mem::take(&mut piece));
+                }
+                piece.push(ch);
+            }
+            cur = piece;
+            continue;
+        }
+        let cand = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if text_w(&cand, size) <= max_w {
+            cur = cand;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Примечание подвала сцены.
+struct Note {
+    text: String,
+    size: f64,
+    color: &'static str,
+}
+
+impl Note {
+    fn new(text: impl Into<String>, size: f64, color: &'static str) -> Self {
+        Note {
+            text: text.into(),
+            size,
+            color,
+        }
+    }
+}
+
+/// Кегль примечания: сначала уменьшение (маркеры остаются одной
+/// строкой), перенос — только когда и 8 pt не влезает.
+fn note_layout(text: &str, base: f64, max_w: f64) -> (f64, Vec<String>) {
+    let mut size = base;
+    while size > 8.0 && text_w(text, size) > max_w {
+        size -= 1.0;
+    }
+    (size, wrap_text(text, size, max_w))
+}
+
+/// Высота блока примечаний — холст обязан знать её ДО отрисовки.
+fn notes_height(notes: &[Note], x: f64, w: f64) -> f64 {
+    let max_w = (w - x - 8.0).max(40.0);
+    let mut h = 0.0;
+    for n in notes {
+        let (size, lines) = note_layout(&n.text, n.size, max_w);
+        h += lines.len() as f64 * (size + 3.5) + 3.0;
+    }
+    h
+}
+
+/// SVG-блок примечаний от базовой линии `y0`; возвращает (svg, высота).
+fn notes_svg(notes: &[Note], x: f64, w: f64, y0: f64) -> (String, f64) {
+    let max_w = (w - x - 8.0).max(40.0);
+    let mut out = String::new();
+    let mut y = y0;
+    for n in notes {
+        let (size, lines) = note_layout(&n.text, n.size, max_w);
+        for line in &lines {
+            out.push_str(&format!(
+                "<text x=\"{x:.0}\" y=\"{y:.1}\" font-size=\"{size:.0}\" fill=\"{}\">{}</text>\n",
+                n.color,
+                esc(line)
+            ));
+            y += size + 3.5;
+        }
+        y += 3.0;
+    }
+    (out, y - y0)
+}
+
+/// Текст с белым ореолом: читается поверх рёбер, сетки и квандов.
+fn halo_text(x: f64, y: f64, size: f64, anchor: &str, fill: &str, content: &str) -> String {
+    let common =
+        format!("x=\"{x:.1}\" y=\"{y:.1}\" font-size=\"{size:.0}\" text-anchor=\"{anchor}\"");
+    format!(
+        "<text {common} stroke=\"#ffffff\" stroke-width=\"2.4\" \
+         stroke-linejoin=\"round\" fill=\"#ffffff\">{}</text>\n\
+         <text {common} fill=\"{fill}\">{}</text>\n",
+        esc(content),
+        esc(content)
+    )
+}
+
+/// Компактная подпись клетки теплокарты: полный num() → короче →
+/// мельче; крайний случай — маркер «·» (знак живёт в цвете клетки).
+fn cell_label(v: f64, cell_w: f64) -> (String, f64) {
+    let max_w = cell_w - 5.0;
+    let candidates = [
+        num(v),
+        format!("{:.4}", v),
+        format!("{:.2}", v),
+        format!("{:.1}", v),
+        format!("{:.0}", v),
+        format!("{:.1e}", v),
+        format!("{:.0e}", v),
+    ];
+    for size in [10.0, 9.0, 8.0] {
+        for c in &candidates {
+            if text_w(c, size) <= max_w {
+                return (c.clone(), size);
+            }
+        }
+    }
+    ("·".into(), 10.0)
+}
+
+/// Подпись значения столбца в слот: (текст, кегль), если влезает
+/// горизонтально; None — тесно, нужна вертикальная надпись.
+fn bar_value_label(text: &str, slot_w: f64) -> Option<(String, f64)> {
+    for size in [10.0, 9.0, 8.0, 7.0] {
+        if text_w(text, size) <= slot_w - 2.0 {
+            return Some((text.to_string(), size));
+        }
+    }
+    None
+}
+
+/// Прямоугольник для проверки наложений (экранные координаты).
+#[derive(Clone, Copy, Debug)]
+struct LBox {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+/// Пересечение прямоугольников с зазором `gap`.
+fn boxes_hit(a: &LBox, b: &LBox, gap: f64) -> bool {
+    a.x0 < b.x1 + gap && b.x0 < a.x1 + gap && a.y0 < b.y1 + gap && b.y0 < a.y1 + gap
+}
+
+/// Размещённая подпись оси: бокс [x, x+w] в ряду `row`, выноска от
+/// засечки `tick` рисуется сценой при |центр − засечка| > 5 px.
+#[derive(Clone, Debug)]
+struct Placed {
+    x: f64,
+    y: f64,
+    w: f64,
+    tick: f64,
+    row: i32,
+    text: String,
+}
+
+/// Левый край бокса подписи шириной `wpx` у засечки `tick` — с укором
+/// в холст [pad, w−pad] и защитой от паники при ширине больше холста.
+fn label_x0(tick: f64, wpx: f64, w: f64, pad: f64) -> f64 {
+    if wpx > w - 2.0 * pad {
+        return pad;
+    }
+    let xc = tick.clamp(pad + wpx / 2.0, w - pad - wpx / 2.0);
+    xc - wpx / 2.0
+}
+
+/// Укладка подписей одномерной оси (грабля 23: чередование «верх/низ»
+/// не спасало — соседние по лог-шкале подписи налетали друг на друга).
+/// Четыре ряда: ±1 (ближние), ±2 (дальние); row 3 — маркер значения
+/// (самый важный, размещается первым). Зазор в ряду — 7 px, всё — в
+/// границах холста, детерминированно (порядок слева направо).
+fn place_axis_labels(
+    items: &[(f64, String)],
+    value: Option<(f64, String)>,
+    w: f64,
+    pad: f64,
+    ys: [f64; 5],
+    font: f64,
+) -> Vec<Placed> {
+    let mut placed: Vec<Placed> = Vec::new();
+    if let Some((tick, text)) = value {
+        let wpx = text_w(&text, font + 3.0);
+        placed.push(Placed {
+            x: label_x0(tick, wpx, w, pad),
+            y: ys[4],
+            w: wpx,
+            tick,
+            row: 3,
+            text,
+        });
+    }
+    for (k, (tick, text)) in items.iter().enumerate() {
+        let wpx = text_w(text, font);
+        let rows: [i32; 4] = if k % 2 == 0 {
+            [1, 2, -1, -2]
+        } else {
+            [-1, -2, 1, 2]
+        };
+        let mut done = false;
+        for &row in &rows {
+            let y = match row {
+                1 => ys[1],
+                2 => ys[0],
+                -1 => ys[2],
+                _ => ys[3],
+            };
+            let x0 = label_x0(*tick, wpx, w, pad);
+            let clash = placed
+                .iter()
+                .any(|q| q.row == row && x0 < q.x + q.w + 7.0 && q.x < x0 + wpx + 7.0);
+            if !clash {
+                placed.push(Placed {
+                    x: x0,
+                    y,
+                    w: wpx,
+                    tick: *tick,
+                    row,
+                    text: text.clone(),
+                });
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            // Все четыре ряда конфликтуют: первый свободный горизонтальный
+            // зазор дальнего нижнего ряда (с выноской от засечки).
+            let mut boxes: Vec<(f64, f64)> = placed
+                .iter()
+                .filter(|q| q.row == -2)
+                .map(|q| (q.x, q.x + q.w))
+                .collect();
+            boxes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let mut x = pad;
+            for (bx0, bx1) in boxes {
+                if x + wpx + 7.0 <= bx0 {
+                    break;
+                }
+                if x < bx1 + 7.0 {
+                    x = bx1 + 7.0;
+                }
+            }
+            x = x.clamp(pad, (w - pad - wpx).max(pad));
+            placed.push(Placed {
+                x,
+                y: ys[3],
+                w: wpx,
+                tick: *tick,
+                row: -2,
+                text: text.clone(),
+            });
+        }
+    }
+    placed
+}
+
+/// Разбивка имени узла графа на строки под ширину: 10 pt / 150 px,
+/// при необходимости 9 pt / 8 pt. Многострочность ≤2 сохраняет
+/// привязку к узлу без наездов на соседей.
+fn node_label_lines(name: &str) -> (f64, Vec<String>) {
+    for (size, max_w) in [(10.0, 150.0), (9.0, 140.0), (8.0, 130.0)] {
+        let lines = wrap_text(name, size, max_w);
+        if lines.len() <= 2 {
+            return (size, lines);
+        }
+    }
+    (8.0, wrap_text(name, 8.0, 130.0))
+}
+
+// ------- Аудит собственного SVG (регрессионная сеть грабли 23) -------
+
+/// Аудит сцены: каждая <text>-надпись обязана лежать в границах холста
+/// (viewBox), с учётом text-anchor и поворота. Пустой результат — чисто.
+#[allow(dead_code)]
+pub fn audit_text_bounds(svg: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    let (w, h) = match parse_view_box(svg) {
+        Some(v) => v,
+        None => {
+            bad.push("нет viewBox".into());
+            return bad;
+        }
+    };
+    let tol = 1.0;
+    for (attrs, content) in text_elements(svg) {
+        let content = unesc(content.trim());
+        let x = attr_f(&attrs, "x").unwrap_or(0.0);
+        let y = attr_f(&attrs, "y").unwrap_or(0.0);
+        let size = attr_f(&attrs, "font-size").unwrap_or(12.0);
+        let anchor = attr_s(&attrs, "text-anchor").unwrap_or_else(|| "start".into());
+        let wpx = text_w(&content, size);
+        let (mut x0, mut x1) = match anchor.as_str() {
+            "middle" => (x - wpx / 2.0, x + wpx / 2.0),
+            "end" => (x - wpx, x),
+            _ => (x, x + wpx),
+        };
+        let mut y0 = y - 0.85 * size;
+        let mut y1 = y + 0.30 * size;
+        if let Some((a, cx, cy)) = parse_rotate(&attrs) {
+            let t = a.to_radians();
+            let (ca, sa) = (t.cos(), t.sin());
+            let rot = |(px, py): (f64, f64)| -> (f64, f64) {
+                let (dx, dy) = (px - cx, py - cy);
+                (cx + dx * ca - dy * sa, cy + dx * sa + dy * ca)
+            };
+            let (ax, ay) = rot((x, y));
+            let (bx, by) = rot((x + wpx, y));
+            x0 = ax.min(bx) - 0.3 * size;
+            x1 = ax.max(bx) + 0.3 * size;
+            y0 = ay.min(by) - 0.85 * size;
+            y1 = ay.max(by) + 0.30 * size;
+        }
+        if x0 < -tol || x1 > w + tol || y0 < -tol || y1 > h + tol {
+            let head: String = content.chars().take(18).collect();
+            bad.push(format!(
+                "«{head}…» за холстом {w}×{h}: x[{x0:.0}…{x1:.0}] y[{y0:.0}…{y1:.0}]"
+            ));
+        }
+    }
+    bad
+}
+
+#[allow(dead_code)]
+fn parse_view_box(svg: &str) -> Option<(f64, f64)> {
+    let i = svg.find("viewBox=\"")? + 9;
+    let rest = &svg[i..];
+    let end = rest.find('"')?;
+    let mut it = rest[..end].split_whitespace();
+    it.next()?;
+    it.next()?;
+    let w: f64 = it.next()?.parse().ok()?;
+    let h: f64 = it.next()?.parse().ok()?;
+    Some((w, h))
+}
+
+#[allow(dead_code)]
+fn text_elements(svg: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = svg;
+    while let Some(i) = rest.find("<text") {
+        rest = &rest[i + 5..];
+        let close = match rest.find('>') {
+            Some(c) => c,
+            None => break,
+        };
+        let attrs = rest[..close].to_string();
+        let after = &rest[close + 1..];
+        let end = match after.find("</text>") {
+            Some(e) => e,
+            None => break,
+        };
+        out.push((attrs, after[..end].to_string()));
+        rest = &after[end + 7..];
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn attr_s(attrs: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=\"");
+    let i = attrs.find(&pat)? + pat.len();
+    let rest = &attrs[i..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+#[allow(dead_code)]
+fn attr_f(attrs: &str, key: &str) -> Option<f64> {
+    attr_s(attrs, key).and_then(|v| v.parse().ok())
+}
+
+#[allow(dead_code)]
+fn parse_rotate(attrs: &str) -> Option<(f64, f64, f64)> {
+    let s = attr_s(attrs, "transform")?;
+    let i = s.find("rotate(")? + 7;
+    let rest = &s[i..];
+    let end = rest.find(')')?;
+    let nums: Vec<f64> = rest[..end]
+        .split([',', ' '])
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    match nums.len() {
+        1 => Some((nums[0], 0.0, 0.0)),
+        3 => Some((nums[0], nums[1], nums[2])),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn unesc(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
 }
 
 // ---------------------------------------------------------------------
@@ -146,7 +583,16 @@ pub fn bell_svg(i: f64) -> String {
     let xf = |v: f64| X0 + (v - V0) * (X1 - X0) / (V1 - V0);
     let clamp = |v: f64| v.clamp(V0, V1);
 
-    let mut s = svg_open(640, 240);
+    // Вердикт — до холста: высота примечаний известна заранее (грабля 23:
+    // раньше длинные вердикты упирались в правый край).
+    let (line1, line2) = bell_verdict(i);
+    let notes = vec![
+        Note::new(line1, 12.0, C_TEXT),
+        Note::new(line2, 11.0, C_MUTED),
+    ];
+    let h = (204.0 + notes_height(&notes, 60.0, 640.0) + 10.0).ceil() as u32;
+
+    let mut s = svg_open(640, h);
     s.push_str(&title("CGLMP: нарушение неравенства Белла", 640));
 
     // Зона классики: заливка от левого края до 2.0.
@@ -206,23 +652,22 @@ pub fn bell_svg(i: f64) -> String {
          <circle cx=\"{xv:.1}\" cy=\"108\" r=\"6\" fill=\"#ffffff\" stroke=\"{}\" stroke-width=\"2.6\"/>\n",
         C_RED, C_RED
     ));
+    // Грабля 23: у крайних значений метка «I = …» вылезала за холст —
+    // укор центра по ширине текста.
+    let it = format!("I = {}", num(i));
+    let half = text_w(&it, 12.0) / 2.0;
+    let xc = xv.clamp(8.0 + half, 632.0 - half);
     s.push_str(&format!(
-        "<text x=\"{xv:.1}\" y=\"98\" font-size=\"12\" font-weight=\"bold\" fill=\"{}\" \
-         text-anchor=\"middle\">I = {}</text>\n",
+        "<text x=\"{xc:.1}\" y=\"98\" font-size=\"12\" font-weight=\"bold\" fill=\"{}\" \
+         text-anchor=\"middle\">{}</text>\n",
         C_RED,
-        num(i)
+        esc(&it)
     ));
 
-    // Вердикт: человеческая расшифровка.
-    let (line1, line2) = bell_verdict(i);
-    s.push_str(&format!(
-        "<text x=\"60\" y=\"208\" font-size=\"12\" fill=\"{}\">{}</text>\n\
-         <text x=\"60\" y=\"226\" font-size=\"11\" fill=\"{}\">{}</text>\n</svg>",
-        C_TEXT,
-        esc(&line1),
-        C_MUTED,
-        esc(&line2)
-    ));
+    // Вердикт: человеческая расшифровка (с уменьшением кегля/переносом).
+    let (block, _) = notes_svg(&notes, 60.0, 640.0, 204.0);
+    s.push_str(&block);
+    s.push_str("</svg>");
     s
 }
 
@@ -288,12 +733,50 @@ pub fn scale_svg(x_m: f64) -> Result<String, String> {
     const L1: f64 = 27.0;
     let xf = |lg: f64| X0 + (lg - L0) * (X1 - X0) / (L1 - L0);
 
-    let mut s = svg_open(640, 300);
-    s.push_str(&title("Шкала Вселенной (логарифм, метры)", 640));
+    // Примечания — до отрисовки: высота холста известна заранее
+    // (грабля 23: раньше третья строка обрезалась на правом краю).
+    let (line1, line2) = scale_verdict(x_m);
+    let line3 = "якоря: Планк → протон → атом → ДНК → вирус → эритроцит → человек → \
+                 Эверест → Земля → Солнце → орбита → парсек → Галактика → Вселенная"
+        .to_string();
+    let notes = vec![
+        Note::new(line1, 12.0, C_TEXT),
+        Note::new(line2, 11.0, C_TEXT),
+        Note::new(line3, 10.0, C_MUTED),
+    ];
+    const W: f64 = 640.0;
+    const NX: f64 = 70.0;
+    const NOTES_Y: f64 = 246.0;
+    let h = (NOTES_Y + notes_height(&notes, NX, W) + 10.0).ceil() as u32;
+
+    // Укладка подписей якорей (грабля 23: чередование «верх/низ» не
+    // спасало — «Земля» налетала на «орбиту Земли», «ДНК» на «вирус»).
+    // Ряды: [дальний верх, ближний верх, ближний низ, дальний низ,
+    // маркер значения]; маркер размещается первым и в своём ряду.
+    const BAND_TOP: f64 = 132.0;
+    const BAND_BOT: f64 = 172.0;
+    let ys = [96.0, 114.0, 192.0, 210.0, 66.0];
+    let items: Vec<(f64, String)> = SCALE_ANCHORS
+        .iter()
+        .map(|(name, m)| (xf(m.log10()), (*name).to_string()))
+        .collect();
+    let lg = x_m.log10();
+    let xv = xf(lg.clamp(L0, L1));
+    let placed = place_axis_labels(
+        &items,
+        Some((xv, format!("{} м", num(x_m)))),
+        W,
+        8.0,
+        ys,
+        9.0,
+    );
+
+    let mut s = svg_open(W as u32, h);
+    s.push_str(&title("Шкала Вселенной (логарифм, метры)", W as u32));
 
     // Полоса шкалы и декадные засечки.
     s.push_str(&format!(
-        "<rect x=\"{X0}\" y=\"130\" width=\"{:.1}\" height=\"40\" fill=\"#f3f4f6\" \
+        "<rect x=\"{X0}\" y=\"{BAND_TOP}\" width=\"{:.1}\" height=\"40\" fill=\"#f3f4f6\" \
          stroke=\"{}\"/>\n",
         X1 - X0,
         C_GRID
@@ -301,54 +784,61 @@ pub fn scale_svg(x_m: f64) -> Result<String, String> {
     for l in [-30i32, -20, -10, 0, 10, 20] {
         let x = xf(l as f64);
         s.push_str(&format!(
-            "<line x1=\"{x:.1}\" y1=\"130\" x2=\"{x:.1}\" y2=\"170\" stroke=\"{}\"/>\n\
-             <text x=\"{x:.1}\" y=\"184\" font-size=\"9\" fill=\"{}\" \
+            "<line x1=\"{x:.1}\" y1=\"{BAND_TOP}\" x2=\"{x:.1}\" y2=\"{BAND_BOT}\" stroke=\"{}\"/>\n\
+             <text x=\"{x:.1}\" y=\"226\" font-size=\"9\" fill=\"{}\" \
              text-anchor=\"middle\">1e{l}</text>\n",
             C_GRID, C_MUTED
         ));
     }
 
-    // Якоря: чередуем подписи сверху/снизу полосы.
-    for (k, (name, m)) in SCALE_ANCHORS.iter().enumerate() {
-        let x = xf(m.log10());
-        let up = k % 2 == 0;
-        let (y, anchor) = if up { (122.0, "end") } else { (196.0, "start") };
+    // Якоря: засечка + подпись (с выноской, если подпись ушла от засечки).
+    for p in &placed {
+        let is_value = p.row == 3;
+        if !is_value {
+            s.push_str(&format!(
+                "<line x1=\"{:.1}\" y1=\"{BAND_TOP}\" x2=\"{:.1}\" y2=\"{BAND_BOT}\" \
+                 stroke=\"{}\"/>\n",
+                p.tick, p.tick, C_MUTED
+            ));
+        }
+        let center = p.x + p.w / 2.0;
+        if (center - p.tick).abs() > 5.0 {
+            // Выноска от засечки к ближнему краю подписи.
+            let edge = if center > p.tick { p.x } else { p.x + p.w };
+            let (y_from, y_to) = if p.y < BAND_TOP {
+                (BAND_TOP, p.y + 3.0)
+            } else {
+                (BAND_BOT, p.y - 5.0)
+            };
+            s.push_str(&format!(
+                "<line x1=\"{:.1}\" y1=\"{y_from:.1}\" x2=\"{edge:.1}\" y2=\"{y_to:.1}\" \
+                 stroke=\"#9ca3af\" stroke-width=\"0.6\"/>\n",
+                p.tick
+            ));
+        }
+        let (fill, weight, size) = if is_value {
+            (C_RED, " font-weight=\"bold\"", 12.0)
+        } else {
+            (C_MUTED, "", 9.0)
+        };
         s.push_str(&format!(
-            "<line x1=\"{x:.1}\" y1=\"130\" x2=\"{x:.1}\" y2=\"170\" stroke=\"{}\"/>\n\
-             <text x=\"{x:.1}\" y=\"{y}\" font-size=\"9\" fill=\"{}\" \
-             text-anchor=\"{anchor}\">{}</text>\n",
-            C_MUTED,
-            C_MUTED,
-            esc(name)
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{size:.0}\"{weight} \
+             fill=\"{fill}\">{}</text>\n",
+            p.x,
+            p.y,
+            esc(&p.text)
         ));
     }
-
-    // Позиция значения.
-    let lg = x_m.log10();
-    let xv = xf(lg.clamp(L0, L1));
+    // Линия маркера значения — через полосу (не задевает ряды подписей).
     s.push_str(&format!(
-        "<line x1=\"{xv:.1}\" y1=\"118\" x2=\"{xv:.1}\" y2=\"182\" stroke=\"{}\" \
-         stroke-width=\"2.6\"/>\n\
-         <text x=\"{xv:.1}\" y=\"106\" font-size=\"12\" font-weight=\"bold\" fill=\"{}\" \
-         text-anchor=\"middle\">{} м</text>\n",
-        C_RED,
-        C_RED,
-        num(x_m)
+        "<line x1=\"{xv:.1}\" y1=\"128\" x2=\"{xv:.1}\" y2=\"176\" stroke=\"{}\" \
+         stroke-width=\"2.6\"/>\n",
+        C_RED
     ));
 
-    // Вердикт: между какими якорями и отношение к человеку.
-    let (line1, line2) = scale_verdict(x_m);
-    s.push_str(&format!(
-        "<text x=\"70\" y=\"234\" font-size=\"12\" fill=\"{}\">{}</text>\n\
-         <text x=\"70\" y=\"252\" font-size=\"11\" fill=\"{}\">{}</text>\n\
-         <text x=\"70\" y=\"270\" font-size=\"10\" fill=\"{}\">{}</text>\n</svg>",
-        C_TEXT,
-        esc(&line1),
-        C_TEXT,
-        esc(&line2),
-        C_MUTED,
-        esc("якоря: Планк → протон → атом → ДНК → вирус → эритроцит → человек → Эверест → Земля → Солнце → орбита → парсек → Галактика → Вселенная")
-    ));
+    let (block, _) = notes_svg(&notes, NX, W, NOTES_Y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -430,43 +920,77 @@ pub fn prob_svg(ps: &[f64]) -> Result<String, String> {
         .map(|(k, _)| k)
         .unwrap_or(0);
 
-    let mut s = svg_open(640, 240);
-    s.push_str(&title("Born: вероятности исходов", 640));
+    // Подписи исходов (грабля 23): при тесных слотах — вертикально,
+    // с укором вниз, чтобы не наехать на заголовок.
+    let labels: Vec<String> = ps
+        .iter()
+        .map(|p| format!("{:.2}%", if sum > 0.0 { p / sum * 100.0 } else { 0.0 }))
+        .collect();
+    let slot = bw + 8.0;
+    let crowded = labels.iter().any(|t| bar_value_label(t, slot).is_none());
+    let idx_w = text_w(&format!("p{}", ps.len() - 1), 10.0);
+    let idx_step = ((idx_w + 2.0) / slot).ceil().max(1.0) as usize;
+    let idx_size = if idx_w <= slot - 2.0 { 10.0 } else { 8.0 };
+
+    let notes = vec![Note::new(
+        format!(
+            "Σ = {} · максимум p{amax} = {} · Born-коллапс: один исход станет реальностью",
+            num(sum),
+            num(ps[amax])
+        ),
+        12.0,
+        C_TEXT,
+    )];
+    const W: f64 = 640.0;
+    const NOTES_Y: f64 = 222.0;
+    let h = (NOTES_Y + notes_height(&notes, 60.0, W) + 8.0).ceil() as u32;
+
+    let mut s = svg_open(W as u32, h);
+    s.push_str(&title("Born: вероятности исходов", W as u32));
     s.push_str(&format!(
         "<line x1=\"60\" y1=\"180\" x2=\"600\" y2=\"180\" stroke=\"{}\"/>\n",
         C_GRID
     ));
     for (k, p) in ps.iter().enumerate() {
         let x = x0 + (bw + 8.0) * k as f64;
-        let h = (p / pmax * 118.0).max(1.5);
+        let hgt = (p / pmax * 118.0).max(1.5);
         let fill = if k == amax { C_BLUE } else { C_BLUE_BG };
+        let xc = x + bw / 2.0;
         s.push_str(&format!(
-            "<rect x=\"{x:.1}\" y=\"{:.1}\" width=\"{bw:.1}\" height=\"{h:.1}\" \
+            "<rect x=\"{x:.1}\" y=\"{:.1}\" width=\"{bw:.1}\" height=\"{hgt:.1}\" \
              fill=\"{fill}\"/>\n",
-            180.0 - h
+            180.0 - hgt
         ));
-        s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
-             text-anchor=\"middle\">{:.2}%</text>\n",
-            x + bw / 2.0,
-            172.0 - h,
-            if k == amax { C_BLUE } else { C_MUTED },
-            if sum > 0.0 { p / sum * 100.0 } else { 0.0 }
-        ));
-        s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"196\" font-size=\"10\" fill=\"{}\" \
-             text-anchor=\"middle\">p{k}</text>\n",
-            x + bw / 2.0,
-            C_MUTED
-        ));
+        let color = if k == amax { C_BLUE } else { C_MUTED };
+        let bold = if k == amax { " font-weight=\"bold\"" } else { "" };
+        if crowded {
+            // Вертикальная надпись над столбцом.
+            let yv = (172.0 - hgt - 4.0).max(30.0 + text_w(&labels[k], 8.0));
+            s.push_str(&format!(
+                "<text x=\"{xc:.1}\" y=\"{yv:.1}\" font-size=\"8\"{bold} fill=\"{color}\" \
+                 transform=\"rotate(-90 {xc:.1} {yv:.1})\" \
+                 text-anchor=\"start\">{}</text>\n",
+                esc(&labels[k])
+            ));
+        } else if let Some((t, size)) = bar_value_label(&labels[k], slot) {
+            s.push_str(&format!(
+                "<text x=\"{xc:.1}\" y=\"{:.1}\" font-size=\"{size:.0}\"{bold} fill=\"{color}\" \
+                 text-anchor=\"middle\">{}</text>\n",
+                172.0 - hgt,
+                esc(&t)
+            ));
+        }
+        if k % idx_step == 0 {
+            s.push_str(&format!(
+                "<text x=\"{xc:.1}\" y=\"196\" font-size=\"{idx_size:.0}\" fill=\"{}\" \
+                 text-anchor=\"middle\">p{k}</text>\n",
+                C_MUTED
+            ));
+        }
     }
-    s.push_str(&format!(
-        "<text x=\"60\" y=\"222\" font-size=\"12\" fill=\"{}\">Σ = {} · максимум \
-         p{amax} = {} · Born-коллапс: один исход станет реальностью</text>\n</svg>",
-        C_TEXT,
-        num(sum),
-        num(ps[amax])
-    ));
+    let (block, _) = notes_svg(&notes, 60.0, W, NOTES_Y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -489,8 +1013,6 @@ pub fn matrix_svg(m: &Matrix) -> Result<String, String> {
     }
     const CELL: f64 = 46.0;
     let (ox, oy) = (56.0, 34.0);
-    let w = ox + m.cols as f64 * CELL + 8.0;
-    let h = oy + m.rows as f64 * CELL + 58.0;
     let label_cells = m.rows <= 8 && m.cols <= 8;
 
     let vmax = (0..m.rows)
@@ -499,7 +1021,25 @@ pub fn matrix_svg(m: &Matrix) -> Result<String, String> {
         .fold(0.0f64, f64::max)
         .max(1e-12);
 
-    let mut s = svg_open(w as u32, h as u32);
+    // След и примечание — до холста (грабля 23: у широких матриц
+    // подпись клеток вылезала за клетку, футер — за холст).
+    let tr: f64 = (0..m.rows.min(m.cols)).map(|k| m.get(k, k).re).sum();
+    let notes = vec![Note::new(
+        format!(
+            "{}×{} · |max| = {} · Re(след) = {} · красный ≥ 0, синий < 0",
+            m.rows,
+            m.cols,
+            num(vmax),
+            num(tr)
+        ),
+        11.0,
+        C_TEXT,
+    )];
+    let w = (ox + m.cols as f64 * CELL + 8.0).max(420.0);
+    let notes_y = oy + m.rows as f64 * CELL + 30.0;
+    let h = (notes_y + notes_height(&notes, ox, w) + 8.0).ceil() as u32;
+
+    let mut s = svg_open(w as u32, h);
     s.push_str(&title(&format!("Матрица {}×{}", m.rows, m.cols), w as u32));
     for i in 0..m.rows {
         for j in 0..m.cols {
@@ -523,30 +1063,23 @@ pub fn matrix_svg(m: &Matrix) -> Result<String, String> {
                 C_GRID
             ));
             if label_cells {
+                // Подпись клетки вписывается в клетку: num() → короче → мельче.
                 let dark = mag > 0.55;
+                let (txt, size) = cell_label(c.re, CELL);
                 s.push_str(&format!(
-                    "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
+                    "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{size:.0}\" fill=\"{}\" \
                      text-anchor=\"middle\">{}</text>\n",
-                    x + CELL / 2.0 - 1.0,
-                    y + CELL / 2.0 + 4.0,
+                    x + CELL / 2.0,
+                    y + CELL / 2.0 + size * 0.35,
                     if dark { "#ffffff" } else { C_TEXT },
-                    num(c.re)
+                    esc(&txt)
                 ));
             }
         }
     }
-    // След по вещественной части (грабля 10: мнимая пыль 1e-17i).
-    let tr: f64 = (0..m.rows.min(m.cols)).map(|k| m.get(k, k).re).sum();
-    s.push_str(&format!(
-        "<text x=\"{ox:.0}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\">{}×{} · \
-         |max| = {} · Re(след) = {} · красный ≥ 0, синий < 0</text>\n</svg>",
-        h - 34.0,
-        C_TEXT,
-        m.rows,
-        m.cols,
-        num(vmax),
-        num(tr)
-    ));
+    let (block, _) = notes_svg(&notes, ox, w, notes_y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -582,8 +1115,37 @@ pub fn bars_svg_titled(vs: &[f64], head: &str) -> Result<String, String> {
         .max(1e-12);
     let base_y = 130.0; // ноль спектра
 
-    let mut s = svg_open(640, 240);
-    s.push_str(&title(head, 640));
+    // Подписи значений (грабля 23): тесные слоты → вертикально
+    // (положительные — вверх от столбца, отрицательные — вниз от
+    // нижнего конца; холст растёт под них заранее).
+    let labels: Vec<String> = vs.iter().map(|v| num(*v)).collect();
+    let slot = bw + 8.0;
+    let crowded = labels.iter().any(|t| bar_value_label(t, slot).is_none());
+    let vert_w = labels.iter().map(|t| text_w(t, 8.0)).fold(0.0, f64::max);
+    let has_neg_vert = crowded && vs.iter().any(|v| *v < 0.0);
+    let idx_w = text_w(&format!("[{}]", vs.len() - 1), 10.0);
+    let idx_step = ((idx_w + 2.0) / slot).ceil().max(1.0) as usize;
+    let idx_size = if idx_w <= slot - 2.0 { 10.0 } else { 8.0 };
+
+    let notes = vec![Note::new(
+        format!(
+            "n = {} · min = {} · max = {} · среднее = {}",
+            vs.len(),
+            num(vs.iter().cloned().fold(f64::INFINITY, f64::min)),
+            num(vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
+            num(vs.iter().sum::<f64>() / n)
+        ),
+        12.0,
+        C_TEXT,
+    )];
+    const W: f64 = 640.0;
+    let neg_bottom = if has_neg_vert { 196.0 + vert_w } else { 206.0 };
+    let idx_y = neg_bottom + 12.0;
+    let notes_y = idx_y + 18.0;
+    let h = (notes_y + notes_height(&notes, 60.0, W) + 8.0).ceil() as u32;
+
+    let mut s = svg_open(W as u32, h);
+    s.push_str(&title(head, W as u32));
     s.push_str(&format!(
         "<line x1=\"60\" y1=\"{base_y}\" x2=\"600\" y2=\"{base_y}\" stroke=\"{}\"/>\n",
         C_GRID
@@ -597,36 +1159,53 @@ pub fn bars_svg_titled(vs: &[f64], head: &str) -> Result<String, String> {
             (base_y, -frac * 62.0)
         };
         let fill = if frac >= 0.0 { C_BLUE } else { C_ORANGE };
+        let xc = x + bw / 2.0;
         s.push_str(&format!(
             "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{bw:.1}\" height=\"{:.1}\" \
              fill=\"{fill}\" fill-opacity=\"0.85\"/>\n",
             hh.max(1.5)
         ));
-        let ly = if frac >= 0.0 { y - 6.0 } else { y + hh + 14.0 };
-        s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{ly:.1}\" font-size=\"9\" fill=\"{}\" \
-             text-anchor=\"middle\">{}</text>\n",
-            x + bw / 2.0,
-            C_MUTED,
-            num(*v)
-        ));
-        s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"208\" font-size=\"10\" fill=\"{}\" \
-             text-anchor=\"middle\">[{k}]</text>\n",
-            x + bw / 2.0,
-            C_MUTED
-        ));
+        if crowded {
+            let wpx = text_w(&labels[k], 8.0);
+            if frac >= 0.0 {
+                let yv = (y - 4.0).max(30.0 + wpx);
+                s.push_str(&format!(
+                    "<text x=\"{xc:.1}\" y=\"{yv:.1}\" font-size=\"8\" fill=\"{}\" \
+                     transform=\"rotate(-90 {xc:.1} {yv:.1})\" \
+                     text-anchor=\"start\">{}</text>\n",
+                    C_MUTED,
+                    esc(&labels[k])
+                ));
+            } else {
+                let yv = y + hh + 4.0;
+                s.push_str(&format!(
+                    "<text x=\"{xc:.1}\" y=\"{yv:.1}\" font-size=\"8\" fill=\"{}\" \
+                     transform=\"rotate(90 {xc:.1} {yv:.1})\" \
+                     text-anchor=\"start\">{}</text>\n",
+                    C_MUTED,
+                    esc(&labels[k])
+                ));
+            }
+        } else if let Some((t, size)) = bar_value_label(&labels[k], slot) {
+            let ly = if frac >= 0.0 { y - 6.0 } else { y + hh + 14.0 };
+            s.push_str(&format!(
+                "<text x=\"{xc:.1}\" y=\"{ly:.1}\" font-size=\"{size:.0}\" fill=\"{}\" \
+                 text-anchor=\"middle\">{}</text>\n",
+                C_MUTED,
+                esc(&t)
+            ));
+        }
+        if k % idx_step == 0 {
+            s.push_str(&format!(
+                "<text x=\"{xc:.1}\" y=\"{idx_y:.1}\" font-size=\"{idx_size:.0}\" fill=\"{}\" \
+                 text-anchor=\"middle\">[{k}]</text>\n",
+                C_MUTED
+            ));
+        }
     }
-    let mean = vs.iter().sum::<f64>() / n;
-    s.push_str(&format!(
-        "<text x=\"60\" y=\"228\" font-size=\"12\" fill=\"{}\">n = {} · min = {} · \
-         max = {} · среднее = {}</text>\n</svg>",
-        C_TEXT,
-        vs.len(),
-        num(vs.iter().cloned().fold(f64::INFINITY, f64::min)),
-        num(vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
-        num(mean)
-    ));
+    let (block, _) = notes_svg(&notes, 60.0, W, notes_y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -985,36 +1564,8 @@ pub fn graph_svg(m: &Matrix, labels: Option<&[String]>) -> Result<String, String
         .fold(0.0f64, f64::max)
         .max(1e-12);
 
-    let mut s = svg_open(640, 460);
-    s.push_str(&title("Граф: силовая укладка Fruchterman–Reingold", 640));
-    // Рёбра.
-    for &(a, b, w) in &edges {
-        let sw = 1.0 + 2.5 * (w / wmax);
-        s.push_str(&format!(
-            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
-             stroke=\"#64748b\" stroke-opacity=\"0.7\" stroke-width=\"{sw:.2}\"/>\n",
-            pos[a].x, pos[a].y, pos[b].x, pos[b].y
-        ));
-    }
-    // Узлы: радиус и цвет растут со степенью.
-    for i in 0..n {
-        let r = radii[i];
-        let fill = lerp_hex(C_BLUE_BG, C_RED, deg[i] as f64 / dmax as f64);
-        s.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{r:.1}\" fill=\"{fill}\" \
-             stroke=\"#1f2937\" stroke-width=\"1\"/>\n",
-            pos[i].x, pos[i].y
-        ));
-        s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
-             text-anchor=\"middle\">{}</text>\n",
-            pos[i].x,
-            pos[i].y + r + 13.0,
-            C_TEXT,
-            esc(&names[i])
-        ));
-    }
-    // Вердикт: статистика графа.
+    // Вердикт и холст — до отрисовки (грабля 23: строки статистики
+    // упирались в правый край).
     let comps = components(n, &edges);
     let mean_deg = 2.0 * edges.len() as f64 / n as f64;
     let density = if n > 1 {
@@ -1029,24 +1580,156 @@ pub fn graph_svg(m: &Matrix, labels: Option<&[String]>) -> Result<String, String
     if loops > 0 {
         line2.push_str(&format!(" · петель {loops} (не рисуются)"));
     }
-    s.push_str(&format!(
-        "<text x=\"60\" y=\"396\" font-size=\"12\" fill=\"{}\">N = {} · рёбер = {} \
-         · средняя степень = {:.2} · плотность = {:.1}% · компонент = {}</text>\n\
-         <text x=\"60\" y=\"416\" font-size=\"11\" fill=\"{}\">{}</text>\n\
-         <text x=\"60\" y=\"434\" font-size=\"10\" fill=\"{}\">узлы: радиус и цвет — \
-         по степени ({} → {}); рёбра: толщина — по весу</text>\n</svg>",
-        C_TEXT,
-        n,
-        edges.len(),
-        mean_deg,
-        density,
-        comps,
-        C_MUTED,
-        esc(&line2),
-        C_MUTED,
-        C_BLUE_BG,
-        C_RED
-    ));
+    let notes = vec![
+        Note::new(
+            format!(
+                "N = {} · рёбер = {} · средняя степень = {:.2} · плотность = {:.1}% · \
+                 компонент = {}",
+                n, edges.len(), mean_deg, density, comps
+            ),
+            12.0,
+            C_TEXT,
+        ),
+        Note::new(line2, 11.0, C_MUTED),
+        Note::new(
+            format!(
+                "узлы: радиус и цвет — по степени ({} → {}); рёбра: толщина — по весу",
+                C_BLUE_BG, C_RED
+            ),
+            10.0,
+            C_MUTED,
+        ),
+    ];
+    const W: u32 = 640;
+    const NOTES_Y: f64 = 396.0;
+    let h = (NOTES_Y + notes_height(&notes, 60.0, W as f64) + 14.0).ceil() as u32;
+
+    let mut s = svg_open(W, h);
+    s.push_str(&title("Граф: силовая укладка Fruchterman–Reingold", W));
+    // Рёбра.
+    for &(a, b, w) in &edges {
+        let sw = 1.0 + 2.5 * (w / wmax);
+        s.push_str(&format!(
+            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+             stroke=\"#64748b\" stroke-opacity=\"0.7\" stroke-width=\"{sw:.2}\"/>\n",
+            pos[a].x, pos[a].y, pos[b].x, pos[b].y
+        ));
+    }
+    // Узлы: радиус и цвет растут со степенью (метки — после, поверх).
+    for i in 0..n {
+        let r = radii[i];
+        let fill = lerp_hex(C_BLUE_BG, C_RED, deg[i] as f64 / dmax as f64);
+        s.push_str(&format!(
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{r:.1}\" fill=\"{fill}\" \
+             stroke=\"#1f2937\" stroke-width=\"1\"/>\n",
+            pos[i].x, pos[i].y
+        ));
+    }
+    // Метки узлов (грабля 23: длинные имена краевых узлов обрезались
+    // и налетали на соседей). Кандидаты: ниже → выше → справа → слева;
+    // каждый бокс проверяется против узлов и уже размещённых меток,
+    // с укором в холст; текст — с белым ореолом поверх рёбер.
+    let circle_boxes: Vec<LBox> = (0..n)
+        .map(|i| LBox {
+            x0: pos[i].x - radii[i] - 3.0,
+            y0: pos[i].y - radii[i] - 3.0,
+            x1: pos[i].x + radii[i] + 3.0,
+            y1: pos[i].y + radii[i] + 3.0,
+        })
+        .collect();
+    let mut label_boxes: Vec<LBox> = Vec::new();
+    for i in 0..n {
+        let (size, lines) = node_label_lines(&names[i]);
+        let lw = lines.iter().map(|l| text_w(l, size)).fold(0.0, f64::max);
+        let nlines = lines.len();
+        let (cx, cy, r) = (pos[i].x, pos[i].y, radii[i]);
+        // (первая базовая линия, anchor, x текста, бокс) — детерминированный порядок.
+        let mut cands: Vec<(f64, &'static str, f64, LBox)> = Vec::new();
+        {
+            let fy = cy + r + 13.0;
+            let tx = cx.clamp(10.0 + lw / 2.0, 630.0 - lw / 2.0);
+            cands.push((
+                fy,
+                "middle",
+                tx,
+                LBox {
+                    x0: tx - lw / 2.0,
+                    y0: fy - 8.0,
+                    x1: tx + lw / 2.0,
+                    y1: fy + nlines as f64 * 11.0 - 8.0,
+                },
+            ));
+        }
+        {
+            let fy = cy - r - 10.0 - (nlines - 1) as f64 * 11.0;
+            let tx = cx.clamp(10.0 + lw / 2.0, 630.0 - lw / 2.0);
+            cands.push((
+                fy,
+                "middle",
+                tx,
+                LBox {
+                    x0: tx - lw / 2.0,
+                    y0: fy - 8.0,
+                    x1: tx + lw / 2.0,
+                    y1: fy + nlines as f64 * 11.0 - 8.0,
+                },
+            ));
+        }
+        if nlines == 1 {
+            let tx = (cx + r + 6.0).min(630.0 - lw);
+            cands.push((
+                cy + 3.5,
+                "start",
+                tx,
+                LBox {
+                    x0: tx,
+                    y0: cy - 5.0,
+                    x1: tx + lw,
+                    y1: cy + 7.0,
+                },
+            ));
+            let tx = (cx - r - 6.0).max(10.0);
+            cands.push((
+                cy + 3.5,
+                "end",
+                tx,
+                LBox {
+                    x0: tx - lw,
+                    y0: cy - 5.0,
+                    x1: tx,
+                    y1: cy + 7.0,
+                },
+            ));
+        }
+        let mut picked: Option<(f64, &'static str, f64)> = None;
+        for (fy, anchor, tx, b) in cands {
+            if b.y0 < 30.0 || b.y1 > 386.0 {
+                continue;
+            }
+            let free = label_boxes.iter().all(|q| !boxes_hit(&b, q, 2.0))
+                && circle_boxes.iter().all(|q| !boxes_hit(&b, q, 0.5));
+            if free {
+                label_boxes.push(b);
+                picked = Some((fy, anchor, tx));
+                break;
+            }
+        }
+        // Фолбэк: ниже узла, с ореолом (практически недостижимо: 4 кандидата).
+        let (fy, anchor, tx) = picked.unwrap_or_else(|| {
+            (
+                cy + r + 13.0,
+                "middle",
+                cx.clamp(10.0 + lw / 2.0, 630.0 - lw / 2.0),
+            )
+        });
+        for (li, line) in lines.iter().enumerate() {
+            let y = fy + li as f64 * 11.0;
+            s.push_str(&halo_text(tx, y, size, anchor, C_TEXT, line));
+        }
+    }
+    let (block, _) = notes_svg(&notes, 60.0, W as f64, NOTES_Y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -1224,12 +1907,65 @@ pub fn field_svg(m: &Matrix) -> Result<String, String> {
     let (ox, oy) = (56.0, 40.0);
     let plot_w = (m.cols as f64 - 1.0) * cell;
     let plot_h = (m.rows as f64 - 1.0) * cell;
-    let w = ox * 2.0 + plot_w;
-    let h = oy + plot_h + 96.0;
     let mid = (zmin + zmax) / 2.0;
     let half = ((zmax - zmin) / 2.0).max(1e-12);
 
-    let mut s = svg_open(w as u32, h as u32);
+    // Изолинии — до холста (грабля 23: статистика изолиний входит в
+    // примечания, а примечания определяют высоту холста).
+    let mut iso = String::new();
+    let mut total_len = 0.0;
+    let mut n_lines = 0usize;
+    if zmax - zmin > 1e-12 {
+        for (k, lev) in (1..=7)
+            .map(|q| zmin + (zmax - zmin) * q as f64 / 8.0)
+            .enumerate()
+        {
+            let segs = marching_squares(&z, lev);
+            let lines = chain_segments(&segs);
+            let color = lerp_hex("#2563eb", "#dc2626", k as f64 / 6.0);
+            for line in &lines {
+                let pts: Vec<String> = line
+                    .iter()
+                    .map(|p| format!("{:.1},{:.1}", ox + p.x * cell, oy + p.y * cell))
+                    .collect();
+                iso.push_str(&format!(
+                    "<polyline points=\"{}\" fill=\"none\" stroke=\"{color}\" \
+                     stroke-width=\"1.6\" stroke-linejoin=\"round\"/>\n",
+                    pts.join(" ")
+                ));
+                n_lines += 1;
+            }
+            for seg in &segs {
+                total_len +=
+                    ((seg[0].x - seg[1].x).powi(2) + (seg[0].y - seg[1].y).powi(2)).sqrt();
+            }
+        }
+    }
+    let notes = vec![
+        Note::new(
+            format!("сетка {}×{} · z ∈ [{}, {}]", m.rows, m.cols, num(zmin), num(zmax)),
+            12.0,
+            C_TEXT,
+        ),
+        Note::new(
+            if zmax - zmin > 1e-12 {
+                format!(
+                    "изолинии: 7 уровней · полилиний {} · суммарная длина ≈ {:.1} ед. сетки \
+                     · marching squares (двусмысленные клетки — средним)",
+                    n_lines, total_len
+                )
+            } else {
+                "плоское поле: zmin = zmax — изолиний нет".to_string()
+            },
+            11.0,
+            C_MUTED,
+        ),
+    ];
+    let w = (ox * 2.0 + plot_w).max(460.0);
+    let notes_y = oy + plot_h + 28.0;
+    let h = (notes_y + notes_height(&notes, ox, w) + 8.0).ceil() as u32;
+
+    let mut s = svg_open(w as u32, h);
     s.push_str(&title("Поле: изолинии marching squares", w as u32));
     // Фон: дивергентная карта по среднему четырёх узлов клетки.
     for i in 0..m.rows - 1 {
@@ -1250,60 +1986,10 @@ pub fn field_svg(m: &Matrix) -> Result<String, String> {
             ));
         }
     }
-
-    // Изолинии: 7 уровней строго внутри диапазона.
-    let mut total_len = 0.0;
-    let mut n_lines = 0usize;
-    if zmax - zmin > 1e-12 {
-        for (k, lev) in (1..=7)
-            .map(|q| zmin + (zmax - zmin) * q as f64 / 8.0)
-            .enumerate()
-        {
-            let segs = marching_squares(&z, lev);
-            let lines = chain_segments(&segs);
-            let color = lerp_hex("#2563eb", "#dc2626", k as f64 / 6.0);
-            for line in &lines {
-                let pts: Vec<String> = line
-                    .iter()
-                    .map(|p| format!("{:.1},{:.1}", ox + p.x * cell, oy + p.y * cell))
-                    .collect();
-                s.push_str(&format!(
-                    "<polyline points=\"{}\" fill=\"none\" stroke=\"{color}\" \
-                     stroke-width=\"1.6\" stroke-linejoin=\"round\"/>\n",
-                    pts.join(" ")
-                ));
-                n_lines += 1;
-            }
-            for seg in &segs {
-                total_len +=
-                    ((seg[0].x - seg[1].x).powi(2) + (seg[0].y - seg[1].y).powi(2)).sqrt();
-            }
-        }
-    }
-
-    let verdict2 = if zmax - zmin > 1e-12 {
-        format!(
-            "изолинии: 7 уровней · полилиний {} · суммарная длина ≈ {:.1} ед. сетки \
-             · marching squares (двусмысленные клетки — средним)",
-            n_lines, total_len
-        )
-    } else {
-        "плоское поле: zmin = zmax — изолиний нет".to_string()
-    };
-    s.push_str(&format!(
-        "<text x=\"{ox:.0}\" y=\"{:.1}\" font-size=\"12\" fill=\"{}\">сетка {}×{} · \
-         z ∈ [{}, {}]</text>\n\
-         <text x=\"{ox:.0}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\">{}</text>\n</svg>",
-        oy + plot_h + 26.0,
-        C_TEXT,
-        m.rows,
-        m.cols,
-        num(zmin),
-        num(zmax),
-        oy + plot_h + 46.0,
-        C_MUTED,
-        esc(&verdict2)
-    ));
+    s.push_str(&iso);
+    let (block, _) = notes_svg(&notes, ox, w, notes_y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -1418,10 +2104,8 @@ pub fn surf_svg(m: &Matrix) -> Result<String, String> {
         )
     };
 
-    let mut s = svg_open(640, 460);
-    s.push_str(&title("Поверхность z = f(x, y): 3D-проекция", 640));
-
-    // Квады по глубине (painter's: дальние раньше).
+    // Квады по глубине (painter's: дальние раньше) — до холста:
+    // их число входит в примечания, примечания — в высоту холста.
     let mut quads: Vec<(f64, [(f64, f64); 4], f64)> = Vec::new();
     for i in 0..m.rows - 1 {
         for j in 0..m.cols - 1 {
@@ -1440,6 +2124,44 @@ pub fn surf_svg(m: &Matrix) -> Result<String, String> {
         }
     }
     quads.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    // Примечания — до холста (грабля 23: третья строка футера
+    // «…без зависимостей» обрезалась на правом краю — полевой отчёт).
+    let notes = vec![
+        Note::new(
+            format!(
+                "сетка {}×{} · квадов {} · z ∈ [{}, {}]",
+                m.rows,
+                m.cols,
+                quads.len(),
+                num(zmin),
+                num(zmax)
+            ),
+            12.0,
+            C_TEXT,
+        ),
+        Note::new(
+            format!(
+                "камера: азимут {AZ}°, высота {EL}° (ортоскопия) · painter's-алгоритм: \
+                 дальние квады раньше",
+            ),
+            11.0,
+            C_MUTED,
+        ),
+        Note::new(
+            "цвет — высота: синий (мин) → красный (макс) · поворот/проекция — как \
+             plot_surface, без зависимостей",
+            10.0,
+            C_MUTED,
+        ),
+    ];
+    const W: u32 = 640;
+    const NOTES_Y: f64 = 404.0;
+    let h = (NOTES_Y + notes_height(&notes, 60.0, W as f64) + 12.0).ceil() as u32;
+
+    let mut s = svg_open(W, h);
+    s.push_str(&title("Поверхность z = f(x, y): 3D-проекция", W));
+
     for (_, screen, zt) in &quads {
         let fill = lerp_hex("#3b82f6", "#ef4444", (zt + 1.0) / 2.0);
         let pts_str: Vec<String> = screen
@@ -1453,39 +2175,26 @@ pub fn surf_svg(m: &Matrix) -> Result<String, String> {
         ));
     }
 
-    // Штатив осей поверх сцены.
+    // Штатив осей поверх сцены (грабля 23: метки «x»/«y» тонули в
+    // сетке): линия + подпись за концом оси, с белым ореолом.
     let (osx, osy) = to_screen(origin.0, origin.1);
     for (tx, ty, tz, label) in tripod {
         let (sx, sy, _) = project3(tx, ty, tz, cf, sf, ct, st);
         let (px, py) = to_screen(sx, sy);
         s.push_str(&format!(
             "<line x1=\"{osx:.1}\" y1=\"{osy:.1}\" x2=\"{px:.1}\" y2=\"{py:.1}\" \
-             stroke=\"{}\" stroke-width=\"1.2\"/>\n\
-             <text x=\"{px:.1}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\" \
-             text-anchor=\"middle\">{label}</text>\n",
-            C_MUTED,
-            py - 6.0,
+             stroke=\"{}\" stroke-width=\"1.2\"/>\n",
             C_MUTED
         ));
+        let (dx, dy) = (px - osx, py - osy);
+        let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+        let (lx, ly) = (px + dx / d * 14.0, py + dy / d * 14.0);
+        s.push_str(&halo_text(lx, ly + 3.5, 11.0, "middle", C_MUTED, label));
     }
 
-    s.push_str(&format!(
-        "<text x=\"60\" y=\"404\" font-size=\"12\" fill=\"{}\">сетка {}×{} · квадов {} \
-         · z ∈ [{}, {}]</text>\n\
-         <text x=\"60\" y=\"424\" font-size=\"11\" fill=\"{}\">камера: азимут {AZ}°, \
-         высота {EL}° (ортоскопия) · painter's-алгоритм: дальние квады раньше</text>\n\
-         <text x=\"60\" y=\"442\" font-size=\"10\" fill=\"{}\">цвет — высота: синий \
-         (мин) → красный (макс) · поворот/проекция — как plot_surface, без \
-         зависимостей</text>\n</svg>",
-        C_TEXT,
-        m.rows,
-        m.cols,
-        quads.len(),
-        num(zmin),
-        num(zmax),
-        C_MUTED,
-        C_MUTED
-    ));
+    let (block, _) = notes_svg(&notes, 60.0, W as f64, NOTES_Y);
+    s.push_str(&block);
+    s.push_str("</svg>");
     Ok(s)
 }
 
@@ -1898,5 +2607,240 @@ mod tests {
         assert!(surf_svg(&Matrix::zeros(49, 49)).is_err());
         let nan = Matrix::from_rows(&[vec![0.0, f64::NAN], vec![1.0, 2.0]]).unwrap();
         assert!(surf_svg(&nan).is_err());
+    }
+
+    // ===== Сессия-10: типографика (грабля 23) =====
+
+    #[test]
+    fn typography_wrap_basics() {
+        let lines = wrap_text("якоря: Планк → протон → атом", 9.0, 60.0);
+        assert!(lines.len() >= 2);
+        for l in &lines {
+            assert!(text_w(l, 9.0) <= 60.0, "строка шире лимита: «{l}»");
+        }
+        // Слово-гигант режется по символам.
+        let hard = wrap_text("оченьдлинноеслово", 9.0, 40.0);
+        assert!(hard.len() >= 3);
+        for l in &hard {
+            assert!(text_w(l, 9.0) <= 40.0);
+        }
+        // Пустая строка — одна пустая строка, не ноль.
+        assert_eq!(wrap_text("", 9.0, 60.0).len(), 1);
+    }
+
+    #[test]
+    fn typography_note_shrink_before_wrap() {
+        // 79 символов при 12 pt — 588 px: в 572 влезает только мельче,
+        // и маркеры остаются одной строкой.
+        let (size, lines) = note_layout(
+            "N = 6 · рёбер = 11 · средняя степень = 3.67 · плотность = 73.3% · компонент = 1",
+            12.0,
+            572.0,
+        );
+        assert_eq!(lines.len(), 1, "маркеры обязаны оставаться одной строкой");
+        assert!(size < 12.0 && size >= 8.0);
+        // Совсем длинная строка — перенос при минимальном кегле.
+        let (_, lines2) = note_layout(&"слово ".repeat(40), 12.0, 200.0);
+        assert!(lines2.len() > 1);
+    }
+
+    #[test]
+    fn audit_bounds_parser_basics() {
+        // Известное переполнение ловится.
+        let bad = "<svg xmlns=\"x\" viewBox=\"0 0 100 50\">\n<text x=\"90\" y=\"30\" \
+                   font-size=\"10\">длинный текст</text>\n</svg>";
+        assert_eq!(audit_text_bounds(bad).len(), 1);
+        // Якорь «middle» учитывается.
+        let ok = "<svg viewBox=\"0 0 300 50\">\n<text x=\"150\" y=\"30\" font-size=\"10\" \
+                  text-anchor=\"middle\">ок</text>\n</svg>";
+        assert!(audit_text_bounds(ok).is_empty());
+        // Повёрнутый текст — по повёрнутому охвату.
+        let rot = "<svg viewBox=\"0 0 100 200\">\n<text x=\"50\" y=\"150\" font-size=\"10\" \
+                   transform=\"rotate(-90 50 150)\">вертикально</text>\n</svg>";
+        assert!(audit_text_bounds(rot).is_empty());
+        // Повёрнутый за холст — ловится.
+        let rot_bad = "<svg viewBox=\"0 0 100 100\">\n<text x=\"50\" y=\"90\" font-size=\"10\" \
+                       transform=\"rotate(-90 50 90)\">вертикально длинно</text>\n</svg>";
+        assert_eq!(audit_text_bounds(rot_bad).len(), 1);
+    }
+
+    #[test]
+    fn scale_anchor_placer_no_collisions() {
+        let items: Vec<(f64, String)> = SCALE_ANCHORS
+            .iter()
+            .map(|(n, m)| (70.0 + (m.log10() + 35.0) * 550.0 / 62.0, (*n).to_string()))
+            .collect();
+        let placed = place_axis_labels(
+            &items,
+            Some((80.0, "1.616e-35 м".into())),
+            640.0,
+            8.0,
+            [96.0, 114.0, 192.0, 210.0, 66.0],
+            9.0,
+        );
+        assert_eq!(placed.len(), items.len() + 1, "все якоря + маркер значения");
+        for p in &placed {
+            assert!(
+                p.x >= 7.5 && p.x + p.w <= 632.5,
+                "«{}» выходит за холст: [{:.1}…{:.1}]",
+                p.text,
+                p.x,
+                p.x + p.w
+            );
+        }
+        for i in 0..placed.len() {
+            for j in (i + 1)..placed.len() {
+                let (a, b) = (&placed[i], &placed[j]);
+                if a.row == b.row {
+                    assert!(
+                        a.x + a.w + 7.0 <= b.x || b.x + b.w + 7.0 <= a.x,
+                        "наложение в ряду {}: «{}» и «{}»",
+                        a.row,
+                        a.text,
+                        b.text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axis_placer_extreme_crowding() {
+        // 20 подписей с шагом 12 px: все размещаются, в холсте, без наложений.
+        let items: Vec<(f64, String)> = (0..20)
+            .map(|k| (100.0 + k as f64 * 12.0, format!("якорь-{k:02}")))
+            .collect();
+        let placed = place_axis_labels(
+            &items,
+            None,
+            640.0,
+            8.0,
+            [96.0, 114.0, 192.0, 210.0, 66.0],
+            9.0,
+        );
+        assert_eq!(placed.len(), 20);
+        for p in &placed {
+            assert!(p.x >= 7.5 && p.x + p.w <= 632.5, "«{}» за холстом", p.text);
+        }
+        for i in 0..placed.len() {
+            for j in (i + 1)..placed.len() {
+                let (a, b) = (&placed[i], &placed[j]);
+                if a.row == b.row {
+                    assert!(
+                        a.x + a.w + 7.0 <= b.x || b.x + b.w + 7.0 <= a.x,
+                        "наложение в ряду {}: «{}» и «{}»",
+                        a.row,
+                        a.text,
+                        b.text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_cell_labels_fit_cell() {
+        // Подписи клеток с длинными числами вписаны в клетку.
+        let dense = Matrix::from_rows(
+            &(0..8)
+                .map(|i| {
+                    (0..8)
+                        .map(|j| (i as f64 * 8.0 + j as f64) * 0.12345 - 4.0)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let s = matrix_svg(&dense).unwrap();
+        for i in 0..8 {
+            for j in 0..8 {
+                let (txt, size) = cell_label(dense.get(i, j).re, 46.0);
+                assert!(text_w(&txt, size) <= 41.0, "«{txt}» шире клетки");
+            }
+        }
+        assert!(s.contains("Матрица 8×8"));
+    }
+
+    #[test]
+    fn all_scenes_labels_fit_canvas() {
+        // Регрессионная сеть грабли 23: на ЛЮБЫХ расчётах ни одна
+        // надпись не выходит за холст (включая повёрнутые и вертикальные).
+        let dense8 = Matrix::from_rows(
+            &(0..8)
+                .map(|i| {
+                    (0..8)
+                        .map(|j| (i as f64 * 8.0 + j as f64) * 0.12345 - 4.0)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let k4 = Matrix::from_rows(&[
+            vec![0.0, 1.0, 1.0, 1.0],
+            vec![1.0, 0.0, 1.0, 1.0],
+            vec![1.0, 1.0, 0.0, 1.0],
+            vec![1.0, 1.0, 1.0, 0.0],
+        ])
+        .unwrap();
+        let mut slit = Vec::new();
+        for i in 0..13 {
+            let y = i as f64 / 12.0 * 2.0 - 1.0;
+            slit.push(
+                (0..17)
+                    .map(|j| {
+                        let x = j as f64 / 16.0 * 4.0 - 2.0;
+                        (std::f64::consts::PI * x / 3.0).cos().powi(2) * (-y * y / 2.0).exp()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let slit_m = Matrix::from_rows(&slit).unwrap();
+        let mut sombrero = Vec::new();
+        for i in 0..11 {
+            let y = i as f64 / 10.0 * 2.0 - 1.0;
+            sombrero.push(
+                (0..13)
+                    .map(|j| {
+                        let x = j as f64 / 12.0 * 2.0 - 1.0;
+                        (-3.0 * (x * x + y * y)).exp()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let sombrero_m = Matrix::from_rows(&sombrero).unwrap();
+        let long_labels: Vec<String> = vec![
+            "экстремально длинное имя узла графа".into(),
+            "б".into(),
+            "среднее имя".into(),
+            "д".into(),
+        ];
+        let scenes: Vec<String> = vec![
+            bell_svg(BELL_ACIN),
+            bell_svg(1.87),
+            bell_svg(3.2),
+            bell_svg(2.0),
+            scale_svg(1.616255e-35).unwrap(),
+            scale_svg(8.8e26).unwrap(),
+            scale_svg(1.7).unwrap(),
+            scale_svg(1e-40).unwrap(), // мельче Планка — укор маркера значения
+            prob_svg(&[0.8083, 0.0796, 0.1121]).unwrap(),
+            prob_svg(&(0..40).map(|_| 1.0 / 40.0).collect::<Vec<_>>()).unwrap(),
+            prob_svg(&[1.0]).unwrap(),
+            bars_svg(&[1.0, -2.0, 3.0]).unwrap(),
+            bars_svg(&(0..40).map(|k| (k as f64 - 19.0) * 1234.5).collect::<Vec<_>>()).unwrap(),
+            bars_svg(&[-5000.0, 0.25, 123456.0]).unwrap(),
+            bars_svg_titled(&[3.0, -4.0], "Комплексное число: Re и Im").unwrap(),
+            matrix_svg(&Matrix::identity(3)).unwrap(),
+            matrix_svg(&dense8).unwrap(),
+            graph_svg(&k4, None).unwrap(),
+            graph_svg(&k4, Some(&long_labels)).unwrap(),
+            field_svg(&slit_m).unwrap(),
+            field_svg(&Matrix::from_rows(&[vec![1.0, 1.0], vec![1.0, 1.0]]).unwrap()).unwrap(),
+            surf_svg(&sombrero_m).unwrap(),
+        ];
+        for (k, svg) in scenes.iter().enumerate() {
+            let bad = audit_text_bounds(svg);
+            assert!(bad.is_empty(), "сцена {k}: надписи за холстом (грабля 23): {bad:?}");
+        }
     }
 }
