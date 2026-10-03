@@ -1271,3 +1271,91 @@ fn quantum_walk_loschmidt_revival() {
     assert!(l25 > 0.8, "L(2.5) = {l25} — квантовый ревайвал в хабе");
     near(l25, 0.830, 0.01, "высота ревайвала");
 }
+
+// ---------------------------------------------------------------------------
+// Сессия-9: суверенный рендер — коннектом и интерференция В ЯЗЫКЕ
+// ---------------------------------------------------------------------------
+
+/// Строковый вывод Калькулятора как SVG (Value::Str печатается в
+/// кавычках — срезаем первый/последний байт, как в viz_session.sh).
+fn svg_of(st: &mut CalcState, expr: &str) -> String {
+    let out = st
+        .eval_line(expr)
+        .unwrap_or_else(|e| panic!("{expr}: {e}"));
+    let t = out.trim();
+    let t = t.strip_prefix('"').unwrap_or(t);
+    let t = t.strip_suffix('"').unwrap_or(t);
+    t.to_string()
+}
+
+#[test]
+fn sovereign_render_fly_connectome_graph() {
+    let mut st = lab();
+    // K4-ядро коннектома мухи (реальные веса сессии-4, симметричные):
+    // 11 рёбер из 15 возможных — силовая укладка прямо в языке.
+    st.eval_line(
+        "let A = [0,735,24,0,1496,1222; \
+                  735,0,251,231,206,194; \
+                  24,251,0,0,40,28; \
+                  0,231,0,0,0,0; \
+                  1496,206,40,0,0,8; \
+                  1222,194,28,0,8,0]",
+    )
+    .unwrap();
+    let svg = svg_of(&mut st, "viz_graph(A)");
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.ends_with("</svg>"));
+    assert!(svg.contains("N = 6"));
+    assert!(svg.contains("рёбер = 11"));
+    assert!(svg.contains("компонент = 1"));
+    assert!(svg.contains("Fruchterman"));
+    // Дважды — бит-в-бит (золотая спираль, без RNG).
+    let svg2 = svg_of(&mut st, "viz_graph(A)");
+    assert_eq!(svg, svg2, "укладка детерминирована");
+    // Ошибка через язык: не квадратная «смежность».
+    assert!(st.eval_line("viz_graph([1,2,3])").is_err());
+}
+
+#[test]
+fn sovereign_render_double_slit_field_and_surf() {
+    let mut st = lab();
+    // Двущелевая картина Born В ЯЗЫКЕ: z = cos²(πx/2)·exp(−y²·3),
+    // литерал с ФОРМУЛАМИ — значения считает сам движок (x ∈ [−3, 3],
+    // y ∈ [−1, 1], сетка 9×13).
+    let rows: Vec<String> = (0..9)
+        .map(|i| {
+            let y = i as f64 / 8.0 * 2.0 - 1.0;
+            (0..13)
+                .map(|j| {
+                    let x = j as f64 / 12.0 * 6.0 - 3.0;
+                    // скобки обязательны: (-3)^2 ≠ -3^2 (грабля 22)
+                    format!("cos({x:.6}*pi/2)^2*exp(-({y:.6})^2*3)")
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    st.eval_line(&format!("let Z = [{}]", rows.join(";")))
+        .unwrap();
+    // Одна матрица — два рендера («от перестановки слагаемых сумма
+    // не меняется»): изолинии и 3D-поверхность.
+    let field = svg_of(&mut st, "viz_field(Z)");
+    assert!(field.starts_with("<svg"));
+    assert!(field.contains("сетка 9×13"));
+    assert!(field.contains("изолинии: 7 уровней"));
+    assert!(field.contains("<polyline"));
+    let surf = svg_of(&mut st, "viz_surf(Z)");
+    assert!(surf.contains("квадов 96")); // (9−1)·(13−1)
+    assert!(surf.contains("painter"));
+    // Физика прямо в языке: строка y=0 (селектор строки 4) — яркие
+    // полосы x = −2, 0, 2 дают |Z| = 1, тёмная x = −1 даёт 0.
+    let fringe = |j: usize| {
+        let mut col = vec!["0".to_string(); 13];
+        col[j] = "1".into();
+        format!("abs(trace([0,0,0,0,1,0,0,0,0]*Z*[{}]))", col.join(";"))
+    };
+    near(re(&mut st, &fringe(6)), 1.0, 1e-9, "яркая полоса x=0");
+    near(re(&mut st, &fringe(2)), 1.0, 1e-9, "яркая полоса x=-2");
+    near(re(&mut st, &fringe(10)), 1.0, 1e-9, "яркая полоса x=+2");
+    near(re(&mut st, &fringe(4)), 0.0, 1e-9, "тёмная полоса x=-1");
+}

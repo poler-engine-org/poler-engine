@@ -299,6 +299,8 @@ pub fn is_function(name: &str) -> bool {
         | "trits" | "trit_val" | "trit_and" | "trit_or" | "trit_not"
         // визуализация (цикл U, сессия-8)
         | "viz" | "viz_bell" | "viz_scale" | "viz_prob" | "viz_bars" | "viz_matrix"
+        // суверенный рендер (сессия-9)
+        | "viz_graph" | "viz_field" | "viz_surf"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -944,6 +946,41 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let m = matrix_arg(args, 0)?;
             Ok(Value::Str(viz::matrix_svg(&m)?))
         }
+        // ---------- суверенный рендер (сессия-9) ----------
+        "viz_graph" => {
+            // Смежность + опциональные метки ОДНОЙ строкой через запятую
+            // (грабля 16: литерала списка строк в языке нет).
+            if args.is_empty() || args.len() > 2 {
+                return Err(format!(
+                    "viz_graph: ожидается 1–2 аргумента, получено {}",
+                    args.len()
+                ));
+            }
+            let m = matrix_arg(args, 0)?;
+            let labels = match args.get(1) {
+                None => None,
+                Some(Value::Str(s)) => Some(
+                    s.split(',')
+                        .map(|t| t.trim().to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                Some(other) => {
+                    return Err(format!(
+                        "viz_graph: метки — строка через запятую \
+                         (\"имя1, имя2, …\"), получено {other}"
+                    ))
+                }
+            };
+            Ok(Value::Str(viz::graph_svg(&m, labels.as_deref())?))
+        }
+        "viz_field" => {
+            let m = matrix_arg(args, 0)?;
+            Ok(Value::Str(viz::field_svg(&m)?))
+        }
+        "viz_surf" => {
+            let m = matrix_arg(args, 0)?;
+            Ok(Value::Str(viz::surf_svg(&m)?))
+        }
         // ---------- триты ----------
         "trits" => {
             let v = one_arg(args, name)?;
@@ -1153,6 +1190,13 @@ pub fn catalog(filter: &str) -> String {
             "viz_prob([p…]) — Born-вероятности столбцами · viz_bars([v…]) — спектр значений",
             "viz_matrix(M) — теплокарта матрицы до 64×64: красный ≥ 0, синий < 0",
             "вывод — SVG 1.1 строкой: сохраняйте в файл и открывайте глазами",
+        ]),
+        ("суверенный рендер (сессия-9)", &[
+            "viz_graph(A, \"м1, м2, …\") — силовая укладка Fruchterman–Reingold: смежность → схема",
+            "узлы: радиус/цвет по степени · рёбра: толщина по весу · компоненты union-find",
+            "viz_field(M) — изолинии marching squares (7 уровней) поверх дивергентной карты",
+            "viz_surf(M) — 3D-поверхность: поворот, ортоскопия, painter's-алгоритм (до 48×48)",
+            "математика вырезана из Graphviz/NetworkX/Matplotlib — ноль зависимостей, чистый Rust",
         ]),
     ];
     let mut out = String::new();
@@ -1478,5 +1522,62 @@ mod tests {
         assert!(call("eye", &[s(4097.0)]).is_err());
         assert!(call("eye", &[s(0.0)]).is_err());
         assert!(call("eye", &[s(2.5)]).is_err());
+    }
+
+    #[test]
+    fn viz_session9_sovereign_render_calls() {
+        // Сессия-9: реестр + диспетчер для графа/поля/поверхности.
+        assert!(is_function("viz_graph"));
+        assert!(is_function("viz_field"));
+        assert!(is_function("viz_surf"));
+        assert!(!is_function("viz_graf"));
+
+        // K4 с метками одной строкой через запятую (грабля 16).
+        let k4 = Value::Matrix(
+            Matrix::from_rows(&[
+                vec![0.0, 1.0, 1.0, 1.0],
+                vec![1.0, 0.0, 1.0, 1.0],
+                vec![1.0, 1.0, 0.0, 1.0],
+                vec![1.0, 1.0, 1.0, 0.0],
+            ])
+            .unwrap(),
+        );
+        let v = call(
+            "viz_graph",
+            &[k4.clone(), Value::Str("a, b, c, d".into())],
+        )
+        .unwrap();
+        match v {
+            Value::Str(svg) => {
+                assert!(svg.starts_with("<svg"));
+                assert!(svg.ends_with("</svg>"));
+                assert!(svg.contains("рёбер = 6"));
+                assert!(svg.contains("компонент = 1"));
+                assert!(svg.contains(">a<") && svg.contains(">d<"));
+            }
+            other => panic!("viz_graph: не строка {other:?}"),
+        }
+        // Без меток — авто-имена v0…v3.
+        match call("viz_graph", &[k4]).unwrap() {
+            Value::Str(svg) => assert!(svg.contains(">v0<")),
+            other => panic!("viz_graph: не строка {other:?}"),
+        }
+        // Метки не строкой и неверное число меток — ошибки.
+        let two = Value::Matrix(Matrix::from_rows(&[vec![0.0, 1.0], vec![1.0, 0.0]]).unwrap());
+        assert!(call("viz_graph", &[two.clone(), Value::Scalar(1.0)]).is_err());
+        assert!(call("viz_graph", &[two, Value::Str("одна".into())]).is_err());
+
+        // Поле и поверхность через тот же реестр.
+        let f = Matrix::from_rows(&[vec![0.0, 1.0, 0.0], vec![1.0, 2.0, 1.0]]).unwrap();
+        match call("viz_field", &[Value::Matrix(f.clone())]).unwrap() {
+            Value::Str(svg) => assert!(svg.contains("изолинии: 7 уровней")),
+            other => panic!("viz_field: не строка {other:?}"),
+        }
+        match call("viz_surf", &[Value::Matrix(f)]).unwrap() {
+            Value::Str(svg) => assert!(svg.contains("квадов 2")),
+            other => panic!("viz_surf: не строка {other:?}"),
+        }
+        // Каталог знает новую группу.
+        assert!(catalog("").contains("суверенный рендер"));
     }
 }
