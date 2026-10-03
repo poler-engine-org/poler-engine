@@ -11,6 +11,12 @@
 //! стабилизаторы и 3-цикл Беллов под X⊗X† (блок 10), QPE-трит-считывание
 //! и 81-мерный трит-конвейер «19 = 1T01 → фазы → QFT-декод» (блок 11).
 //!
+//! Сессия 7 добавляет: CGLMP d=4 на двух квквартах (блоки 16–17) —
+//! локальный предел 2 (брутфорс 256 стратегий), max-ent аналитику статьи
+//! (2/3)(√2+√(10−√2)) и некомпактный оптимум I₄* = 2.972698267102 на
+//! палиндроме (1,γ₄,γ₄,1), где γ₄ — корень квадратики над √2-башней
+//! (DE+eig переоткрыли его до вывода алгебры): квкварт бьёт кутрит.
+//!
 //! Все проверки сведены к вещественным скалярам через abs/trace/det:
 //! принтер Калькулятора печатает комплексные числа строкой, поэтому
 //! тест оперирует только модулями, следами и нуль-нормами
@@ -838,6 +844,205 @@ fn acin_optimum_nonmaximally_entangled() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Блоки 16–17 (сессия 7): CGLMP d=4 — КВКВАРТЫ. Локальный предел 2 (брутфорс
+// 256 стратегий), max-ent = (2/3)(√2+√(10−√2)) (статья Collins et al. 2001),
+// некомпактный оптимум I₄* = 2.972698267102 на палиндроме (1,γ,γ,1)/√(2+2γ²),
+// где γ₄ — корень квадратики √2(1+√(2−√2))γ² + 2√(2−√2)γ − √2(1+√(2−√2)) = 0
+// над √2-башней. DE (12 DOF) + собственный вектор B₄ нашли его независимо
+// до вывода алгебры. I₄* > I₃*(Ацина): квкварт бьёт кутрит; η* меньше —
+// терпеливее к шуму. Живой прогон: download/experiments/d4_ququart_v063.txt.
+// ---------------------------------------------------------------------------
+
+/// Настройка CGLMP d=4: |Φ₄⟩ + линейные лестницы статьи (α₂=1/2, β₁=1/4,
+/// β₂=−1/4; DE сессии 7 подтвердил их оптимальность и для некомпакта)
+/// + QFT с сопряжённых сторон F₄⊗F₄† + проекторы 4 классов (A−B) mod 4.
+fn cglmp4_setup(st: &mut CalcState) {
+    for line in [
+        "let F4 = (1/2)*[1,1,1,1; 1,i,-1,-i; 1,-1,1,-1; 1,-i,-1,i]",
+        "let u0 = [1;0;0;0]",
+        "let u1 = [0;1;0;0]",
+        "let u2 = [0;0;1;0]",
+        "let u3 = [0;0;0;1]",
+        // ВАЖНО (грабли сессии 4, d=4 издание): F₄⊗F₄†, НЕ F₄⊗F₄
+        "let FF4 = kron(F4, dagger(F4))",
+        "let A2p = [1,0,0,0; 0,exp(pi/4*i),0,0; 0,0,exp(pi/2*i),0; 0,0,0,exp(3*pi/4*i)]",
+        "let B1p = [1,0,0,0; 0,exp(pi/8*i),0,0; 0,0,exp(pi/4*i),0; 0,0,0,exp(3*pi/8*i)]",
+        "let B2p = [1,0,0,0; 0,exp(-pi/8*i),0,0; 0,0,exp(-pi/4*i),0; 0,0,0,exp(-3*pi/8*i)]",
+        // проекторы классов c = (A−B) mod 4 (ранг 4 в 16-мерии)
+        "let Qc0 = kron(u0,u0)*transpose(kron(u0,u0)) + kron(u1,u1)*transpose(kron(u1,u1)) + kron(u2,u2)*transpose(kron(u2,u2)) + kron(u3,u3)*transpose(kron(u3,u3))",
+        "let Qc1 = kron(u1,u0)*transpose(kron(u1,u0)) + kron(u2,u1)*transpose(kron(u2,u1)) + kron(u3,u2)*transpose(kron(u3,u2)) + kron(u0,u3)*transpose(kron(u0,u3))",
+        "let Qc2 = kron(u2,u0)*transpose(kron(u2,u0)) + kron(u3,u1)*transpose(kron(u3,u1)) + kron(u0,u2)*transpose(kron(u0,u2)) + kron(u1,u3)*transpose(kron(u1,u3))",
+        "let Qc3 = kron(u3,u0)*transpose(kron(u3,u0)) + kron(u0,u1)*transpose(kron(u0,u1)) + kron(u1,u2)*transpose(kron(u1,u2)) + kron(u2,u3)*transpose(kron(u2,u3))",
+        "let M11 = kron(eye(4), B1p)",
+        "let M12 = kron(eye(4), B2p)",
+        "let M21 = kron(A2p, B1p)",
+        "let M22 = kron(A2p, B2p)",
+        "let psiB4 = (1/2)*[1;0;0;0;0;1;0;0;0;0;1;0;0;0;0;1]",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+}
+
+#[test]
+fn cglmp_ququart_d4_violation() {
+    let mut st = lab();
+    cglmp4_setup(&mut st);
+    // (1) ЛОКАЛЬНЫЙ ПРЕДЕЛ: брутфорс всех 256 детерминированных стратегий
+    // (a1,a2,b1,b2 ∈ Z4) по формуле Id статьи — максимум РОВНО 2.
+    let mut best = f64::NEG_INFINITY;
+    for a1 in 0..4i32 {
+        for a2 in 0..4 {
+            for b1 in 0..4 {
+                for b2 in 0..4 {
+                    let p = |x: i32, y: i32, c: i32| -> f64 {
+                        if (x - y).rem_euclid(4) == c {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    };
+                    let (p11, p12, p21, p22) = (
+                        |c: i32| p(a1, b1, c),
+                        |c: i32| p(a1, b2, c),
+                        |c: i32| p(a2, b1, c),
+                        |c: i32| p(a2, b2, c),
+                    );
+                    let v = (p11(0) + p21(3) + p22(0) + p12(0) - p11(3) - p21(0) - p22(3)
+                        - p12(1))
+                        + (1.0 / 3.0)
+                            * (p11(1) + p21(2) + p22(1) + p12(3) - p11(2) - p21(1) - p22(2)
+                                - p12(2));
+                    best = best.max(v);
+                }
+            }
+        }
+    }
+    near(best, 2.0, 1e-12, "локальный предел I4 = 2 (брутфорс 256 стратегий)");
+    // (2) измеренные состояния max-ent
+    for line in [
+        "let me11 = FF4*M11*psiB4",
+        "let me12 = FF4*M12*psiB4",
+        "let me21 = FF4*M21*psiB4",
+        "let me22 = FF4*M22*psiB4",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+    // (3) q0 = P(A1=B1) = 1/(8(2−√(2+√2))) = 1/(2d²sin²(π/16)) — аналитика статьи
+    near(
+        re(&mut st, "trace(dagger(me11)*Qc0*me11)"),
+        1.0 / (8.0 * (2.0 - (2.0 + 2.0_f64.sqrt()).sqrt())),
+        1e-12,
+        "CGLMP d=4 q0 = 1/(8(2−√(2+√2)))",
+    );
+    // (4) ГЛАВНОЕ: I4(max-ent) = (2/3)(√2+√(10−√2)) ≈ 2.896243 > 2 — статья, точно
+    let i4me = re(
+        &mut st,
+        "trace(dagger(me11)*Qc0*me11) + trace(dagger(me21)*Qc3*me21) + trace(dagger(me22)*Qc0*me22) + trace(dagger(me12)*Qc0*me12) - trace(dagger(me11)*Qc3*me11) - trace(dagger(me21)*Qc0*me21) - trace(dagger(me22)*Qc3*me22) - trace(dagger(me12)*Qc1*me12) + (1/3)*(trace(dagger(me11)*Qc1*me11) + trace(dagger(me21)*Qc2*me21) + trace(dagger(me22)*Qc1*me22) + trace(dagger(me12)*Qc3*me12) - trace(dagger(me11)*Qc2*me11) - trace(dagger(me21)*Qc1*me21) - trace(dagger(me22)*Qc2*me22) - trace(dagger(me12)*Qc2*me12))",
+    );
+    near(
+        i4me,
+        (2.0 / 3.0) * (2.0_f64.sqrt() + (10.0 - 2.0_f64.sqrt()).sqrt()),
+        1e-11,
+        "I4(max-ent) = (2/3)(√2+√(10−√2)) — Collins et al. 2001",
+    );
+    assert!(i4me > 2.0, "нарушение локального реализма: I4 = {i4me} > 2");
+    // (5) d=4 max-ent УСТУПАЕТ оптимуму Ацина d=3: интрига некомпакта
+    assert!(
+        i4me < 1.0 + (11.0_f64 / 3.0).sqrt(),
+        "max-ent d=4 ({i4me}) < Ацин d=3 (2.914854) — некомпакт обязан побить"
+    );
+}
+
+/// Оптимум «Ацина для квквартов» (сессия 7): палиндромное состояние
+/// |Ψ₄⟩ = (|00⟩+γ|11⟩+γ|22⟩+|33⟩)/√(2+2γ²) с линейными лестницами статьи.
+/// γ₄ = [√(8−3√2+4√(2−√2)) − √(2−√2)]/[√2(1+√(2−√2))] — корень квадратики
+/// √2(1+t)γ² + 2tγ − √2(1+t) = 0, t = √(2−√2). DE+eig переоткрыли 0.7393724
+/// до вывода алгебры. Четыре пути: контур, Rayleigh, собственное уравнение,
+/// шумовой порог. I₄* = 2.972698267102 > I₃*(Ацина) = 2.914854216.
+#[test]
+fn ququart_acin_optimum_d4() {
+    let mut st = lab();
+    cglmp4_setup(&mut st);
+    for line in [
+        "let gam4 = (sqrt(8 - 3*sqrt(2) + 4*sqrt(2-sqrt(2))) - sqrt(2-sqrt(2))) / (sqrt(2)*(1+sqrt(2-sqrt(2))))",
+        "let nn4 = 2 + 2*gam4^2",
+        "let mv4 = (1/sqrt(nn4))*[1;0;0;0;0;gam4;0;0;0;0;gam4;0;0;0;0;1]",
+        "let s11 = FF4*M11*mv4",
+        "let s12 = FF4*M12*mv4",
+        "let s21 = FF4*M21*mv4",
+        "let s22 = FF4*M22*mv4",
+        // оператор Белла B₄ из примитивов движка (16 членов, CSE кеширует)
+        "let Bop4 = dagger(M11)*dagger(FF4)*Qc0*FF4*M11 + dagger(M21)*dagger(FF4)*Qc3*FF4*M21 + dagger(M22)*dagger(FF4)*Qc0*FF4*M22 + dagger(M12)*dagger(FF4)*Qc0*FF4*M12 - dagger(M11)*dagger(FF4)*Qc3*FF4*M11 - dagger(M21)*dagger(FF4)*Qc0*FF4*M21 - dagger(M22)*dagger(FF4)*Qc3*FF4*M22 - dagger(M12)*dagger(FF4)*Qc1*FF4*M12 + (1/3)*(dagger(M11)*dagger(FF4)*Qc1*FF4*M11 + dagger(M21)*dagger(FF4)*Qc2*FF4*M21 + dagger(M22)*dagger(FF4)*Qc1*FF4*M22 + dagger(M12)*dagger(FF4)*Qc3*FF4*M12 - dagger(M11)*dagger(FF4)*Qc2*FF4*M11 - dagger(M21)*dagger(FF4)*Qc1*FF4*M21 - dagger(M22)*dagger(FF4)*Qc2*FF4*M22 - dagger(M12)*dagger(FF4)*Qc2*FF4*M12)",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+    // 1) γ₄ — точный корень квадратики над √2-башней
+    near(
+        re(&mut st, "gam4"),
+        0.7393724305634157,
+        1e-13,
+        "γ₄ = [√(8−3√2+4√(2−√2)) − √(2−√2)]/[√2(1+√(2−√2))]",
+    );
+    // 2) контур CGLMP: I₄* = 2.972698267102 — точная алгебра сессии 7
+    let i4 = re(
+        &mut st,
+        "trace(dagger(s11)*Qc0*s11) + trace(dagger(s21)*Qc3*s21) + trace(dagger(s22)*Qc0*s22) + trace(dagger(s12)*Qc0*s12) - trace(dagger(s11)*Qc3*s11) - trace(dagger(s21)*Qc0*s21) - trace(dagger(s22)*Qc3*s22) - trace(dagger(s12)*Qc1*s12) + (1/3)*(trace(dagger(s11)*Qc1*s11) + trace(dagger(s21)*Qc2*s21) + trace(dagger(s22)*Qc1*s22) + trace(dagger(s12)*Qc3*s12) - trace(dagger(s11)*Qc2*s11) - trace(dagger(s21)*Qc1*s21) - trace(dagger(s22)*Qc2*s22) - trace(dagger(s12)*Qc2*s12))",
+    );
+    near(i4, 2.9726982671022437, 1e-11, "I₄*(квкварт) — точная алгебра");
+    // превышает локальный предел, max-ent И оптимум Ацина d=3
+    assert!(i4 > 2.0, "нарушение локального реализма: {i4} > 2");
+    assert!(
+        i4 > (2.0 / 3.0) * (2.0_f64.sqrt() + (10.0 - 2.0_f64.sqrt()).sqrt()),
+        "некомпактное состояние бьёт max-ent d=4 (2.896243)"
+    );
+    assert!(
+        i4 > 1.0 + (11.0_f64 / 3.0).sqrt(),
+        "КВКВАРТ БЬЁТ КУТРИТ: I₄* ({i4}) > I₃*(Ацина) = 2.914854"
+    );
+    // 3) Rayleigh и собственное уравнение: |Ψ₄⟩ — собственный вектор B₄
+    near(
+        re_part(&mut st, "trace(dagger(mv4)*Bop4*mv4)"),
+        2.9726982671022437,
+        1e-11,
+        "⟨Ψ|B₄|Ψ⟩ = λ_max (Rayleigh)",
+    );
+    near(
+        modulus(&mut st, "abs(Bop4*mv4 - 2.9726982671022437*mv4)"),
+        0.0,
+        1e-10,
+        "B₄·Ψ = λ·Ψ — собственный вектор (норма невязки)",
+    );
+    // 4) шумовой порог: η* = 2/I₄* → I₄(η*) = 2 ровно;
+    //    η*(d=4) < η*(Ацин d=3): квквартовый некомпакт ТОЛЕРАНТНЕЕ к шуму
+    st.eval_line("let eta4 = 2/2.9726982671022437").unwrap();
+    st.eval_line("let rho4 = mv4*transpose(mv4)").unwrap();
+    st.eval_line("let rho41 = eta4*rho4 + (1-eta4)*(1/16)*eye(16)").unwrap();
+    for (nm, m) in [("r11", "M11"), ("r12", "M12"), ("r21", "M21"), ("r22", "M22")] {
+        st.eval_line(&format!("let {nm} = {m}*rho41*dagger({m})")).unwrap();
+        st.eval_line(&format!("let a{nm} = FF4*{nm}*dagger(FF4)")).unwrap();
+    }
+    near(
+        re_part(
+            &mut st,
+            "trace(Qc0*ar11) + trace(Qc3*ar21) + trace(Qc0*ar22) + trace(Qc0*ar12) - trace(Qc3*ar11) - trace(Qc0*ar21) - trace(Qc3*ar22) - trace(Qc1*ar12) + (1/3)*(trace(Qc1*ar11) + trace(Qc2*ar21) + trace(Qc1*ar22) + trace(Qc3*ar12) - trace(Qc2*ar11) - trace(Qc1*ar21) - trace(Qc2*ar22) - trace(Qc2*ar12))",
+        ),
+        2.0,
+        1e-9,
+        "I₄(η*_квкварт) = 2 — критическая видимость",
+    );
+    near(
+        re(&mut st, "eta4"),
+        2.0 / 2.9726982671022437,
+        1e-12,
+        "η*(d=4) = 0.672789 < η*(Ацин d=3) = 0.686141 — терпеливее к шуму",
+    );
+    assert!(
+        2.0 / 2.9726982671022437 < 2.0 / (1.0 + (11.0_f64 / 3.0).sqrt()),
+        "η*(d=4) < η*(Ацин d=3): квкварт терпеливее к шуму"
+    );
+}
+
 /// Настройка QAOA: 6 кутритов K4-ядра коннектома мухи (реальные веса).
 fn qaoa_setup(st: &mut CalcState) {
     for line in [
@@ -965,6 +1170,81 @@ fn t5c_crystal_to_quantum_bridge() {
         1.0 / 2.0_f64.sqrt(),
         1e-10,
         "P(коллапс → «кристалл») = 1/2",
+    );
+}
+
+/// «ПАМЯТЬ ВЫБИРАЕТ НЕКОМПАКТНОСТЬ» (сессия 7): кристалл
+/// permanent_memory.t5c (8198×8198 тритов) сканирован на 67 182 610
+/// 6-тритовых окон; argmax I₃ по собственным окнам памяти:
+/// окно [1,0,−1,0,−1,1] (13 вхождений; строки 'and','to','in','system'…)
+/// → γ_mem = 578/729 = 0.7928669410 → I₃ = 99.999987% оптимума Ацина
+/// (точный γ* = (√11−√3)/2 = 0.7922870 недостижим из 6 тритов).
+/// Аналитика семейства Ацина: I₃(γ) = 4(2√3γ+3)/(3(2+γ²)) (сессия 7).
+/// Живой прогон: download/experiments/crystal_gamma_v063.txt.
+#[test]
+fn crystal_chooses_acin_gamma() {
+    let mut st = lab();
+    cglmp_setup(&mut st);
+    // выбор памяти: γ = 578/729 (цифры окна 210102₃ как база-3 дробь)
+    st.eval_line("let gmem = 578/729").unwrap();
+    st.eval_line("let nnm = 2 + gmem^2").unwrap();
+    st.eval_line("let mvm = (1/sqrt(nnm)) * [1;0;0;0;gmem;0;0;0;1]").unwrap();
+    for (nm, m) in [
+        ("s11", "kron(eye(3), B1p)"),
+        ("s12", "kron(eye(3), B2p)"),
+        ("s21", "kron(A2p, B1p)"),
+        ("s22", "kron(A2p, B2p)"),
+    ] {
+        st.eval_line(&format!("let {nm} = FF * {m} * mvm")).unwrap();
+    }
+    // (1) контур CGLMP для выбранного памятью γ — и сверка с аналитикой
+    //     семейства Ацина I₃(γ) = 4(2√3γ+3)/(3(2+γ²))
+    let i3m = re(
+        &mut st,
+        "trace(dagger(s11)*Pc0*s11) + trace(dagger(s21)*Pcm*s21) + trace(dagger(s22)*Pc0*s22) + trace(dagger(s12)*Pc0*s12) - trace(dagger(s11)*Pcm*s11) - trace(dagger(s21)*Pc0*s21) - trace(dagger(s22)*Pcm*s22) - trace(dagger(s12)*Pcp*s12)",
+    );
+    let i3a = re(&mut st, "4*(2*sqrt(3)*gmem + 3)/(3*(2 + gmem^2))");
+    near(i3m, 2.9148538425489474, 1e-11, "I₃(γ_mem) — выбор памяти 578/729");
+    near(
+        i3m - i3a,
+        0.0,
+        1e-12,
+        "контур == аналитика 4(2√3γ+3)/(3(2+γ²))",
+    );
+    // (2) память почти на пределе: выше компактного Белла, чуть ниже Ацина
+    assert!(
+        i3m > (4.0 / 9.0) * (3.0 + 2.0 * 3.0_f64.sqrt()),
+        "память выше компактного Белла 2.872934 (+1.46%)"
+    );
+    assert!(
+        i3m < 1.0 + (11.0_f64 / 3.0).sqrt(),
+        "зазор до точного оптимума 3.7e-7 — алгебра точнее 6 тритов"
+    );
+    // (3) МОСТ: те же триты окна [1,0,−1,0,−1,1] → фазовая решётка → QFT
+    //     читает их как |−t mod 3⟩ = |2,0,1,0,1,2⟩ с P = 1 («фазы накормлены
+    //     тритами кристалла» буквально); грабли сессии 4: t=1 → фаза om
+    st.eval_line("let F729 = kron(F3, kron(F3, kron(F3, kron(F3, kron(F3, F3)))))").unwrap();
+    st.eval_line("let flat6 = kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1], kron((1/sqrt(3))*[1;1;1],(1/sqrt(3))*[1;1;1])))))").unwrap();
+    st.eval_line("let DMEM = kron([1,0,0;0,om,0;0,0,om^2], kron([1,0,0;0,1,0;0,0,1], kron([1,0,0;0,om^2,0;0,0,om^4], kron([1,0,0;0,1,0;0,0,1], kron([1,0,0;0,om^2,0;0,0,om^4],[1,0,0;0,om,0;0,0,om^2])))))").unwrap();
+    st.eval_line("let dec_mem = kron(e2, kron(e0, kron(e1, kron(e0, kron(e1, e2)))))").unwrap();
+    near(
+        zero_norm(&mut st, "F729*DMEM*flat6 - dec_mem"),
+        0.0,
+        1e-24,
+        "мост: окно памяти [1,0,−1,0,−1,1] → |−t mod 3⟩",
+    );
+    near(
+        modulus(&mut st, "trace(dagger(dec_mem)*(F729*DMEM*flat6))"),
+        1.0,
+        1e-10,
+        "P(декод окна памяти) = 1 — фазы накормлены тритами",
+    );
+    // (4) γ окна в цифрах: 2/3 + 1/9 + 0/27 + 1/81 + 0/243 + 2/729 = 578/729
+    near(
+        re(&mut st, "2/3 + 1/9 + 1/81 + 2/729"),
+        578.0 / 729.0,
+        1e-12,
+        "цифры окна 210102₃ = γ_mem",
     );
 }
 
