@@ -36,3 +36,6 @@ corpus_extracted/
 *.poler
 
 docs/FULL_CHAT_SESSION.md
+
+# Сборочные .poler-архивы (постоянный архиватор, scripts/poler_build.sh) — регенерируемы
+builds/

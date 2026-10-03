@@ -810,3 +810,33 @@ qutrit_lab 20 → 22 (коннектом через язык + двущелев�
     • внешний ревизор scripts/viz_text_audit.py: реальные метрики
       DejaVu Sans Mono (PIL getlength) по всем 12 артефактам —
       суверенность оценок движка проверяется независимо.
+
+### Грабля 24 (Сессия-11, ансамбль .poler): сеть ≠ сырой поток, pack ≠ gitignore
+
+24. **stream-download раньше писал tar.gz КАК ЕСТЬ**: до v0.65.0 сетевой
+    путь звался write_stream — сырой gzip-поток ложился в .poler одним
+    STORE-чанком (ratio 1.0003, негреппельный бинарный мусор). IngestPipeline
+    с magic-сниффингом был подключён ТОЛЬКО к локальному --stream-file.
+    Лечение (src/archive/ingest.rs): ingest_reader<R: Read> — общий конвейер
+    для ЛЮБОГО источника (HTTP-стрим, stdin): сниффинг первых ≤512 байт →
+    gzip/zstd-декодер НА ЛЕТУ → TarObserver писателя сам разводит пофайловую
+    таблицу. Результат на georust/geo: tar.gz 6.2 МиБ → .poler 5.4 МиБ с
+    563 файлами (ratio 0.256 — ГЛУБЖЕ самого gzip, zstd-15 на 85/86 чанков).
+    • pack_dir — «постоянный архиватор сборки»: каталог → .poler с
+      пофайловой таблицей через tar-обёртку (TarWriterShim → TarObserver):
+      границы файлов, SHA256 записей и BLAKE3-дедуп МЕЖДУ файлами —
+      бесплатно; права 0755 сохраняются в tar-заголовках;
+    • --pack по умолчанию WYSIWYG (всё содержимое каталога, вкл.
+      скрытые) — явный каталог пакуется как есть; --pack-gitignore
+      включает режим репо-чекаута (фильтр .gitignore + пропуск скрытых);
+      репо-стагинг внутри poler-engine тихо выкинул бы *.poler
+      (правило .gitignore:36) — демо-стагинг держим в /tmp;
+    • --box-arg со значением, начинающимся с «--», требует =синтаксис
+      (--box-arg=--archives): иначе clap съедает его как флаг;
+    • динамический payload в poler-box: rootfs-коробка — tmpfs БЕЗ ОС;
+      PT_INTERP=/lib64/ld-linux-x86-64.so.2 + libgcc_s/libm/libc нужно
+      стейджить в архив (box_demo.sh: 4 библиотеки, ~2.7 МиБ) — иначе
+      execveat(memfd) падает ENOENT;
+    • листинг движка в пайп (`--archive-list | head`) ловит SIGPIPE →
+      паника «failed printing to stdout: Broken pipe» — в скриптах
+      вывод сначала в temp-файл, потом head файла (poler_build.sh).

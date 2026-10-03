@@ -1250,6 +1250,8 @@ struct Cli {
 
     /// Потоковое скачивание URL (HTTP/HTTPS) → сжатый .poler БЕЗ сырой
     /// выгрузки на диск (директива DIRECTIVE_STREAMING_INGESTION_PIPELINE).
+    /// v0.65.0: контейнеры (tar.gz/tar.zst/gz/zst) распаковываются НА ЛЕТУ —
+    /// исходники ложатся с пофайловой таблицей и zstd-сжатием (ансамбль).
     #[arg(
         long = "stream-download",
         value_name = "URL",
@@ -1297,8 +1299,35 @@ struct Cli {
     )]
     stream_bench: Option<u64>,
 
+    /// v0.65.0 ПОСТОЯННЫЙ АРХИВАТОР: упаковка каталога в .poler с
+    /// пофайловой таблицей (FastCDC + BLAKE3-дедуп между файлами + zstd).
+    /// Сборки poler-engine пакуются этим путём (scripts/poler_build.sh):
+    /// бинарник/артефакты/доки — в один сжатый .poler, сырые копии
+    /// удаляются. Права 0o755 сохраняются — poler-box запускает
+    /// бинарники прямо из архива (циклический ансамбль).
+    /// WYSIWYG: пакуется ВСЁ содержимое каталога (вкл. скрытые);
+    /// --pack-gitignore включает фильтр .gitignore+hidden (репо-чекаут).
+    #[arg(
+        long = "pack",
+        value_name = "DIR",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl", "archive_to_crystal",
+            "poler_list", "poler_verify", "poler_extract",
+            "grep", "chunk", "web", "crawl", "web_search", "web_stats", "mcp",
+            "mcp_http", "shell", "exec", "tui", "impact", "browser_index", "web_lens",
+            "web_lens_install", "crystal_build", "crystal_ingest_dir", "learn_web",
+            "learn_dir", "stream_quant",
+        ]
+    )]
+    pack: Option<PathBuf>,
+
+    /// С --pack: уважать .gitignore и пропускать скрытые (режим
+    /// репо-чекаута). По умолчанию WYSIWYG — всё содержимое каталога.
+    #[arg(long = "pack-gitignore", default_value_t = false)]
+    pack_gitignore: bool,
+
     /// Выходной .poler-архив для --stream-download/--stream-file/
-    /// --stream-bench/--browser-crawl.
+    /// --stream-bench/--pack/--browser-crawl.
     #[arg(long = "output-archive", value_name = "POLER")]
     output_archive: Option<PathBuf>,
 
@@ -2105,9 +2134,11 @@ fn run(cli: Cli) -> ExitCode {
         return ExitCode::from(run_learn(&cli) as u8);
     }
     // ---------- v0.39.0: Zero-Disk Streaming Ingestion Pipeline ----------
+    // v0.65.0: + --pack (постоянный архиватор сборки)
     if cli.stream_download.is_some()
         || cli.stream_file.is_some()
         || cli.stream_bench.is_some()
+        || cli.pack.is_some()
     {
         return ExitCode::from(run_stream_ingest(&cli) as u8);
     }
@@ -6533,7 +6564,7 @@ fn url_hint(url: &str) -> String {
         .to_string()
 }
 
-/// --stream-download / --stream-file / --stream-bench → .poler.
+/// --stream-download / --stream-file / --stream-bench / --pack → .poler.
 fn run_stream_ingest(cli: &Cli) -> i32 {
     use poler_engine::archive::{write_stream, SyntheticStream};
     let cfg = stream_write_cfg(cli);
@@ -6551,7 +6582,7 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
         }
         eprintln!("stream-download: {url} → {}", out.display());
         let agent = ureq::AgentBuilder::new()
-            .user_agent("poler-engine/0.39 (zero-disk streaming)")
+            .user_agent("poler-engine/0.65 (zero-disk streaming + on-the-fly unpack)")
             .build();
         let resp = match agent.get(url).call() {
             Ok(r) => r,
@@ -6564,7 +6595,16 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
                 return 2;
             }
         };
-        match write_stream(resp.into_reader(), &out, cfg, &url_hint(url)) {
+        // v0.65.0 ансамбль: тот же IngestPipeline, что и у --stream-file —
+        // сниффинг магии стрима, gzip/zstd-декодер НА ЛЕТУ, TarObserver
+        // разводит пофайловую таблицу. Сырой tar.gz на диск НЕ пишется.
+        match poler_engine::archive::ingest_reader(
+            resp.into_reader(),
+            &out,
+            cfg,
+            poler_engine::archive::IngestMode::Auto,
+            &url_hint(url),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("stream-download: {e}");
@@ -6574,7 +6614,15 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
     } else if let Some(path) = &cli.stream_file {
         if path == "-" {
             eprintln!("stream-file: stdin → {}", out.display());
-            match write_stream(std::io::stdin(), &out, cfg, "stdin") {
+            // v0.65.0: stdin — тот же инжест-конвейер (tar.gz из пайпа
+            // раскладывается в пофайловую таблицу на лету)
+            match poler_engine::archive::ingest_reader(
+                std::io::stdin(),
+                &out,
+                cfg,
+                poler_engine::archive::IngestMode::Auto,
+                "stdin",
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("stream-file: {e}");
@@ -6590,6 +6638,23 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
                     eprintln!("stream-file: {path}: {e}");
                     return 2;
                 }
+            }
+        }
+    } else if let Some(dir) = &cli.pack {
+        // v0.65.0 ПОСТОЯННЫЙ АРХИВАТОР: каталог → .poler с пофайловой таблицей.
+        // WYSIWYG по умолчанию (всё, вкл. скрытые); --pack-gitignore — режим
+        // репо-чекаута (фильтр .gitignore + пропуск скрытых, как grep-слой).
+        eprintln!("pack: {} → {}", dir.display(), out.display());
+        let (hidden, ignore) = if cli.pack_gitignore {
+            (false, true)
+        } else {
+            (true, false)
+        };
+        match poler_engine::archive::pack_dir(dir, &out, cfg, hidden, ignore) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("pack: {e}");
+                return 2;
             }
         }
     } else {
