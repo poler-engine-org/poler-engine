@@ -214,6 +214,49 @@ pub fn pack_dir(
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    // Грабля Сессии-12: выходной архив, писавшийся ВНУТРИ упаковываемого
+    // каталога, попадал в обход — пакуется растущий сам-себя .part и
+    // sidecar таблицы, реальные файлы теряются молча. Пропускаем вывод
+    // и его sidecar-файлы (out, out.part, out.part.files, out.files).
+    let self_outputs: Vec<std::path::PathBuf> = {
+        let abs = |p: &Path| -> std::path::PathBuf {
+            if let Ok(c) = std::fs::canonicalize(p) {
+                return c;
+            }
+            // Файла ещё нет (например, финальный .poler до rename) —
+            // лексическая нормализация от текущего каталога.
+            let joined = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(p)
+            };
+            let mut pb = std::path::PathBuf::new();
+            for c in joined.components() {
+                match c {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        pb.pop();
+                    }
+                    other => {
+                        pb.push(other.as_os_str());
+                    }
+                }
+            }
+            pb
+        };
+        let mut suffixes = vec![std::path::PathBuf::new()];
+        suffixes.push(".part".into());
+        suffixes.push(".part.files".into());
+        suffixes.push(".files".into());
+        let mut v = Vec::new();
+        for sfx in &suffixes {
+            let mut p = out_path.as_os_str().to_os_string();
+            p.push(sfx.as_os_str());
+            v.push(abs(Path::new(&p)));
+        }
+        v
+    };
+
     let mut writer = StreamWriter::open(out_path, cfg)?;
     {
         let mut tar_builder = tar::Builder::new(TarWriterShim { writer: &mut writer });
@@ -230,6 +273,11 @@ pub fn pack_dir(
                 continue;
             }
             let path = entry.path();
+            // Свой вывод не пакуем (self-reference — см. граблю выше).
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if self_outputs.iter().any(|p| *p == canon) {
+                continue;
+            }
             let rel = path.strip_prefix(root).unwrap_or(path);
             let name = rel.to_string_lossy().replace('\\', "/");
             let meta = std::fs::metadata(path)?;
@@ -415,6 +463,45 @@ mod tests {
             std::fs::read(out_dir.join("bin/poler-engine")).unwrap(),
             b"ELF-payload-not-real"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Грабля Сессии-12: выход .poler ВНУТРИ упаковываемого каталога.
+    /// Раньше растущий .part + sidecar попадали в обход, а реальные
+    /// файлы терялись молча (архив «сам-себя»). Теперь вывод
+    /// и его sidecar-файлы исключаются из обхода.
+    #[test]
+    fn pack_dir_output_inside_tree_not_packed() {
+        let d = std::env::temp_dir().join(format!(
+            "poler-selfref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("first.txt"), b"AAA").unwrap();
+        std::fs::write(d.join("second.txt"), b"BBB").unwrap();
+
+        // Вывод — в тот же каталог, который пакуем.
+        let out = d.join("same_dir.poler");
+        let stats = pack_dir(&d, &out, cfg(), false, false).unwrap();
+        assert_eq!(stats.files, 2, "только реальные файлы, без self-reference");
+
+        let r = PolerReader::open(&out).unwrap();
+        let names: Vec<&str> = r.files().iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"first.txt"), "{names:?}");
+        assert!(names.contains(&"second.txt"), "{names:?}");
+        for name in &names {
+            assert!(
+                !name.contains("same_dir.poler"),
+                "свой вывод в архиве: {name}"
+            );
+        }
+        let rep = r.verify().unwrap();
+        assert!(rep.all_ok, "verify: {:?}", rep.files_bad);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

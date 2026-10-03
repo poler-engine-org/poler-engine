@@ -2198,6 +2198,195 @@ pub fn surf_svg(m: &Matrix) -> Result<String, String> {
     Ok(s)
 }
 
+// ---------------------------------------------------------------------
+// viz_iso3 (Сессия-12): изоповерхность 3D-поля — marching tetrahedra
+// ---------------------------------------------------------------------
+
+/// Изоповерхность воксельного поля: стек срезов `slices[iz][iy][ix]`
+/// (матрица = z-сечение), уровень `level` (по умолчанию — середина
+/// диапазона поля). Треугольники извлекает `geo::marching`
+/// (самокорректирующиеся таблицы, watertight), сцена — как у viz_surf:
+/// нормировка в куб [−1,1]³, поворот −60°/28°, painter's-алгоритм.
+/// Цвет — высота z: синий → красный.
+pub fn iso3_svg(slices: &[Matrix], level: Option<f64>) -> Result<String, String> {
+    use crate::geo::marching::{marching_tetrahedra, VoxelGrid};
+
+    if slices.is_empty() {
+        return Err("viz_iso3: пустой стек срезов".into());
+    }
+    if slices.len() > 40 || slices[0].rows > 40 || slices[0].cols > 40 {
+        return Err(format!(
+            "viz_iso3: {}×{}×{} — слишком крупно для сцены (до 40 по каждой оси)",
+            slices[0].cols,
+            slices[0].rows,
+            slices.len()
+        ));
+    }
+    let mut zslices: Vec<Vec<Vec<f64>>> = Vec::with_capacity(slices.len());
+    for (k, m) in slices.iter().enumerate() {
+        let mut plane: Vec<Vec<f64>> = Vec::with_capacity(m.rows);
+        for i in 0..m.rows {
+            let mut row = Vec::with_capacity(m.cols);
+            for j in 0..m.cols {
+                let v = m.get(i, j).re;
+                if !v.is_finite() {
+                    return Err(format!("viz_iso3: срез {k}, узел ({i},{j}) не конечен"));
+                }
+                row.push(v);
+            }
+            plane.push(row);
+        }
+        zslices.push(plane);
+    }
+    let grid = VoxelGrid::from_slices(&zslices)?;
+    let (lo, hi) = grid.minmax();
+    if !(lo < hi) {
+        return Err("viz_iso3: поле постоянно — изоповерхность не определена".into());
+    }
+    let level = level.unwrap_or((lo + hi) / 2.0);
+
+    let tris = marching_tetrahedra(&grid, level);
+    if tris.is_empty() {
+        return Err(format!(
+            "viz_iso3: уровень {level} вне поля [{lo}, {hi}] — пусто"
+        ));
+    }
+
+    // Нормировка координат в [−1, 1]³ (индексы → куб).
+    let (nx, ny, nz) = (grid.nx as f64, grid.ny as f64, grid.nz as f64);
+    let nrm = |v: &crate::geo::marching::Vec3| -> (f64, f64, f64) {
+        (
+            2.0 * v.0 / (nx - 1.0) - 1.0,
+            2.0 * v.1 / (ny - 1.0) - 1.0,
+            2.0 * v.2 / (nz - 1.0) - 1.0,
+        )
+    };
+
+    const AZ: f64 = -60.0;
+    const EL: f64 = 28.0;
+    let (phi, theta) = (AZ.to_radians(), EL.to_radians());
+    let (cf, sf) = (phi.cos(), phi.sin());
+    let (ct, st) = (theta.cos(), theta.sin());
+
+    // Проекции + глубина: painter's — дальние раньше.
+    let mut faces: Vec<(f64, [(f64, f64); 3], f64)> = Vec::with_capacity(tris.len());
+    let mut bbox = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for t in &tris {
+        let mut screen = [(0.0f64, 0.0f64); 3];
+        let mut depth = 0.0;
+        let mut zavg = 0.0;
+        for (k, v) in t.iter().enumerate() {
+            let (x, y, z) = nrm(v);
+            let (sx, sy, d) = project3(x, y, z, cf, sf, ct, st);
+            screen[k] = (sx, sy);
+            depth += d;
+            zavg += z;
+        }
+        bbox[0] = bbox[0].min(screen[0].0).min(screen[1].0).min(screen[2].0);
+        bbox[1] = bbox[1].min(screen[0].1).min(screen[1].1).min(screen[2].1);
+        bbox[2] = bbox[2].max(screen[0].0).max(screen[1].0).max(screen[2].0);
+        bbox[3] = bbox[3].max(screen[0].1).max(screen[1].1).max(screen[2].1);
+        faces.push((depth / 3.0, screen, zavg / 3.0));
+    }
+    faces.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    let (cw, ch) = (552.0, 316.0);
+    let scale = (cw / (bbox[2] - bbox[0]).max(1e-9)).min(ch / (bbox[3] - bbox[1]).max(1e-9));
+    let (cxm, cym) = (320.0, 206.0);
+    let to_screen = |sx: f64, sy: f64| -> (f64, f64) {
+        (
+            cxm + (sx - (bbox[0] + bbox[2]) / 2.0) * scale,
+            cym - (sy - (bbox[1] + bbox[3]) / 2.0) * scale,
+        )
+    };
+
+    // Штатив осей в ближне-нижнем углу.
+    let (bx, by, bz) = (-1.05, -1.05, -1.05);
+    let tripod = [
+        (bx + 0.55, by, bz, "x"),
+        (bx, by + 0.55, bz, "y"),
+        (bx, by, bz + 0.55, "z"),
+    ];
+    let origin = project3(bx, by, bz, cf, sf, ct, st);
+
+    let notes = vec![
+        Note::new(
+            format!(
+                "изоповерхность f = {level} · сетка {}×{}×{} · треугольников {}",
+                grid.nx,
+                grid.ny,
+                grid.nz,
+                tris.len()
+            ),
+            12.0,
+            C_TEXT,
+        ),
+        Note::new(
+            format!(
+                "поле ∈ [{}, {}] · marching tetrahedra: 6 тетраэдров/куб, \
+                 самокоррекция нормалей · watertight",
+                num(lo),
+                num(hi)
+            ),
+            10.0,
+            C_MUTED,
+        ),
+        Note::new(
+            "цвет — высота z: синий (мин) → красный (макс) · камера −60°/28°, \
+             painter's-алгоритм",
+            10.0,
+            C_MUTED,
+        ),
+    ];
+    const W: u32 = 640;
+    const NOTES_Y: f64 = 380.0;
+    let h = (NOTES_Y + notes_height(&notes, 60.0, W as f64) + 12.0).ceil() as u32;
+
+    let mut s = svg_open(W, h);
+    s.push_str(&title("Изоповерхность: marching tetrahedra", W));
+
+    for (_, screen, zt) in &faces {
+        let fill = lerp_hex("#3b82f6", "#ef4444", (zt + 1.0) / 2.0);
+        let pts_str: Vec<String> = screen
+            .iter()
+            .map(|(x, y)| {
+                let (px, py) = to_screen(*x, *y);
+                format!("{px:.1},{py:.1}")
+            })
+            .collect();
+        s.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"{fill}\" fill-opacity=\"0.96\" \
+             stroke=\"#334155\" stroke-opacity=\"0.3\" stroke-width=\"0.3\"/>\n",
+            pts_str.join(" ")
+        ));
+    }
+
+    let (osx, osy) = to_screen(origin.0, origin.1);
+    for (tx, ty, tz, label) in tripod {
+        let (sx, sy, _) = project3(tx, ty, tz, cf, sf, ct, st);
+        let (px, py) = to_screen(sx, sy);
+        s.push_str(&format!(
+            "<line x1=\"{osx:.1}\" y1=\"{osy:.1}\" x2=\"{px:.1}\" y2=\"{py:.1}\" \
+             stroke=\"{}\" stroke-width=\"1.2\"/>\n",
+            C_MUTED
+        ));
+        let (dx, dy) = (px - osx, py - osy);
+        let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+        let (lx, ly) = (px + dx / d * 14.0, py + dy / d * 14.0);
+        s.push_str(&halo_text(lx, ly + 3.5, 11.0, "middle", C_MUTED, label));
+    }
+
+    let (block, _) = notes_svg(&notes, 60.0, W as f64, NOTES_Y);
+    s.push_str(&block);
+    s.push_str("</svg>");
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

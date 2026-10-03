@@ -141,6 +141,9 @@ pub mod exec;
 
 pub mod gateway;
 pub mod game;
+/// Сессия-12: GIS-ядро на тритных координатах — geo-types порт,
+/// DE-9IM в 9-тритном коде, marching tetrahedra для изоповерхностей.
+pub mod geo;
 pub mod graph;
 pub mod license;
 pub mod literary;

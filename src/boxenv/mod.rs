@@ -229,6 +229,17 @@ fn govern_and_reap(
             kill_reason = reason;
         }
     }
+    // Гигиена Сессии-12: tmpfs умирает вместе с mntns stage2, но ПУСТЫЕ
+    // маунтпоинты /tmp/poler-box-<pid> оставались на диске навсегда
+    // (полевой отчёт root-пробы: 107 следов в /tmp). Вычищаем оба
+    // варианта имени (изолированный и debug) — манифест «ни байта мусора».
+    for pat in [
+        format!("poler-box-{}", child_pid),
+        format!("poler-box-dbg-{}", child_pid),
+    ] {
+        let dir = std::env::temp_dir().join(pat);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     let (exit_code, signal) = if libc_wifexited(status) {
         (Some(libc_wexitstatus(status)), None)
     } else if libc_wifsignaled(status) {

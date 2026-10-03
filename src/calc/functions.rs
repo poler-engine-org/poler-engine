@@ -75,6 +75,42 @@ fn matrix_arg(args: &[Value], i: usize) -> Result<Matrix, String> {
     }
 }
 
+/// Кольцо/точка: матрица N×2 (N=1 — точка, N=2 — отрезок, ≥3 — кольцо,
+/// замыкается автоматически). Возвращает f64-координаты.
+fn ring_arg(args: &[Value], i: usize, name: &str) -> Result<Vec<(f64, f64)>, String> {
+    let m = match args.get(i) {
+        Some(Value::Matrix(m)) => m.clone(),
+        Some(other) => {
+            return Err(format!(
+                "{name}: аргумент {} — матрица Nx2 (кольцо/точка), получено {other}",
+                i + 1
+            ))
+        }
+        None => return Err(format!("{name}: не хватает аргументов")),
+    };
+    if m.cols != 2 || m.rows < 1 {
+        return Err(format!(
+            "{name}: матрица {}×{} — нужно Nx2 (x, y в столбцах)",
+            m.rows, m.cols
+        ));
+    }
+    let mut pts = Vec::with_capacity(m.rows);
+    for r in 0..m.rows {
+        pts.push((m.get(r, 0).re, m.get(r, 1).re));
+    }
+    Ok(pts)
+}
+
+/// f64-кольцо → тритные точки решётки 3⁻ᵏ.
+fn quantize_ring(ring: &[(f64, f64)], k: u8) -> Result<Vec<crate::geo::trit_coord::TritPoint>, String> {
+    ring.iter()
+        .map(|&(x, y)| {
+            crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+                .map_err(|e| format!("квантование ({x}, {y}): {e}"))
+        })
+        .collect()
+}
+
 /// Complex → Value: вещественный результат остаётся числом (нулевая
 /// регрессия отображения), комплексный — Complex (цикл O).
 fn complex_to_value(c: Complex) -> Value {
@@ -301,6 +337,8 @@ pub fn is_function(name: &str) -> bool {
         | "viz" | "viz_bell" | "viz_scale" | "viz_prob" | "viz_bars" | "viz_matrix"
         // суверенный рендер (сессия-9)
         | "viz_graph" | "viz_field" | "viz_surf"
+        // GIS-ядро на тритах (сессия-12)
+        | "viz_iso3" | "de9im" | "geo_pred"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -325,6 +363,8 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 | "planet_lon" | "planet_dist"
                 // viz-функции принимают список целиком (сессия-8)
                 | "viz" | "viz_prob" | "viz_bars"
+                // стек срезов — целиком (сессия-12)
+                | "viz_iso3"
         ) {
             return map_over_lists(name, args);
         }
@@ -981,6 +1021,119 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let m = matrix_arg(args, 0)?;
             Ok(Value::Str(viz::surf_svg(&m)?))
         }
+        // ---------- GIS-ядро на тритах (сессия-12) ----------
+        "viz_iso3" => {
+            // Стек z-срезов: список матриц (список строится функциями —
+            // литерала списка матриц в языке нет; либо одна матрица
+            // (rows = nz·ny, блоки строк — срезы), либо список).
+            let level = match args.get(1) {
+                None => None,
+                Some(Value::Scalar(v)) => Some(*v),
+                Some(Value::Quantity(q, u)) if u.is_dimensionless() => Some(*q),
+                Some(other) => {
+                    return Err(format!(
+                        "viz_iso3: уровень — число, получено {other}"
+                    ))
+                }
+            };
+            let slices: Vec<Matrix> = match args.get(0) {
+                Some(Value::List(items)) => {
+                    let mut ms = Vec::with_capacity(items.len());
+                    for (i, it) in items.iter().enumerate() {
+                        match it {
+                            Value::Matrix(m) => ms.push(m.clone()),
+                            other => {
+                                return Err(format!(
+                                    "viz_iso3: срез {i} должен быть матрицей, \
+                                     получено {other}"
+                                ))
+                            }
+                        }
+                    }
+                    ms
+                }
+                Some(Value::Matrix(m)) => {
+                    // Одна матрица (nz·ny)×nx: nz блоков по ny строк.
+                    if m.rows % m.cols != 0 || m.rows / m.cols < 2 {
+                        return Err(format!(
+                            "viz_iso3: матрица {}×{} не разбивается на куб \
+                             (rows должны быть nz·cols)",
+                            m.rows, m.cols
+                        ));
+                    }
+                    let ny = m.cols;
+                    let nz = m.rows / ny;
+                    let mut ms = Vec::with_capacity(nz);
+                    for k in 0..nz {
+                        let mut plane = Matrix::zeros(ny, m.cols);
+                        for i in 0..ny {
+                            for j in 0..m.cols {
+                                plane.set(i, j, m.get(k * ny + i, j));
+                            }
+                        }
+                        ms.push(plane);
+                    }
+                    ms
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "viz_iso3: аргумент 1 — список матриц или блочная \
+                         матрица, получено {other}"
+                    ))
+                }
+                None => return Err("viz_iso3: не хватает аргументов".into()),
+            };
+            Ok(Value::Str(viz::iso3_svg(&slices, level)?))
+        }
+        "de9im" => {
+            // relate(a, b [, k]): кольца — матрицы Nx2; точка — 1x2.
+            let a = ring_arg(args, 0, "de9im")?;
+            let b = ring_arg(args, 1, "de9im")?;
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "de9im: масштаб k ∈ [0, 12] — число, получено {other}"
+                    ))
+                }
+            };
+            let qa = quantize_ring(&a, k)?;
+            let qb = quantize_ring(&b, k)?;
+            let m = crate::geo::de9im::relate(&qa, &qb)
+                .map_err(|e| format!("de9im: {e}"))?;
+            let preds = m.predicate_names().join(", ");
+            Ok(Value::Str(format!(
+                "{} · код {} · предикаты: {}",
+                m.bal_string(),
+                m.trit_code(),
+                if preds.is_empty() { "—" } else { &preds }
+            )))
+        }
+        "geo_pred" => {
+            // Список сработавших предикатов relate(a, b [, k]).
+            let a = ring_arg(args, 0, "geo_pred")?;
+            let b = ring_arg(args, 1, "geo_pred")?;
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "geo_pred: масштаб k ∈ [0, 12] — число, получено {other}"
+                    ))
+                }
+            };
+            let qa = quantize_ring(&a, k)?;
+            let qb = quantize_ring(&b, k)?;
+            let m = crate::geo::de9im::relate(&qa, &qb)
+                .map_err(|e| format!("geo_pred: {e}"))?;
+            Ok(Value::List(
+                m.predicate_names()
+                    .into_iter()
+                    .map(|p| Value::Str(p.to_string()))
+                    .collect(),
+            ))
+        }
         // ---------- триты ----------
         "trits" => {
             let v = one_arg(args, name)?;
@@ -1197,6 +1350,14 @@ pub fn catalog(filter: &str) -> String {
             "viz_field(M) — изолинии marching squares (7 уровней) поверх дивергентной карты",
             "viz_surf(M) — 3D-поверхность: поворот, ортоскопия, painter's-алгоритм (до 48×48)",
             "математика вырезана из Graphviz/NetworkX/Matplotlib — ноль зависимостей, чистый Rust",
+        ]),
+        ("GIS-ядро на тритах (сессия-12)", &[
+            "de9im(кольцоA, кольцоB[, k]) — топология OGC 9-IM: 9 тритов → сбалансированный код",
+            "матрица «−0+…» · предикаты: intersects/contains/within/touches/overlaps/equals…",
+            "geo_pred(A, B[, k]) — список сработавших предикатов",
+            "точность без epsilon: координаты квантуются в тритную решётку 3⁻ᵏ (k ≤ 12)",
+            "viz_iso3(стек срезов, уровень) — изоповерхность: marching tetrahedra, watertight",
+            "кольцо — матрица Nx2 [x,y; x,y; …] · стек — список матриц либо блочная (nz·ny)×nx",
         ]),
     ];
     let mut out = String::new();
@@ -1579,5 +1740,112 @@ mod tests {
         }
         // Каталог знает новую группу.
         assert!(catalog("").contains("суверенный рендер"));
+    }
+
+    // ─────────── GIS-ядро на тритах (сессия-12) ───────────
+
+    fn ring_of(pts: &[(f64, f64)]) -> Value {
+        Value::Matrix(
+            Matrix::from_rows(
+                &pts.iter().map(|&(x, y)| vec![x, y]).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn de9im_overlapping_and_nested() {
+        let a = ring_of(&[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]);
+        let b = ring_of(&[(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)]);
+        match call("de9im", &[a.clone(), b]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("overlaps"), "отчёт: {rep}");
+                assert!(rep.contains("код"));
+            }
+            other => panic!("de9im: не строка {other:?}"),
+        }
+        let big = ring_of(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        let small = ring_of(&[(3.0, 3.0), (5.0, 3.0), (5.0, 5.0), (3.0, 5.0)]);
+        match call("geo_pred", &[big, small]).unwrap() {
+            Value::List(items) => {
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(s) => s.clone(),
+                        o => format!("{o}"),
+                    })
+                    .collect();
+                assert!(names.contains(&"contains".to_string()), "{names:?}");
+                assert!(!names.contains(&"overlaps".to_string()));
+            }
+            other => panic!("geo_pred: не список {other:?}"),
+        }
+    }
+
+    #[test]
+    fn de9im_point_and_disjoint() {
+        let sq = ring_of(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)]);
+        let inside = ring_of(&[(2.0, 2.0)]);
+        match call("geo_pred", &[inside, sq]).unwrap() {
+            Value::List(items) => {
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(s) => s.clone(),
+                        o => format!("{o}"),
+                    })
+                    .collect();
+                assert!(names.contains(&"within".to_string()), "{names:?}");
+            }
+            other => panic!("geo_pred: не список {other:?}"),
+        }
+        let far = ring_of(&[(9.0, 9.0)]);
+        match call("de9im", &[far, ring_of(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)])]).unwrap() {
+            Value::Str(rep) => assert!(rep.contains("disjoint")),
+            other => panic!("de9im: не строка {other:?}"),
+        }
+        // Неверный масштаб — ошибка.
+        assert!(call("de9im", &[ring_of(&[(0.0, 0.0)]), ring_of(&[(1.0, 1.0)]), s(13.0)]).is_err());
+    }
+
+    #[test]
+    fn viz_iso3_sphere_scene() {
+        // Сфера как стек z-срезов (3 среза 8×8): f = r − d.
+        let n = 8usize;
+        let c = (n - 1) as f64 / 2.0;
+        let r = n as f64 * 0.4;
+        let slices: Vec<Value> = (0..3)
+            .map(|iz| {
+                let z = iz as f64;
+                let mut rows: Vec<Vec<f64>> = Vec::new();
+                for iy in 0..n {
+                    let mut row: Vec<f64> = Vec::new();
+                    for ix in 0..n {
+                        let d = (
+                            (ix as f64 - c).powi(2)
+                                + (iy as f64 - c).powi(2)
+                                + (z - c).powi(2)
+                        )
+                        .sqrt();
+                        row.push(r - d);
+                    }
+                    rows.push(row);
+                }
+                Value::Matrix(Matrix::from_rows(&rows).unwrap())
+            })
+            .collect();
+        match call("viz_iso3", &[Value::List(slices)]).unwrap() {
+            Value::Str(svg) => {
+                assert!(svg.starts_with("<svg"));
+                assert!(svg.contains("marching tetrahedra"));
+                assert!(svg.contains("треугольников"));
+            }
+            other => panic!("viz_iso3: не строка {other:?}"),
+        }
+        // Уровень вне поля — ошибка.
+        let flat = Value::Matrix(
+            Matrix::from_rows(&[vec![1.0, 1.0], vec![1.0, 1.0]]).unwrap(),
+        );
+        assert!(call("viz_iso3", &[flat]).is_err());
     }
 }
