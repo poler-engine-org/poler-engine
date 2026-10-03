@@ -750,6 +750,94 @@ fn cglmp_violation_of_local_realism() {
     );
 }
 
+/// Оптимум Ацина (сессия 6): НЕкомпактное состояние
+/// |Ψ_mv⟩ = (|00⟩+γ|11⟩+|22⟩)/√(2+γ²), γ=(√11−√3)/2 ≈ 0.792287,
+/// СО СТАНДАРТНЫМИ фазовыми лестницами CGLMP даёт точный максимум
+/// I₃ = 1+√(11/3) ≈ 2.914854 — Acín-Durt-Gisin-Latorre (quant-ph/0111143).
+/// DE-поиск сессии 6 переоткрыл это состояние независимо (γ = 0.792287
+/// с 4 знаками) до сверки со статьёй. Четыре пути проверки: контур CGLMP,
+/// оператор Белла == статье (позлементно), собственное уравнение, шум.
+#[test]
+fn acin_optimum_nonmaximally_entangled() {
+    let mut st = lab();
+    cglmp_setup(&mut st);
+    for line in [
+        "let gam = (sqrt(11)-sqrt(3))/2",
+        "let nn = 2 + gam^2",
+        "let mv = (1/sqrt(nn)) * [1;0;0;0;gam;0;0;0;1]",
+        "let s11m = FF * kron(eye(3), B1p) * mv",
+        "let s12m = FF * kron(eye(3), B2p) * mv",
+        "let s21m = FF * kron(A2p, B1p) * mv",
+        "let s22m = FF * kron(A2p, B2p) * mv",
+        "let M11 = kron(eye(3), B1p)",
+        "let M12 = kron(eye(3), B2p)",
+        "let M21 = kron(A2p, B1p)",
+        "let M22 = kron(A2p, B2p)",
+        // оператор Белла из примитивов движка: B = Σ±(A⊗B)†·F F†·Pc·F F·(A⊗B)
+        "let Bop = dagger(M11)*dagger(FF)*Pc0*FF*M11 + dagger(M21)*dagger(FF)*Pcm*FF*M21 + dagger(M22)*dagger(FF)*Pc0*FF*M22 + dagger(M12)*dagger(FF)*Pc0*FF*M12 - dagger(M11)*dagger(FF)*Pcm*FF*M11 - dagger(M21)*dagger(FF)*Pc0*FF*M21 - dagger(M22)*dagger(FF)*Pcm*FF*M22 - dagger(M12)*dagger(FF)*Pcp*FF*M12",
+        // оператор Белла из статьи (quant-ph/0111143, Eq. bellop) — литерал
+        "let Bpaper = [0,0,0,0,2/sqrt(3),0,0,0,2; 0,0,0,0,0,2/sqrt(3),0,0,0; 0,0,0,0,0,0,0,0,0; 0,0,0,0,0,0,0,2/sqrt(3),0; 2/sqrt(3),0,0,0,0,0,0,0,2/sqrt(3); 0,2/sqrt(3),0,0,0,0,0,0,0; 0,0,0,0,0,0,0,0,0; 0,0,0,2/sqrt(3),0,0,0,0,0; 2,0,0,0,2/sqrt(3),0,0,0,0]",
+    ] {
+        st.eval_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+    // 1) контур CGLMP: I₃ = 1+√(11/3) — точный литературный максимум d=3
+    let i3 = re(
+        &mut st,
+        "trace(dagger(s11m)*Pc0*s11m) + trace(dagger(s21m)*Pcm*s21m) + trace(dagger(s22m)*Pc0*s22m) + trace(dagger(s12m)*Pc0*s12m) - trace(dagger(s11m)*Pcm*s11m) - trace(dagger(s21m)*Pc0*s21m) - trace(dagger(s22m)*Pcm*s22m) - trace(dagger(s12m)*Pcp*s12m)",
+    );
+    near(i3, 1.0 + (11.0_f64 / 3.0).sqrt(), 1e-12, "I₃(Ацин) = 1+√(11/3)");
+    // превышает и локальный предел (2), и компактный максимум Белла
+    assert!(i3 > 2.0, "нарушение локального реализма: {i3} > 2");
+    assert!(
+        i3 > (4.0 / 9.0) * (3.0 + 2.0 * 3.0_f64.sqrt()),
+        "некомпактное состояние бьёт компактный максимум 2.8729"
+    );
+    // 2) оператор Белла движка == оператору статьи позлементно
+    near(
+        zero_norm(&mut st, "Bop-Bpaper"),
+        0.0,
+        1e-24,
+        "Bop == Bpaper (статья, Eq. bellop)",
+    );
+    // 3) Rayleigh и собственное уравнение: |Ψ_mv⟩ — собственный вектор B
+    near(
+        re_part(&mut st, "trace(dagger(mv)*Bop*mv)"),
+        1.0 + (11.0_f64 / 3.0).sqrt(),
+        1e-12,
+        "⟨Ψ|B|Ψ⟩ = λ_max (Rayleigh)",
+    );
+    near(
+        modulus(&mut st, "Bop*mv - (1+sqrt(11/3))*mv"),
+        0.0,
+        1e-12,
+        "B·Ψ = λ·Ψ — собственный вектор (норма невязки)",
+    );
+    // 4) шумовой порог: η* = 2/(1+√(11/3)) → I₃(η*) = 2 ровно;
+    //    η*(Ацин) < η*(Белл): некомпактное состояние ТОЛЕРАНТНЕЕ к шуму
+    st.eval_line("let etam = 2/(1+sqrt(11/3))").unwrap();
+    st.eval_line("let rhom = mv*transpose(mv)").unwrap();
+    st.eval_line("let rhom1 = etam*rhom + (1-etam)*(1/9)*eye(9)").unwrap();
+    for (nm, m) in [("r11m", "M11"), ("r12m", "M12"), ("r21m", "M21"), ("r22m", "M22")] {
+        st.eval_line(&format!("let {nm} = {m}*rhom1*dagger({m})")).unwrap();
+        st.eval_line(&format!("let a{nm} = FF*{nm}*dagger(FF)")).unwrap();
+    }
+    near(
+        re_part(
+            &mut st,
+            "trace(Pc0*ar11m) + trace(Pcm*ar21m) + trace(Pc0*ar22m) + trace(Pc0*ar12m) - trace(Pcm*ar11m) - trace(Pc0*ar21m) - trace(Pcm*ar22m) - trace(Pcp*ar12m)",
+        ),
+        2.0,
+        1e-10,
+        "I₃(η*_Ацин) = 2 — критическая видимость",
+    );
+    near(
+        re(&mut st, "2/(1+sqrt(11/3))"),
+        2.0 / (1.0 + (11.0_f64 / 3.0).sqrt()),
+        1e-12,
+        "η* = 2/(1+√(11/3)) ≈ 0.686141 < η*(Белл) = 0.696152",
+    );
+}
+
 /// Настройка QAOA: 6 кутритов K4-ядра коннектома мухи (реальные веса).
 fn qaoa_setup(st: &mut CalcState) {
     for line in [
