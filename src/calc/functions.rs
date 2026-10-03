@@ -15,6 +15,7 @@ use super::solve::Complex;
 use super::trits::Trits;
 use super::units;
 use super::units::Unit;
+use super::viz;
 use super::Value;
 
 // ---------------------------------------------------------------------
@@ -103,6 +104,35 @@ fn str_arg(args: &[Value], i: usize) -> Result<String, String> {
     match args.get(i) {
         Some(Value::Str(s)) => Ok(s.clone()),
         Some(other) => Err(format!("аргумент {} должен быть строкой \"…\": {other}", i + 1)),
+        None => Err("не хватает аргументов".into()),
+    }
+}
+
+/// Список чисел целиком (viz_prob/viz_bars сессии-8):
+/// скаляры и безразмерные величины; вектор-матрица [a, b, c]
+/// (грабля 16: литерал в скобках — матрица-строка).
+fn float_list_arg(args: &[Value], i: usize, name: &str) -> Result<Vec<f64>, String> {
+    match args.get(i) {
+        Some(Value::List(items)) => items
+            .iter()
+            .map(|x| match x {
+                Value::Scalar(v) => Ok(*v),
+                Value::Quantity(q, u) if u.is_dimensionless() => Ok(*q),
+                other => Err(format!(
+                    "{name}: элементы списка должны быть числами, получено {other}"
+                )),
+            })
+            .collect(),
+        Some(Value::Matrix(m)) => viz::matrix_as_vector(m).ok_or_else(|| {
+            format!(
+                "{name}: матрица {}×{} — не вектор; подайте строку [a, b, c] или столбец",
+                m.rows, m.cols
+            )
+        }),
+        Some(other) => Err(format!(
+            "{name}: аргумент {} должен быть списком [ … ], получено {other}",
+            i + 1
+        )),
         None => Err("не хватает аргументов".into()),
     }
 }
@@ -267,6 +297,8 @@ pub fn is_function(name: &str) -> bool {
         | "pauli_x" | "pauli_y" | "pauli_z" | "hadamard"
         // триты
         | "trits" | "trit_val" | "trit_and" | "trit_or" | "trit_not"
+        // визуализация (цикл U, сессия-8)
+        | "viz" | "viz_bell" | "viz_scale" | "viz_prob" | "viz_bars" | "viz_matrix"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -289,6 +321,8 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 | "hypot" | "clamp" | "mod" | "binomial" | "trit_and" | "trit_or"
                 | "midpoint" | "dist" | "bearing" | "dest" | "sunrise" | "sunset"
                 | "planet_lon" | "planet_dist"
+                // viz-функции принимают список целиком (сессия-8)
+                | "viz" | "viz_prob" | "viz_bars"
         ) {
             return map_over_lists(name, args);
         }
@@ -868,6 +902,48 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Matrix(m))
         }
 
+        // ---------- визуализация (цикл U, сессия-8) ----------
+        "viz" => {
+            need(args, 1, name)?;
+            Ok(Value::Str(viz::auto_svg(&args[0])?))
+        }
+        "viz_bell" => {
+            let i = one_arg(args, name)?;
+            Ok(Value::Str(viz::bell_svg(i)))
+        }
+        "viz_scale" => {
+            // Метры: скаляр по конвенции либо величина длиновой
+            // размерности (конверсия через factor к базовой).
+            need(args, 1, name)?;
+            let x_m = match args.get(0) {
+                Some(Value::Scalar(x)) => *x,
+                Some(Value::Quantity(q, u))
+                    if u.dim[0] == 1 && u.dim[1..].iter().all(|d| *d == 0) =>
+                {
+                    q * u.factor
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "viz_scale: аргумент 1 должен быть числом (метры) или длиной, \
+                         получено {other}"
+                    ))
+                }
+                None => return Err("viz_scale: не хватает аргументов".into()),
+            };
+            Ok(Value::Str(viz::scale_svg(x_m)?))
+        }
+        "viz_prob" => {
+            let ps = float_list_arg(args, 0, name)?;
+            Ok(Value::Str(viz::prob_svg(&ps)?))
+        }
+        "viz_bars" => {
+            let vs = float_list_arg(args, 0, name)?;
+            Ok(Value::Str(viz::bars_svg(&vs)?))
+        }
+        "viz_matrix" => {
+            let m = matrix_arg(args, 0)?;
+            Ok(Value::Str(viz::matrix_svg(&m)?))
+        }
         // ---------- триты ----------
         "trits" => {
             let v = one_arg(args, name)?;
@@ -1069,6 +1145,14 @@ pub fn catalog(filter: &str) -> String {
         ("геодезия", &[
             "dist bearing (lat1, lon1, lat2, lon2) — км / град",
             "midpoint dest earth_radius",
+        ]),
+        ("визуализация (цикл U, сессия-8)", &[
+            "viz(x) — авто: число → Белл/шкала, список → вероятности/спектр, матрица → теплокарта",
+            "viz_bell(I) — радар CGLMP: классика 2.0 · Цирельсон 2.828 · Ацин 2.915 · квкварт 2.973",
+            "viz_scale(x) — лог-шкала Вселенной в метрах: Планковская длина → наблюдаемая Вселенная",
+            "viz_prob([p…]) — Born-вероятности столбцами · viz_bars([v…]) — спектр значений",
+            "viz_matrix(M) — теплокарта матрицы до 64×64: красный ≥ 0, синий < 0",
+            "вывод — SVG 1.1 строкой: сохраняйте в файл и открывайте глазами",
         ]),
     ];
     let mut out = String::new();

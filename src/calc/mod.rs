@@ -52,6 +52,7 @@ pub mod scriptgen;
 pub mod solve;
 pub mod trits;
 pub mod units;
+pub mod viz;
 
 /// Значение калькулятора.
 #[derive(Clone, PartialEq)]
