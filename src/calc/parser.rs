@@ -22,6 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use super::constants;
 use super::functions;
@@ -33,7 +34,7 @@ use super::units;
 use super::units::Unit;
 use super::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -448,6 +449,149 @@ pub fn free_vars(e: &Expr, out: &mut BTreeSet<String>) {
 
 /// Вычислить AST. `vars` может пополняться присваиваниями.
 pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String> {
+    // CSE-кеш подвыражений — ГРАБЛИ сессии-4 (исправлены): вложенные
+    // выражения с повторяющимися поддеревьями удваиваются на каждом уровне
+    // (2¹¹–2¹⁵ перевычислений на сканах углов QAOA, сессия виснет минутами).
+    // Структурный кеш превращает 2^N повторов в N вычислений + дешёвые клоны.
+    // Безопасно: в пределах одного statement `vars` не мутирует (Assign —
+    // только корень, и он чистит кеш), недетерминированных функций
+    // в calc нет (random/now отсутствуют) — повтор = тот же результат.
+    let mut memo = HashMap::new();
+    eval_cse(e, vars, &mut memo)
+}
+
+/// Потолок кеша: защищает память от гигантских выражений с сотнями
+/// уникальных больших поддеревьев (матрица 729×729 Complex ≈ 8.5 МБ на запись).
+const MEMO_CAP: usize = 4096;
+
+/// Ключ кеша: заимствованное поддерево + побитовая структурная эквивалентность.
+/// f64 не реализует Hash/Eq (NaN!) — поэтому сравнение и хеш пишем руками
+/// по битам: консистентно (±0.0 и NaN-биты различаются → разные ключи,
+/// безопасный промах вместо ложного попадания).
+#[derive(Debug)]
+struct ExprKey<'a>(&'a Expr);
+
+impl<'a> PartialEq for ExprKey<'a> {
+    fn eq(&self, o: &Self) -> bool {
+        expr_eq(self.0, o.0)
+    }
+}
+impl Eq for ExprKey<'_> {}
+
+impl Hash for ExprKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        hash_expr(self.0, state)
+    }
+}
+
+/// Побитовая структурная эквивалентность (без IEEE-приключений ±0.0/NaN).
+fn expr_eq(a: &Expr, b: &Expr) -> bool {
+    use Expr::*;
+    match (a, b) {
+        (Num(x), Num(y)) => x.to_bits() == y.to_bits(),
+        (UnitLit(x, s1), UnitLit(y, s2)) => x.to_bits() == y.to_bits() && s1 == s2,
+        (Str(s1), Str(s2)) => s1 == s2,
+        (Ident(s1), Ident(s2)) => s1 == s2,
+        (Call { name: n1, args: a1 }, Call { name: n2, args: a2 }) => {
+            n1 == n2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_eq(x, y))
+        }
+        (Neg(x), Neg(y)) | (Fact(x), Fact(y)) => expr_eq(x, y),
+        (
+            Bin { op: o1, lhs: l1, rhs: r1 },
+            Bin { op: o2, lhs: l2, rhs: r2 },
+        ) => o1 == o2 && expr_eq(l1, l2) && expr_eq(r1, r2),
+        (MatrixLit(m1), MatrixLit(m2)) => {
+            m1.len() == m2.len()
+                && m1.iter().zip(m2).all(|(r1, r2)| {
+                    r1.len() == r2.len() && r1.iter().zip(r2).all(|(x, y)| expr_eq(x, y))
+                })
+        }
+        (Assign { name: n1, expr: e1 }, Assign { name: n2, expr: e2 }) => {
+            n1 == n2 && expr_eq(e1, e2)
+        }
+        (Convert { expr: e1, spec: s1 }, Convert { expr: e2, spec: s2 }) => {
+            expr_eq(e1, e2) && s1 == s2
+        }
+        (Equation { lhs: l1, rhs: r1 }, Equation { lhs: l2, rhs: r2 }) => {
+            expr_eq(l1, l2) && expr_eq(r1, r2)
+        }
+        _ => false,
+    }
+}
+
+/// Структурный хеш: дискриминант + биты листьев.
+fn hash_expr<H: std::hash::Hasher>(e: &Expr, state: &mut H) {
+    use Expr::*;
+    std::mem::discriminant(e).hash(state);
+    match e {
+        Num(v) => v.to_bits().hash(state),
+        UnitLit(v, spec) => {
+            v.to_bits().hash(state);
+            spec.hash(state);
+        }
+        Str(s) | Ident(s) => s.hash(state),
+        Call { name, args } => {
+            name.hash(state);
+            args.len().hash(state);
+            for a in args {
+                hash_expr(a, state);
+            }
+        }
+        Neg(x) | Fact(x) => hash_expr(x, state),
+        Bin { op, lhs, rhs } => {
+            op.hash(state);
+            hash_expr(lhs, state);
+            hash_expr(rhs, state);
+        }
+        MatrixLit(rows) => {
+            rows.len().hash(state);
+            for r in rows {
+                r.len().hash(state);
+                for c in r {
+                    hash_expr(c, state);
+                }
+            }
+        }
+        Assign { name, expr } => {
+            name.hash(state);
+            hash_expr(expr, state);
+        }
+        Convert { expr, spec } => {
+            hash_expr(expr, state);
+            spec.hash(state);
+        }
+        Equation { lhs, rhs } => {
+            hash_expr(lhs, state);
+            hash_expr(rhs, state);
+        }
+    }
+}
+
+fn eval_cse<'a>(
+    e: &'a Expr,
+    vars: &mut HashMap<String, Value>,
+    memo: &mut HashMap<ExprKey<'a>, Value>,
+) -> Result<Value, String> {
+    // кешируем только «дорогие» узлы — вызовы функций и бинарные операции;
+    // листья (Num/Ident/Str) дешёвые, их кешировать нет смысла
+    let cacheable = matches!(e, Expr::Call { .. } | Expr::Bin { .. });
+    if cacheable {
+        if let Some(v) = memo.get(&ExprKey(e)) {
+            return Ok(v.clone());
+        }
+    }
+    let v = eval_node(e, vars, memo)?;
+    if cacheable && memo.len() < MEMO_CAP {
+        memo.insert(ExprKey(e), v.clone());
+    }
+    Ok(v)
+}
+
+fn eval_node<'a>(
+    e: &'a Expr,
+    vars: &mut HashMap<String, Value>,
+    memo: &mut HashMap<ExprKey<'a>, Value>,
+) -> Result<Value, String> {
     match e {
         Expr::Num(v) => Ok(Value::Scalar(*v)),
         Expr::UnitLit(v, spec) => {
@@ -478,21 +622,21 @@ pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String
         Expr::Call { name, args } => {
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
-                vals.push(eval(a, vars)?);
+                vals.push(eval_cse(a, vars, memo)?);
             }
             functions::call_function(name, &vals)
         }
         Expr::Neg(x) => {
-            let v = eval(x, vars)?;
+            let v = eval_cse(x, vars, memo)?;
             negate(&v)
         }
         Expr::Bin { op, lhs, rhs } => {
-            let a = eval(lhs, vars)?;
-            let b = eval(rhs, vars)?;
+            let a = eval_cse(lhs, vars, memo)?;
+            let b = eval_cse(rhs, vars, memo)?;
             binary_op(*op, &a, &b)
         }
         Expr::Fact(x) => {
-            let v = eval(x, vars)?;
+            let v = eval_cse(x, vars, memo)?;
             factorial(&v)
         }
         Expr::MatrixLit(rows) => {
@@ -501,7 +645,7 @@ pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String
             for r in rows {
                 let mut row = Vec::with_capacity(r.len());
                 for c in r {
-                    let v = eval(c, vars)?;
+                    let v = eval_cse(c, vars, memo)?;
                     match v {
                         Value::Scalar(x) => row.push(Complex::new(x, 0.0)),
                         Value::Complex(z) => row.push(z),
@@ -527,12 +671,14 @@ pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String
             Ok(Value::Matrix(Matrix::from_complex_rows(&data)?))
         }
         Expr::Assign { name, expr } => {
-            let v = eval(expr, vars)?;
+            // присваивание мутирует vars → все кеш-записи недействительны
+            memo.clear();
+            let v = eval_cse(expr, vars, memo)?;
             vars.insert(name.clone(), v.clone());
             Ok(v)
         }
         Expr::Convert { expr, spec } => {
-            let v = eval(expr, vars)?;
+            let v = eval_cse(expr, vars, memo)?;
             convert_value(v, spec)
         }
         Expr::Equation { .. } => {
@@ -1386,6 +1532,56 @@ mod tests {
         ] {
             let _ = parse(src, false);
             let _ = parse(src, true);
+        }
+    }
+
+    // ===== ГРАБЛИ сессии-4 → CSE-кеш (сессия-5) =====
+
+    #[test]
+    fn cse_repeated_subtrees_correct() {
+        // ГРАБЛИ сессии-4: вложенные выражения с повторяющимися поддеревьями
+        // удваивались на каждом уровне (2^N перевычислений). Кеш обязан
+        // возвращать ТОТ ЖЕ результат, что и наивный обход.
+        let mut vars: HashMap<String, Value> = HashMap::new();
+        vars.insert("x".into(), Value::Scalar(1.0));
+        // поддерево (x+1) повторено 4 раза: 2+2+2+2 = 8
+        let e = parse("((x+1)+(x+1))+((x+1)+(x+1))", false).unwrap();
+        assert_eq!(eval(&e, &mut vars).unwrap(), Value::Scalar(8.0));
+        // 12 повторов (x+x) как множителей: 2^12 = 4096 —
+        // без кеша это 2^12 раз вычислить (x+x); с кешем — один раз
+        let src = "(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)*(x+x)";
+        let e = parse(src, false).unwrap();
+        assert_eq!(eval(&e, &mut vars).unwrap(), Value::Scalar(4096.0));
+        // присваивание мутирует vars → кеш обязан сбрасываться:
+        // f = (x+x) при x=3; затем x = 7; f + (x+x) = 6 + 14 = 20
+        let mut st: HashMap<String, Value> = HashMap::new();
+        st.insert("x".into(), Value::Scalar(3.0));
+        let e1 = parse("let f = (x+x)", false).unwrap();
+        eval(&e1, &mut st).unwrap(); // f = 6
+        st.insert("x".into(), Value::Scalar(7.0)); // x изменился
+        let e2 = parse("f + (x+x)", false).unwrap();
+        assert_eq!(eval(&e2, &mut st).unwrap(), Value::Scalar(20.0)); // 6 + 14
+    }
+
+    #[test]
+    fn cse_matrix_expression_no_blowup() {
+        // матричный аналог: kron(A,B) повторён 8 раз в сумме —
+        // без CSE восемь дорогих kron'ов, с CSE один + клоны
+        let mut vars: HashMap<String, Value> = HashMap::new();
+        vars.insert(
+            "A".into(),
+            Value::Matrix(Matrix::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0]]).unwrap()),
+        );
+        vars.insert(
+            "B".into(),
+            Value::Matrix(Matrix::from_rows(&[vec![2.0, 0.0], vec![0.0, 2.0]]).unwrap()),
+        );
+        let src = "kron(A,B)+kron(A,B)+kron(A,B)+kron(A,B)+kron(A,B)+kron(A,B)+kron(A,B)+kron(A,B)";
+        let e = parse(src, false).unwrap();
+        let v = eval(&e, &mut vars).unwrap();
+        match v {
+            Value::Matrix(m) => assert_eq!(m.get(0, 0).re, 16.0), // 8 × 2
+            other => panic!("не матрица: {other:?}"),
         }
     }
 }

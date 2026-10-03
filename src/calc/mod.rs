@@ -248,7 +248,17 @@ impl CalcState {
         let expr = parser::parse(src, false)?;
         let val = parser::eval(&expr, &mut self.vars)?;
         self.vars.insert("ans".into(), val.clone());
-        let out = format!("{val}");
+        let mut out = format!("{val}");
+        // ГРАБЛИ сессии-4 (исправлены): let E = … — предупреждение о
+        // коллизии с константой e (Эйлер): переменная сильнее, пока жива,
+        // но в новой сессии идентификатор тихо вернётся к числу Эйлера
+        if let parser::Expr::Assign { name, .. } = &expr {
+            if let Some(canon) = constants::collide(name) {
+                out.push_str(&format!(
+                    "\n⚠ имя «{name}» совпадает с константой {canon}: переменная в приоритете, пока жива; потеряется (новая сессия/опечатка) — вернётся константа"
+                ));
+            }
+        }
         self.push_history(src, &out);
         Ok(out)
     }
@@ -857,5 +867,33 @@ mod tests {
         assert_eq!(calc("trits(5)"), "\"1TT\"");
         // теория чисел
         assert_eq!(calc("next_prime(1e6)"), "1000003.0");
+    }
+
+    // ===== ГРАБЛИ сессии-4 → исправления сессии-5 =====
+
+    #[test]
+    fn let_e_warns_euler_collision() {
+        // присваивание E работает и предупреждает о коллизии с e
+        let out = calc("let E = 5");
+        assert!(out.starts_with("5.0"), "{out}");
+        assert!(out.contains("совпадает с константой e"), "{out}");
+        // переменная сильнее константы, пока жива:
+        // trace(E) = 2 (след I₂), НЕ 2.718 (в сессии 4 «пропал» trace(E))
+        let mut st = CalcState::new();
+        let _ = st.eval_line("let E = [1, 0; 0, 1]").unwrap();
+        let r = st.eval_line("trace(E)").unwrap();
+        assert!(r.starts_with("2.0"), "{r}");
+        // без переменной E тихо разрешается в число Эйлера — так и было
+        let r = calc("E");
+        assert!(r.starts_with("2.718"), "{r}");
+        // регистронезависимые коллизии тоже предупреждаются (Pi, psi —
+        // psi = 2π/3, фаза тритной щели POLER!)
+        let out = calc("let Pi = 3");
+        assert!(out.contains("совпадает с константой"), "{out}");
+        let out = calc("let psi = 2");
+        assert!(out.contains("совпадает с константой"), "{out}");
+        // обычное имя — без предупреждения
+        let out = calc("let wave = [1, 0]");
+        assert!(!out.contains("совпадает с константой"), "{out}");
     }
 }

@@ -131,6 +131,18 @@ pub fn lookup(name: &str) -> Option<(f64, Unit)> {
     Some((cd.value, unit))
 }
 
+/// ГРАБЛИ сессии-4: `let E = …` молча коллизирует с числом Эйлера —
+/// пока переменная жива, она сильнее (порядок: vars → i → constants),
+/// но стоит её потерять (новая сессия, регистр e/E) — идентификатор E
+/// тихо превращается в 2.718… (в сессии 4 так «пропал» trace(E)).
+/// Возвращает каноническое имя константы при регистронезависимом совпадении.
+pub fn collide(name: &str) -> Option<&'static str> {
+    CONSTANTS
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .map(|c| c.name)
+}
+
 /// Источник константы (для объяснений и scriptgen).
 pub fn source_of(name: &str) -> Option<&'static str> {
     CONSTANTS

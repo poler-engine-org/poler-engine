@@ -526,10 +526,18 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         "abs" => {
             // цикл O: модуль комплексного |3+4i| = 5 и амплитуды 1×1
             // (квантовая вероятность: abs(⟨1|ψ⟩)^2)
+            // ГРАБЛИ сессии-4 (исправлены): abs был только скалярным — теперь
+            // вектор (1×n / n×1) даёт евклидову норму ‖v‖₂, общая матрица —
+            // норму Фробениуса ‖A‖_F = sqrt(Σ|a_ij|²): одна формула на оба случая
             match args {
                 [Value::Complex(c)] => Ok(Value::Scalar(c.abs())),
-                [Value::Matrix(m)] if m.rows == 1 && m.cols == 1 => {
-                    Ok(Value::Scalar(m.get(0, 0).abs()))
+                [Value::Matrix(m)] => {
+                    if m.rows == 1 && m.cols == 1 {
+                        Ok(Value::Scalar(m.get(0, 0).abs()))
+                    } else {
+                        let s = m.data.iter().map(|c| c.re * c.re + c.im * c.im).sum::<f64>();
+                        Ok(Value::Scalar(s.sqrt()))
+                    }
                 }
                 _ => Ok(Value::Scalar(one_arg(args, name)?.abs())),
             }
@@ -537,7 +545,13 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         "floor" => Ok(Value::Scalar(one_arg(args, name)?.floor())),
         "ceil" => Ok(Value::Scalar(one_arg(args, name)?.ceil())),
         "round" => Ok(Value::Scalar(one_arg(args, name)?.round())),
-        "sign" => Ok(Value::Scalar(one_arg(args, name)?.signum())),
+        // ГРАБЛИ сессии-4 (исправлены): sign(0) → 0 (мат-конвенция знака);
+        // f64::signum отдаёт 1.0 для +0.0 (и −1.0 для −0.0) — на нулевых
+        // траекториях CGLMP-сканов это ломало симметрию разностей
+        "sign" => {
+            let x = one_arg(args, name)?;
+            Ok(Value::Scalar(if x == 0.0 { 0.0 } else { x.signum() }))
+        }
         "fract" => Ok(Value::Scalar(one_arg(args, name)?.fract())),
         "deg2rad" => Ok(Value::Scalar(one_arg(args, name)?.to_radians())),
         "rad2deg" => Ok(Value::Scalar(one_arg(args, name)?.to_degrees())),
@@ -747,11 +761,14 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             }
             Ok(Value::Matrix(Matrix::identity(n as usize)))
         }
-        // eye — алиас identity с квантовым лимитом (kron растит быстро)
+        // eye — алиас identity; ГРАБЛИ сессии-4 (исправлены): искусственный
+        // лимит 64 душил кутрит-конвейеры (eye(81), eye(729) для 3⁶ состояний,
+        // eye(2187) для 3⁷). Потолок 4096: dense n² × 16 байт, eye(4096) ≈ 268 МБ;
+        // крупнее — собирайте kron'ом, память всё равно упрётся раньше
         "eye" => {
             let n = one_arg(args, name)?;
-            if n.fract() != 0.0 || !(1.0..=64.0).contains(&n) {
-                return Err("eye(n): n — целое 1..=64".into());
+            if n.fract() != 0.0 || !(1.0..=4096.0).contains(&n) {
+                return Err("eye(n): n — целое 1..=4096 (4096²·16 байт ≈ 268 МБ dense)".into());
             }
             Ok(Value::Matrix(Matrix::identity(n as usize)))
         }
@@ -1323,5 +1340,59 @@ mod tests {
         assert!(!catalog("zeta").is_empty());
     }
 
+    // ===== ГРАБЛИ сессии-4 → исправления сессии-5 =====
 
+    #[test]
+    fn sign_zero_returns_zero() {
+        // было: sign(0) = 1.0 (f64::signum отдаёт 1.0 для +0.0)
+        // — ломало симметрию разностей CGLMP-сканов
+        assert_eq!(call("sign", &[s(0.0)]).unwrap(), s(0.0));
+        assert_eq!(call("sign", &[s(-0.0)]).unwrap(), s(0.0));
+        assert_eq!(call("sign", &[s(5.0)]).unwrap(), s(1.0));
+        assert_eq!(call("sign", &[s(-5.0)]).unwrap(), s(-1.0));
+    }
+
+    #[test]
+    fn abs_vector_and_frobenius_norm() {
+        // вектор-строка [3, 4] → ‖v‖₂ = 5 (было: ошибка «не скаляр»)
+        let m = Matrix::from_rows(&[vec![3.0, 4.0]]).unwrap();
+        assert_eq!(call("abs", &[Value::Matrix(m)]).unwrap(), s(5.0));
+        // вектор-столбец [3; 4]
+        let m = Matrix::from_rows(&[vec![3.0], vec![4.0]]).unwrap();
+        assert_eq!(call("abs", &[Value::Matrix(m)]).unwrap(), s(5.0));
+        // матрица [1, 2; 3, 4] → ‖A‖_F = sqrt(1+4+9+16) = sqrt(30)
+        let m = Matrix::from_rows(&[vec![1.0, 2.0], vec![3.0, 4.0]]).unwrap();
+        let v = match call("abs", &[Value::Matrix(m)]).unwrap() {
+            Value::Scalar(x) => x,
+            other => panic!("не скаляр: {other:?}"),
+        };
+        assert!(close(v, 30.0f64.sqrt(), 1e-12), "{v}");
+        // 1×1 по-прежнему модуль элемента
+        let m = Matrix::from_rows(&[vec![-7.0]]).unwrap();
+        assert_eq!(call("abs", &[Value::Matrix(m)]).unwrap(), s(7.0));
+    }
+
+    #[test]
+    fn eye_beyond_64_qutrit_pipelines() {
+        // было: eye(n) ≤ 64 — кутритные конвейеры 3^4=81, 3^6=729 не собирались
+        let v = call("eye", &[s(81.0)]).unwrap();
+        match v {
+            Value::Matrix(m) => {
+                assert_eq!((m.rows, m.cols), (81, 81));
+                // единичная: след = n
+                let tr: f64 = (0..81).map(|i| m.get(i, i).re).sum();
+                assert!(close(tr, 81.0, 1e-12));
+            }
+            other => panic!("не матрица: {other:?}"),
+        }
+        let v = call("eye", &[s(729.0)]).unwrap();
+        match v {
+            Value::Matrix(m) => assert_eq!((m.rows, m.cols), (729, 729)),
+            other => panic!("не матрица: {other:?}"),
+        }
+        // потолок 4096 остаётся защитой dense-памяти (268 МБ)
+        assert!(call("eye", &[s(4097.0)]).is_err());
+        assert!(call("eye", &[s(0.0)]).is_err());
+        assert!(call("eye", &[s(2.5)]).is_err());
+    }
 }
