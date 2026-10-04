@@ -18,6 +18,11 @@
 //! регрессии существа в собственное прошлое с сохранением опыта из
 //! будущего (канал Больцмана/Крукса), с бюджетом испытаний Вселенной.
 
+//! Сессия-14: LogProb стал полноценным типом `Value` калькулятора —
+//! лог-доменная арифметика (сложение/вычитание через logaddexp/
+//! logsubexp, суммы рядов сверхмалых вероятностей через lpsum):
+//! весь калькулятор оперирует за пределами динамического диапазона f64.
+
 /// Постоянная Больцмана, Дж/К — точно по SI-2019.
 pub const K_B: f64 = 1.380649e-23;
 
@@ -32,6 +37,31 @@ pub struct LogProb {
 }
 
 impl LogProb {
+    /// Из натурального логарифма (контроль конечности).
+    pub fn from_ln(ln: f64) -> Result<Self, String> {
+        if !ln.is_finite() {
+            return Err(format!("log-домен: ln = {ln} — не число"));
+        }
+        Ok(LogProb { ln })
+    }
+
+    /// Поднять положительное число в лог-домен: logp(0.5) → ln = −ln 2.
+    /// Ноль и отрицательные не представлены (вероятность > 0).
+    pub fn from_f64(p: f64) -> Result<Self, String> {
+        if !p.is_finite() || p <= 0.0 {
+            return Err(format!(
+                "logp: аргумент {p} — нужно строго положительное число \
+                 (вероятность 0 представима только пределом)"
+            ));
+        }
+        Ok(LogProb { ln: p.ln() })
+    }
+
+    /// ln P — натуральный логарифм (может быть ~ −1e30).
+    pub fn ln(&self) -> f64 {
+        self.ln
+    }
+
     /// b^x для b > 0; результат может быть вне f64 — это и есть точка.
     pub fn powf(base: f64, exp: f64) -> Result<Self, String> {
         if !base.is_finite() || !exp.is_finite() {
@@ -62,6 +92,47 @@ impl LogProb {
         LogProb { ln: self.ln * k }
     }
 
+    /// Частное вероятностей — разность логарифмов (шансы/отношения
+    /// правдоподобий не теряют порядков даже при ln ~ −1e30).
+    pub fn div(self, other: LogProb) -> LogProb {
+        LogProb { ln: self.ln - other.ln }
+    }
+
+    /// Сумма вероятностей в лог-домене: ln(P + Q) = logaddexp.
+    /// Стабильно: ln a + ln(1 + e^{ln b − ln a}) при a ≥ b —
+    /// ln1p не теряет малое слагаемое даже при разнице 700 порядков
+    /// (P + Q ≈ P, но след Q живёт в ln1p до порога −745).
+    pub fn logaddexp(self, other: LogProb) -> LogProb {
+        let (a, b) = if self.ln >= other.ln {
+            (self.ln, other.ln)
+        } else {
+            (other.ln, self.ln)
+        };
+        LogProb { ln: a + (b - a).exp().ln_1p() }
+    }
+
+    /// Разность вероятностей в лог-домене: ln(P − Q), требует P > Q
+    /// (нулевая/отрицательная разность в лог-домене не живёт).
+    /// Дополнение события: 1 − P = logsubexp(ln 1, ln P).
+    pub fn logsubexp(self, other: LogProb) -> Result<LogProb, String> {
+        if self.ln <= other.ln {
+            return Err(format!(
+                "вычитание лог-вероятностей: уменьшаемое должно быть больше \
+                 ({} ≤ {}) — разность ≤ 0 не представима",
+                self.fmt10(),
+                other.fmt10()
+            ));
+        }
+        let d = other.ln - self.ln; // < 0
+        // ln(1 − e^d): при d < −745 разность неотличима от уменьшаемого.
+        let inner = if d < -745.0 {
+            0.0
+        } else {
+            (-(d.exp())).ln_1p()
+        };
+        Ok(LogProb { ln: self.ln + inner })
+    }
+
     /// log10 P.
     pub fn log10(&self) -> f64 {
         self.ln / LN10
@@ -86,6 +157,11 @@ impl LogProb {
         } else {
             None
         }
+    }
+
+    /// Является ли вероятность (0 < P ≤ 1), а не шансом/отношением.
+    pub fn is_probability(&self) -> bool {
+        self.ln <= 0.0
     }
 
     /// Десятичная запись: число, если представимо, иначе 10^(…).
@@ -181,6 +257,22 @@ pub fn universe_trials_log10() -> f64 {
     const T_U: f64 = 4.35e17; // возраст Вселенной ~13.8 млрд лет, с
     const N_PART: f64 = 1.0e80; // частиц в наблюдаемой Вселенной
     (T_U / T_P).log10() + N_PART.log10()
+}
+
+/// Сумма ряда вероятностей в лог-домене (статистическая сумма /
+/// функция разбиения Z = Σ P_i): каждый член может быть ~ 10^(−10^5) —
+/// в f64 такой ряд «суммируется» в 0 с потерей всей информации,
+/// здесь — честный logaddexp-аккумулятор без единого порядка потерь.
+/// Члены — ln P_i; accepts также поднимаемые величины > 0.
+pub fn lpsum_lns(items: &[f64]) -> Result<LogProb, String> {
+    if items.is_empty() {
+        return Err("lpsum: пустой ряд — нечего суммировать".into());
+    }
+    let mut acc = LogProb::from_ln(items[0])?;
+    for &x in &items[1..] {
+        acc = acc.logaddexp(LogProb::from_ln(x)?);
+    }
+    Ok(acc)
 }
 
 /// Полная калькуляция: P(опыт из будущего сохранится | регрессия
@@ -341,6 +433,94 @@ mod tests {
         assert!(LogProb::powf(-2.0, 3.0).is_err());
         assert!(LogProb::powf(f64::NAN, 3.0).is_err());
         assert!(LogProb::exp_neg(-1.0).is_err());
+    }
+
+    #[test]
+    fn logaddexp_sum_of_geometric_series() {
+        // Σ_{i=1..N} 2^(−i) = 1 − 2^(−N): ряд сверхмалых слагаемых,
+        // чья сумма — обычное число. В f64 при N > 1074 члены — 0.0,
+        // сумма — 0.0; в лог-домене сумма стремится к 1 точно.
+        for n in [4usize, 64, 1024, 100_000] {
+            let lns: Vec<f64> = (1..=n as i64).map(|i| -(i as f64) * LN2).collect();
+            let s = lpsum_lns(&lns).unwrap();
+            let expected = 1.0 - if n <= 1000 { 2.0f64.powi(-(n as i32)) } else { 0.0 };
+            assert!((s.to_f64().unwrap() - expected).abs() < 1e-12, "N={n}");
+        }
+        // шок-сравнение: каждый член 2^(−100000) вне f64 (to_f64 = None),
+        // а их сумма — представимое число ~1: ряд не потерял ни одного члена.
+        let term = LogProb::powf(2.0, -100_000.0).unwrap();
+        assert!(term.to_f64().is_none());
+        let lns: Vec<f64> = (1..=100_000i64).map(|i| -(i as f64) * LN2).collect();
+        let s = lpsum_lns(&lns).unwrap();
+        assert!((s.to_f64().unwrap() - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn logaddexp_and_subexp_roundtrip() {
+        let a = LogProb::from_f64(0.6).unwrap();
+        let b = LogProb::from_f64(0.2).unwrap();
+        let sum = a.logaddexp(b);
+        assert!((sum.to_f64().unwrap() - 0.8).abs() < 1e-15);
+        let back = sum.logsubexp(b).unwrap();
+        assert!((back.to_f64().unwrap() - 0.6).abs() < 1e-12);
+        // вычитание большего из меньшего — ошибка
+        assert!(a.logsubexp(sum).is_err());
+    }
+
+    #[test]
+    fn complement_of_super_small_probability() {
+        // 1 − 2^(−10^5): дополнение события — само сверхмало в экспоненте,
+        // но ln(1 − ε) ≈ −ε ≈ −2^(−10^5) → |ln| < 1e-4 — представимо.
+        let p = LogProb::powf(2.0, -1e5).unwrap();
+        let one = LogProb::from_f64(1.0).unwrap();
+        let c = one.logsubexp(p).unwrap();
+        assert!(c.to_f64().is_some());
+        assert!((c.to_f64().unwrap() - 1.0).abs() < 1e-5); // ≈ 1 − 3e-30105
+        // а в лоб: 1.0 − 2^(−10^5) в f64 = ровно 1.0 (ε выпал в underflow)
+    }
+
+    #[test]
+    fn logaddexp_keeps_tiny_tail() {
+        // P + Q при Q на 700 порядков меньше: logaddexp хранит след Q.
+        let p = LogProb::from_f64(1.0).unwrap();
+        let q = LogProb::from_ln(-690.0).unwrap(); // e^-690 ≈ 1e-300
+        let s = p.logaddexp(q);
+        assert!((s.ln() - q.ln().exp()).abs() < 1e-12); // ln = ln(1+1e-300) ≈ 1e-300
+        // а при разнице > 745 порядков след недоступен f64-логарифму — это предел
+        let q2 = LogProb::from_ln(-800.0).unwrap();
+        let s2 = p.logaddexp(q2);
+        assert_eq!(s2.ln(), 0.0);
+    }
+
+    #[test]
+    fn lpsum_boltzmann_partition_function() {
+        // Z = Σ e^(−E_i): все члены ~ e^(−1e5) — в f64 нули, здесь — число.
+        let lns: Vec<f64> = (1..=100).map(|i| -(i as f64) * 1e3).collect();
+        let z = lpsum_lns(&lns).unwrap();
+        // доминирует первый член: Z ≈ e^(−1000)·(1 + e^(−1000) + …) ≈ e^(−1000)
+        assert!((z.ln() + 1000.0).abs() < 1e-6, "Z: {}", z.ln());
+        assert!(z.to_f64().is_none()); // e^-1000 вне f64 — но Z посчитан
+    }
+
+    #[test]
+    fn div_is_log_difference() {
+        let a = LogProb::powf(2.0, -1e13).unwrap();
+        let b = LogProb::powf(2.0, -1e11).unwrap();
+        // шансы b/a = 2^(+9.9e12) — отношение > 1, ln > 0
+        let r = b.div(a);
+        assert!((r.ln() - (1e13 - 1e11) * LN2).abs() < 1e-3);
+        assert!(!r.is_probability());
+        assert!(a.is_probability());
+        // а сверхмалое/сверхмалое той же глубины = 1
+        assert!(a.div(a).ln().abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_f64_rejects_nonpositive() {
+        assert!(LogProb::from_f64(0.0).is_err());
+        assert!(LogProb::from_f64(-0.5).is_err());
+        assert!(LogProb::from_f64(f64::NAN).is_err());
+        assert!((LogProb::from_f64(2.5).unwrap().ln() - 2.5f64.ln()).abs() < 1e-15);
     }
 
     #[test]

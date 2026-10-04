@@ -1262,6 +1262,22 @@ pub fn auto_svg(v: &Value) -> Result<String, String> {
         Value::Complex(c) => {
             bars_svg_titled(&[c.re, c.im], "Комплексное число: Re и Im")
         }
+        Value::LogProb(p) => {
+            // сессия-14: представимая вероятность идёт обычным маршрутом
+            // (0.5 → шкала), сверхмалая — честная диагностика глубины
+            // (как BigInt: точная величина вне лог-шкалы сцены 10^±27).
+            match p.to_f64() {
+                Some(x) if x > 0.0 => auto_scalar(x),
+                _ => Err(format!(
+                    "viz(лог-вероятность {} = {}): величина за пределами \
+                     лог-шкалы сцены (10^±27) — глубина {} тритов «против»; \
+                     подайте log10(P) числом: viz(log10(logpow(2, -1e15)))",
+                    p.fmt10(),
+                    p.fmt3(),
+                    crate::calc::logprob::LogProb::trit_depth(p)
+                )),
+            }
+        }
         Value::BigInt(n) => Err(format!(
             "viz(BigInt с {N} цифрами): точная большая арифметика — вне \
              лог-шкалы; подайте log10 вручную",
@@ -2387,6 +2403,148 @@ pub fn iso3_svg(slices: &[Matrix], level: Option<f64>) -> Result<String, String>
     Ok(s)
 }
 
+// =====================================================================
+// Сессия-14: ГЕКС-КАРТЫ — тритная спираль H3 на холсте движка
+// =====================================================================
+// Пайплайн PORTING_NOTES: гекс-сетка (мини-H3) → карта биомов Этерии.
+// Осевые координаты → pointy-top гексы; цвет — биом; легенда —
+// «■ имя ×N»; примечание — параметры мира. Детерминизм полный.
+
+/// Гекс-карта из ячеек (q, r, биом): SVG-сцена с легендой.
+/// `note` — строка-подпись (seed, радиус, число ячеек).
+pub fn hex_svg(
+    cells: &[(i64, i64, usize)],
+    title_text: &str,
+    note: &str,
+) -> Result<String, String> {
+    use crate::geo::eteria::BIOMES;
+    if cells.is_empty() {
+        return Err("viz_hex: пустой набор ячеек".into());
+    }
+    if cells.iter().any(|&(_, _, b)| b >= BIOMES.len()) {
+        return Err("viz_hex: биом ∈ [0, 5] (океан…фредерит)".into());
+    }
+    const W: f64 = 640.0;
+    // геометрия pointy-top: центр ячейки (q,r) → (u, v) в единицах размера
+    let uv = |q: i64, r: i64| -> (f64, f64) {
+        (3f64.sqrt() * (q as f64 + r as f64 / 2.0), 1.5 * r as f64)
+    };
+    let (mut umin, mut umax, mut vmin, mut vmax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(q, r, _) in cells {
+        let (u, v) = uv(q, r);
+        umin = umin.min(u);
+        umax = umax.max(u);
+        vmin = vmin.min(v);
+        vmax = vmax.max(v);
+    }
+    // размер гекса: вписываем диск + запас на сам гекс (радиус S)
+    let avail_w = W - 64.0;
+    let avail_h = 430.0;
+    let su = avail_w / (umax - umin + 3f64.sqrt());
+    let sv = avail_h / (vmax - vmin + 2.0);
+    let s = su.min(sv).clamp(6.0, 30.0);
+    let ox = 32.0 - umin * s + 3f64.sqrt() * s / 2.0; // центр ячейки → холст
+    let oy = 34.0 - vmin * s + s;
+    let px = |q: i64, r: i64| -> (f64, f64) {
+        let (u, v) = uv(q, r);
+        (u * s + ox, v * s + oy)
+    };
+
+    // легенда: «■ имя ×N» с переносом строк
+    let counts = {
+        let mut c = [0usize; 6];
+        for &(_, _, b) in cells {
+            c[b] += 1;
+        }
+        c
+    };
+    let items: Vec<(usize, String)> = (0..BIOMES.len())
+        .filter(|&b| counts[b] > 0)
+        .map(|b| (b, format!("{} ×{}", BIOMES[b].0, counts[b])))
+        .collect();
+    let item_w = |t: &str| text_w(t, 11.0) + 26.0;
+    let mut legend_rows: Vec<Vec<(usize, String, f64)>> = vec![Vec::new()];
+    let mut row_w = 30.0;
+    for (b, t) in items {
+        let w = item_w(&t);
+        if row_w + w > W - 20.0 && !legend_rows.last().unwrap().is_empty() {
+            legend_rows.push(Vec::new());
+            row_w = 30.0;
+        }
+        legend_rows.last_mut().unwrap().push((b, t, row_w));
+        row_w += w;
+    }
+    let legend_h = legend_rows.len() as f64 * 17.0 + 6.0;
+
+    // высота холста: титул + карта + легенда + примечание
+    let plot_h = (vmax - vmin) * s + 2.0 * s;
+    let notes = vec![Note::new(note, 10.0, C_MUTED)];
+    let notes_y = 34.0 + plot_h + legend_h + 18.0;
+    let h = (notes_y + notes_height(&notes, 30.0, W) + 8.0).ceil() as u32;
+
+    let mut out = svg_open(W as u32, h);
+    out.push_str(&title(title_text, W as u32));
+    // фон-океан: весь плот под гексами — мягкий синий
+    out.push_str(&format!(
+        "<rect x=\"16\" y=\"30\" width=\"{:.0}\" height=\"{:.0}\" fill=\"#dbeafe\" \
+         stroke=\"{}\" stroke-width=\"0.6\"/>\n",
+        W - 32.0,
+        plot_h + 8.0,
+        C_GRID
+    ));
+    // гексы
+    let mut polygons = 0usize;
+    for &(q, r, b) in cells {
+        let (cx, cy) = px(q, r);
+        let mut pts = String::new();
+        for k in 0..6 {
+            let a = std::f64::consts::FRAC_PI_6 + k as f64 * std::f64::consts::FRAC_PI_3;
+            let (hx, hy) = (cx + s * a.cos(), cy + s * a.sin());
+            pts.push_str(&format!("{:.1},{:.1} ", hx, hy));
+        }
+        out.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"{}\" stroke=\"#ffffff\" stroke-width=\"0.7\"/>\n",
+            pts.trim_end(),
+            BIOMES[b].1
+        ));
+        polygons += 1;
+        // подпись координат — только на крупных гексах (R ≤ 4)
+        if s >= 22.0 {
+            out.push_str(&halo_text(
+                cx,
+                cy + 3.5,
+                8.5,
+                "middle",
+                "#ffffff",
+                &format!("{q},{r}"),
+            ));
+        }
+    }
+    // легенда
+    for (ri, row) in legend_rows.iter().enumerate() {
+        let y = 34.0 + plot_h + 14.0 + ri as f64 * 17.0;
+        for &(b, ref t, x) in row {
+            out.push_str(&format!(
+                "<rect x=\"{x:.0}\" y=\"{y:.0}\" width=\"11\" height=\"11\" fill=\"{}\" \
+                 stroke=\"#ffffff\"/>\n",
+                BIOMES[b].1
+            ));
+            out.push_str(&format!(
+                "<text x=\"{:.0}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\">{}</text>\n",
+                x + 15.0,
+                y + 9.5,
+                C_TEXT,
+                esc(t)
+            ));
+        }
+    }
+    let (block, _) = notes_svg(&notes, 30.0, W, notes_y);
+    out.push_str(&block);
+    out.push_str("</svg>");
+    debug_assert!(polygons == cells.len());
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3031,5 +3189,35 @@ mod tests {
             let bad = audit_text_bounds(svg);
             assert!(bad.is_empty(), "сцена {k}: надписи за холстом (грабля 23): {bad:?}");
         }
+    }
+
+    #[test]
+    fn hex_svg_eteria_map() {
+        // карта Этерии R8: 217 гексов, все полигоны, легенда, подписи в холсте
+        let cells = crate::geo::eteria::hex_cells(7, 8).unwrap();
+        let triples: Vec<(i64, i64, usize)> =
+            cells.iter().map(|c| (c.q, c.r, c.biome)).collect();
+        let svg = hex_svg(
+            &triples,
+            "Этерия · гекс-карта биомов",
+            "seed 7 · R8 · 217 ячеек · трит-спираль 6 тритов",
+        )
+        .unwrap();
+        assert!(starts_and_ends(&svg));
+        assert_eq!(svg.matches("<polygon").count(), 217);
+        assert!(svg.contains("океан ×"), "легенда: {svg}");
+        assert!(svg.contains("фредерит") || svg.contains("горы ×") || svg.contains("лес ×"));
+        // грабля 23: ни одна надпись не вылезает за холст
+        let bad = audit_text_bounds(&svg);
+        assert!(bad.is_empty(), "надписи за холстом: {bad:?}");
+        // маленький диск — крупный гекс, подписи координат включаются
+        let small: Vec<(i64, i64, usize)> =
+            crate::geo::hexgrid::hex_disk(2).iter().map(|&(q, r)| (q, r, 3)).collect();
+        let svg2 = hex_svg(&small, "Малый диск", "R2").unwrap();
+        assert_eq!(svg2.matches("<polygon").count(), 19);
+        assert!(svg2.contains("1,0"), "подписи координат: {}", &svg2[..svg2.len().min(400)]);
+        // ошибки
+        assert!(hex_svg(&[], "пусто", "-").is_err());
+        assert!(hex_svg(&[(0, 0, 9)], "биом", "-").is_err());
     }
 }

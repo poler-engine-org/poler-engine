@@ -76,6 +76,21 @@ fn need(args: &[Value], n: usize, name: &str) -> Result<(), String> {
     }
 }
 
+/// Seed мира (сессия-14): целое ≥ 0 (или умолчание). Мир детерминирован:
+/// один seed — одна Этерия.
+fn seed_arg(args: &[Value], i: usize, default: u64) -> Result<u64, String> {
+    match args.get(i) {
+        None => Ok(default),
+        Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 9.0e15 && v.fract() == 0.0 => Ok(*v as u64),
+        Some(Value::Quantity(..)) => args[i]
+            .as_f64()
+            .filter(|v| *v >= 0.0 && v.fract() == 0.0)
+            .map(|v| v as u64)
+            .ok_or_else(|| "seed — целое ≥ 0".to_string()),
+        Some(other) => Err(format!("seed — целое ≥ 0, получено {other}")),
+    }
+}
+
 fn one_arg(args: &[Value], name: &str) -> Result<f64, String> {
     need(args, 1, name)?;
     scalar_arg(args, 0)
@@ -353,8 +368,12 @@ pub fn is_function(name: &str) -> bool {
         | "viz_graph" | "viz_field" | "viz_surf"
         // GIS-ядро на тритах (сессия-12)
         | "viz_iso3" | "de9im" | "geo_pred"
-        // сверхдиапазонные вероятности (сессия-13)
-        | "logpow" | "regress"
+        // сверхдиапазонные вероятности (сессия-13/14)
+        | "logpow" | "regress" | "logp" | "expneg" | "lpsum"
+        // переплетение модулей (сессия-14): 27-дерево, гексы, Этерия
+        | "spatial27" | "hexring" | "hexdisk" | "hexdist" | "hexid"
+        | "de9im_line" | "eteria_field" | "eteria_hex" | "eteria_boltz"
+        | "viz_hex"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -381,6 +400,10 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 | "viz" | "viz_prob" | "viz_bars"
                 // стек срезов — целиком (сессия-12)
                 | "viz_iso3"
+                // сумма ряда — список ЦЕЛИКОМ, а не поэлементно (сессия-14)
+                | "lpsum"
+                // окно запроса — список из 6 чисел (сессия-14)
+                | "spatial27"
         ) {
             return map_over_lists(name, args);
         }
@@ -515,6 +538,10 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         "ln" => {
             // цикл N: расширенный логарифм — ln(0) = −∞ (предел),
             // ln(x<0) = ln|x| + iπ (главная ветвь)
+            // сессия-14: ln(лог-вероятности) — ln P как обычное число
+            if let Some(Value::LogProb(p)) = args.first() {
+                return Ok(Value::Scalar(p.ln()));
+            }
             let x = one_arg(args, name)?;
             if x == 0.0 {
                 return Ok(Value::Scalar(f64::NEG_INFINITY));
@@ -556,6 +583,9 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
         "log2" => {
+            if let Some(Value::LogProb(p)) = args.first() {
+                return Ok(Value::Scalar(p.ln() / std::f64::consts::LN_2));
+            }
             let x = one_arg(args, name)?;
             if x == 0.0 {
                 return Ok(Value::Scalar(f64::NEG_INFINITY));
@@ -570,6 +600,9 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Scalar(x.log2()))
         }
         "log10" => {
+            if let Some(Value::LogProb(p)) = args.first() {
+                return Ok(Value::Scalar(p.log10()));
+            }
             let x = one_arg(args, name)?;
             if x == 0.0 {
                 return Ok(Value::Scalar(f64::NEG_INFINITY));
@@ -1150,19 +1183,57 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                     .collect(),
             ))
         }
-        // ---------- сверхдиапазонные вероятности (сессия-13) ----------
+        // ---------- сверхдиапазонные вероятности (сессия-13/14) ----------
         "logpow" => {
             // logpow(b, x): b^x, когда результат за пределами f64 —
-            // ответ в лог-домене: [log10, log3] (десятичные порядки и
-            // тритная глубина против события).
+            // сессия-14: полноценное значение-лог-вероятность: участвует
+            // в +−·/^ и рядах lpsum; Display показывает 10^(…) и 3^(…).
             need(args, 2, name)?;
             let b = scalar_arg(args, 0)?;
             let x = scalar_arg(args, 1)?;
-            let p = logprob::LogProb::powf(b, x)?;
-            Ok(Value::List(vec![
-                Value::Scalar(p.log10()),
-                Value::Scalar(p.log3()),
-            ]))
+            Ok(Value::LogProb(logprob::LogProb::powf(b, x)?))
+        }
+        "logp" => {
+            // logp(p): поднять представимое число в лог-домен — вход в
+            // сверхмалый мир (logp(0.5) + logpow(2, -1e15) работает).
+            let x = num_arg_si(args, 0, name, "вероятность p > 0")?;
+            Ok(Value::LogProb(logprob::LogProb::from_f64(x)?))
+        }
+        "expneg" => {
+            // expneg(x) = e^(−x), x ≥ 0 — больцмановский/круксовский
+            // штраф как лог-вероятность (ΔS/k_B ~ 1e30 — за пределами f64).
+            let x = num_arg_si(args, 0, name, "показатель x ≥ 0")?;
+            Ok(Value::LogProb(logprob::LogProb::exp_neg(x)?))
+        }
+        "lpsum" => {
+            // lpsum(p1, p2, …) / lpsum([p1, …]) — сумма ряда вероятностей
+            // в лог-домене (Z = Σ P_i): члены ~ 10^(−10^5) не выпадают в 0.
+            let items: Vec<Value> = match args.first() {
+                Some(Value::List(items)) if args.len() == 1 => items.clone(),
+                _ => args.to_vec(),
+            };
+            if items.is_empty() {
+                return Err("lpsum: пустой ряд — нужны члены (> 0)".into());
+            }
+            let mut lns: Vec<f64> = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::LogProb(p) => lns.push(p.ln()),
+                    Value::Scalar(v) => {
+                        lns.push(logprob::LogProb::from_f64(*v).map_err(|e| {
+                            format!("lpsum: член {} — {e}", i + 1)
+                        })?.ln())
+                    }
+                    other => {
+                        return Err(format!(
+                            "lpsum: член {} — лог-вероятность или число > 0, получено {}",
+                            i + 1,
+                            other.type_name()
+                        ))
+                    }
+                }
+            }
+            Ok(Value::LogProb(logprob::lpsum_lns(&lns)?))
         }
         "regress" => {
             // regress(N_бит, Δt_с[, Вт, К]): P(опыт из будущего | регрессия
@@ -1182,6 +1253,238 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 Some(_) => num_arg_si(args, 3, name, "температура мозга, К")?,
             };
             Ok(Value::Str(logprob::regress_report(n, dt, watts, kelvin)?))
+        }
+
+        // ---------- переплетение модулей (сессия-14) ----------
+        "spatial27" => {
+            // spatial27(конверты Nx6, окно[, k]): 27-дерево (тритное 3×3×3)
+            // против октодерева — пространственный индекс XYZ на тритах.
+            // Ответ — список номеров строк (1-based), чьи конверты
+            // пересекают окно. Конверт: [minx,miny,minz,maxx,maxy,maxz].
+            let boxes_m = matrix_arg(args, 0)?;
+            if boxes_m.cols != 6 || boxes_m.rows < 1 {
+                return Err(format!(
+                    "spatial27: конверты — матрица Nx6 [minx,miny,minz,maxx,maxy,maxz], \
+                     получено {}×{}",
+                    boxes_m.rows, boxes_m.cols
+                ));
+            }
+            // окно: список из 6 чисел ИЛИ матрица 1×6
+            let qnums: Vec<f64> = match args.get(1) {
+                Some(Value::List(items)) if items.len() == 6 => items
+                    .iter()
+                    .map(|v| v.as_f64().ok_or_else(|| "spatial27: окно — 6 чисел".to_string()))
+                    .collect::<Result<_, _>>()?,
+                Some(Value::Matrix(m)) if m.cols == 6 && m.rows == 1 => {
+                    (0..6).map(|j| m.get(0, j).re).collect()
+                }
+                other => {
+                    return Err(format!(
+                        "spatial27: окно — список из 6 чисел [minx,miny,minz,maxx,maxy,maxz], \
+                         получено {:?}",
+                        other.map(|v| v.type_name())
+                    ))
+                }
+            };
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!("spatial27: k ∈ [0, 12], получено {other}"))
+                }
+            };
+            let lat = crate::geo::trit_coord::Lattice::new(k)?;
+            let qi = |v: f64| -> Result<i64, String> { Ok(lat.quantize(v)?.to_i64()) };
+            let mut bboxes = Vec::with_capacity(boxes_m.rows);
+            let mut bounds_min = [i64::MAX; 3];
+            let mut bounds_max = [i64::MIN; 3];
+            for r in 0..boxes_m.rows {
+                let c: Vec<i64> = (0..6)
+                    .map(|j| qi(boxes_m.get(r, j).re))
+                    .collect::<Result<_, _>>()?;
+                for a in 0..3 {
+                    bounds_min[a] = bounds_min[a].min(c[a]);
+                    bounds_max[a] = bounds_max[a].max(c[a + 3]);
+                }
+                bboxes.push(crate::geo::tree27::BBox3::new(
+                    c[0], c[1], c[2], c[3], c[4], c[5],
+                ));
+            }
+            let q = crate::geo::tree27::BBox3::new(
+                qi(qnums[0])?,
+                qi(qnums[1])?,
+                qi(qnums[2])?,
+                qi(qnums[3])?,
+                qi(qnums[4])?,
+                qi(qnums[5])?,
+            );
+            let bounds = crate::geo::tree27::BBox3::new(
+                bounds_min[0], bounds_min[1], bounds_min[2],
+                bounds_max[0], bounds_max[1], bounds_max[2],
+            );
+            let mut tree = crate::geo::tree27::Tree27::new(bounds, 8);
+            for (i, b) in bboxes.iter().enumerate() {
+                tree.insert(*b, i).map_err(|e| format!("spatial27: {e}"))?;
+            }
+            Ok(Value::List(
+                tree.query(&q)
+                    .into_iter()
+                    .map(|i| Value::Scalar(i as f64 + 1.0)) // 1-based
+                    .collect(),
+            ))
+        }
+        "hexring" | "hexdisk" => {
+            // hexring(k) / hexdisk(r): гексы трит-спирали (мини-H3).
+            let r = num_arg_si(args, 0, name, "радиус кольца/диска")?;
+            if !(0.0..=13.0).contains(&r) || r.fract() != 0.0 {
+                return Err(format!(
+                    "hexring/hexdisk: радиус — целое ∈ [0, 13] (6-тритная спираль), получено {r}"
+                ));
+            }
+            let cells = if name == "hexring" {
+                crate::geo::hexgrid::hex_ring(r as i64)
+            } else {
+                crate::geo::hexgrid::hex_disk(r as i64)
+            };
+            if cells.is_empty() {
+                return Err("hexring: кольцо 0 пусто — радиус ≥ 1 (диск 0 = центр)".into());
+            }
+            let rows: Vec<Vec<f64>> = cells.iter().map(|&(q, r)| vec![q as f64, r as f64]).collect();
+            Ok(Value::Matrix(Matrix::from_rows(&rows)?))
+        }
+        "hexdist" => {
+            // hexdist(q1, r1, q2, r2): гекс-дистанция (|Δq|+|Δr|+|Δq+Δr|)/2.
+            need(args, 4, name)?;
+            let a = (num_arg_si(args, 0, name, "q1")? as i64, num_arg_si(args, 1, name, "r1")? as i64);
+            let b = (num_arg_si(args, 2, name, "q2")? as i64, num_arg_si(args, 3, name, "r2")? as i64);
+            Ok(Value::Scalar(crate::geo::hexgrid::hex_distance(a, b) as f64))
+        }
+        "hexid" => {
+            // hexid(q, r): тритный адрес ячейки — s спирали + 6-тритный блок.
+            need(args, 2, name)?;
+            let q = num_arg_si(args, 0, name, "q")? as i64;
+            let r = num_arg_si(args, 1, name, "r")? as i64;
+            let s = crate::geo::hexgrid::axial_to_spiral(q, r)
+                .map_err(|e| format!("hexid: {e}"))?;
+            let t = crate::geo::hexgrid::hex_trit_id(s).map_err(|e| format!("hexid: {e}"))?;
+            let ring = crate::geo::hexgrid::hex_distance((0, 0), (q, r));
+            Ok(Value::Str(format!(
+                "s = {s} · блок 6 тритов: {} · кольцо {ring}",
+                t.to_string_bal()
+            )))
+        }
+        "de9im_line" => {
+            // relate LineString×Polygon: линия — ОТКРЫТАЯ ломаная Nx2,
+            // кольцо — ≥ 3 вершин (замыкается автоматически).
+            let a = ring_arg(args, 0, "de9im_line")?;
+            let b = ring_arg(args, 1, "de9im_line")?;
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "de9im_line: масштаб k ∈ [0, 12] — число, получено {other}"
+                    ))
+                }
+            };
+            let qa = quantize_ring(&a, k)?;
+            let qb = quantize_ring(&b, k)?;
+            let m = crate::geo::de9im::relate_line_ring(&qa, &qb)
+                .map_err(|e| format!("de9im_line: {e}"))?;
+            let preds = m.predicate_names().join(", ");
+            Ok(Value::Str(format!(
+                "{} · код {} · предикаты: {}",
+                m.bal_string(),
+                m.trit_code(),
+                if preds.is_empty() { "—" } else { &preds }
+            )))
+        }
+        "eteria_field" => {
+            // eteria_field([seed[, n]]): карта высот Этерии → viz_field.
+            let seed = seed_arg(args, 0, 7)?;
+            let n = match args.get(1) {
+                None => 33usize,
+                Some(Value::Scalar(v)) if *v == 9.0 || *v == 17.0 || *v == 33.0 || *v == 65.0 => {
+                    *v as usize
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "eteria_field: n ∈ {{9, 17, 33, 65}} (2^m+1), получено {other}"
+                    ))
+                }
+            };
+            let z = crate::geo::eteria::heightmap(seed, n)?;
+            Ok(Value::Matrix(Matrix::from_rows(&z)?))
+        }
+        "eteria_hex" => {
+            // eteria_hex([seed[, radius]]): [q, r, высота, биом] гекс-карты.
+            let seed = seed_arg(args, 0, 7)?;
+            let radius = match args.get(1) {
+                None => 8.0,
+                Some(_) => num_arg_si(args, 1, name, "радиус гекс-диска")?,
+            };
+            if !(1.0..=10.0).contains(&radius) || radius.fract() != 0.0 {
+                return Err(format!(
+                    "eteria_hex: радиус — целое ∈ [1, 10], получено {radius}"
+                ));
+            }
+            let cells = crate::geo::eteria::hex_cells(seed, radius as i64)?;
+            let rows: Vec<Vec<f64>> = cells
+                .iter()
+                .map(|c| vec![c.q as f64, c.r as f64, c.h, c.biome as f64])
+                .collect();
+            Ok(Value::Matrix(Matrix::from_rows(&rows)?))
+        }
+        "eteria_boltz" => {
+            // eteria_boltz([seed[, radius[, scale]]]): больцмановское
+            // переплетение — Z = Σ e^(−E_i) в лог-домене за f64.
+            let seed = seed_arg(args, 0, 7)?;
+            let radius = match args.get(1) {
+                None => 8.0,
+                Some(_) => num_arg_si(args, 1, name, "радиус гекс-диска")?,
+            };
+            let scale = match args.get(2) {
+                None => 1e5,
+                Some(_) => num_arg_si(args, 2, name, "масштаб энергий")?,
+            };
+            Ok(Value::Str(
+                crate::geo::eteria::boltzmann_report(seed, radius as i64, scale)?,
+            ))
+        }
+        "viz_hex" => {
+            // viz_hex(гекс-карта[, заголовок]): SVG-карта биомов.
+            // карта — матрица Nx4 [q, r, высота, биом] (eteria_hex) или Nx3.
+            let m = matrix_arg(args, 0)?;
+            if (m.cols != 3 && m.cols != 4) || m.rows < 1 {
+                return Err(format!(
+                    "viz_hex: карта — Nx4 [q, r, высота, биом] либо Nx3 [q, r, биом], \
+                     получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            let title_text = match args.get(1) {
+                Some(Value::Str(s)) => s.clone(),
+                None => "Этерия · гекс-карта биомов".to_string(),
+                Some(other) => {
+                    return Err(format!("viz_hex: заголовок — строка, получено {other}"))
+                }
+            };
+            let biome_col = m.cols - 1;
+            let mut cells = Vec::with_capacity(m.rows);
+            for r in 0..m.rows {
+                let q = m.get(r, 0).re;
+                let rr = m.get(r, 1).re;
+                let b = m.get(r, biome_col).re;
+                if q.fract() != 0.0 || rr.fract() != 0.0 || b.fract() != 0.0 || b < 0.0 || b > 5.0 {
+                    return Err(format!(
+                        "viz_hex: строка {}: [q, r, биом] — целые, биом ∈ [0, 5]",
+                        r + 1
+                    ));
+                }
+                cells.push((q as i64, rr as i64, b as usize));
+            }
+            let note = format!("{} ячеек · трит-спираль H3 · сессия-14", m.rows);
+            Ok(Value::Str(viz::hex_svg(&cells, &title_text, &note)?))
         }
         // ---------- триты ----------
         "trits" => {
@@ -1409,12 +1712,26 @@ pub fn catalog(filter: &str) -> String {
             "кольцо — матрица Nx2 [x,y; x,y; …] · стек — список матриц либо блочная (nz·ny)×nx",
         ]),
         ("сверхдиапазонные вероятности (сессия-13)", &[
-            "logpow(b, x) — b^x за пределами f64: ответ [log10, log3] — порядки и тритная глубина",
+            "logpow(b, x) — b^x за пределами f64: значение-лог-вероятность (10^… = 3^…)",
             "logpow(2, -1e15) → 10^(-3.010e+14) — то, что раньше выпадало в 0.0",
+            "logp(p) — поднять число > 0 в лог-домен · expneg(x) = e^(-x) — больцмановский штраф",
+            "lpsum(p1, p2, … | [ряд]) — сумма ряда сверхмалых вероятностей (Z = Σ P_i)",
+            "арифметика: P+Q (logaddexp) · P−Q · P·Q · P/Q · P^k · 1−P — всё без потерь порядков",
             "regress(N_бит, Δt_с[, Вт, К]) — регрессия в прошлое с сохранением опыта",
             "P(опыт|регрессия) = 2^(-N) · P(регрессия) = e^(-ΔS/k_B), ΔS = σ·Δt, σ = P/T",
             "умолчания: мозг 20 Вт / 310.15 К · бюджет Вселенной 10^(140.91) испытаний",
             "тритная глубина d: P = 3^(-d) — сколько тритов сбалансированной тройки «против»",
+        ]),
+        ("переплетение модулей (сессия-14)", &[
+            "spatial27(конверты Nx6, окно[, k]) — 27-дерево: тритное деление 3×3×3 XYZ",
+            "окно = [minx,miny,minz,maxx,maxy,maxz] → номера строк, пересекающих окно",
+            "hexring(k) / hexdisk(r) — гексы трит-спирали · hexdist(q1,r1,q2,r2) — дистанция",
+            "hexid(q, r) — тритный адрес: s спирали + 6-тритный блок (729 состояний)",
+            "de9im_line(линия Nx2, кольцо[, k]) — relate LineString×Polygon",
+            "eteria_field([seed[, n]]) — карта высот Этерии → viz_field(eteria_field())",
+            "eteria_hex([seed[, R]]) — [q, r, высота, биом] · viz_hex(eteria_hex()) — SVG-карта",
+            "eteria_boltz([seed[, R[, scale]]]) — Z = Σ e^(-E_i) в лог-домене за f64",
+            "конвейер: diamond-square → гексы H3 → биомы → LogProb → lpsum → viz_hex",
         ]),
     ];
     let mut out = String::new();
@@ -1910,26 +2227,142 @@ mod tests {
 
     #[test]
     fn logpow_within_and_beyond_f64() {
-        // 10^10 представимо: [log10, log3] = [10, 20.959…].
+        // 10^10 представимо: значение + тритная форма рядом.
         match call("logpow", &[s(10.0), s(10.0)]).unwrap() {
-            Value::List(items) => {
-                assert!(matches!(items[0], Value::Scalar(v) if (v - 10.0).abs() < 1e-9));
-                assert!(matches!(items[1], Value::Scalar(v) if (v - 20.959).abs() < 1e-2));
+            Value::LogProb(p) => {
+                assert!((p.log10() - 10.0).abs() < 1e-9);
+                assert!((p.log3() - 20.959).abs() < 1e-2);
+                assert!((p.to_f64().unwrap() - 1e10).abs() < 1e-3);
             }
-            other => panic!("logpow: не список {other:?}"),
+            other => panic!("logpow: не лог-вероятность {other:?}"),
         }
         // 2^(-10^15) — вне f64, лог-домен отвечает точно.
         match call("logpow", &[s(2.0), s(-1e15)]).unwrap() {
-            Value::List(items) => {
-                assert!(matches!(items[0], Value::Scalar(v) if (v + 3.0103e14).abs() < 1e10));
-                assert!(matches!(items[1], Value::Scalar(v) if (v + 6.3093e14).abs() < 1e10));
+            Value::LogProb(p) => {
+                assert!((p.log10() + 3.0103e14).abs() < 1e10);
+                assert!((p.log3() + 6.3093e14).abs() < 1e10);
+                assert!(p.to_f64().is_none());
+                let shown = format!("{}", Value::LogProb(p));
+                assert!(shown.contains("10^(-3.010e+14)"), "вывод: {shown}");
+                assert!(shown.contains("3^(-6.309e+14)"), "вывод: {shown}");
             }
-            other => panic!("logpow: не список {other:?}"),
+            other => panic!("logpow: не лог-вероятность {other:?}"),
         }
         // Основание ≤ 0 и не-числа — ошибки.
         assert!(call("logpow", &[s(-2.0), s(3.0)]).is_err());
         assert!(call("logpow", &[s(2.0)]).is_err());
         assert!(call("logpow", &[Value::Str("x".into()), s(3.0)]).is_err());
+    }
+
+    #[test]
+    fn logprob_value_arithmetic_end_to_end() {
+        // Сложение вероятностей — logaddexp: 0.5 + 0.25 = 0.75
+        // (операторы гоняем через binary_op — единая точка диспетчеризации).
+        let a = Value::LogProb(crate::calc::logprob::LogProb::from_f64(0.5).unwrap());
+        let b = Value::LogProb(crate::calc::logprob::LogProb::from_f64(0.25).unwrap());
+        let r = crate::calc::parser::binary_op(crate::calc::parser::BinOp::Add, &a, &b).unwrap();
+        match r {
+            Value::LogProb(p) => assert!((p.to_f64().unwrap() - 0.75).abs() < 1e-15),
+            other => panic!("0.5+0.25: {other:?}"),
+        }
+        // Скаляр поднимается: logp(0.5) + 0.25 = 0.75
+        let c = Value::Scalar(0.25);
+        let r2 = crate::calc::parser::binary_op(crate::calc::parser::BinOp::Add, &a, &c).unwrap();
+        match r2 {
+            Value::LogProb(p) => assert!((p.to_f64().unwrap() - 0.75).abs() < 1e-15),
+            other => panic!("logp+scalar: {other:?}"),
+        }
+        // Дополнение сверхмалой: 1 − logpow(2, -1e5) ≈ 1.
+        let lp = call("logpow", &[s(2.0), s(-1e5)]).unwrap();
+        let one = Value::Scalar(1.0);
+        let r3 = crate::calc::parser::binary_op(crate::calc::parser::BinOp::Sub, &one, &lp).unwrap();
+        match r3 {
+            Value::LogProb(p) => {
+                assert!(p.to_f64().is_some());
+                assert!((p.to_f64().unwrap() - 1.0).abs() < 1e-5);
+            }
+            other => panic!("1−P: {other:?}"),
+        }
+        // Произведение сверхмалых — сумма логарифмов: 2^(-1e5)·2^(-1e5) = 2^(-2e5).
+        let r4 = crate::calc::parser::binary_op(crate::calc::parser::BinOp::Mul, &lp, &lp).unwrap();
+        match r4 {
+            Value::LogProb(p) => assert!((p.log10() + 6.0206e4).abs() < 1e-1),
+            other => panic!("P·P: {other:?}"),
+        }
+        // Деление — разность логов: 2^(-1e5) / 2^(-1e5) = 1.
+        let r5 = crate::calc::parser::binary_op(crate::calc::parser::BinOp::Div, &lp, &lp).unwrap();
+        match r5 {
+            Value::LogProb(p) => assert!(p.ln().abs() < 1e-9),
+            other => panic!("P/P: {other:?}"),
+        }
+        // Отрицание и P·(−1) — запрещены.
+        assert!(crate::calc::parser::binary_op(crate::calc::parser::BinOp::Mul, &lp, &Value::Scalar(-1.0)).is_err());
+        // P^2 — степень.
+        let r6 = crate::calc::parser::binary_op(crate::calc::parser::BinOp::Pow, &lp, &Value::Scalar(2.0)).unwrap();
+        match r6 {
+            Value::LogProb(p) => assert!((p.log10() + 6.0206e4).abs() < 1e-1),
+            other => panic!("P^2: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lpsum_series_and_logp_expneg() {
+        // lpsum(0.5, 0.25, 0.125) = 0.875
+        match call("lpsum", &[s(0.5), s(0.25), s(0.125)]).unwrap() {
+            Value::LogProb(p) => assert!((p.to_f64().unwrap() - 0.875).abs() < 1e-14),
+            other => panic!("lpsum: {other:?}"),
+        }
+        // ряд сверхмалых: Σ 3^(-i), i=1..40 — геометрическая, сумма = 1/2
+        let items: Vec<Value> = (1..=40i64)
+            .map(|i| call("logpow", &[s(3.0), s(-(i as f64))]).unwrap())
+            .collect();
+        match call("lpsum", &[Value::List(items)]).unwrap() {
+            Value::LogProb(p) => {
+                // 1/2 − 3^(−40) ≈ 0.5
+                assert!((p.to_f64().unwrap() - 0.5).abs() < 1e-10);
+            }
+            other => panic!("lpsum ряд: {other:?}"),
+        }
+        // все члены вне f64: Σ 2^(−(1e6+i·1e3)) ≈ 2^(−1e6)
+        let tiny: Vec<Value> = (0..10i64)
+            .map(|i| call("logpow", &[s(2.0), s(-(1e6 + i as f64 * 1e3))]).unwrap())
+            .collect();
+        match call("lpsum", &[Value::List(tiny)]).unwrap() {
+            Value::LogProb(p) => {
+                assert!((p.log10() + 3.0103e5).abs() < 1e2, "Z: {}", p.log10());
+                assert!(p.to_f64().is_none()); // а в f64 сумма «получилась» бы 0.0
+            }
+            other => panic!("lpsum сверхмалы: {other:?}"),
+        }
+        // logp — вход в лог-домен, отрицательные запрещены
+        match call("logp", &[s(0.5)]).unwrap() {
+            Value::LogProb(p) => assert!((p.to_f64().unwrap() - 0.5).abs() < 1e-15),
+            other => panic!("logp: {other:?}"),
+        }
+        assert!(call("logp", &[s(0.0)]).is_err());
+        assert!(call("logp", &[s(-0.5)]).is_err());
+        // expneg — больцмановский штраф
+        match call("expneg", &[s(1e30)]).unwrap() {
+            Value::LogProb(p) => {
+                assert!((p.log10() + 4.3429e29).abs() < 1e26);
+                assert!(p.to_f64().is_none());
+            }
+            other => panic!("expneg: {other:?}"),
+        }
+        assert!(call("expneg", &[s(-1.0)]).is_err());
+        // пустой ряд — ошибка; смесь с строкой — ошибка
+        assert!(call("lpsum", &[]).is_err());
+        assert!(call("lpsum", &[Value::Str("x".into())]).is_err());
+        // ln/log10/log2 от лог-вероятности — числа
+        let lp = call("logpow", &[s(2.0), s(-1e5)]).unwrap();
+        match call("log10", &[lp.clone()]).unwrap() {
+            Value::Scalar(v) => assert!((v + 3.0103e4).abs() < 1e-2),
+            other => panic!("log10(LogProb): {other:?}"),
+        }
+        match call("ln", &[lp]).unwrap() {
+            Value::Scalar(v) => assert!((v + 6.93147e4).abs() < 1e-1),
+            other => panic!("ln(LogProb): {other:?}"),
+        }
     }
 
     #[test]
@@ -1997,5 +2430,201 @@ mod tests {
         // Каталог знает группу.
         assert!(catalog("").contains("сверхдиапазонные вероятности"));
         assert!(catalog("регресс").contains("regress"));
+    }
+
+    // ─────────── переплетение модулей (сессия-14) ───────────
+
+    fn mat(rows: &[Vec<f64>]) -> Value {
+        Value::Matrix(Matrix::from_rows(rows).unwrap())
+    }
+
+    #[test]
+    fn spatial27_matches_bruteforce() {
+        // 30 конвертов в объёме [-5..5]³, окно [0..2]³ — против перебора
+        let mut rows = Vec::new();
+        let mut boxes: Vec<[f64; 6]> = (0..30)
+            .map(|i| {
+                let x = ((i * 37) % 11) as f64 - 5.0;
+                let y = ((i * 53) % 11) as f64 - 5.0;
+                let z = ((i * 71) % 11) as f64 - 5.0;
+                let w = ((i * 29) % 3) as f64;
+                [x, y, z, x + w, y + w, z + w]
+            })
+            .collect();
+        // гарантированные пересечения окна
+        boxes.push([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        boxes.push([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        boxes.push([-2.0, -2.0, -2.0, 0.5, 0.5, 0.5]);
+        for b in &boxes {
+            rows.push(b.to_vec());
+        }
+        let window = Value::List(
+            [0.0, 0.0, 0.0, 2.0, 2.0, 2.0]
+                .iter()
+                .map(|&v| Value::Scalar(v))
+                .collect(),
+        );
+        let hits = match call("spatial27", &[mat(&rows), window.clone()]).unwrap() {
+            Value::List(items) => items,
+            other => panic!("spatial27: {other:?}"),
+        };
+        // лобовой перебор в квантах k=6 (умолчание): касание считается
+        let expected: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                let q = |v: f64| (v * 729.0).round() as i64;
+                (q(b[0]) <= q(2.0) && q(b[3]) >= q(0.0))
+                    && (q(b[1]) <= q(2.0) && q(b[4]) >= q(0.0))
+                    && (q(b[2]) <= q(2.0) && q(b[5]) >= q(0.0))
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        let got: Vec<f64> = hits
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            expected.iter().map(|&i| i as f64).collect::<Vec<_>>(),
+            "27-дерево ≠ перебор"
+        );
+        assert!(!got.is_empty());
+        // плохие аргументы
+        assert!(call("spatial27", &[mat(&[vec![1.0, 2.0]]), window.clone()]).is_err());
+        assert!(call(
+            "spatial27",
+            &[mat(&rows), Value::List(vec![Value::Scalar(1.0)])]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hex_functions_roundtrip() {
+        // кольцо 1 = 6 соседей центра
+        match call("hexring", &[s(1.0)]).unwrap() {
+            Value::Matrix(m) => {
+                assert_eq!(m.rows, 6);
+                assert_eq!(m.cols, 2);
+            }
+            other => panic!("hexring: {other:?}"),
+        }
+        // диск 4 = 61 ячейка
+        match call("hexdisk", &[s(4.0)]).unwrap() {
+            Value::Matrix(m) => assert_eq!(m.rows, 61),
+            other => panic!("hexdisk: {other:?}"),
+        }
+        // дистанция (0,0)→(3,-3) = 3
+        match call("hexdist", &[s(0.0), s(0.0), s(3.0), s(-3.0)]).unwrap() {
+            Value::Scalar(v) => assert_eq!(v, 3.0),
+            other => panic!("hexdist: {other:?}"),
+        }
+        // тритный адрес: центр s=0; кольцо 1 стартует с (−1,1) s=1
+        match call("hexid", &[s(0.0), s(0.0)]).unwrap() {
+            Value::Str(t) => assert!(t.contains("s = 0"), "{t}"),
+            other => panic!("hexid: {other:?}"),
+        }
+        match call("hexid", &[s(-1.0), s(1.0)]).unwrap() {
+            Value::Str(t) => assert!(t.contains("s = 1"), "{t}"),
+            other => panic!("hexid: {other:?}"),
+        }
+        // ошибки
+        assert!(call("hexring", &[s(14.0)]).is_err());
+        assert!(call("hexring", &[s(1.5)]).is_err());
+        assert!(call("hexid", &[s(14.0), s(0.0)]).is_err()); // дистанция 14 > 13
+    }
+
+    #[test]
+    fn de9im_line_cases() {
+        let sq = mat(&[
+            vec![0.0, 0.0],
+            vec![4.0, 0.0],
+            vec![4.0, 4.0],
+            vec![0.0, 4.0],
+        ]);
+        // насквозь: II=+1, IB=0, IE=+1
+        let through = mat(&[vec![-1.0, 2.0], vec![5.0, 2.0]]);
+        match call("de9im_line", &[through, sq.clone()]).unwrap() {
+            Value::Str(t) => {
+                assert!(t.starts_with("+0+"), "матрица: {t}");
+                assert!(t.contains("код"), "{t}");
+            }
+            other => panic!("de9im_line: {other:?}"),
+        }
+        // внутри: within
+        let inside = mat(&[vec![1.0, 1.0], vec![3.0, 3.0]]);
+        match call("de9im_line", &[inside, sq.clone()]).unwrap() {
+            Value::Str(t) => assert!(t.contains("within"), "{t}"),
+            other => panic!("de9im_line: {other:?}"),
+        }
+        // снаружи: disjoint
+        let outside = mat(&[vec![-3.0, -3.0], vec![-1.0, -1.0]]);
+        match call("de9im_line", &[outside, sq]).unwrap() {
+            Value::Str(t) => assert!(t.contains("disjoint"), "{t}"),
+            other => panic!("de9im_line: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eteria_pipeline_end_to_end() {
+        // поле высот: 33×33, значения в [0,1]
+        match call("eteria_field", &[]).unwrap() {
+            Value::Matrix(m) => {
+                assert_eq!((m.rows, m.cols), (33, 33));
+                for r in 0..m.rows {
+                    for c in 0..m.cols {
+                        let v = m.get(r, c).re;
+                        assert!((0.0..=1.0).contains(&v), "h = {v}");
+                    }
+                }
+            }
+            other => panic!("eteria_field: {other:?}"),
+        }
+        assert!(call("eteria_field", &[s(7.0), s(10.0)]).is_err());
+        // гекс-карта R8: 217×4
+        let cells = match call("eteria_hex", &[]).unwrap() {
+            Value::Matrix(m) => {
+                assert_eq!((m.rows, m.cols), (217, 4));
+                m
+            }
+            other => panic!("eteria_hex: {other:?}"),
+        };
+        // биомы целые 0..5
+        for r in 0..cells.rows {
+            let b = cells.get(r, 3).re;
+            assert!(b.fract() == 0.0 && (0.0..=5.0).contains(&b));
+        }
+        // viz_hex по карте Этерии: 217 полигонов
+        match call("viz_hex", &[Value::Matrix(cells.clone())]).unwrap() {
+            Value::Str(svg) => {
+                assert!(svg.starts_with("<svg"));
+                assert_eq!(svg.matches("<polygon").count(), 217);
+                assert!(svg.contains("океан ×"));
+            }
+            other => panic!("viz_hex: {other:?}"),
+        }
+        // больцмановский отчёт: весь ряд за f64
+        match call("eteria_boltz", &[]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("217 ячеек"), "{rep}");
+                assert!(rep.contains("весь ряд вне f64"), "{rep}");
+                assert!(rep.contains("Z = Σ P_i"), "{rep}");
+            }
+            other => panic!("eteria_boltz: {other:?}"),
+        }
+        // собственный заголовок и ошибки viz_hex
+        assert!(call(
+            "viz_hex",
+            &[Value::Matrix(cells.clone()), Value::Str("Мой мир".into())]
+        )
+        .is_ok());
+        assert!(call("viz_hex", &[mat(&[vec![1.0, 2.0]])]).is_err());
+        // seed меняет мир
+        let a = call("eteria_field", &[s(7.0)]).unwrap();
+        let b = call("eteria_field", &[s(42.0)]).unwrap();
+        assert_ne!(format!("{a}"), format!("{b}"));
+        // а один seed — детерминирован
+        let a2 = call("eteria_field", &[s(7.0)]).unwrap();
+        assert_eq!(format!("{a}"), format!("{a2}"));
     }
 }

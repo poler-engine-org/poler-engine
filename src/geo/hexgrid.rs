@@ -1,0 +1,409 @@
+//! Гекс-сетка на трит-спирали — мини-порт H3 (Сессия-14).
+//!
+//! Якорь порта: `h3.poler` (uber/h3): битовая упаковка индекса ячейки,
+//! кольца/диски (hexRing, kRing). Тритная замена битов:
+//!
+//! * **осевые координаты** (q, r) — гекс-решётка без тригонометрии:
+//!   соседей 6, дистанция (|Δq| + |Δr| + |Δq+Δr|)/2 — целочисленно;
+//! * **трит-спираль** — обход диска по кольцам: центр s=0, кольцо k
+//!   занимает s ∈ [3k²−3k+1, 3k²+3k]; ОДИН 6-тритный блок держит
+//!   729 состояний (смещённый код s−364) → диски до радиуса 13
+//!   (547 ячеек) упакованы в 6 тритов — против байта+резерва в H3;
+//! * **икосаэдр** — 20 граней из 12 вершин золотого сечения (как в H3):
+//!   индекс грани — 3 трита (смещённый код f−13, 27 состояний),
+//!   адрес ячейки мира = 3 трита (грань) + 6 тритов (спираль) = 9 тритов —
+//!   ровно один DE-9IM-блок: топология и география живут в одном формате.
+//!
+//! Детерминизм: обход колец фиксирован (SW-старт, направления E→NE→NW→W→SW→SE),
+//! биты адреса воспроизводимы от запуска к запуску.
+
+use crate::calc::trits::Trits;
+
+/// Направления соседей (осевые): E, NE, NW, W, SW, SE.
+pub const AXIAL_DIRS: [(i64, i64); 6] = [
+    (1, 0),
+    (1, -1),
+    (0, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, 1),
+];
+
+/// Максимальный радиус диска в 6-тритном блоке: s_max = 3·13·14 = 546 < 729.
+pub const MAX_DISK_RADIUS: i64 = 13;
+
+/// Смещение кода спирали: 6 тритов (±364) + 365 = диапазон s ∈ [0, 728].
+const SPIRAL_OFFSET: i64 = 364;
+/// Смещение кода грани: 3 трита (±13) + 13 = диапазон f ∈ [0, 26].
+const FACE_OFFSET: i64 = 13;
+
+/// Гекс-дистанция между осевыми координатами (целочисленно).
+pub fn hex_distance(a: (i64, i64), b: (i64, i64)) -> i64 {
+    let (dq, dr) = (a.0 - b.0, a.1 - b.1);
+    (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
+}
+
+/// Соседи ячейки (6 штук).
+pub fn hex_neighbors(c: (i64, i64)) -> [(i64, i64); 6] {
+    AXIAL_DIRS.map(|(dq, dr)| (c.0 + dq, c.1 + dr))
+}
+
+/// Кольцо радиуса k (6k ячеек, k ≥ 1): старт SW, обход по направлениям.
+pub fn hex_ring(k: i64) -> Vec<(i64, i64)> {
+    if k <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity((6 * k) as usize);
+    let mut hex = (-k, k); // центр + k·SW
+    for &d in AXIAL_DIRS.iter() {
+        for _ in 0..k {
+            out.push(hex);
+            hex = (hex.0 + d.0, hex.1 + d.1);
+        }
+    }
+    out
+}
+
+/// Диск радиуса r (1 + 3r(r+1) ячеек): центр + кольца 1..=r.
+pub fn hex_disk(r: i64) -> Vec<(i64, i64)> {
+    if r < 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity((1 + 3 * r * (r + 1)) as usize);
+    out.push((0, 0));
+    for k in 1..=r {
+        out.extend(hex_ring(k));
+    }
+    out
+}
+
+/// Осевые координаты → индекс трит-спирали s (позиция в обходе диска).
+pub fn axial_to_spiral(q: i64, r: i64) -> Result<i64, String> {
+    let k = hex_distance((0, 0), (q, r));
+    if k == 0 {
+        return Ok(0);
+    }
+    if k > MAX_DISK_RADIUS {
+        return Err(format!(
+            "hex: дистанция {k} > {MAX_DISK_RADIUS} — вне 6-тритного блока спирали"
+        ));
+    }
+    let base = 3 * k * (k - 1) + 1; // первый s кольца k
+    let want = (q, r);
+    let pos = hex_ring(k)
+        .iter()
+        .position(|&c| c == want)
+        .ok_or_else(|| "hex: кольцо не содержит ячейку (внутренняя ошибка)".to_string())?;
+    Ok(base + pos as i64)
+}
+
+/// Индекс спирали s → осевые координаты.
+pub fn spiral_to_axial(s: i64) -> Result<(i64, i64), String> {
+    if s < 0 || s > 3 * MAX_DISK_RADIUS * (MAX_DISK_RADIUS + 1) {
+        return Err(format!(
+            "hex: s = {s} вне диапазона 6-тритного блока [0, {}]",
+            3 * MAX_DISK_RADIUS * (MAX_DISK_RADIUS + 1)
+        ));
+    }
+    if s == 0 {
+        return Ok((0, 0));
+    }
+    // кольцо k занимает s ∈ [3k²−3k+1, 3k²+3k] → k = floor((3+√(9+12(s−1)))/6)
+    let kf = ((9.0 + 12.0 * (s - 1) as f64).sqrt() + 3.0) / 6.0;
+    let mut k = kf.floor() as i64;
+    // корректировка границ (f64-квадратный корень у края диапазона)
+    while k > 1 && s < 3 * k * (k - 1) + 1 {
+        k -= 1;
+    }
+    while 3 * k * (k + 1) < s {
+        k += 1;
+    }
+    let base = 3 * k * (k - 1) + 1;
+    let ring = hex_ring(k);
+    let idx = (s - base) as usize;
+    if idx >= ring.len() {
+        return Err(format!("hex: s = {s} не ложится в кольцо {k} (внутренняя ошибка)"));
+    }
+    Ok(ring[idx])
+}
+
+/// Трит-адрес ячейки диска: 6-тритный блок, смещённый код s−364.
+pub fn hex_trit_id(s: i64) -> Result<Trits, String> {
+    let code = s - SPIRAL_OFFSET;
+    if code < -364 || code > 364 {
+        return Err(format!(
+            "hex: s = {s} вне 6-тритного блока (729 состояний, диски ≤ r {MAX_DISK_RADIUS})"
+        ));
+    }
+    let t = Trits::from_i64(code)?;
+    // выравнивание до 6 разрядов (старшие нули значимы — это блок)
+    let mut digits = t.digits.clone();
+    while digits.len() < 6 {
+        digits.insert(0, 0);
+    }
+    Ok(Trits { digits })
+}
+
+/// Обратное к `hex_trit_id`: 6-тритный блок → s.
+pub fn trit_id_to_hex(t: &Trits) -> Result<i64, String> {
+    if t.len() > 6 {
+        return Err(format!("hex: адрес {:?} длиннее 6 тритов", t.digits));
+    }
+    Ok(t.to_i64() + SPIRAL_OFFSET)
+}
+
+/// Адрес ячейки мира: грань икосаэдра (3 трита) + спираль (6 тритов) = 9.
+pub fn world_trit_id(face: usize, s: i64) -> Result<Trits, String> {
+    if face >= 20 {
+        return Err(format!("hex: грань {face} вне икосаэдра (0..19)"));
+    }
+    let fcode = face as i64 - FACE_OFFSET;
+    let fc = Trits::from_i64(fcode)?;
+    let mut fd = fc.digits.clone();
+    while fd.len() < 3 {
+        fd.insert(0, 0);
+    }
+    let sc = hex_trit_id(s)?;
+    let mut digits = fd;
+    digits.extend(sc.digits.iter().cloned());
+    Ok(Trits { digits })
+}
+
+/// Разбор мирового адреса: (грань, s).
+pub fn world_trit_parse(t: &Trits) -> Result<(usize, i64), String> {
+    let mut digits = t.digits.clone();
+    while digits.len() < 9 {
+        digits.insert(0, 0);
+    }
+    if digits.len() > 9 {
+        return Err(format!("hex: мировой адрес {:?} длиннее 9 тритов", t.digits));
+    }
+    // грань — ПЕРВЫЕ 3 трита, спираль — ПОСЛЕДНИЕ 6
+    let sd = digits.split_off(3);
+    let fd = digits;
+    let face = (Trits { digits: fd }.to_i64() + FACE_OFFSET) as usize;
+    let s = trit_id_to_hex(&Trits { digits: sd })?;
+    if face >= 20 {
+        return Err(format!("hex: грань {face} вне икосаэдра"));
+    }
+    Ok((face, s))
+}
+
+// ─────────────── икосаэдр H3: 20 граней золотого сечения ───────────────
+
+/// 12 вершин икосаэдра (0, ±1, ±φ) на описанной сфере R = √(1+φ²) ≈ 1.902
+/// (рёбра длины 2 — точные пороги граней без округлений).
+pub fn icosa_vertices() -> [(f64, f64, f64); 12] {
+    let p = (1.0 + 5.0f64.sqrt()) / 2.0;
+    let mut v = Vec::with_capacity(12);
+    for &s1 in [1.0, -1.0].iter() {
+        for &s2 in [p, -p].iter() {
+            v.push((0.0, s1, s2));
+            v.push((s1, s2, 0.0));
+            v.push((s2, 0.0, s1));
+        }
+    }
+    // v имеет дубликаты циклических перестановок — собираем уникальные
+    let mut uniq: Vec<(f64, f64, f64)> = Vec::new();
+    for x in v {
+        if !uniq.iter().any(|&u| {
+            (u.0 - x.0).abs() < 1e-9 && (u.1 - x.1).abs() < 1e-9 && (u.2 - x.2).abs() < 1e-9
+        }) {
+            uniq.push(x);
+        }
+    }
+    let mut arr = [(0.0, 0.0, 0.0); 12];
+    for (i, &u) in uniq.iter().take(12).enumerate() {
+        arr[i] = u;
+    }
+    arr
+}
+
+/// 20 граней икосаэдра: тройки вершин с ребрами длины 2 (сфера R=1).
+pub fn icosa_faces() -> Vec<[usize; 3]> {
+    let v = icosa_vertices();
+    let d2 = |a: (f64, f64, f64), b: (f64, f64, f64)| {
+        (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)
+    };
+    let mut faces = Vec::new();
+    for i in 0..12 {
+        for j in (i + 1)..12 {
+            if (d2(v[i], v[j]) - 4.0).abs() > 1e-9 {
+                continue; // не ребро
+            }
+            for k in (j + 1)..12 {
+                if (d2(v[i], v[k]) - 4.0).abs() < 1e-9
+                    && (d2(v[j], v[k]) - 4.0).abs() < 1e-9
+                {
+                    faces.push([i, j, k]);
+                }
+            }
+        }
+    }
+    faces
+}
+
+/// Центры граней (нормированные) — для выбора грани направления.
+pub fn icosa_face_centers() -> Vec<(f64, f64, f64)> {
+    let v = icosa_vertices();
+    icosa_faces()
+        .iter()
+        .map(|&[a, b, c]| {
+            let mut x = (v[a].0 + v[b].0 + v[c].0) / 3.0;
+            let mut y = (v[a].1 + v[b].1 + v[c].1) / 3.0;
+            let mut z = (v[a].2 + v[b].2 + v[c].2) / 3.0;
+            let n = (x * x + y * y + z * z).sqrt();
+            x /= n;
+            y /= n;
+            z /= n;
+            (x, y, z)
+        })
+        .collect()
+}
+
+/// Грань направления: максимум скалярного произведения с центрами.
+pub fn face_of_direction(dir: (f64, f64, f64)) -> Result<usize, String> {
+    let (x, y, z) = dir;
+    let n = (x * x + y * y + z * z).sqrt();
+    if !n.is_finite() || n < 1e-12 {
+        return Err("hex: нулевое направление не задаёт грань".into());
+    }
+    let (x, y, z) = (x / n, y / n, z / n);
+    let centers = icosa_face_centers();
+    let mut best = 0usize;
+    let mut best_dot = f64::NEG_INFINITY;
+    for (i, &c) in centers.iter().enumerate() {
+        let dot = c.0 * x + c.1 * y + c.2 * z;
+        if dot > best_dot {
+            best_dot = dot;
+            best = i;
+        }
+    }
+    Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_sizes_and_distances() {
+        assert_eq!(hex_ring(1).len(), 6);
+        assert_eq!(hex_ring(5).len(), 30);
+        assert_eq!(hex_disk(0).len(), 1);
+        assert_eq!(hex_disk(1).len(), 7);
+        assert_eq!(hex_disk(10).len(), 331);
+        assert_eq!(hex_disk(13).len(), 547);
+        // все ячейки кольца k на дистанции k, все уникальны
+        for k in [1i64, 4, 9] {
+            let ring = hex_ring(k);
+            for &c in &ring {
+                assert_eq!(hex_distance((0, 0), c), k, "кольцо {k}: {c:?}");
+            }
+            let mut sorted = ring.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), ring.len(), "кольцо {k}: дубликаты");
+        }
+    }
+
+    #[test]
+    fn spiral_roundtrip_full_disk() {
+        // полный диск радиуса 10 (331 ячейка) — туда и обратно
+        for &c in hex_disk(10).iter() {
+            let s = axial_to_spiral(c.0, c.1).unwrap();
+            let back = spiral_to_axial(s).unwrap();
+            assert_eq!(back, c, "s={s}");
+        }
+        // граничные значения
+        assert_eq!(axial_to_spiral(0, 0).unwrap(), 0);
+        assert_eq!(spiral_to_axial(0).unwrap(), (0, 0));
+        // первый шаг кольца 1 = старт SW = (−1, 1)
+        assert_eq!(spiral_to_axial(1).unwrap(), (-1, 1));
+        assert_eq!(axial_to_spiral(-1, 1).unwrap(), 1);
+        // последнее s кольца k: 3k²+3k
+        for k in [1i64, 5, 10, 13] {
+            let s_max = 3 * k * (k + 1);
+            let c = spiral_to_axial(s_max).unwrap();
+            assert_eq!(hex_distance((0, 0), c), k, "s_max кольца {k}");
+        }
+    }
+
+    #[test]
+    fn six_trit_block_packing() {
+        // s=0 → код −364 → 6 тритов
+        let t0 = hex_trit_id(0).unwrap();
+        assert_eq!(t0.len(), 6);
+        assert_eq!(trit_id_to_hex(&t0).unwrap(), 0);
+        // весь диапазон блока: s ∈ [0, 728]
+        for s in [0i64, 1, 364, 365, 546, 728] {
+            let t = hex_trit_id(s).unwrap();
+            assert_eq!(t.len(), 6, "s={s}");
+            assert_eq!(trit_id_to_hex(&t).unwrap(), s, "s={s}");
+        }
+        // вне блока — ошибка
+        assert!(hex_trit_id(729).is_err());
+        assert!(hex_trit_id(-1).is_err());
+        // полный диск радиуса 13 пакуется
+        for &c in hex_disk(13).iter() {
+            let s = axial_to_spiral(c.0, c.1).unwrap();
+            let t = hex_trit_id(s).unwrap();
+            assert_eq!(trit_id_to_hex(&t).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn world_address_nine_trits() {
+        // (грань, s) → 9 тритов → обратно
+        for (face, s) in [(0usize, 0i64), (7, 42), (19, 546)] {
+            let t = world_trit_id(face, s).unwrap();
+            assert_eq!(t.len(), 9, "грань {face}, s {s}");
+            let (f2, s2) = world_trit_parse(&t).unwrap();
+            assert_eq!((f2, s2), (face, s));
+        }
+        assert!(world_trit_id(20, 0).is_err());
+        assert!(world_trit_id(0, 729).is_err());
+    }
+
+    #[test]
+    fn neighbors_are_at_unit_distance() {
+        for &n in hex_neighbors((3, -2)).iter() {
+            assert_eq!(hex_distance((3, -2), n), 1);
+        }
+        // сосед центра (0,1) — классическая гекс-координата
+        assert!(hex_neighbors((0, 0)).contains(&(0, 1)));
+        assert!(hex_neighbors((0, 0)).contains(&(1, 0)));
+        assert!(hex_neighbors((0, 0)).contains(&(1, -1)));
+    }
+
+    #[test]
+    fn icosahedron_structure() {
+        let v = icosa_vertices();
+        // 12 вершин на описанной сфере R = √(1+φ²) ≈ 1.902
+        let p = (1.0 + 5.0f64.sqrt()) / 2.0;
+        let r_expected = (1.0 + p * p).sqrt();
+        for &x in v.iter() {
+            let r = (x.0 * x.0 + x.1 * x.1 + x.2 * x.2).sqrt();
+            assert!((r - r_expected).abs() < 1e-9, "вершина не на сфере: {x:?}");
+        }
+        let faces = icosa_faces();
+        assert_eq!(faces.len(), 20, "у икосаэдра 20 граней");
+        let centers = icosa_face_centers();
+        assert_eq!(centers.len(), 20);
+        // центры граней — на ЕДИНИЧНОЙ сфере (для face_of_direction)
+        for &c in centers.iter() {
+            let r = (c.0 * c.0 + c.1 * c.1 + c.2 * c.2).sqrt();
+            assert!((r - 1.0).abs() < 1e-9);
+        }
+        // центр грани ближе к своей грани, чем к чужой: face_of(центр) = сама
+        for (i, &c) in centers.iter().enumerate() {
+            assert_eq!(face_of_direction(c).unwrap(), i, "грань {i}");
+        }
+        // 20 направлений дают 20 разных граней (полное покрытие сферы)
+        let mut seen = std::collections::HashSet::new();
+        for &c in centers.iter() {
+            seen.insert(face_of_direction(c).unwrap());
+        }
+        assert_eq!(seen.len(), 20);
+    }
+}

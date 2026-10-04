@@ -447,6 +447,8 @@ pub fn free_vars(e: &Expr, out: &mut BTreeSet<String>) {
 // Вычислитель
 // ---------------------------------------------------------------------
 
+use crate::calc::logprob::LogProb;
+
 /// Вычислить AST. `vars` может пополняться присваиваниями.
 pub fn eval(e: &Expr, vars: &mut HashMap<String, Value>) -> Result<Value, String> {
     // CSE-кеш подвыражений — ГРАБЛИ сессии-4 (исправлены): вложенные
@@ -709,6 +711,11 @@ fn negate(v: &Value) -> Result<Value, String> {
             }
             Ok(Value::List(out))
         }
+        Value::LogProb(_) => Err(
+            "вероятность не бывает отрицательной — лог-домен хранит только P > 0 \
+             (дополнение: 1 − P — вычитание, а не минус)"
+                .into(),
+        ),
         Value::Str(_) => Err("нельзя negate строку".into()),
     }
 }
@@ -879,6 +886,32 @@ pub fn binary_op(op: BinOp, a: &Value, b: &Value) -> Result<Value, String> {
         (Value::Str(_), _) | (_, Value::Str(_)) => {
             Err("арифметика со строками не определена".into())
         }
+
+        // --- лог-вероятности (сессия-14): арифметика за пределами f64 ---
+        (Value::LogProb(p), Value::LogProb(q)) => match op {
+            Add => Ok(Value::LogProb(p.logaddexp(*q))),
+            Sub => Ok(Value::LogProb(p.logsubexp(*q)?)),
+            Mul => Ok(Value::LogProb(p.mul(*q))),
+            Div => Ok(Value::LogProb(p.div(*q))),
+            Pow => Err(
+                "вероятность^вероятность не определена (показатель — число: P^k)".into(),
+            ),
+            Mod => Err("остаток для лог-вероятностей не определён".into()),
+        },
+        (Value::LogProb(p), Value::Scalar(y)) => logprob_scalar_op(op, *p, *y, true),
+        (Value::Scalar(x), Value::LogProb(q)) => logprob_scalar_op(op, *q, *x, false),
+        (Value::LogProb(_), Value::Quantity(_, _))
+        | (Value::Quantity(_, _), Value::LogProb(_)) => {
+            Err("вероятность безразмерна — единицы несовместимы (снимите их: /s и т.п.)".into())
+        }
+        (Value::LogProb(_), Value::Matrix(_))
+        | (Value::Matrix(_), Value::LogProb(_))
+        | (Value::LogProb(_), Value::Complex(_))
+        | (Value::Complex(_), Value::LogProb(_)) => Err(
+            "лог-вероятность живёт со скалярами и другими лог-вероятностями \
+             (подсказка: lpsum — сумма ряда, logpow — b^x за f64)"
+                .into(),
+        ),
         // --- BigInt с остальными типами: f64-приближение (физика/матрицы ---
         // живут в f64-мире; точность больших целых — в big-операциях выше)
         (Value::BigInt(a), _) => {
@@ -892,6 +925,71 @@ pub fn binary_op(op: BinOp, a: &Value, b: &Value) -> Result<Value, String> {
         // списки пойманы выше broadcast-ами — сюда попадаем только с
         // нестандартными комбинациями (List с матрицей и т.п.)
         _ => Err("операция не определена для этих типов".into()),
+    }
+}
+
+/// Лог-вероятность × обычное число (сессия-14).
+///
+/// Семантика «P — вероятность, s — число»:
+/// * `P·s`, `P/s` — умножение/деление вероятности на число (ln ± ln s);
+/// * `P^s` — степень (ln·s); `s/P` — отношение (шансы);
+/// * `P ± s` — число поднимается в лог-домен (s > 0): сумма/дополнение
+///   ряда вероятностей, включая 1 − P для сверхмалых P.
+///
+/// Порядок важен только для вычитания и деления (лог-домен — не
+/// коммутативная группа по вычитанию: logsubexp требует порядка).
+fn logprob_scalar_op(op: BinOp, p: LogProb, s: f64, prob_first: bool) -> Result<Value, String> {
+    use BinOp::*;
+    match op {
+        Mul => {
+            if s < 0.0 {
+                return Err("P·(отрицательное): вероятность не бывает отрицательной".into());
+            }
+            if s == 0.0 {
+                return Err("P·0 = 0 — ноль не живёт в лог-домене (только предел)".into());
+            }
+            Ok(Value::LogProb(LogProb::from_ln(p.ln() + s.ln())?))
+        }
+        Div if prob_first => {
+            if s == 0.0 {
+                return Err("P/0 — деление на ноль".into());
+            }
+            if s < 0.0 {
+                return Err("P/(отрицательное): вероятность не бывает отрицательной".into());
+            }
+            Ok(Value::LogProb(LogProb::from_ln(p.ln() - s.ln())?))
+        }
+        Div => {
+            // s / P — отношение/шансы (может быть > 1 — это законно)
+            if s <= 0.0 {
+                return Err(format!("{s}/P: числитель должен быть > 0 (лог-домен)"));
+            }
+            Ok(Value::LogProb(LogProb::from_ln(s.ln() - p.ln())?))
+        }
+        Pow if prob_first => {
+            if !s.is_finite() {
+                return Err(format!("P^{s}: показатель должен быть числом"));
+            }
+            Ok(Value::LogProb(p.pow(s)))
+        }
+        Pow => Err("число^вероятность не определена (b^x за f64 — logpow(b, x))".into()),
+        Add | Sub => {
+            let lift = LogProb::from_f64(s)
+                .map_err(|_| {
+                    format!(
+                        "число {s} не поднимается в лог-домен (нужно > 0): \
+                         сумма вероятностей определена только для P > 0"
+                    )
+                })?;
+            if op == Add {
+                Ok(Value::LogProb(p.logaddexp(lift)))
+            } else if prob_first {
+                Ok(Value::LogProb(p.logsubexp(lift)?))
+            } else {
+                Ok(Value::LogProb(lift.logsubexp(p)?))
+            }
+        }
+        Mod => Err("остаток для лог-вероятностей не определён".into()),
     }
 }
 

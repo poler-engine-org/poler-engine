@@ -17,6 +17,10 @@
 //!                     │                       ├─ Scalar / Quantity(единицы)
 //!                     │                       ├─ Matrix (expm, Фаддеев, Ли)
 //!                     │                       ├─ Complex (корни, спектры)
+//!                     │                       ├─ BigInt (fib(1000), 1000!)
+//!                     │                       ├─ LogProb (сессия-14: P = e^ln при
+//!                     │                       │   ln ~ −1e30 — за пределами f64;
+//!                     │                       │   +−·/^ в лог-домене, lpsum — Z = Σ P_i)
 //!                     │                       └─ List / Str
 //!                     ├─ solve: Дюран–Кернер + Ньютон/бисекция
 //!                     ├─ numbers: Миллер–Рабин, ρ-Поллард
@@ -35,6 +39,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::calc::logprob::LogProb;
 use crate::calc::matrix::Matrix;
 use crate::calc::solve::Complex;
 use crate::calc::units::Unit;
@@ -70,6 +75,10 @@ pub enum Value {
     /// Точное большое целое (fib(1000), 1000!, 2^10000) — десятичная
     /// запись, возможен ведущий '-'. Цикл N: «невозможное → возможное».
     BigInt(String),
+    /// Вероятность в лог-домене (сессия-14): P = e^ln при ln ~ −1e30 —
+    /// за пределами f64. Сложение — logaddexp, суммы рядов — lpsum,
+    /// родная форма — тритная глубина P = 3^(−d).
+    LogProb(LogProb),
     /// Список значений (корни, делители, midpoint…).
     List(Vec<Value>),
     /// Строка (имена планет, тритные записи).
@@ -87,6 +96,7 @@ impl Value {
             Value::Quantity(v, u) => Some(v * u.factor),
             // приближение (для физики/solve достаточно; точность — в Display)
             Value::BigInt(s) => s.parse::<f64>().ok(),
+            Value::LogProb(p) => p.to_f64(),
             _ => None,
         }
     }
@@ -98,6 +108,7 @@ impl Value {
             Value::Matrix(_) => "матрица",
             Value::Complex(_) => "комплексное",
             Value::BigInt(_) => "точное целое",
+            Value::LogProb(_) => "лог-вероятность",
             Value::List(_) => "список",
             Value::Str(_) => "строка",
         }
@@ -164,6 +175,16 @@ impl fmt::Display for Value {
                     write!(f, "{it}")?;
                 }
                 write!(f, "]")
+            }
+            Value::LogProb(p) => {
+                // двойная форма: десятичная И тритная (родная POLER);
+                // для представимых — число + тритная глубина рядом.
+                if p.is_probability() {
+                    write!(f, "{} = {}", p.fmt10(), p.fmt3())
+                } else {
+                    // шансы/отношения > 1 — только десятичная запись
+                    write!(f, "{}", p.fmt10())
+                }
             }
             Value::Str(s) => write!(f, "\"{s}\""),
         }
