@@ -9,6 +9,7 @@
 
 use super::astro;
 use super::geodesy;
+use super::logprob;
 use super::matrix::Matrix;
 use super::numbers;
 use super::solve::Complex;
@@ -47,6 +48,19 @@ fn angle_arg(args: &[Value], i: usize) -> Result<f64, String> {
             i + 1
         )),
         None => Err(format!("не хватает аргументов (нужен аргумент {})", i + 1)),
+    }
+}
+
+/// Числовой аргумент с СИ-конверсией: Scalar либо Quantity в базовых
+/// единицах СИ (`3600 s`, `20 W`, `310 K` — работают). Сессия-13.
+fn num_arg_si(args: &[Value], i: usize, name: &str, what: &str) -> Result<f64, String> {
+    match args.get(i) {
+        Some(Value::Scalar(v)) => Ok(*v),
+        Some(q @ Value::Quantity(..)) => q
+            .as_f64()
+            .ok_or_else(|| format!("{name}: {what} — величина без числового значения")),
+        Some(other) => Err(format!("{name}: {what} — число или величина, получено {other}")),
+        None => Err(format!("{name}: не хватает аргументов ({what})")),
     }
 }
 
@@ -339,6 +353,8 @@ pub fn is_function(name: &str) -> bool {
         | "viz_graph" | "viz_field" | "viz_surf"
         // GIS-ядро на тритах (сессия-12)
         | "viz_iso3" | "de9im" | "geo_pred"
+        // сверхдиапазонные вероятности (сессия-13)
+        | "logpow" | "regress"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -1134,6 +1150,39 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                     .collect(),
             ))
         }
+        // ---------- сверхдиапазонные вероятности (сессия-13) ----------
+        "logpow" => {
+            // logpow(b, x): b^x, когда результат за пределами f64 —
+            // ответ в лог-домене: [log10, log3] (десятичные порядки и
+            // тритная глубина против события).
+            need(args, 2, name)?;
+            let b = scalar_arg(args, 0)?;
+            let x = scalar_arg(args, 1)?;
+            let p = logprob::LogProb::powf(b, x)?;
+            Ok(Value::List(vec![
+                Value::Scalar(p.log10()),
+                Value::Scalar(p.log3()),
+            ]))
+        }
+        "regress" => {
+            // regress(N_бит, Δt_с[, Вт, К]): P(опыт из будущего | регрессия
+            // в прошлое) = 2^(-N) и P(регрессия) = e^(-ΔS/k_B) — полный
+            // отчёт с тритными глубинами и бюджетом Вселенной.
+            if args.len() < 2 || args.len() > 4 {
+                return Err("regress: 2–4 аргумента: (N_бит, Δt_с[, Вт, К])".into());
+            }
+            let n = num_arg_si(args, 0, name, "число бит опыта N")?;
+            let dt = num_arg_si(args, 1, name, "глубина регрессии Δt, с")?;
+            let watts = match args.get(2) {
+                None => 20.0,
+                Some(_) => num_arg_si(args, 2, name, "мощность мозга, Вт")?,
+            };
+            let kelvin = match args.get(3) {
+                None => 310.15,
+                Some(_) => num_arg_si(args, 3, name, "температура мозга, К")?,
+            };
+            Ok(Value::Str(logprob::regress_report(n, dt, watts, kelvin)?))
+        }
         // ---------- триты ----------
         "trits" => {
             let v = one_arg(args, name)?;
@@ -1358,6 +1407,14 @@ pub fn catalog(filter: &str) -> String {
             "точность без epsilon: координаты квантуются в тритную решётку 3⁻ᵏ (k ≤ 12)",
             "viz_iso3(стек срезов, уровень) — изоповерхность: marching tetrahedra, watertight",
             "кольцо — матрица Nx2 [x,y; x,y; …] · стек — список матриц либо блочная (nz·ny)×nx",
+        ]),
+        ("сверхдиапазонные вероятности (сессия-13)", &[
+            "logpow(b, x) — b^x за пределами f64: ответ [log10, log3] — порядки и тритная глубина",
+            "logpow(2, -1e15) → 10^(-3.010e+14) — то, что раньше выпадало в 0.0",
+            "regress(N_бит, Δt_с[, Вт, К]) — регрессия в прошлое с сохранением опыта",
+            "P(опыт|регрессия) = 2^(-N) · P(регрессия) = e^(-ΔS/k_B), ΔS = σ·Δt, σ = P/T",
+            "умолчания: мозг 20 Вт / 310.15 К · бюджет Вселенной 10^(140.91) испытаний",
+            "тритная глубина d: P = 3^(-d) — сколько тритов сбалансированной тройки «против»",
         ]),
     ];
     let mut out = String::new();
@@ -1847,5 +1904,98 @@ mod tests {
             Matrix::from_rows(&[vec![1.0, 1.0], vec![1.0, 1.0]]).unwrap(),
         );
         assert!(call("viz_iso3", &[flat]).is_err());
+    }
+
+    // ─────────── сверхдиапазонные вероятности (сессия-13) ───────────
+
+    #[test]
+    fn logpow_within_and_beyond_f64() {
+        // 10^10 представимо: [log10, log3] = [10, 20.959…].
+        match call("logpow", &[s(10.0), s(10.0)]).unwrap() {
+            Value::List(items) => {
+                assert!(matches!(items[0], Value::Scalar(v) if (v - 10.0).abs() < 1e-9));
+                assert!(matches!(items[1], Value::Scalar(v) if (v - 20.959).abs() < 1e-2));
+            }
+            other => panic!("logpow: не список {other:?}"),
+        }
+        // 2^(-10^15) — вне f64, лог-домен отвечает точно.
+        match call("logpow", &[s(2.0), s(-1e15)]).unwrap() {
+            Value::List(items) => {
+                assert!(matches!(items[0], Value::Scalar(v) if (v + 3.0103e14).abs() < 1e10));
+                assert!(matches!(items[1], Value::Scalar(v) if (v + 6.3093e14).abs() < 1e10));
+            }
+            other => panic!("logpow: не список {other:?}"),
+        }
+        // Основание ≤ 0 и не-числа — ошибки.
+        assert!(call("logpow", &[s(-2.0), s(3.0)]).is_err());
+        assert!(call("logpow", &[s(2.0)]).is_err());
+        assert!(call("logpow", &[Value::Str("x".into()), s(3.0)]).is_err());
+    }
+
+    #[test]
+    fn regress_full_report_matches_reference() {
+        // Эталон — Python-калькуляция Сессии-13:
+        // N = 1e5 бит, Δt = 3600 с, 20 Вт, 310.15 К.
+        match call("regress", &[s(1e5), s(3600.0)]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("ΔS/k_B = 1.681e+25"), "ΔS: {rep}");
+                assert!(rep.contains("4.671e+21"), "σ: {rep}");
+                assert!(rep.contains("10^(-3.010e+04)"), "память: {rep}");
+                assert!(rep.contains("3^(-6.309e+04)"), "триты памяти: {rep}");
+                assert!(rep.contains("10^(-7.302e+24)"), "регрессия: {rep}");
+                assert!(rep.contains("3^(-1.530e+25)"), "триты регрессии: {rep}");
+                assert!(rep.contains("10^(140.91)"), "бюджет: {rep}");
+                assert!(rep.contains("0 реализаций"), "вердикт: {rep}");
+                assert!(rep.contains("20 порядков"), "дороже: {rep}");
+                assert!(rep.contains("Θ-канал"), "каналы: {rep}");
+            }
+            other => panic!("regress: не строка {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regress_defaults_overrides_and_errors() {
+        // Умолчания совпадают с явными 20 Вт / 310.15 К.
+        let a = match call("regress", &[s(1.0), s(60.0)]).unwrap() {
+            Value::Str(a) => a,
+            other => panic!("regress: не строка {other:?}"),
+        };
+        let b = match call("regress", &[s(1.0), s(60.0), s(20.0), s(310.15)]).unwrap() {
+            Value::Str(b) => b,
+            other => panic!("regress: не строка {other:?}"),
+        };
+        assert_eq!(a, b);
+        assert!(a.contains("= 0.5 = 3^(-6.309e-01)"), "один бит: {a}");
+        assert!(a.contains("ΔS/k_B = 2.802e+23"), "минута: {a}");
+
+        // 30 лет ≈ 9.467e8 с: ΔS/k_B = 4.422e30.
+        match call("regress", &[s(1e13), s(9.467e8)]).unwrap() {
+            Value::Str(rep) => assert!(rep.contains("4.422e+30"), "30 лет: {rep}"),
+            other => panic!("regress: не строка {other:?}"),
+        }
+
+        // Величины в СИ проходят: 3600 s — те же секунды.
+        let q = match call(
+            "regress",
+            &[s(1.0), Value::Quantity(3600.0, units::by_name("s").unwrap().clone())],
+        ) {
+            Ok(Value::Str(q)) => q,
+            other => panic!("regress с величиной: {other:?}"),
+        };
+        assert!(q.contains("Δt = 3600 с"), "СИ-величина: {q}");
+
+        // Ошибки: неверная арность и физически бессмысленные входы.
+        assert!(call("regress", &[s(1.0)]).is_err());
+        assert!(call("regress", &[]).is_err());
+        assert!(call("regress", &[s(1.0), s(2.0), s(3.0), s(4.0), s(5.0)]).is_err());
+        assert!(call("regress", &[s(-1.0), s(60.0)]).is_err());
+        assert!(call("regress", &[s(1.0), s(0.0)]).is_err());
+        assert!(call("regress", &[s(1.0), s(60.0), s(0.0)]).is_err());
+        assert!(call("regress", &[s(1.0), s(60.0), s(20.0), s(-5.0)]).is_err());
+        assert!(call("regress", &[Value::Str("много".into()), s(60.0)]).is_err());
+
+        // Каталог знает группу.
+        assert!(catalog("").contains("сверхдиапазонные вероятности"));
+        assert!(catalog("регресс").contains("regress"));
     }
 }

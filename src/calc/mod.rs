@@ -45,6 +45,7 @@ pub mod functions;
 pub mod geodesy;
 pub mod hardware;
 pub mod lexer;
+pub mod logprob;
 pub mod matrix;
 pub mod numbers;
 pub mod parser;
