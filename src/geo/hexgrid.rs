@@ -189,6 +189,117 @@ pub fn world_trit_parse(t: &Trits) -> Result<(usize, i64), String> {
     Ok((face, s))
 }
 
+// ─────────────── res>0: дробление апертурой 9 (Сессия-15) ───────────────
+//
+// Доктрина CSE (universal_letters): аналитика вместо LUT. Настоящий H3
+// использует апертуру 7 — масштабирование на √7 иррационально, посему
+// мегабайты таблиц поворотов и пентагон-исключений. Тритная апертура 9
+// = 3² — ТОЧНОЕ решёточное масштабирование осевых координат:
+//
+//   потомок(q, r) = (3q + i, 3r + j),  i, j ∈ {−1, 0, +1}
+//
+// Девять потомков, ребро /3, адрес = +2 трита уточнения на уровень
+// (сбалансированная пара (i, j)). Родитель — div_euclid(3). Ноль таблиц,
+// чистая целочисленная арифметика, воспроизводимость побитово.
+
+/// Апертура дробления: 9 = 3² (решёточный масштаб).
+pub const APERTURE: i64 = 3;
+
+/// Девять потомков ячейки (aperture 9): (3q+i, 3r+j), порядок детерминирован.
+pub fn h3_children(q: i64, r: i64) -> [(i64, i64); 9] {
+    let mut out = [(0i64, 0i64); 9];
+    let mut n = 0usize;
+    for &i in &[-1i64, 0, 1] {
+        for &j in &[-1i64, 0, 1] {
+            out[n] = (APERTURE * q + i, APERTURE * r + j);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// Родитель ячейки + уточняющие триты: ((q', r'), (i, j)).
+/// Сбалансированное деление: остаток 2 ≡ трит −1 С ЗАЁМОМ из частного
+/// (−1 = 3·0 − 1, а не 3·(−1) + 2 — грабля №31, поймана тестом).
+pub fn h3_parent(q: i64, r: i64) -> ((i64, i64), (i64, i64)) {
+    let bal_div = |v: i64| -> (i64, i64) {
+        let mut qu = v.div_euclid(APERTURE);
+        let mut re = v.rem_euclid(APERTURE); // ∈ {0, 1, 2}
+        if re == 2 {
+            re = -1;
+            qu += 1;
+        }
+        (qu, re)
+    };
+    let (pq, i) = bal_div(q);
+    let (pr, j) = bal_div(r);
+    ((pq, pr), (i, j))
+}
+
+/// Уточняющая трит-пара (i, j) → 2 трита (старший i, младший j).
+pub fn refine_trits(i: i64, j: i64) -> Result<Trits, String> {
+    if !(-1..=1).contains(&i) || !(-1..=1).contains(&j) {
+        return Err(format!("hex: уточнение ({i},{j}) — триты, только −1/0/+1"));
+    }
+    let ti = Trits::from_i64(i)?;
+    let tj = Trits::from_i64(j)?;
+    Ok(Trits {
+        digits: [ti.digits.clone(), tj.digits.clone()].concat(),
+    })
+}
+
+/// Разбор уточняющей пары: 2 трита → (i, j).
+pub fn parse_refine(t: &Trits) -> Result<(i64, i64), String> {
+    if t.len() != 2 {
+        return Err(format!("hex: уточнение {:?} — ровно 2 трита", t.digits));
+    }
+    let i = Trits { digits: vec![t.digits[0]] }.to_i64();
+    let j = Trits { digits: vec![t.digits[1]] }.to_i64();
+    Ok((i, j))
+}
+
+/// Дочерний мировой адрес: родитель (9+2k тритов) + уточнение (i, j).
+pub fn child_world_address(parent: &Trits, i: i64, j: i64) -> Result<Trits, String> {
+    if parent.len() < 9 || parent.len() % 2 == 0 {
+        return Err(format!(
+            "hex: родительский адрес {:?} — нечётная длина ≥ 9 (res-0 = 9)",
+            parent.digits
+        ));
+    }
+    let mut digits = parent.digits.clone();
+    digits.extend(refine_trits(i, j)?.digits.iter().cloned());
+    Ok(Trits { digits })
+}
+
+/// Родительский мировой адрес + уточнение: (адрес, i, j).
+pub fn parent_world_address(child: &Trits) -> Result<(Trits, i64, i64), String> {
+    if child.len() < 11 || child.len() % 2 == 0 {
+        return Err(format!(
+            "hex: адрес {:?} — дроблёный (нечётная длина ≥ 11)",
+            child.digits
+        ));
+    }
+    let (i, j) = parse_refine(&Trits {
+        digits: child.digits[child.digits.len() - 2..].to_vec(),
+    })?;
+    let parent = Trits {
+        digits: child.digits[..child.digits.len() - 2].to_vec(),
+    };
+    Ok((parent, i, j))
+}
+
+/// Разрешение адреса: res = (длина − 9) / 2 (уровней дробления).
+pub fn world_address_res(t: &Trits) -> Result<usize, String> {
+    let n = t.len();
+    if n < 9 || n % 2 == 0 {
+        return Err(format!(
+            "hex: адрес {:?} — длина ≥ 9 и нечётная (9 + 2·res)",
+            t.digits
+        ));
+    }
+    Ok((n - 9) / 2)
+}
+
 // ─────────────── икосаэдр H3: 20 граней золотого сечения ───────────────
 
 /// 12 вершин икосаэдра (0, ±1, ±φ) на описанной сфере R = √(1+φ²) ≈ 1.902
@@ -285,6 +396,96 @@ pub fn face_of_direction(dir: (f64, f64, f64)) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aperture9_children_and_parents() {
+        // 9 потомков, все различны, roundtrip родитель↔потомок
+        for &(q, r) in &[(0i64, 0i64), (2, -3), (-5, 7), (13, 13)] {
+            let kids = h3_children(q, r);
+            let mut sorted: Vec<(i64, i64)> = kids.to_vec();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 9, "потомки ({q},{r}) не уникальны");
+            for &(cq, cr) in &kids {
+                let ((pq, pr), (i, j)) = h3_parent(cq, cr);
+                assert_eq!((pq, pr), (q, r), "родитель {cq},{cr} ≠ {q},{r}");
+                assert_eq!((3 * pq + i, 3 * pr + j), (cq, cr));
+            }
+        }
+        // потомки соседних родителей соседствуют на res-1 (ребро /3)
+        let a = h3_children(0, 0);
+        let b = h3_children(1, 0);
+        // потомок (1,0) родителя (0,0) [i=+1,j=0] и (2,0) родителя (1,0) [i=−1]
+        assert!(a.contains(&(1, 0)));
+        assert!(b.contains(&(2, 0)));
+        assert_eq!(hex_distance((1, 0), (2, 0)), 1, "граница res-1");
+        // дистанции внутри семейства: центр-потомок (0,0) к (1,0) = 1
+        assert_eq!(hex_distance((0, 0), (1, 0)), 1);
+    }
+
+    #[test]
+    fn refinement_trit_roundtrip() {
+        for &i in &[-1i64, 0, 1] {
+            for &j in &[-1i64, 0, 1] {
+                let t = refine_trits(i, j).unwrap();
+                assert_eq!(t.len(), 2, "({i},{j}) — 2 трита");
+                let (i2, j2) = parse_refine(&t).unwrap();
+                assert_eq!((i2, j2), (i, j));
+            }
+        }
+        assert!(refine_trits(2, 0).is_err());
+        assert!(parse_refine(&Trits { digits: vec![1] }).is_err());
+        // 9 состояний 2 тритов — весь диапазон уточнения
+        let mut codes = std::collections::HashSet::new();
+        for &i in &[-1i64, 0, 1] {
+            for &j in &[-1i64, 0, 1] {
+                codes.insert(refine_trits(i, j).unwrap().to_i64());
+            }
+        }
+        assert_eq!(codes.len(), 9);
+    }
+
+    #[test]
+    fn world_address_refinement_res() {
+        // res-0 адрес → res-1 → res-2, обратно, разрешение считается
+        let base = world_trit_id(7, 42).unwrap();
+        assert_eq!(world_address_res(&base).unwrap(), 0);
+        let c1 = child_world_address(&base, -1, 1).unwrap();
+        assert_eq!(c1.len(), 11);
+        assert_eq!(world_address_res(&c1).unwrap(), 1);
+        let c2 = child_world_address(&c1, 0, -1).unwrap();
+        assert_eq!(c2.len(), 13);
+        assert_eq!(world_address_res(&c2).unwrap(), 2);
+        // peel-back: два уровня вверх
+        let (p1, i1, j1) = parent_world_address(&c2).unwrap();
+        assert_eq!((i1, j1), (0, -1));
+        assert_eq!(p1.digits, c1.digits);
+        let (p0, i0, j0) = parent_world_address(&p1).unwrap();
+        assert_eq!((i0, j0), (-1, 1));
+        assert_eq!(p0.digits, base.digits);
+        // ошибки формы
+        assert!(child_world_address(&Trits { digits: vec![0; 8] }, 0, 0).is_err());
+        assert!(parent_world_address(&base).is_err());
+        assert!(world_address_res(&Trits { digits: vec![0; 10] }).is_err());
+    }
+
+    #[test]
+    fn children_tile_parent_neighborhood() {
+        // слияние семей: 4 соседних res-0 родителя дают связный res-1 блок,
+        // все 36 ячеек различны, дистанции согласованы с решёткой 3×
+        let parents = [(0i64, 0i64), (1, 0), (0, 1), (1, 1)];
+        let mut cells = Vec::new();
+        for &(q, r) in &parents {
+            cells.extend(h3_children(q, r));
+        }
+        let mut sorted = cells.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 36, "4 семьи × 9 = 36 уникальных res-1 ячеек");
+        // res-1 блок [−1,3]² содержит свои углы
+        assert!(cells.contains(&(-1, -1)));
+        assert!(cells.contains(&(3, 3)));
+    }
 
     #[test]
     fn ring_sizes_and_distances() {

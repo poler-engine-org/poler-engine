@@ -310,6 +310,159 @@ pub fn boltzmann_report(seed: u64, radius: i64, scale: f64) -> Result<String, St
     .join("\n"))
 }
 
+// ─────────────── TIN Делоне + Муха (Сессия-15) ───────────────
+//
+// Переплетение пяти модулей одним конвейером:
+//   universal_letters (Φ — золотое сечение) → сеем вершины спиралью
+//   Фибоначчи (та же константа, что у букв и у Мухи);
+//   delaunay (Bowyer-Watson, муха водит порядок вставки) → TIN;
+//   terrain_detail (diamond-square) → высоты вершин;
+//   logprob: E_i = (1.05−h_i)·scale → Z = Σ e^(−E_i) за пределами f64;
+//   барицентрическая интерполяция TIN против прямой terrain_detail —
+//   честная метрика точности рельефа на решётке.
+
+/// Вершины TIN Этерии: n точек, посеянных золотой спиралью
+/// (x_i = frac(i·φ), y_i = frac(i·φ²) + splitmix-джиттер от seed),
+/// высоты — `terrain_detail` (тот же мир, тот же seed).
+pub fn tin_vertices(seed: u64, n: usize) -> Result<Vec<(f64, f64, f64)>, String> {
+    if !(3..=5000).contains(&n) {
+        return Err(format!("eteria: вершин TIN n ∈ [3, 5000], получено {n}"));
+    }
+    let phi = (1.0 + 5.0f64.sqrt()) / 2.0;
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let fi = i as f64 + 0.5;
+        let jx = splitmix_jitter(&mut state) * 0.4;
+        let jy = splitmix_jitter(&mut state) * 0.4;
+        let x = (fi * phi + jx).fract();
+        let y = (fi * phi * phi + jy).fract();
+        let h = terrain_detail(seed, x, y);
+        out.push((x, y, h));
+    }
+    Ok(out)
+}
+
+/// Детерминированный джиттер ∈ (−0.5, 0.5) без состояния RNG
+/// (splitmix64-шаг, как в value-noise Этерии).
+fn splitmix_jitter(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+}
+
+/// Отчёт «Этерия · TIN + Муха»: триангуляция Делоне на золотом посеве,
+/// больцмановская статистика высот за пределами f64 и честная метрика
+/// TIN-интерполяции против diamond-square.
+pub fn tin_boltz_report(seed: u64, n: usize, scale: f64) -> Result<String, String> {
+    if !(3..=5000).contains(&n) {
+        return Err(format!("eteria: вершин TIN n ∈ [3, 5000], получено {n}"));
+    }
+    if !(1.0..1e12).contains(&scale) {
+        return Err(format!(
+            "eteria: масштаб энергий scale ∈ [1, 1e12], получено {scale}"
+        ));
+    }
+    let verts = tin_vertices(seed, n)?;
+    // решётка k = 10: квант 3⁻¹⁰, координаты ≤ 3¹⁰ — запас i128 (k ≤ 14)
+    let k = 10u8;
+    let mut pts_i: Vec<(i64, i64)> = Vec::with_capacity(n);
+    for &(x, y, _) in &verts {
+        let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+            .map_err(|e| format!("eteria: квантование ({x}, {y}): {e}"))?;
+        pts_i.push((tp.x.to_i64(), tp.y.to_i64()));
+    }
+    let tin = crate::geo::delaunay::delaunay(&pts_i)?;
+    crate::geo::delaunay::verify_delaunay(&tin)?;
+    let z: Vec<f64> = verts.iter().map(|&(_, _, h)| h).collect();
+
+    // больцмановский ряд: E_i = (1.05 − h_i)·scale — маржа 0.05 как в
+    // hex-версии: даже пик платит, ряд не вырождается в одну единицу
+    let lns: Vec<f64> = verts.iter().map(|&(_, _, h)| -(1.05 - h) * scale).collect();
+    let zpart = lpsum_lns(&lns)?;
+    let f64_sum: f64 = lns.iter().map(|&x| x.exp()).sum();
+    let z_in_f64 = if f64_sum == 0.0 {
+        "0.0 (ряд целиком в underflow)"
+    } else {
+        "частично"
+    };
+
+    // топ-3 вершины по высоте (минимум энергии)
+    let mut idx: Vec<usize> = (0..verts.len()).collect();
+    idx.sort_by(|&a, &b| verts[b].2.partial_cmp(&verts[a].2).unwrap());
+    let top: Vec<String> = idx
+        .iter()
+        .take(3)
+        .map(|&i| {
+            let (x, y, h) = verts[i];
+            let p = LogProb::from_ln(lns[i])?;
+            let share = LogProb::from_ln(lns[i] - zpart.ln())?;
+            Ok(format!(
+                "  ({:.3}, {:.3}) {} · h = {:.3} · P = {} · доля = {}",
+                x,
+                y,
+                BIOMES[biome_index(h)].0,
+                h,
+                p.fmt10(),
+                share.fmt10()
+            ))
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+
+    // метрика точности: TIN-интерполяция против terrain_detail в 33
+    // пробах золотой спирали ЗА пределами посева (i = n..n+32)
+    let mut max_dev = 0.0f64;
+    let mut probes = 0usize;
+    for i in n..n + 33 {
+        let fi = i as f64 + 0.5;
+        let phi = (1.0 + 5.0f64.sqrt()) / 2.0;
+        let x = (fi * phi).fract();
+        let y = (fi * phi * phi).fract();
+        let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+            .map_err(|e| format!("eteria: проба ({x}, {y}): {e}"))?;
+        if let Some(h_tin) = tin.height_at(&z, tp.x.to_i64(), tp.y.to_i64()) {
+            let h_direct = terrain_detail(seed, x, y);
+            max_dev = max_dev.max((h_tin - h_direct).abs());
+            probes += 1;
+        }
+    }
+
+    Ok([
+        format!(
+            "Этерия · TIN Делоне · {} вершин золотого посева · {} треугольников · \
+             оболочка {} рёбер · seed {}",
+            verts.len(),
+            tin.tris.len(),
+            tin.hull().len(),
+            seed
+        ),
+        format!(
+            "муха: порядок вставки sin(i·Φ mod 2π) · решётка k = {k} · \
+             Делоне верифицирован (i128, ноль округлений)"
+        ),
+        format!(
+            "E_i = (1.05−h_i)·{} → Z = Σ e^(−E_i) = {} = {}",
+            crate::calc::logprob::fmt_num(scale),
+            zpart.fmt10(),
+            zpart.fmt3()
+        ),
+        format!("прямая сумма в f64: {z_in_f64} · лог-домен: потеряно 0 порядков"),
+        format!(
+            "точность рельефа: TIN против diamond-square в {probes} пробах · \
+             max |Δh| = {:.4}",
+            max_dev
+        ),
+        "топ-вершины (минимум энергии):".to_string(),
+    ]
+    .into_iter()
+    .chain(top)
+    .collect::<Vec<_>>()
+    .join("\n"))
+}
+
 /// Число биомов в наборе ячеек (для легенды карты).
 pub fn biome_counts(cells: &[HexCell]) -> [usize; 6] {
     let mut c = [0usize; 6];

@@ -738,6 +738,189 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
     Ok(m)
 }
 
+/// LineString↔LineString (Сессия-15): две открытые ломаные.
+/// Завершает реляционную матрицу GEO-ядра: точка/кольцо/строка ×
+/// точка/кольцо/строка — якорь `geo.poler …/relate` (GeometryArray, L×L).
+///
+/// Трёхзначные ячейки (как в LineString×Polygon): точечное пересечение → 0,
+/// отрезок → +1. Свидетели:
+/// * концы обеих линий (границы): на чужой линии — строго во внутренности
+///   (IB/BI = 0) или в чужом конце (BB = 0), вне — BE/EB = +1;
+/// * внутренние вершины: лежат строго внутри чужого ребра или совпадают
+///   с чужой внутренней вершиной → II = 0 (точка);
+/// * пары рёбер: Proper → II = 0, Collinear (перекрытие положительной
+///   длины) → II = +1;
+/// * вложенность (IE/EI = −1 ⟺ линия целиком на другой): все вершины
+///   и сэмплы t = 1/4, 1/2, 3/4 с floor/ceil-пробами на другой линии.
+pub fn relate_line_line(a: &[TritPoint], b: &[TritPoint]) -> Result<De9im, String> {
+    let clean = |pts: &[TritPoint]| -> Vec<TritPoint> {
+        let mut v: Vec<TritPoint> = Vec::with_capacity(pts.len());
+        for p in pts {
+            if v.last() != Some(p) {
+                v.push(p.clone());
+            }
+        }
+        v
+    };
+    let la = clean(a);
+    let lb = clean(b);
+    if la.len() < 2 || lb.len() < 2 {
+        return Err("de9im: линия < 2 вершин".into());
+    }
+    if la[0].k != lb[0].k {
+        return Err("de9im: линии на решётках разного масштаба".into());
+    }
+    let (n, m) = (la.len(), lb.len());
+
+    // точка в замыкании ломаной
+    let on_line = |p: &TritPoint, l: &[TritPoint]| -> bool {
+        (0..l.len() - 1).any(|i| on_segment(p, &l[i], &l[i + 1]))
+    };
+    let is_end = |p: &TritPoint, l: &[TritPoint]| p == &l[0] || p == &l[l.len() - 1];
+
+    // ── пары рёбер: Proper / Collinear ──
+    let mut proper = false;
+    let mut collinear = false;
+    for i in 0..n - 1 {
+        for j in 0..m - 1 {
+            match seg_classify(&la[i], &la[i + 1], &lb[j], &lb[j + 1]) {
+                SegX::Proper => proper = true,
+                SegX::Collinear => collinear = true,
+                _ => {}
+            }
+        }
+    }
+
+    // ── внутренние вершины: точечные свидетели II ──
+    let mut ii_point = false;
+    for is_a in [true, false] {
+        let (l_self, l_other) = if is_a { (&la, &lb) } else { (&lb, &la) };
+        for vi in 1..l_self.len() - 1 {
+            let v = &l_self[vi];
+            // строго внутри чужого ребра
+            if (0..l_other.len() - 1).any(|j| {
+                on_segment(v, &l_other[j], &l_other[j + 1])
+                    && v != &l_other[j]
+                    && v != &l_other[j + 1]
+            }) {
+                ii_point = true;
+            }
+            // совпадение с чужой внутренней вершиной
+            if (1..l_other.len() - 1).any(|j| v == &l_other[j]) {
+                ii_point = true;
+            }
+        }
+    }
+
+    // ── концы: IB/BI/BB и BE/EB ──
+    let (mut ib, mut bi, mut bb, mut be, mut eb) = (false, false, false, false, false);
+    // конец B на A: у A-конца → BB, иначе → IB; вне A → EB
+    for e in [&lb[0], &lb[m - 1]] {
+        if on_line(e, &la) {
+            if is_end(e, &la) {
+                bb = true;
+            } else {
+                ib = true;
+            }
+        } else {
+            eb = true;
+        }
+    }
+    // конец A на B: у B-конца → BB, иначе → BI; вне B → BE
+    for e in [&la[0], &la[n - 1]] {
+        if on_line(e, &lb) {
+            if is_end(e, &lb) {
+                bb = true;
+            } else {
+                bi = true;
+            }
+        } else {
+            be = true;
+        }
+    }
+
+    // ── вложенность: A ⊆ B и B ⊆ A (вершины + сэмплы рёбер) ──
+    let mut a_escapes = proper; // собственное пересечение = обе выходят
+    let mut b_escapes = proper;
+    for p in &la {
+        if !on_line(p, &lb) {
+            a_escapes = true;
+        }
+    }
+    for p in &lb {
+        if !on_line(p, &la) {
+            b_escapes = true;
+        }
+    }
+    // сэмплы t = 1/4, 1/2, 3/4 с floor/ceil-пробами (стиль LineString×Polygon:
+    // решётчатые границы не рассекают ячейку проб насквозь)
+    for is_a in [true, false] {
+        let (l_self, l_other) = if is_a { (&la, &lb) } else { (&lb, &la) };
+        for i in 0..l_self.len() - 1 {
+            let p = &l_self[i];
+            let q = &l_self[i + 1];
+            for t in 1..=3i64 {
+                let nx = (4 - t) * p.x.to_i64() + t * q.x.to_i64();
+                let ny = (4 - t) * p.y.to_i64() + t * q.y.to_i64();
+                for (sx, sy) in [(0i64, 0i64), (0, 3), (3, 0), (3, 3)] {
+                    let s = TritPoint {
+                        x: Trits::from_i64((nx + sx) / 4)?,
+                        y: Trits::from_i64((ny + sy) / 4)?,
+                        k: p.k,
+                    };
+                    if !on_line(&s, l_other) {
+                        if is_a {
+                            a_escapes = true;
+                        } else {
+                            b_escapes = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── сборка матрицы: строки I/B/E линии A, столбцы I/B/E линии B ──
+    let mut m = De9im::EMPTY;
+    // II: перекрытие отрезком (+1) или точка (0)
+    if collinear {
+        m.cells[0] = 1;
+    } else if proper || ii_point {
+        m.cells[0] = 0;
+    }
+    // IB: чужой конец строго во внутренности A (точка)
+    if ib {
+        m.cells[1] = 0;
+    }
+    // IE: внутренность A выходит за замыкание B
+    if a_escapes {
+        m.cells[2] = 1;
+    }
+    // BI: свой конец строго во внутренности B (точка)
+    if bi {
+        m.cells[3] = 0;
+    }
+    // BB: общий конец (точка)
+    if bb {
+        m.cells[4] = 0;
+    }
+    // BE: свой конец вне B
+    if be {
+        m.cells[5] = 1;
+    }
+    // EI: внутренность B выходит за замыкание A
+    if b_escapes {
+        m.cells[6] = 1;
+    }
+    // EB: чужой конец вне A
+    if eb {
+        m.cells[7] = 1;
+    }
+    // EE: внешности ограниченных линий пересекаются площадно
+    m.cells[8] = 1;
+    Ok(m)
+}
+
 // ────────────────────────── тесты ──────────────────────────
 
 #[cfg(test)]
@@ -1025,5 +1208,134 @@ mod tests {
         // пустая линия — ошибка; кольцо < 3 — ошибка
         assert!(relate_line_ring(&[], &sq).is_err());
         assert!(relate_line_ring(&l, &ring(&[(0.0, 0.0), (1.0, 0.0)])).is_err());
+    }
+
+    // ─────────────── LineString×LineString (Сессия-15) ───────────────
+
+    #[test]
+    fn ll_x_crossing() {
+        // Накрест: II = 0 (точка), обе выходят → crosses
+        let a = line(&[(-2.0, -2.0), (2.0, 2.0)]);
+        let b = line(&[(-2.0, 2.0), (2.0, -2.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert_eq!(m.ii(), 0, "{}", m.bal_string());
+        assert_eq!(m.ie(), 1);
+        assert_eq!(m.ei(), 1);
+        assert!(m.crosses());
+        assert!(!m.overlaps());
+        assert!(m.intersects());
+    }
+
+    #[test]
+    fn ll_partial_overlap() {
+        // Коллинеарное частичное перекрытие: II = +1 → overlaps
+        let a = line(&[(0.0, 0.0), (4.0, 0.0)]);
+        let b = line(&[(2.0, 0.0), (6.0, 0.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert_eq!(m.ii(), 1, "{}", m.bal_string());
+        assert_eq!(m.ie(), 1);
+        assert_eq!(m.ei(), 1);
+        // конец B (2,0) строго внутри A; конец A (4,0) строго внутри B
+        assert_eq!(m.ib(), 0);
+        assert_eq!(m.bi(), 0);
+        assert!(m.overlaps());
+    }
+
+    #[test]
+    fn ll_equal_lines() {
+        let a = line(&[(0.0, 0.0), (4.0, 0.0)]);
+        let b = line(&[(0.0, 0.0), (4.0, 0.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert!(m.equals(), "{}", m.bal_string());
+        assert_eq!(m.ii(), 1);
+        assert_eq!(m.ie(), -1);
+        assert_eq!(m.ei(), -1);
+        assert_eq!(m.bb(), 0, "общие концы");
+        assert_eq!(m.be(), -1);
+        assert_eq!(m.eb(), -1);
+        // перевёрнутая та же линия — тоже equals
+        let c = line(&[(4.0, 0.0), (0.0, 0.0)]);
+        assert!(relate_line_line(&a, &c).unwrap().equals());
+    }
+
+    #[test]
+    fn ll_contained_subline() {
+        // B — под-отрезок A: A содержит B
+        let a = line(&[(0.0, 0.0), (4.0, 0.0)]);
+        let b = line(&[(1.0, 0.0), (3.0, 0.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert!(m.contains(), "{}", m.bal_string());
+        assert_eq!(m.ii(), 1);
+        assert_eq!(m.ei(), -1, "B не выходит за A");
+        assert_eq!(m.eb(), -1, "концы B на A");
+        assert_eq!(m.ie(), 1, "A выходит за B");
+        // транспонированный взгляд: B внутри A
+        let t = relate_line_line(&b, &a).unwrap();
+        assert!(t.within());
+    }
+
+    #[test]
+    fn ll_t_touch_and_endpoint_touch() {
+        // T-касание: конец A строго во внутренности B
+        let a = line(&[(0.0, 0.0), (0.0, 5.0)]);
+        let b = line(&[(-2.0, 0.0), (2.0, 0.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert_eq!(m.ii(), -1, "{}", m.bal_string());
+        assert_eq!(m.bi(), 0, "конец A во внутренности B");
+        assert!(m.touches());
+        assert!(!m.crosses());
+        // конец-к-концу: BB = 0
+        let c = line(&[(0.0, 0.0), (5.0, 0.0)]);
+        let m2 = relate_line_line(&a, &c).unwrap();
+        assert_eq!(m2.ii(), -1);
+        assert_eq!(m2.bb(), 0, "общий конец (0,0)");
+        assert!(m2.touches());
+    }
+
+    #[test]
+    fn ll_disjoint_and_errors() {
+        let a = line(&[(0.0, 0.0), (1.0, 0.0)]);
+        let b = line(&[(5.0, 5.0), (6.0, 5.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert!(m.disjoint(), "{}", m.bal_string());
+        assert_eq!(m.be(), 1);
+        assert_eq!(m.eb(), 1);
+        assert_eq!(m.ee(), 1);
+        // ошибки: < 2 вершин, разные решётки
+        assert!(relate_line_line(&a, &line(&[(1.0, 1.0)])).is_err());
+        assert!(relate_line_line(&[], &b).is_err());
+    }
+
+    #[test]
+    fn ll_crossing_at_shared_vertex() {
+        // Обе ломаные изламываются в общей точке (0,0) — II = 0 (точка)
+        let a = line(&[(-1.0, 1.0), (0.0, 0.0), (1.0, 1.0)]);
+        let b = line(&[(-1.0, -1.0), (0.0, 0.0), (1.0, -1.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert_eq!(m.ii(), 0, "{}", m.bal_string());
+        assert!(m.crosses());
+        assert_eq!(m.ie(), 1);
+        assert_eq!(m.ei(), 1);
+    }
+
+    #[test]
+    fn ll_transpose_symmetry() {
+        let a = line(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)]);
+        let b = line(&[(2.0, -1.0), (2.0, 2.0), (6.0, 2.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        let t = relate_line_line(&b, &a).unwrap();
+        assert_eq!(transpose(&m), t, "relate(b,a) = transpose(relate(a,b))");
+    }
+
+    #[test]
+    fn ll_zigzag_overlaps_shared_run() {
+        // Гребёнка A и прямая B с общим пробегом: II = +1, обе выходят
+        let a = line(&[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (4.0, 2.0)]);
+        let b = line(&[(-1.0, 2.0), (5.0, 2.0)]);
+        let m = relate_line_line(&a, &b).unwrap();
+        assert_eq!(m.ii(), 1, "общий пробег y=2: {}", m.bal_string());
+        assert_eq!(m.ie(), 1);
+        assert_eq!(m.ei(), 1);
+        assert!(m.overlaps());
     }
 }

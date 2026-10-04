@@ -374,6 +374,8 @@ pub fn is_function(name: &str) -> bool {
         | "spatial27" | "hexring" | "hexdisk" | "hexdist" | "hexid"
         | "de9im_line" | "eteria_field" | "eteria_hex" | "eteria_boltz"
         | "viz_hex"
+        // муха над картой (сессия-15): TIN, res>0, Line×Line
+        | "tin" | "eteria_tin" | "h3children" | "h3parent" | "de9im_ll"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -1451,6 +1453,127 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 crate::geo::eteria::boltzmann_report(seed, radius as i64, scale)?,
             ))
         }
+        "tin" => {
+            // tin(точки Nx2[, k]): TIN Делоне — Bowyer-Watson на тритной
+            // решётке, порядок вставки водит Муха (sin(i·Φ)).
+            let pts = ring_arg(args, 0, "tin")?;
+            if pts.len() < 3 {
+                return Err(format!(
+                    "tin: нужно ≥ 3 точек (Nx2), получено {}",
+                    pts.len()
+                ));
+            }
+            let k = match args.get(1) {
+                None => 10u8,
+                Some(Value::Scalar(v)) if *v >= 1.0 && *v <= 14.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "tin: решётка k ∈ [1, 14] (i128-запас детерминанта), получено {other}"
+                    ))
+                }
+            };
+            let mut pts_i: Vec<(i64, i64)> = Vec::with_capacity(pts.len());
+            for &(x, y) in &pts {
+                let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+                    .map_err(|e| format!("tin: квантование ({x}, {y}): {e}"))?;
+                pts_i.push((tp.x.to_i64(), tp.y.to_i64()));
+            }
+            let tin = crate::geo::delaunay::delaunay(&pts_i)
+                .map_err(|e| format!("tin: {e}"))?;
+            crate::geo::delaunay::verify_delaunay(&tin)
+                .map_err(|e| format!("tin: {e}"))?;
+            let hull = tin.hull().len();
+            let n = tin.pts.len();
+            Ok(Value::Str(format!(
+                "TIN Делоне · {n} точек · {} треугольников · оболочка {hull} рёбер\n\
+                 муха: порядок вставки sin(i·Φ mod 2π) — Gold Phase Lock из universal_letters\n\
+                 Эйлер: T = 2n−2−h = {} · детерминант i128, ноль округлений · Делоне верифицирован",
+                tin.tris.len(),
+                2 * n as i64 - 2 - hull as i64
+            )))
+        }
+        "eteria_tin" => {
+            // eteria_tin([seed[, n[, scale]]]): мир Этерии как TIN —
+            // золотой посев + Муха + LogProb за пределами f64.
+            let seed = seed_arg(args, 0, 7)?;
+            let n = match args.get(1) {
+                None => 256.0,
+                Some(_) => num_arg_si(args, 1, name, "вершин TIN")?,
+            };
+            let scale = match args.get(2) {
+                None => 1e5,
+                Some(_) => num_arg_si(args, 2, name, "масштаб энергий")?,
+            };
+            if !(3.0..=5000.0).contains(&n) {
+                return Err(format!("eteria_tin: вершин n ∈ [3, 5000], получено {n}"));
+            }
+            Ok(Value::Str(crate::geo::eteria::tin_boltz_report(
+                seed,
+                n as usize,
+                scale,
+            )?))
+        }
+        "h3children" => {
+            // h3children(q, r): 9 потомков апертурой 9 = 3² (res+1).
+            need(args, 2, name)?;
+            let q = num_arg_si(args, 0, name, "q")? as i64;
+            let r = num_arg_si(args, 1, name, "r")? as i64;
+            let kids = crate::geo::hexgrid::h3_children(q, r);
+            let list: Vec<String> = kids
+                .iter()
+                .enumerate()
+                .map(|(n, &(cq, cr))| {
+                    let di = (n as i64 / 3) - 1;
+                    let dj = (n as i64 % 3) - 1;
+                    format!("({cq:+}, {cr:+})←({di:+},{dj:+})")
+                })
+                .collect();
+            Ok(Value::Str(format!(
+                "дробление апертурой 9 = 3² (решётка масштабируется ТОЧНО, \
+                 ноль таблиц — против √7-таблиц H3)\n\
+                 потомки ({q}, {r}): {} · адрес +2 трита на уровень",
+                list.join(" ")
+            )))
+        }
+        "h3parent" => {
+            // h3parent(q, r): родитель + уточняющие триты.
+            need(args, 2, name)?;
+            let q = num_arg_si(args, 0, name, "q")? as i64;
+            let r = num_arg_si(args, 1, name, "r")? as i64;
+            let ((pq, pr), (i, j)) = crate::geo::hexgrid::h3_parent(q, r);
+            let t = crate::geo::hexgrid::refine_trits(i, j)
+                .map_err(|e| format!("h3parent: {e}"))?;
+            Ok(Value::Str(format!(
+                "родитель ({q}, {r}) → ({pq}, {pr}) · уточнение ({i:+}, {j:+}) \
+                 → 2 трита: {} · адрес −2 трита",
+                t.to_string_bal()
+            )))
+        }
+        "de9im_ll" => {
+            // relate LineString×LineString: обе — ОТКРЫТЫЕ ломаные Nx2.
+            let a = ring_arg(args, 0, "de9im_ll")?;
+            let b = ring_arg(args, 1, "de9im_ll")?;
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "de9im_ll: масштаб k ∈ [0, 12] — число, получено {other}"
+                    ))
+                }
+            };
+            let qa = quantize_ring(&a, k)?;
+            let qb = quantize_ring(&b, k)?;
+            let m = crate::geo::de9im::relate_line_line(&qa, &qb)
+                .map_err(|e| format!("de9im_ll: {e}"))?;
+            let preds = m.predicate_names().join(", ");
+            Ok(Value::Str(format!(
+                "{} · код {} · предикаты: {}",
+                m.bal_string(),
+                m.trit_code(),
+                if preds.is_empty() { "—" } else { &preds }
+            )))
+        }
         "viz_hex" => {
             // viz_hex(гекс-карта[, заголовок]): SVG-карта биомов.
             // карта — матрица Nx4 [q, r, высота, биом] (eteria_hex) или Nx3.
@@ -1732,6 +1855,17 @@ pub fn catalog(filter: &str) -> String {
             "eteria_hex([seed[, R]]) — [q, r, высота, биом] · viz_hex(eteria_hex()) — SVG-карта",
             "eteria_boltz([seed[, R[, scale]]]) — Z = Σ e^(-E_i) в лог-домене за f64",
             "конвейер: diamond-square → гексы H3 → биомы → LogProb → lpsum → viz_hex",
+        ]),
+        ("муха над картой (сессия-15)", &[
+            "tin(точки Nx2[, k]) — TIN Делоне: Bowyer-Watson, детерминант i128, ноль округлений",
+            "муха водит порядок вставки: sin(i·Φ mod 2π) — Gold Phase Lock из universal_letters",
+            "сокруглённости и adversarial-порядки развязаны золотой фазой; BW не циклится в принципе",
+            "eteria_tin([seed[, n[, scale]]]) — мир Этерии как TIN: золотой посев + Муха + LogProb",
+            "конвейер: Φ-спираль посева → delaunay → высоты terrain_detail → Z = Σ e^(−E_i) за f64",
+            "h3children(q, r) / h3parent(q, r) — дробление апертурой 9 = 3²: точное решёточное",
+            "масштабирование (3q+i, 3r+j), адрес +2 трита на уровень — ноль таблиц против √7 у H3",
+            "de9im_ll(линияA Nx2, линияB Nx2[, k]) — relate LineString×LineString: реляционная",
+            "матрица GEO-ядра замкнута: точка/кольцо/строка × точка/кольцо/строка",
         ]),
     ];
     let mut out = String::new();
