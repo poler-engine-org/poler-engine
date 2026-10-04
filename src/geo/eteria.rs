@@ -375,8 +375,13 @@ pub fn tin_boltz_report(seed: u64, n: usize, scale: f64) -> Result<String, Strin
             .map_err(|e| format!("eteria: квантование ({x}, {y}): {e}"))?;
         pts_i.push((tp.x.to_i64(), tp.y.to_i64()));
     }
-    let tin = crate::geo::delaunay::delaunay(&pts_i)?;
+    let mut tin = crate::geo::delaunay::delaunay(&pts_i)?;
     crate::geo::delaunay::verify_delaunay(&tin)?;
+    // 27-дерево конвертов треугольников (Сессия-16): height_at идёт
+    // трит-путём — переплетение TIN ↔ пространственное индексирование
+    let (idx_objs, idx_nodes) = tin
+        .build_spatial27()
+        .map_err(|e| format!("eteria: {e}"))?;
     let z: Vec<f64> = verts.iter().map(|&(_, _, h)| h).collect();
 
     // больцмановский ряд: E_i = (1.05 − h_i)·scale — маржа 0.05 как в
@@ -442,6 +447,10 @@ pub fn tin_boltz_report(seed: u64, n: usize, scale: f64) -> Result<String, Strin
         format!(
             "муха: порядок вставки sin(i·Φ mod 2π) · решётка k = {k} · \
              Делоне верифицирован (i128, ноль округлений)"
+        ),
+        format!(
+            "ускорение сессии-16: history-DAG + BFS-полость · 27-дерево: \
+             {idx_objs} конвертов · {idx_nodes} узлов — height_at трит-путём"
         ),
         format!(
             "E_i = (1.05−h_i)·{} → Z = Σ e^(−E_i) = {} = {}",

@@ -2545,6 +2545,176 @@ pub fn hex_svg(
     Ok(out)
 }
 
+/// TIN-рельеф (Сессия-16): SVG-карта триангуляции Делоне.
+///
+/// Треугольники — полигоны с цветом биома по СРЕДНЕЙ высоте (та же
+/// палитра, что у гекс-карты Этерии: океан → фредерит), рёбра — светлый
+/// штрих, конверты пропорций сохранены. Без высот — единый графитовый
+/// тон: чистая структура сети (муха над картой без окраса).
+///
+/// Переплетение: цвет идёт из `eteria::BIOMES`, геометрия — из
+/// `geo::delaunay::Tin` (Муха водила порядок вставки), статистика
+/// Эйлера — в примечании вызывающего.
+pub fn tin_svg(
+    tin: &crate::geo::delaunay::Tin,
+    z: Option<&[f64]>,
+    title_text: &str,
+    note: &str,
+) -> Result<String, String> {
+    use crate::geo::eteria::{biome_index, BIOMES};
+    if tin.tris.is_empty() {
+        return Err("viz_tin: триангуляция пуста — ≥ 3 неколлинеарных точек".into());
+    }
+    if let Some(zs) = z {
+        if zs.len() != tin.pts.len() {
+            return Err(format!(
+                "viz_tin: высот {} ≠ вершин {}",
+                zs.len(),
+                tin.pts.len()
+            ));
+        }
+    }
+    const W: f64 = 640.0;
+    // bbox → плот с сохранением пропорций, центрирование
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(x, y) in &tin.pts {
+        x0 = x0.min(x as f64);
+        x1 = x1.max(x as f64);
+        y0 = y0.min(y as f64);
+        y1 = y1.max(y as f64);
+    }
+    let avail_w = W - 64.0;
+    let avail_h = 430.0;
+    let sx = avail_w / (x1 - x0 + 1.0).max(1.0);
+    let sy = avail_h / (y1 - y0 + 1.0).max(1.0);
+    let s = sx.min(sy);
+    let px = |x: i64| (x as f64 - x0) * s + (W - (x1 - x0) * s) / 2.0;
+    let py = |y: i64| (y as f64 - y0) * s + (430.0 - (y1 - y0) * s) / 2.0 + 34.0;
+
+    // нормализация высот → биом по средней высоте треугольника
+    let (zmin, zmax) = match z {
+        Some(zs) => zs.iter().cloned().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+            (a.min(v), b.max(v))
+        }),
+        None => (0.0, 0.0),
+    };
+    let flat = zmax <= zmin;
+    let tri_t = |t: &[usize; 3]| -> f64 {
+        match z {
+            Some(zs) => {
+                if flat {
+                    0.5
+                } else {
+                    (t.iter().map(|&v| zs[v]).sum::<f64>() / 3.0 - zmin) / (zmax - zmin)
+                }
+            }
+            None => 0.0,
+        }
+    };
+
+    // подсчёт биомов треугольников (для легенды)
+    let mut counts = [0usize; 6];
+    let mut biome_of: Vec<usize> = Vec::with_capacity(tin.tris.len());
+    for t in &tin.tris {
+        let b = if z.is_some() {
+            let b = biome_index(tri_t(t).clamp(0.0, 1.0));
+            counts[b] += 1;
+            b
+        } else {
+            usize::MAX
+        };
+        biome_of.push(b);
+    }
+
+    // легенда «■ имя ×N» (только с рельефом)
+    let items: Vec<(usize, String)> = (0..BIOMES.len())
+        .filter(|&b| counts[b] > 0)
+        .map(|b| (b, format!("{} ×{}", BIOMES[b].0, counts[b])))
+        .collect();
+    let item_w = |t: &str| text_w(t, 11.0) + 26.0;
+    let mut legend_rows: Vec<Vec<(usize, String, f64)>> = vec![Vec::new()];
+    let mut row_w = 30.0;
+    for (b, t) in items {
+        let w = item_w(&t);
+        if row_w + w > W - 20.0 && !legend_rows.last().unwrap().is_empty() {
+            legend_rows.push(Vec::new());
+            row_w = 30.0;
+        }
+        legend_rows.last_mut().unwrap().push((b, t, row_w));
+        row_w += w;
+    }
+    let legend_h = legend_rows.len() as f64 * 17.0 + 6.0;
+
+    let plot_h = (y1 - y0) * s + 8.0;
+    let notes = vec![Note::new(note, 10.0, C_MUTED)];
+    let notes_y = 34.0 + plot_h + legend_h + 18.0;
+    let h = (notes_y + notes_height(&notes, 30.0, W) + 8.0).ceil() as u32;
+
+    let mut out = svg_open(W as u32, h);
+    out.push_str(&title(title_text, W as u32));
+    // подложка карты — светлый плот с рамкой (не океан: это карта сети)
+    out.push_str(&format!(
+        "<rect x=\"16\" y=\"30\" width=\"{:.0}\" height=\"{:.0}\" fill=\"#f8fafc\" \
+         stroke=\"{}\" stroke-width=\"0.6\"/>\n",
+        W - 32.0,
+        plot_h + 8.0,
+        C_GRID
+    ));
+    // треугольники: цвет биома по средней высоте (или графит без высот)
+    let mut polygons = 0usize;
+    for (ti, t) in tin.tris.iter().enumerate() {
+        let mut pts = String::new();
+        for &v in t {
+            let (x, y) = tin.pts[v];
+            pts.push_str(&format!("{:.1},{:.1} ", px(x), py(y)));
+        }
+        let fill = if z.is_some() {
+            BIOMES[biome_of[ti]].1
+        } else {
+            "#94a3b8"
+        };
+        out.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"{}\" stroke=\"#ffffff\" stroke-width=\"0.7\"/>\n",
+            pts.trim_end(),
+            fill
+        ));
+        polygons += 1;
+    }
+    // вершины: точки сети на читаемом масштабе (не замусоривать мелкие карты)
+    if tin.pts.len() <= 400 && s > 6.0 {
+        for &(x, y) in &tin.pts {
+            out.push_str(&format!(
+                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"1.6\" fill=\"#1e293b\"/>\n",
+                px(x),
+                py(y)
+            ));
+        }
+    }
+    // легенда биомов
+    for (ri, row) in legend_rows.iter().enumerate() {
+        let y = 34.0 + plot_h + 14.0 + ri as f64 * 17.0;
+        for &(b, ref t, x) in row {
+            out.push_str(&format!(
+                "<rect x=\"{x:.0}\" y=\"{y:.0}\" width=\"11\" height=\"11\" fill=\"{}\" \
+                 stroke=\"#ffffff\"/>\n",
+                BIOMES[b].1
+            ));
+            out.push_str(&format!(
+                "<text x=\"{:.0}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\">{}</text>\n",
+                x + 15.0,
+                y + 9.5,
+                C_TEXT,
+                esc(t)
+            ));
+        }
+    }
+    let (block, _) = notes_svg(&notes, 30.0, W, notes_y);
+    out.push_str(&block);
+    out.push_str("</svg>");
+    debug_assert!(polygons == tin.tris.len());
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3219,5 +3389,77 @@ mod tests {
         // ошибки
         assert!(hex_svg(&[], "пусто", "-").is_err());
         assert!(hex_svg(&[(0, 0, 9)], "биом", "-").is_err());
+    }
+
+    // ===== Сессия-16: TIN-рельеф =====
+
+    #[test]
+    fn tin_svg_relief_and_structure() {
+        use crate::geo::delaunay::delaunay;
+        let pts = vec![(0, 0), (8, 0), (8, 8), (0, 8), (4, 4)];
+        let tin = delaunay(&pts).unwrap();
+        // рельеф: пирамида — 4 треугольника с разными биомами
+        let z = vec![0.0, 0.1, 0.9, 0.2, 0.7];
+        let svg = tin_svg(&tin, Some(&z), "TIN · пирамида", "5 вершин · 4 треугольника").unwrap();
+        assert!(starts_and_ends(&svg));
+        assert_eq!(svg.matches("<polygon").count(), 4, "все треугольники нарисованы");
+        assert!(svg.contains("лес ×2"), "высокий центр — лес: см. вывод");
+        assert!(svg.matches("<circle").count() == 5, "вершины сети");
+        let bad = audit_text_bounds(&svg);
+        assert!(bad.is_empty(), "надписи за холстом: {bad:?}");
+        // структура без высот: графитовый тон, без легенды биомов
+        let svg2 = tin_svg(&tin, None, "TIN · сеть", "структура").unwrap();
+        assert!(starts_and_ends(&svg2));
+        assert!(svg2.contains("#94a3b8"), "нейтральный тон без рельефа");
+        assert!(!svg2.contains("океан ×"), "без легенды биомов");
+        // детерминизм: побитово
+        let svg3 = tin_svg(&tin, Some(&z), "TIN · пирамида", "5 вершин · 4 треугольника").unwrap();
+        assert_eq!(svg, svg3);
+    }
+
+    #[test]
+    fn tin_svg_eteria_relief() {
+        // конвейер Сессии-16: золотой посев → Муха → треугольники → биомы
+        let verts = crate::geo::eteria::tin_vertices(7, 128).unwrap();
+        let k = 10u8;
+        let pts_i: Vec<(i64, i64)> = verts
+            .iter()
+            .map(|&(x, y, _)| {
+                let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k).unwrap();
+                (tp.x.to_i64(), tp.y.to_i64())
+            })
+            .collect();
+        let tin = crate::geo::delaunay::delaunay(&pts_i).unwrap();
+        let z: Vec<f64> = verts.iter().map(|&(_, _, h)| h).collect();
+        let svg = tin_svg(
+            &tin,
+            Some(&z),
+            "Этерия · TIN-рельеф",
+            "128 вершин золотого посева · Муха · сессия-16",
+        )
+        .unwrap();
+        assert!(starts_and_ends(&svg));
+        assert!(svg.matches("<polygon").count() == tin.tris.len());
+        // разнообразие биомов: не один цвет на всю карту
+        let colors: std::collections::HashSet<&str> = svg
+            .lines()
+            .filter(|l| l.contains("<polygon"))
+            .filter_map(|l| l.split("fill=\"").nth(1))
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        assert!(colors.len() >= 3, "мозаика биомов: {:?}", colors);
+        let bad = audit_text_bounds(&svg);
+        assert!(bad.is_empty(), "надписи за холстом: {bad:?}");
+    }
+
+    #[test]
+    fn tin_svg_errors() {
+        use crate::geo::delaunay::delaunay;
+        let tin = delaunay(&[(0, 0), (8, 0), (4, 6)]).unwrap();
+        // несогласованные высоты
+        assert!(tin_svg(&tin, Some(&[1.0, 2.0]), "-", "-").is_err());
+        // пустая триангуляция
+        let empty = crate::geo::delaunay::Tin::empty();
+        assert!(tin_svg(&empty, None, "-", "-").is_err());
     }
 }

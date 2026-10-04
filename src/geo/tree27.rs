@@ -80,6 +80,7 @@ impl BBox3 {
 }
 
 /// Узел 27-дерева.
+#[derive(Clone, Debug)]
 struct Node {
     /// Ячейка узла (включая границы).
     cell: BBox3,
@@ -245,6 +246,8 @@ fn child_index(dx: Trit, dy: Trit, dz: Trit) -> usize {
 }
 
 /// 27-дерево над тритной решёткой: тритное деление 3×3×3 вместо октодерева.
+/// `Clone`/`Debug` — TIN хранит дерево как пространственный индекс (Сессия-16).
+#[derive(Clone, Debug)]
 pub struct Tree27 {
     root: Node,
     /// Число объектов.

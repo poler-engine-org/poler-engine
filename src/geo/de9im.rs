@@ -921,12 +921,276 @@ pub fn relate_line_line(a: &[TritPoint], b: &[TritPoint]) -> Result<De9im, Strin
     Ok(m)
 }
 
+// ─────────────── полигоны с дырками (Сессия-16) ───────────────
+
+/// Позиция точки относительно полигона с дырками: 1 — строго внутри
+/// (внешнее кольцо накрывает, ни одна дырка не глотает), 0 — на границе
+/// (любое кольцо), −1 — снаружи (вне внешнего или внутри дырки).
+fn point_in_poly(p: &TritPoint, outer: &[TritPoint], holes: &[Vec<TritPoint>]) -> i8 {
+    match point_in_ring(p, outer) {
+        1 => {
+            for h in holes {
+                match point_in_ring(p, h) {
+                    1 => return -1, // внутри дырки — внешность полигона
+                    0 => return 0,  // на границе дырки — граница полигона
+                    _ => {}
+                }
+            }
+            1
+        }
+        0 => 0,
+        _ => -1, // вне внешнего (дырки внутри — на них отсюда не попасть)
+    }
+}
+
+/// Полигон↔полигон с дырками (Сессия-16): замыкает реляционную матрицу
+/// площадных геометрий. Вход — список колец: `[outer, hole1, hole2, …]`
+/// (дырки строго внутри внешнего, не касаются — простые полигоны OGC).
+///
+/// Свидетели (генерализация `relate_ring_ring` на случай дырок):
+/// * вершины и середины рёбер ВСЕХ колец — позиция относительно ЧУЖОГО
+///   ПОЛИГОНА целиком (внутри = внутри внешнего И вне дырок); граничная
+///   точка несёт сектор I(A) ⇒ вершина/середина внутри B — косвенный
+///   свидетель II (как в кольцевом кейсе);
+/// * offset-узлы: середина ребра + квант К ВНУТРЕННОСТИ полигона — для
+///   внешнего кольца по знаку обхода, для дырки ПРОТИВ (внутрь полигона
+///   = наружу дырки). Закрывает совпадающие/вложенные полигоны без нырков;
+/// * пересечения рёбер всех пар колец (внешнее×внешнее, внешнее×дырки,
+///   дырки×дырки): Proper — границы пересекаются накрест (сектора I(A) и
+///   I(B) чередуются шахматно ⇒ II), Touch — точечное касание границ,
+///   Collinear — линейное перекрытие границ.
+pub fn relate_polygon_polygon(
+    rings_a: &[Vec<TritPoint>],
+    rings_b: &[Vec<TritPoint>],
+) -> Result<De9im, String> {
+    if rings_a.is_empty() || rings_b.is_empty() {
+        return Err("de9im_poly: полигон — хотя бы одно кольцо".into());
+    }
+    for (who, rings) in [("A", rings_a), ("B", rings_b)] {
+        for (i, r) in rings.iter().enumerate() {
+            if r.len() < 3 {
+                return Err(format!(
+                    "de9im_poly: кольцо {i} полигона {who} < 3 вершин"
+                ));
+            }
+        }
+        let k = rings[0][0].k;
+        if rings.iter().any(|r| r.iter().any(|p| p.k != k)) {
+            return Err(format!(
+                "de9im_poly: кольца полигона {who} на решётках разного масштаба"
+            ));
+        }
+    }
+    if rings_a[0][0].k != rings_b[0][0].k {
+        return Err("de9im_poly: полигоны на решётках разного масштаба".into());
+    }
+
+    // замыкание всех колец
+    let close = |rings: &[Vec<TritPoint>]| -> Vec<Vec<TritPoint>> {
+        rings.iter().map(|r| close_ring(r)).collect()
+    };
+    let ra = close(rings_a);
+    let rb = close(rings_b);
+    let (outer_a, holes_a) = ra.split_first().unwrap();
+    let (outer_b, holes_b) = rb.split_first().unwrap();
+
+    // ── свидетели колец A против полигона B (и симметрично) ──
+    let mut a_vert_in = false; // вершина кольца A строго внутри полигона B
+    let mut a_vert_out = false;
+    let mut a_mid_in = false; // середина ребра кольца A строго внутри B
+    let mut a_mid_out = false;
+    let mut a_off_in = false; // offset-узел (квант ВНУТРЬ полигона A) внутри B
+    let mut a_off_out = false;
+    let mut b_vert_in = false;
+    let mut b_vert_out = false;
+    let mut b_mid_in = false;
+    let mut b_mid_out = false;
+    let mut b_off_in = false;
+    let mut b_off_out = false;
+
+    let mut proper = false; // собственное пересечение рёбер
+    let mut touch = false; // касание границ в точке
+    let mut collinear = false; // коллинеарное перекрытие границ
+
+    for is_a in [true, false] {
+        let rings = if is_a { &ra } else { &rb };
+        let (other_outer, other_holes) = if is_a {
+            (outer_b, holes_b)
+        } else {
+            (outer_a, holes_a)
+        };
+        let pos_other = |p: &TritPoint| point_in_poly(p, other_outer, other_holes);
+        for (ri, r) in rings.iter().enumerate() {
+            let is_hole = ri > 0;
+            // эффективная ориентация для offset: внутренность ПОЛИГОНА
+            // относительно ребра — по знаку обхода внешнего, ПРОТИВ знака дырки
+            let orient = ring_orientation(r)?;
+            let eff_orient: Trit = if is_hole { -orient } else { orient };
+            let n = r.len();
+            for i in 0..n {
+                let p = &r[i];
+                let q = &r[(i + 1) % n];
+                // вершины
+                match pos_other(p) {
+                    1 => {
+                        if is_a {
+                            a_vert_in = true
+                        } else {
+                            b_vert_in = true
+                        }
+                    }
+                    -1 => {
+                        if is_a {
+                            a_vert_out = true
+                        } else {
+                            b_vert_out = true
+                        }
+                    }
+                    _ => {}
+                }
+                // середины рёбер: floor/ceil-пробы (как в кольцевом кейсе)
+                let mx = p.x.to_i64() + q.x.to_i64();
+                let my = p.y.to_i64() + q.y.to_i64();
+                for (dx, dy) in [(0i64, 0i64), (1, 0), (0, 1), (1, 1)] {
+                    let mid = TritPoint {
+                        x: Trits::from_i64((mx + dx) / 2)?,
+                        y: Trits::from_i64((my + dy) / 2)?,
+                        k: p.k,
+                    };
+                    match pos_other(&mid) {
+                        1 => {
+                            if is_a {
+                                a_mid_in = true
+                            } else {
+                                b_mid_in = true
+                            }
+                        }
+                        -1 => {
+                            if is_a {
+                                a_mid_out = true
+                            } else {
+                                b_mid_out = true
+                            }
+                        }
+                        _ => {}
+                    }
+                    // offset-проба: точная середина + квант к внутренности ПОЛИГОНА
+                    if dx == 0 && dy == 0 {
+                        let ddx = q.x.to_i64() - p.x.to_i64();
+                        let ddy = q.y.to_i64() - p.y.to_i64();
+                        if (ddx, ddy) != (0, 0) {
+                            let (mut nx, mut ny) = (-ddy, ddx); // левая нормаль
+                            if eff_orient == -1 {
+                                (nx, ny) = (ddy, -ddx); // CW — внутренность справа
+                            }
+                            let sx = nx.signum();
+                            let sy = ny.signum();
+                            if (sx, sy) != (0, 0) {
+                                let off = TritPoint {
+                                    x: Trits::from_i64((mx + dx) / 2 + sx)?,
+                                    y: Trits::from_i64((my + dy) / 2 + sy)?,
+                                    k: p.k,
+                                };
+                                match pos_other(&off) {
+                                    1 => {
+                                        if is_a {
+                                            a_off_in = true
+                                        } else {
+                                            b_off_in = true
+                                        }
+                                    }
+                                    -1 => {
+                                        if is_a {
+                                            a_off_out = true
+                                        } else {
+                                            b_off_out = true
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // пересечения рёбер: ВСЕ пары колец A × колец B
+    for r in &ra {
+        for s in &rb {
+            let (na, nb) = (r.len(), s.len());
+            for i in 0..na {
+                for j in 0..nb {
+                    match seg_classify(
+                        &r[i],
+                        &r[(i + 1) % na],
+                        &s[j],
+                        &s[(j + 1) % nb],
+                    ) {
+                        SegX::Proper => proper = true,
+                        SegX::Touch => touch = true,
+                        SegX::Collinear => collinear = true,
+                        SegX::None => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // ── сборка матрицы: правила relate_ring_ring (генерализация) ──
+    let mut m = De9im::EMPTY;
+    // II: внутренности площадно пересекаются ⟺ нырок, накрытие, совпадение
+    if a_vert_in
+        || b_vert_in
+        || proper
+        || a_mid_in
+        || b_mid_in
+        || a_off_in
+        || b_off_in
+    {
+        m.cells[0] = 1;
+    }
+    // IB: граница B проходит по внутренности A (линейно)
+    if b_vert_in || b_mid_in || proper {
+        m.cells[1] = 1;
+    }
+    // BI: симметрично
+    if a_vert_in || a_mid_in || proper {
+        m.cells[3] = 1;
+    }
+    // BB: коллинеарное перекрытие (+1), точечное касание/пересечение (0)
+    if collinear {
+        m.cells[4] = 1;
+    } else if touch || proper {
+        m.cells[4] = 0;
+    }
+    // IE: часть внутренности A снаружи B (площадно)
+    if a_vert_out || a_mid_out || a_off_out || proper || b_vert_in || b_mid_in {
+        m.cells[2] = 1;
+    }
+    // EI: симметрично
+    if b_vert_out || b_mid_out || b_off_out || proper || a_vert_in || a_mid_in {
+        m.cells[6] = 1;
+    }
+    // BE: часть границы A снаружи B (линейно)
+    if a_vert_out || a_mid_out || proper {
+        m.cells[5] = 1;
+    }
+    // EB: симметрично
+    if b_vert_out || b_mid_out || proper {
+        m.cells[7] = 1;
+    }
+    // EE: внешности двух ограниченных полигонов всегда пересекаются площадно
+    m.cells[8] = 1;
+    Ok(m)
+}
+
 // ────────────────────────── тесты ──────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     const K: u8 = 6;
 
     fn tp(x: f64, y: f64) -> TritPoint {
@@ -1337,5 +1601,166 @@ mod tests {
         assert_eq!(m.ie(), 1);
         assert_eq!(m.ei(), 1);
         assert!(m.overlaps());
+    }
+    // ─────────── Сессия-16: полигоны с дырками ───────────
+
+    fn poly(rings: &[&[(f64, f64)]]) -> Vec<Vec<TritPoint>> {
+        rings.iter().map(|r| ring(r)).collect()
+    }
+
+    #[test]
+    fn poly_no_holes_matches_ring_ring() {
+        // ГЛАВНЫЙ регресс: полигон без дырок == старый кольцевой relate
+        let cases: Vec<(&[(f64, f64)], &[(f64, f64)])> = vec![
+            (
+                &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+                &[(5.0, 5.0), (7.0, 5.0), (7.0, 7.0), (5.0, 7.0)],
+            ), // disjoint
+            (
+                &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+                &[(3.0, 3.0), (5.0, 3.0), (5.0, 5.0), (3.0, 5.0)],
+            ), // вложение
+            (
+                &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+                &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            ), // идентичные
+            (
+                &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+                &[(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)],
+            ), // перекрытие
+            (
+                &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+                &[(2.0, 0.0), (4.0, 0.0), (4.0, 2.0), (2.0, 2.0)],
+            ), // общая сторона
+            (
+                &[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)],
+                &[(2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0)],
+            ), // касание углом
+        ];
+        for (i, (a, b)) in cases.iter().enumerate() {
+            let (ra, rb) = (ring(a), ring(b));
+            let ring_m = relate(&ra, &rb).unwrap();
+            let poly_m = relate_polygon_polygon(&poly(&[a]), &poly(&[b])).unwrap();
+            assert_eq!(
+                ring_m, poly_m,
+                "кейс {i}: кольцевая {ring_m:?} ≠ полигональная {poly_m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn poly_hole_swallows_square_disjoint() {
+        // B целиком в дырке A: общих точек нет — disjoint
+        let a = poly(&[
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)],
+        ]);
+        let b = poly(&[&[(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]]);
+        let m = relate_polygon_polygon(&a, &b).unwrap();
+        assert!(m.disjoint(), "B в дырке: {}", m.bal_string());
+        assert_eq!(m.ii(), -1);
+        // при этом обе внутренности выглядывают в чужую внешность
+        assert_eq!(m.ie(), 1, "рамка A снаружи B");
+        assert_eq!(m.ei(), 1, "B в дырке = внешность A");
+    }
+
+    #[test]
+    fn poly_hole_vs_covering_square_overlaps() {
+        // B накрывает дырку A: рамка A ∩ B ≠ ∅, обе выглядывают — overlaps
+        let a = poly(&[
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)],
+        ]);
+        let b = poly(&[&[(2.0, 2.0), (8.0, 2.0), (8.0, 8.0), (2.0, 8.0)]]);
+        let m = relate_polygon_polygon(&a, &b).unwrap();
+        assert!(m.overlaps(), "рамка ∩ накрытие: {}", m.bal_string());
+        assert_eq!(m.ii(), 1, "уголки рамки внутри B");
+        // граница B проходит и по рамке (I(A)), и по дырке (E(A))
+        assert_eq!(m.ib(), 1);
+    }
+
+    #[test]
+    fn poly_identical_with_holes_equals() {
+        // идентичные полигоны с дырками: II через offset-свидетелей
+        let mk = || {
+            poly(&[
+                &[(0.0, 0.0), (12.0, 0.0), (12.0, 12.0), (0.0, 12.0)],
+                &[(2.0, 2.0), (6.0, 2.0), (6.0, 6.0), (2.0, 6.0)],
+                &[(7.0, 7.0), (10.0, 7.0), (10.0, 10.0), (7.0, 10.0)],
+            ])
+        };
+        let m = relate_polygon_polygon(&mk(), &mk()).unwrap();
+        assert!(m.equals(), "идентичные: {}", m.bal_string());
+        assert_eq!(m.ii(), 1);
+        assert_eq!(m.ie(), -1);
+        assert_eq!(m.ei(), -1);
+        assert_eq!(m.bb(), 1, "все три кольца коллинеарно совпадают");
+    }
+
+    #[test]
+    fn poly_hole_equals_other_polygon_touches() {
+        // B совпадает с дыркой A: границы общие (BB = +1), внутренности
+        // не пересекаются — B в дырке = внешность A
+        let a = poly(&[
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)],
+        ]);
+        let b = poly(&[&[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)]]);
+        let m = relate_polygon_polygon(&a, &b).unwrap();
+        assert_eq!(m.ii(), -1, "внутренности разделены: {}", m.bal_string());
+        assert_eq!(m.bb(), 1, "кольцо B == дырка A: коллинеар");
+        assert!(m.touches(), "границы касаются, внутренности нет");
+        assert!(!m.contains(), "дырка — не внутренность A");
+    }
+
+    #[test]
+    fn poly_two_holes_disjoint_siblings() {
+        // две дырки в одном полигоне: разные дырки — disjoint
+        let a = poly(&[
+            &[(0.0, 0.0), (12.0, 0.0), (12.0, 12.0), (0.0, 12.0)],
+            &[(2.0, 2.0), (5.0, 2.0), (5.0, 5.0), (2.0, 5.0)],
+        ]);
+        let b = poly(&[
+            &[(0.0, 0.0), (12.0, 0.0), (12.0, 12.0), (0.0, 12.0)],
+            &[(7.0, 7.0), (10.0, 7.0), (10.0, 10.0), (7.0, 10.0)],
+        ]);
+        let m = relate_polygon_polygon(&a, &b).unwrap();
+        // A∩B = рамка минус ОБЕ дырки... нет: I(A)∩I(B) = рамка без дырок —
+        // непусто (угол между дырками). Проверяем именно это: overlaps.
+        assert_eq!(m.ii(), 1, "общая рамка: {}", m.bal_string());
+        assert!(m.overlaps() || m.intersects());
+    }
+
+    #[test]
+    fn poly_transpose_symmetry_with_holes() {
+        let a = poly(&[
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)],
+        ]);
+        let b = poly(&[&[(2.0, 2.0), (8.0, 2.0), (8.0, 8.0), (2.0, 8.0)]]);
+        let m = relate_polygon_polygon(&a, &b).unwrap();
+        let t = relate_polygon_polygon(&b, &a).unwrap();
+        assert_eq!(
+            transpose(&m),
+            t,
+            "relate_poly(b,a) = transpose(relate_poly(a,b))"
+        );
+    }
+
+    #[test]
+    fn poly_validation_errors() {
+        let good = poly(&[&[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]]);
+        // короткое кольцо
+        let bad = poly(&[&[(0.0, 0.0), (1.0, 1.0)]]);
+        assert!(relate_polygon_polygon(&bad, &good).is_err());
+        // пустой полигон
+        assert!(relate_polygon_polygon(&[], &good).is_err());
+        // разные решётки
+        let coarse: Vec<Vec<TritPoint>> = vec![vec![
+            TritPoint::quantize(0.0, 0.0, 4).unwrap(),
+            TritPoint::quantize(2.0, 0.0, 4).unwrap(),
+            TritPoint::quantize(2.0, 2.0, 4).unwrap(),
+        ]];
+        assert!(relate_polygon_polygon(&coarse, &good).is_err());
     }
 }

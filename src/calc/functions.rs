@@ -140,6 +140,58 @@ fn quantize_ring(ring: &[(f64, f64)], k: u8) -> Result<Vec<crate::geo::trit_coor
         .collect()
 }
 
+/// Полигон с дырками (сессия-16): матрица Nx2 (кольцо без дырок) либо
+/// список [внешнее, дырка1, …] из `poly(…)` — в тритных точках решётки.
+fn polygon_arg(
+    args: &[Value],
+    i: usize,
+    name: &str,
+    k: u8,
+) -> Result<Vec<Vec<crate::geo::trit_coord::TritPoint>>, String> {
+    let rings_f: Vec<Vec<(f64, f64)>> = match args.get(i) {
+        Some(Value::Matrix(m)) => {
+            if m.cols != 2 || m.rows < 1 {
+                return Err(format!(
+                    "{name}: полигон — матрица Nx2 либо poly(кольца), получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            vec![(0..m.rows).map(|r| (m.get(r, 0).re, m.get(r, 1).re)).collect()]
+        }
+        Some(Value::List(items)) if !items.is_empty() => {
+            let mut out = Vec::with_capacity(items.len());
+            for (j, it) in items.iter().enumerate() {
+                match it {
+                    Value::Matrix(m) if m.cols == 2 && m.rows >= 1 => {
+                        out.push(
+                            (0..m.rows)
+                                .map(|r| (m.get(r, 0).re, m.get(r, 1).re))
+                                .collect(),
+                        );
+                    }
+                    other => {
+                        return Err(format!(
+                            "{name}: кольцо {} полигона — матрица Nx2, получено {other}",
+                            j + 1
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        Some(other) => {
+            return Err(format!(
+                "{name}: полигон — кольцо Nx2 или poly(кольца), получено {other}"
+            ))
+        }
+        None => return Err(format!("{name}: не хватает аргументов")),
+    };
+    rings_f
+        .iter()
+        .map(|r| quantize_ring(r, k).map_err(|e| format!("{name}: {e}")))
+        .collect()
+}
+
 /// Complex → Value: вещественный результат остаётся числом (нулевая
 /// регрессия отображения), комплексный — Complex (цикл O).
 fn complex_to_value(c: Complex) -> Value {
@@ -376,6 +428,8 @@ pub fn is_function(name: &str) -> bool {
         | "viz_hex"
         // муха над картой (сессия-15): TIN, res>0, Line×Line
         | "tin" | "eteria_tin" | "h3children" | "h3parent" | "de9im_ll"
+        // кристалл рельефа (сессия-16): ускорение BW, viz_tin, полигоны с дырками
+        | "eteria_tin_pts" | "viz_tin" | "poly" | "de9im_poly"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -406,6 +460,8 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 | "lpsum"
                 // окно запроса — список из 6 чисел (сессия-14)
                 | "spatial27"
+                // полигон с дырками — список колец целиком (сессия-16)
+                | "poly" | "de9im_poly"
         ) {
             return map_over_lists(name, args);
         }
@@ -1487,6 +1543,7 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Str(format!(
                 "TIN Делоне · {n} точек · {} треугольников · оболочка {hull} рёбер\n\
                  муха: порядок вставки sin(i·Φ mod 2π) — Gold Phase Lock из universal_letters\n\
+                 сессия-16: history-DAG локализация + BFS-полость — O(n log n) в среднем\n\
                  Эйлер: T = 2n−2−h = {} · детерминант i128, ноль округлений · Делоне верифицирован",
                 tin.tris.len(),
                 2 * n as i64 - 2 - hull as i64
@@ -1572,6 +1629,140 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 m.bal_string(),
                 m.trit_code(),
                 if preds.is_empty() { "—" } else { &preds }
+            )))
+        }
+        "eteria_tin_pts" => {
+            // eteria_tin_pts([seed[, n]]): вершины золотого посева Nx3
+            // [x, y, высота] — готовый вход viz_tin (сессия-16).
+            let seed = seed_arg(args, 0, 7)?;
+            let n = match args.get(1) {
+                None => 256.0,
+                Some(_) => num_arg_si(args, 1, name, "вершин TIN")?,
+            };
+            if !(3.0..=5000.0).contains(&n) {
+                return Err(format!(
+                    "eteria_tin_pts: вершин n ∈ [3, 5000], получено {n}"
+                ));
+            }
+            let verts = crate::geo::eteria::tin_vertices(seed, n as usize)?;
+            let rows: Vec<Vec<f64>> = verts
+                .iter()
+                .map(|&(x, y, h)| vec![x, y, h])
+                .collect();
+            Ok(Value::Matrix(Matrix::from_rows(&rows)?))
+        }
+        "viz_tin" => {
+            // viz_tin(точки Nx2|Nx3[, k][, "заголовок"]): SVG-рельеф
+            // триангуляции (сессия-16). Nx3 — [x, y, высота] → биомы;
+            // Nx2 — структура сети без окраса.
+            let m = matrix_arg(args, 0)?;
+            if (m.cols != 2 && m.cols != 3) || m.rows < 1 {
+                return Err(format!(
+                    "viz_tin: точки — матрица Nx2 (x, y) либо Nx3 (x, y, высота), \
+                     получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            let k = match args.get(1) {
+                None => 10u8,
+                Some(Value::Scalar(v)) if *v >= 1.0 && *v <= 14.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "viz_tin: решётка k ∈ [1, 14] (i128-запас детерминанта), \
+                         получено {other}"
+                    ))
+                }
+            };
+            let title_text = match args.get(2) {
+                Some(Value::Str(s)) => s.clone(),
+                None => "TIN Делоне · карта триангуляции".to_string(),
+                Some(other) => {
+                    return Err(format!(
+                        "viz_tin: заголовок — строка, получено {other}"
+                    ))
+                }
+            };
+            let has_z = m.cols == 3;
+            let mut pts_i: Vec<(i64, i64)> = Vec::with_capacity(m.rows);
+            let mut z: Vec<f64> = Vec::with_capacity(m.rows);
+            for r in 0..m.rows {
+                let (x, y) = (m.get(r, 0).re, m.get(r, 1).re);
+                let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+                    .map_err(|e| format!("viz_tin: квантование ({x}, {y}): {e}"))?;
+                pts_i.push((tp.x.to_i64(), tp.y.to_i64()));
+                // Nx2 — без высот (колонки 2 нет): 0.0, окрас отключён has_z
+                z.push(if has_z { m.get(r, 2).re } else { 0.0 });
+            }
+            let mut tin = crate::geo::delaunay::delaunay(&pts_i)
+                .map_err(|e| format!("viz_tin: {e}"))?;
+            crate::geo::delaunay::verify_delaunay(&tin)
+                .map_err(|e| format!("viz_tin: {e}"))?;
+            let (_, idx_nodes) = tin
+                .build_spatial27()
+                .map_err(|e| format!("viz_tin: {e}"))?;
+            let hull = tin.hull().len();
+            let note = format!(
+                "{} вершин · {} треугольников · оболочка {hull} рёбер · \
+                 27-дерево: {idx_nodes} узлов · муха sin(i·Φ)",
+                tin.pts.len(),
+                tin.tris.len()
+            );
+            Ok(Value::Str(viz::tin_svg(
+                &tin,
+                if has_z { Some(&z) } else { None },
+                &title_text,
+                &note,
+            )?))
+        }
+        "poly" => {
+            // poly(кольцо, дырка1, …): полигон с дырками — список колец
+            // (первое — внешнее) для de9im_poly (сессия-16).
+            if args.is_empty() {
+                return Err("poly: хотя бы одно кольцо — внешнее".into());
+            }
+            let mut rings = Vec::with_capacity(args.len());
+            for (i, a) in args.iter().enumerate() {
+                match a {
+                    Value::Matrix(m) if m.cols == 2 && m.rows >= 3 => {
+                        rings.push(Value::Matrix(m.clone()));
+                    }
+                    other => {
+                        return Err(format!(
+                            "poly: кольцо {} — матрица Nx2 (≥ 3 вершин), получено {other}",
+                            i + 1
+                        ))
+                    }
+                }
+            }
+            Ok(Value::List(rings))
+        }
+        "de9im_poly" => {
+            // de9im_poly(A, B[, k]): relate полигон×полигон с дырками.
+            // Полигон — кольцо Nx2 (без дырок) либо poly(кольца…).
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "de9im_poly: масштаб k ∈ [0, 12] — число, получено {other}"
+                    ))
+                }
+            };
+            let pa = polygon_arg(args, 0, "de9im_poly", k)?;
+            let pb = polygon_arg(args, 1, "de9im_poly", k)?;
+            let m = crate::geo::de9im::relate_polygon_polygon(&pa, &pb)
+                .map_err(|e| format!("de9im_poly: {e}"))?;
+            let preds = m.predicate_names().join(", ");
+            let holes_a = pa.len() - 1;
+            let holes_b = pb.len() - 1;
+            Ok(Value::Str(format!(
+                "{} · код {} · предикаты: {}\n\
+                 A: {} колец (дырок {holes_a}) · B: {} колец (дырок {holes_b})",
+                m.bal_string(),
+                m.trit_code(),
+                if preds.is_empty() { "—" } else { &preds },
+                pa.len(),
+                pb.len()
             )))
         }
         "viz_hex" => {
@@ -1866,6 +2057,18 @@ pub fn catalog(filter: &str) -> String {
             "масштабирование (3q+i, 3r+j), адрес +2 трита на уровень — ноль таблиц против √7 у H3",
             "de9im_ll(линияA Nx2, линияB Nx2[, k]) — relate LineString×LineString: реляционная",
             "матрица GEO-ядра замкнута: точка/кольцо/строка × точка/кольцо/строка",
+        ]),
+        ("кристалл рельефа (сессия-16)", &[
+            "сессия-16 ускоряет Муху: history-DAG локализация + BFS-полость по смежности",
+            "tin() теперь O(n log n) в среднем: спуск по истории мёртвых треугольников (Гибас—Кемани—Сугихара)",
+            "кросс-аудит: delaunay_bruteforce — эталон, тесты сверяют обе машины побитово",
+            "27-дерево в TIN: конверты треугольников → height_at трит-путём (spatial27 внутри)",
+            "eteria_tin_pts([seed[, n]]) — вершины золотого посева Nx3 [x, y, высота]",
+            "viz_tin(точки Nx2|Nx3[, k][, \"заголовок\"]) — SVG-рельеф: биомы по средней высоте треугольников",
+            "viz_tin(eteria_tin_pts(7, 256)) — карта Этерии триангуляцией Мухи (конвейер одной строкой)",
+            "poly(кольцо, дырка1, …) — полигон с дырками: первое кольцо внешнее, остальные — дырки",
+            "de9im_poly(A, B[, k]) — relate полигон×полигон: A и B — кольцо Nx2 или poly(…)",
+            "дырка = внешность: B в дырке A → disjoint · B = дырка A → touches · идентичные → equals",
         ]),
     ];
     let mut out = String::new();
@@ -2760,5 +2963,134 @@ mod tests {
         // а один seed — детерминирован
         let a2 = call("eteria_field", &[s(7.0)]).unwrap();
         assert_eq!(format!("{a}"), format!("{a2}"));
+    }
+
+    // ===== Сессия-16: кристалл рельефа =====
+
+    #[test]
+    fn tin_report_mentions_acceleration() {
+        let pts = mat(&[
+            vec![0.0, 0.0],
+            vec![4.0, 0.0],
+            vec![4.0, 4.0],
+            vec![0.0, 4.0],
+            vec![2.0, 2.0],
+        ]);
+        match call("tin", &[pts]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("5 точек"), "{rep}");
+                assert!(rep.contains("4 треугольников"), "{rep}");
+                assert!(rep.contains("history-DAG"), "сессия-16 в отчёте: {rep}");
+                assert!(rep.contains("Gold Phase Lock"), "{rep}");
+                assert!(rep.contains("верифицирован"), "{rep}");
+            }
+            other => panic!("tin: {other:?}"),
+        }
+        // ошибки
+        assert!(call("tin", &[mat(&[vec![0.0, 0.0]])]).is_err());
+    }
+
+    #[test]
+    fn eteria_tin_pts_feeds_viz_tin() {
+        // конвейер одной строкой: посев → Муха → TIN → биомы → SVG
+        let pts = match call("eteria_tin_pts", &[s(7.0), s(128.0)]).unwrap() {
+            Value::Matrix(m) => {
+                assert_eq!((m.rows, m.cols), (128, 3));
+                for r in 0..m.rows {
+                    let (x, y, h) = (
+                        m.get(r, 0).re,
+                        m.get(r, 1).re,
+                        m.get(r, 2).re,
+                    );
+                    assert!((0.0..=1.0).contains(&x), "x = {x}");
+                    assert!((0.0..=1.0).contains(&y), "y = {y}");
+                    assert!((0.0..=1.0).contains(&h), "h = {h}");
+                }
+                m
+            }
+            other => panic!("eteria_tin_pts: {other:?}"),
+        };
+        match call("viz_tin", &[Value::Matrix(pts.clone())]).unwrap() {
+            Value::Str(svg) => {
+                assert!(svg.starts_with("<svg"));
+                assert!(svg.contains("128 вершин"), "дедуп не нужен: см. вывод");
+                assert!(svg.contains("27-дерево"), "{svg}");
+                assert!(svg.contains("муха"), "{svg}");
+                let polys = svg.matches("<polygon").count();
+                assert!(polys >= 200, "мозаика из {polys} треугольников");
+            }
+            other => panic!("viz_tin: {other:?}"),
+        }
+        // структура без высот: Nx2 из тех же точек
+        let pts2 = match call("eteria_tin_pts", &[s(7.0), s(32.0)]).unwrap() {
+            Value::Matrix(m) => m,
+            other => panic!("eteria_tin_pts: {other:?}"),
+        };
+        let rows: Vec<Vec<f64>> = (0..pts2.rows)
+            .map(|r| vec![pts2.get(r, 0).re, pts2.get(r, 1).re])
+            .collect();
+        let flat = mat(&rows);
+        match call("viz_tin", &[flat]).unwrap() {
+            Value::Str(svg) => assert!(svg.contains("#94a3b8"), "графит без рельефа"),
+            other => panic!("viz_tin Nx2: {other:?}"),
+        }
+        // ошибки
+        assert!(call("eteria_tin_pts", &[s(7.0), s(2.0)]).is_err());
+        assert!(call("viz_tin", &[mat(&[vec![1.0, 2.0]])]).is_err());
+        assert!(call("viz_tin", &[mat(&[vec![1.0, 2.0, 3.0]])]).is_err());
+    }
+
+    #[test]
+    fn de9im_poly_hole_semantics() {
+        let outer_a = ring_of(&[
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+        ]);
+        let hole_a = ring_of(&[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)]);
+        let poly_a = match call("poly", &[outer_a.clone(), hole_a.clone()]).unwrap() {
+            v @ Value::List(_) => v,
+            other => panic!("poly: {other:?}"),
+        };
+        // B в дырке A — disjoint
+        let in_hole = ring_of(&[(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]);
+        match call("de9im_poly", &[poly_a.clone(), in_hole]).unwrap() {
+            Value::Str(t) => {
+                assert!(t.contains("disjoint"), "B в дырке: {t}");
+                assert!(t.contains("дырок 1"), "{t}");
+            }
+            other => panic!("de9im_poly: {other:?}"),
+        }
+        // B = дырка A — touches
+        match call("de9im_poly", &[poly_a.clone(), hole_a]).unwrap() {
+            Value::Str(t) => assert!(t.contains("touches"), "B = дырка: {t}"),
+            other => panic!("de9im_poly: {other:?}"),
+        }
+        // идентичные с дырками — equals
+        let outer_a2 = ring_of(&[
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+        ]);
+        let hole_a2 = ring_of(&[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)]);
+        let poly_a2 = call("poly", &[outer_a2, hole_a2]).unwrap();
+        match call("de9im_poly", &[poly_a.clone(), poly_a2]).unwrap() {
+            Value::Str(t) => assert!(t.contains("equals"), "идентичные: {t}"),
+            other => panic!("de9im_poly: {other:?}"),
+        }
+        // кольца без poly (обратная совместимость): вложенные квадраты
+        let big = ring_of(&[(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)]);
+        let small = ring_of(&[(2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0)]);
+        match call("de9im_poly", &[big, small]).unwrap() {
+            Value::Str(t) => assert!(t.contains("contains"), "кольца как полигоны: {t}"),
+            other => panic!("de9im_poly: {other:?}"),
+        }
+        // ошибки: короткое кольцо в poly, не-кольцо, разные k
+        let short = ring_of(&[(0.0, 0.0), (1.0, 1.0)]);
+        assert!(call("poly", &[short]).is_err());
+        assert!(call("de9im_poly", &[s(1.0), s(2.0)]).is_err());
+        assert!(call("poly", &[]).is_err());
     }
 }
