@@ -537,23 +537,40 @@ fn close_ring(ring: &[TritPoint]) -> Vec<TritPoint> {
     }
 }
 
-/// LineString↔кольцо (Сессия-14): ломаная (A, ОТКРЫТАЯ, ≥ 2 вершин)
-/// против полигона (B, кольцо). Порт недостающего кейса relate:
-/// строки в топологии, якорь `geo.poler …/relate/mod.rs` (GeometryArray).
-///
-/// Свидетели: вершины/середины рёбер линии (внутри/на/снаружи кольца,
-/// с разделением КОНЦОВ линии — её граница — и внутренних вершин),
-/// классифицированные пересечения рёбер, вершины/середины кольца
-/// (лежат ли на линии — для EB).
-///
-/// Трёхзначная модель ячеек: точка пересечения → 0, линейное → +1.
-/// Тонкости: собственное (proper) пересечение рёбер переводит линию
-/// через границу простого кольца ⇒ куски ВНУТРИ и СНАРУЖИ оба есть
-/// (II = IE = +1); внутренность линии ∩ внутренность кольца всегда
-/// 1-мерна (открытая область вдоль отрезка), II ∈ {−1, +1}.
+/// LineString↔кольцо (Сессия-14): тонкая обёртка — кольцо = полигон
+/// без дырок. Вся механика — в [`relate_line_polygon`] (Сессия-17
+/// обобщила её на кольца с дырками для GeometryCollection).
 pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im, String> {
     if ring.len() < 3 {
         return Err("de9im: кольцо < 3 вершин".into());
+    }
+    relate_line_polygon(line, &[ring.to_vec()])
+}
+
+/// LineString↔полигон с дырками (Сессия-17): ломаная (A, ОТКРЫТАЯ,
+/// ≥ 2 вершин) против полигона B = `[outer, hole1, …]`.
+///
+/// Свидетели: вершины/сэмплы рёбер линии (внутри/на/снаружи ПОЛИГОНА —
+/// дырка считается внешностью), концы линии (граница A), классифицированные
+/// пересечения рёбер со ВСЕМИ кольцами, вершины/середины всех колец
+/// (лежат ли на линии — для EB).
+///
+/// Трёхзначная модель ячеек: точка пересечения → 0, линейное → +1.
+/// Тонкости: собственное (proper) пересечение рёбра линии с ЛЮБЫМ кольцом
+/// (внешним ИЛИ дырки) переводит линию через границу полигона ⇒ куски
+/// внутри и снаружи оба есть (II = IE = +1): дырка — внешность, переход
+/// «тело↔дырка» — это тоже смена стороны.
+pub fn relate_line_polygon(
+    line: &[TritPoint],
+    rings: &[Vec<TritPoint>],
+) -> Result<De9im, String> {
+    if rings.is_empty() {
+        return Err("de9im: полигон — хотя бы одно кольцо".into());
+    }
+    for (i, r) in rings.iter().enumerate() {
+        if r.len() < 3 {
+            return Err(format!("de9im: кольцо {i} полигона < 3 вершин"));
+        }
     }
     // чистка вырожденных повторов соседних вершин линии
     let mut l: Vec<TritPoint> = Vec::with_capacity(line.len());
@@ -566,16 +583,19 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
         return Err("de9im: пустая линия".into());
     }
     if l.len() == 1 {
-        return relate_point_ring(&l[0], ring);
+        return relate_point_polygon(&l[0], rings);
     }
-    if l[0].k != ring[0].k {
-        return Err("de9im: линия и кольцо на решётках разного масштаба".into());
+    let rings_c: Vec<Vec<TritPoint>> = rings.iter().map(|r| close_ring(r)).collect();
+    let k = l[0].k;
+    if rings_c.iter().any(|r| r.iter().any(|p| p.k != k)) {
+        return Err("de9im: линия и кольца полигона на решётках разного масштаба".into());
     }
-    let ring = close_ring(ring);
+    let (outer, holes) = rings_c.split_first().unwrap();
+    let pos_poly = |p: &TritPoint| point_in_poly(p, outer, holes);
     let n = l.len();
 
     // ── свидетели линии ──
-    let mut mid_in = false; // середина ребра линии строго внутри кольца
+    let mut mid_in = false; // сэмпл ребра линии строго внутри полигона
     let mut mid_out = false;
     let mut mid_on = false;
     let mut inner_vert_in = false; // внутренняя (не концевая) вершина
@@ -584,7 +604,7 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
     for (i, p) in l.iter().enumerate() {
         if i > 0 && i + 1 < n {
             // внутренняя вершина линии
-            match point_in_ring(p, &ring) {
+            match pos_poly(p) {
                 1 => inner_vert_in = true,
                 -1 => inner_vert_out = true,
                 _ => inner_vert_on = true,
@@ -592,10 +612,10 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
         }
     }
     // сэмплы внутренности рёбер: t = 1/4, 1/2, 3/4, по каждой оси
-    // floor/ceil-пробы. Точная гарантия: границы кольца — решётчатые
-    // прямые, поэтому ячейка проб вокруг точки сэмпла не рассекается
-    // границей «насквозь» — хотя бы одна проба строго по ту же сторону,
-    // что и точка сэмпла (диагональ через угол не теряет II).
+    // floor/ceil-пробы. Точная гарантия: границы — решётчатые прямые,
+    // поэтому ячейка проб вокруг точки сэмпла не рассекается границей
+    // «насквозь» — хотя бы одна проба строго по ту же сторону (диагональ
+    // через угол не теряет II). Дырки — те же решётчатые границы.
     let is_line_end = |p: &TritPoint| p == &l[0] || p == &l[n - 1];
     for i in 0..n - 1 {
         let p = &l[i];
@@ -609,12 +629,12 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
                     y: Trits::from_i64((ny + sy) / 4)?,
                     k: p.k,
                 };
-                match point_in_ring(&s, &ring) {
+                match pos_poly(&s) {
                     1 => mid_in = true,
                     -1 => mid_out = true,
                     _ => {
-                        // проба на границе: свидетель IB — только если это
-                        // НЕ конец линии (касание конца = BB)
+                        // проба на границе (любое кольцо): свидетель IB —
+                        // только если это НЕ конец линии (касание конца = BB)
                         if !is_line_end(&s) {
                             mid_on = true;
                         }
@@ -626,100 +646,105 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
     // концы линии — граница A
     let (mut ep_in, mut ep_on, mut ep_out) = (false, false, false);
     for p in [&l[0], &l[n - 1]] {
-        match point_in_ring(p, &ring) {
+        match pos_poly(p) {
             1 => ep_in = true,
             -1 => ep_out = true,
             _ => ep_on = true,
         }
     }
-    // ── пересечения рёбер линии с рёбрами кольца ──
+    // ── пересечения рёбер линии с рёбрами ВСЕХ колец ──
     let mut proper = false;
     let mut touch = false; // любое касание (для диагнозов)
     let mut touch_interior = false; // касание ВО внутренности линии (для IB)
     let mut collinear = false;
-    let nr = ring.len();
     let line_end = |p: &TritPoint| p == &l[0] || p == &l[n - 1];
-    for i in 0..n - 1 {
-        for j in 0..nr {
-            let (a, b) = (&l[i], &l[i + 1]);
-            let (c, d) = (&ring[j], &ring[(j + 1) % nr]);
-            match seg_classify(a, b, c, d) {
-                SegX::Proper => proper = true,
-                SegX::Touch => {
-                    touch = true;
-                    // точка касания во внутренности линии? случаи:
-                    // вершина кольца на ребре линии / конец ребра линии на
-                    // ребре кольца, но не конец самой линии.
-                    let on_edge = |q: &TritPoint| -> bool {
-                        if on_segment(q, a, b) {
-                            if q != a && q != b {
-                                return true; // строго внутри ребра
+    for ring in &rings_c {
+        let nr = ring.len();
+        for i in 0..n - 1 {
+            for j in 0..nr {
+                let (a, b) = (&l[i], &l[i + 1]);
+                let (c, d) = (&ring[j], &ring[(j + 1) % nr]);
+                match seg_classify(a, b, c, d) {
+                    SegX::Proper => proper = true,
+                    SegX::Touch => {
+                        touch = true;
+                        // точка касания во внутренности линии? случаи:
+                        // вершина кольца на ребре линии / конец ребра линии
+                        // на ребре кольца, но не конец самой линии.
+                        let on_edge = |q: &TritPoint| -> bool {
+                            if on_segment(q, a, b) {
+                                if q != a && q != b {
+                                    return true; // строго внутри ребра
+                                }
+                                if q == a && i > 0 {
+                                    return true; // внутренняя вершина линии
+                                }
+                                if q == b && i + 1 < n - 1 {
+                                    return true;
+                                }
                             }
-                            if q == a && i > 0 {
-                                return true; // внутренняя вершина линии
-                            }
-                            if q == b && i + 1 < n - 1 {
-                                return true;
-                            }
+                            false
+                        };
+                        if on_edge(c) || on_edge(d) {
+                            touch_interior = true;
+                        } else if (on_segment(a, c, d) && !line_end(a))
+                            || (on_segment(b, c, d) && !line_end(b))
+                        {
+                            touch_interior = true;
                         }
-                        false
-                    };
-                    if on_edge(c) || on_edge(d) {
-                        touch_interior = true;
-                    } else if (on_segment(a, c, d) && !line_end(a))
-                        || (on_segment(b, c, d) && !line_end(b))
-                    {
-                        touch_interior = true;
                     }
+                    SegX::Collinear => collinear = true,
+                    SegX::None => {}
                 }
-                SegX::Collinear => collinear = true,
-                SegX::None => {}
             }
         }
     }
-    // ── свидетели кольца для EB: все ли лежат на линии ──
-    let mut ring_on_line = true;
-    for j in 0..nr {
-        let a = &ring[j];
-        let b = &ring[(j + 1) % nr];
-        let mid = TritPoint {
-            x: Trits::from_i64((a.x.to_i64() + b.x.to_i64()) / 2)?,
-            y: Trits::from_i64((a.y.to_i64() + b.y.to_i64()) / 2)?,
-            k: a.k,
-        };
-        let on = |p: &TritPoint| -> bool {
-            (0..n - 1).any(|i| on_segment(p, &l[i], &l[i + 1]))
-        };
-        if !on(a) || !on(&mid) {
-            ring_on_line = false;
-            break;
+    // ── свидетели всех колец для EB: все ли лежат на линии ──
+    let mut rings_on_line = true;
+    'outer_loop: for ring in &rings_c {
+        let nr = ring.len();
+        for j in 0..nr {
+            let a = &ring[j];
+            let b = &ring[(j + 1) % nr];
+            let mid = TritPoint {
+                x: Trits::from_i64((a.x.to_i64() + b.x.to_i64()) / 2)?,
+                y: Trits::from_i64((a.y.to_i64() + b.y.to_i64()) / 2)?,
+                k: a.k,
+            };
+            let on = |p: &TritPoint| -> bool {
+                (0..n - 1).any(|i| on_segment(p, &l[i], &l[i + 1]))
+            };
+            if !on(a) || !on(&mid) {
+                rings_on_line = false;
+                break 'outer_loop;
+            }
         }
     }
     let _ = touch; // диагнозы касаний учтены в touch_interior
 
-    // ── сборка матрицы: строки I/B/E линии, столбцы I/B/E кольца ──
+    // ── сборка матрицы: строки I/B/E линии, столбцы I/B/E полигона ──
     let mut m = De9im::EMPTY;
-    // II: кусок внутренности линии внутри кольца (1-мерный)
+    // II: кусок внутренности линии внутри полигона (1-мерный)
     if mid_in || inner_vert_in || proper {
         m.cells[0] = 1;
     }
-    // IB: внутренность линии на границе кольца — коллинеарный участок (+1)
-    // или точечное касание/собственное пересечение ВО внутренности линии (0);
+    // IB: внутренность линии на границе полигона (любое кольцо) —
+    // коллинеарный участок (+1) или точечное касание (0);
     // касание в КОНЦЕ линии — это BB, не IB.
     if collinear {
         m.cells[1] = 1;
     } else if proper || touch_interior || mid_on || inner_vert_on {
         m.cells[1] = 0;
     }
-    // IE: кусок внутренности линии снаружи кольца
+    // IE: кусок внутренности линии снаружи полигона (вне внешнего или в дырке)
     if mid_out || inner_vert_out || proper {
         m.cells[2] = 1;
     }
-    // BI: конец линии внутри кольца (точка)
+    // BI: конец линии внутри полигона (точка)
     if ep_in {
         m.cells[3] = 0;
     }
-    // BB: конец линии на границе кольца (точка)
+    // BB: конец линии на границе полигона (точка)
     if ep_on {
         m.cells[4] = 0;
     }
@@ -727,10 +752,10 @@ pub fn relate_line_ring(line: &[TritPoint], ring: &[TritPoint]) -> Result<De9im,
     if ep_out {
         m.cells[5] = 0;
     }
-    // EI: внутренность кольца не накрыта 1-мерной линией — всегда площадь
+    // EI: внутренность полигона не накрыта 1-мерной линией — всегда площадь
     m.cells[6] = 1;
-    // EB: граница кольца не накрыта линией целиком
-    if !ring_on_line {
+    // EB: граница полигона (все кольца) не накрыта линией целиком
+    if !rings_on_line {
         m.cells[7] = 1;
     }
     // EE: внешности ограниченных фигур пересекаются площадно
@@ -1183,6 +1208,164 @@ pub fn relate_polygon_polygon(
     }
     // EE: внешности двух ограниченных полигонов всегда пересекаются площадно
     m.cells[8] = 1;
+    Ok(m)
+}
+
+// ─────────────── смешанная размерность: GeometryCollection (Сессия-17) ───────────────
+//
+// Директива: «mixed-размерность relate (GeometryCollection)». OGC-семантика
+// коллекций (как JTS/GEOS): внутренность/граница/внешность коллекции —
+// ОБЪЕДИНЕНИЕ внутренних/граничных/внешностей компонент; размерность
+// объединения = max размерностей, что в тритной модели ячейки —
+// cell-wise max (−1 < 0 < +1). Пара матриц компонент сворачивается
+// в матрицу коллекции без потери сигнала: любое непустое пересечение
+// всплывает, размерность доминирует старшая.
+//
+// Граница линии (по JTS) = концы; граница коллекции = объединение границ
+// компонент (для ПЕРЕСЕКАЮЩИХСЯ компонент OGC строже — задокументировано
+// честно как конвенция движка).
+
+/// Геометрия произвольной размерности — компонент коллекций relate.
+#[derive(Clone, Debug)]
+pub enum Geometry {
+    Point(TritPoint),
+    /// Открытая ломаная ≥ 2 вершин (1 вершина допустима входом — точка).
+    Line(Vec<TritPoint>),
+    /// Полигон `[outer, holes…]` (кольца не замкнуты — замкнётся).
+    Polygon(Vec<Vec<TritPoint>>),
+    /// Коллекция разной размерности (GeometryCollection OGC).
+    Collection(Vec<Geometry>),
+}
+
+/// Объединение матриц по ячейкам: cell-wise max (dim(∪) = max dim).
+fn matrix_union(acc: &mut De9im, m: &De9im) {
+    for i in 0..9 {
+        if m.cells[i] > acc.cells[i] {
+            acc.cells[i] = m.cells[i];
+        }
+    }
+}
+
+/// relate двух геометрий ПРОИЗВОЛЬНОЙ размерности: точки, линии,
+/// полигоны (с дырками) и коллекции — полная реляционная матрица
+/// смешанных размерностей. Коллекция сворачивается по парам компонент
+/// (рекурсивно: коллекция×коллекция = все пары), матрицы объединяются
+/// ячейками. Пустая коллекция — честная ошибка.
+pub fn relate_geometry(a: &Geometry, b: &Geometry) -> Result<De9im, String> {
+    match (a, b) {
+        (Geometry::Collection(cs), _) => {
+            if cs.is_empty() {
+                return Err("de9im: пустая коллекция".into());
+            }
+            let mut acc = De9im::EMPTY;
+            for c in cs {
+                matrix_union(&mut acc, &relate_geometry(c, b)?);
+            }
+            Ok(acc)
+        }
+        (_, Geometry::Collection(cs)) => {
+            if cs.is_empty() {
+                return Err("de9im: пустая коллекция".into());
+            }
+            let mut acc = De9im::EMPTY;
+            for c in cs {
+                matrix_union(&mut acc, &relate_geometry(a, c)?);
+            }
+            Ok(acc)
+        }
+        (Geometry::Point(p), Geometry::Point(q)) => relate_point_point(p, q),
+        (Geometry::Point(p), Geometry::Line(l)) => relate_point_line(p, l),
+        (Geometry::Point(p), Geometry::Polygon(g)) => relate_point_polygon(p, g),
+        (Geometry::Line(l), Geometry::Point(p)) => Ok(transpose(&relate_point_line(p, l)?)),
+        (Geometry::Line(l), Geometry::Line(m)) => relate_line_line(l, m),
+        (Geometry::Line(l), Geometry::Polygon(g)) => relate_line_polygon(l, g),
+        (Geometry::Polygon(g), Geometry::Point(p)) => Ok(transpose(&relate_point_polygon(p, g)?)),
+        (Geometry::Polygon(g), Geometry::Line(l)) => Ok(transpose(&relate_line_polygon(l, g)?)),
+        (Geometry::Polygon(g), Geometry::Polygon(h)) => relate_polygon_polygon(g, h),
+    }
+}
+
+/// Точка↔LineString (Сессия-17): замыкает точечную строку матрицы.
+/// Позиции точки: строго во внутренности линии (II = 0), на конце
+/// (IB = 0 — граница линии), вне замыкания (IE = 0) — три честных
+/// исхода, самопересечения дают несколько сигналов сразу.
+pub fn relate_point_line(p: &TritPoint, line: &[TritPoint]) -> Result<De9im, String> {
+    let mut l: Vec<TritPoint> = Vec::with_capacity(line.len());
+    for q in line {
+        if l.last() != Some(q) {
+            l.push(q.clone());
+        }
+    }
+    if l.is_empty() {
+        return Err("de9im: пустая линия".into());
+    }
+    if l.len() == 1 {
+        return relate_point_point(p, &l[0]);
+    }
+    if p.k != l[0].k {
+        return Err("de9im: точка и линия на решётках разного масштаба".into());
+    }
+    let n = l.len();
+    let mut inside = false; // точка во внутренности линии (ребро/внутр. вершина)
+    let mut on_end = false; // точка = конец линии (граница)
+    for i in 0..n - 1 {
+        if on_segment(p, &l[i], &l[i + 1]) {
+            let at_start = p == &l[i];
+            let at_end = p == &l[i + 1];
+            if (at_start && i == 0) || (at_end && i + 1 == n - 1) {
+                on_end = true;
+            } else {
+                // строго внутри ребра ИЛИ внутренняя вершина линии
+                inside = true;
+            }
+        }
+    }
+    let mut m = De9im::EMPTY;
+    if inside {
+        m.cells[0] = 0; // II
+    }
+    if on_end {
+        m.cells[1] = 0; // IB: конец линии
+    }
+    if !inside && !on_end {
+        m.cells[2] = 0; // IE: точка вне замыкания линии
+    }
+    m.cells[6] = 1; // EI: линия минус точка — 1-мерна
+    // EB: концы линии минус возможная точка — конечное множество точек
+    let any_ep_besides = (&l[0] != p) || (&l[n - 1] != p);
+    m.cells[7] = if any_ep_besides { 0 } else { -1 };
+    m.cells[8] = 1; // EE
+    Ok(m)
+}
+
+/// Точка↔полигон с дырками (Сессия-17): позиции — внутри (II),
+/// на границе ЛЮБОГО кольца (IB), снаружи — вне внешнего или В ДЫРКЕ (IE).
+pub fn relate_point_polygon(p: &TritPoint, rings: &[Vec<TritPoint>]) -> Result<De9im, String> {
+    if rings.is_empty() {
+        return Err("de9im: полигон — хотя бы одно кольцо".into());
+    }
+    for (i, r) in rings.iter().enumerate() {
+        if r.len() < 3 {
+            return Err(format!("de9im: кольцо {i} полигона < 3 вершин"));
+        }
+    }
+    let closed: Vec<Vec<TritPoint>> = rings.iter().map(|r| close_ring(r)).collect();
+    let (outer, holes) = closed.split_first().unwrap();
+    if outer[0].k != p.k {
+        return Err("de9im: точка и полигон на решётках разного масштаба".into());
+    }
+    let pos = point_in_poly(p, outer, holes);
+    let mut m = De9im::EMPTY;
+    match pos {
+        1 => m.cells[0] = 0,  // II: точка внутри (дырки не глотают)
+        0 => m.cells[1] = 0,  // IB: на любом кольце
+        _ => m.cells[2] = 0,  // IE: снаружи (вне внешнего или в дырке)
+    }
+    // E(A) — всё кроме точки; внутренность/граница полигона заведомо
+    // площадно/линейно выходят за пределы одной точки.
+    m.cells[6] = 1; // EI
+    m.cells[7] = 1; // EB
+    m.cells[8] = 1; // EE
     Ok(m)
 }
 
@@ -1763,4 +1946,178 @@ mod tests {
         ]];
         assert!(relate_polygon_polygon(&coarse, &good).is_err());
     }
+    // ─────────── Сессия-17: смешанная размерность ───────────
+
+    #[test]
+    fn point_line_three_positions() {
+        let line = vec![tp(0.0, 0.0), tp(4.0, 0.0), tp(4.0, 4.0)];
+        // строго внутри первого ребра
+        let m = relate_point_line(&tp(2.0, 0.0), &line).unwrap();
+        assert_eq!(m.ii(), 0);
+        assert_eq!(m.ib(), -1);
+        assert_eq!(m.ie(), -1);
+        assert!(m.intersects());
+        assert!(!m.touches());
+        // внутренняя вершина (4, 0) — внутренность, не граница
+        let m = relate_point_line(&tp(4.0, 0.0), &line).unwrap();
+        assert_eq!(m.ii(), 0, "внутренняя вершина — внутренность");
+        assert_eq!(m.ib(), -1);
+        // конец линии — граница: IB = 0, touches
+        let m = relate_point_line(&tp(0.0, 0.0), &line).unwrap();
+        assert_eq!(m.ii(), -1);
+        assert_eq!(m.ib(), 0, "конец — граница линии");
+        assert!(m.touches(), "касание концом");
+        // вне замыкания — disjoint
+        let m = relate_point_line(&tp(2.0, 1.0), &line).unwrap();
+        assert!(m.disjoint());
+        assert_eq!(m.ie(), 0);
+        // вырожденная линия = точка
+        let m = relate_point_line(&tp(1.0, 1.0), &[tp(1.0, 1.0)]).unwrap();
+        assert!(m.equals(), "точка == точка через line-вход");
+        // ошибки
+        assert!(relate_point_line(&tp(0.0, 0.0), &[]).is_err());
+    }
+
+    #[test]
+    fn point_polygon_with_hole_positions() {
+        let p = poly(&[
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)],
+        ]);
+        // строго внутри тела
+        let m = relate_point_polygon(&tp(1.0, 1.0), &p).unwrap();
+        assert_eq!(m.ii(), 0);
+        assert!(m.within(), "точка в теле полигона");
+        // в дырке — внешность: disjoint
+        let m = relate_point_polygon(&tp(5.0, 5.0), &p).unwrap();
+        assert!(m.disjoint(), "дырка = внешность");
+        assert_eq!(m.ie(), 0);
+        // на границе дырки — IB
+        let m = relate_point_polygon(&tp(5.0, 3.0), &p).unwrap();
+        assert_eq!(m.ib(), 0);
+        assert!(m.touches());
+        // на внешней границе
+        let m = relate_point_polygon(&tp(0.0, 5.0), &p).unwrap();
+        assert_eq!(m.ib(), 0);
+        // снаружи
+        let m = relate_point_polygon(&tp(12.0, 5.0), &p).unwrap();
+        assert!(m.disjoint());
+        // согласованность с кольцевым кейсом без дырок
+        let ring_only = vec![ring(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])];
+        for probe in [(1.0, 1.0), (12.0, 5.0), (0.0, 5.0)] {
+            let a = relate_point_ring(&tp(probe.0, probe.1), &ring_only[0]).unwrap();
+            let b = relate_point_polygon(&tp(probe.0, probe.1), &ring_only).unwrap();
+            assert_eq!(a, b, "кольцо == полигон без дырок: {probe:?}");
+        }
+        // ошибки: пустой полигон, короткое кольцо
+        assert!(relate_point_polygon(&tp(1.0, 1.0), &[]).is_err());
+        let short = vec![vec![tp(0.0, 0.0), tp(1.0, 0.0)]];
+        assert!(relate_point_polygon(&tp(1.0, 1.0), &short).is_err());
+    }
+
+    #[test]
+    fn line_polygon_hole_semantics() {
+        let p = poly(&[
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)],
+        ]);
+        // линия сквозь дырку: оба конца снаружи, внутренность проходит
+        // через дырку (внешность полигона) — внутренности НЕ пересекаются,
+        // но границу рёбра дырки пересекает накрест → touches
+        let through_hole = vec![tp(5.0, -2.0), tp(5.0, 12.0)];
+        let m = relate_line_polygon(&through_hole, &p).unwrap();
+        assert!(m.intersects());
+        assert!(!m.disjoint());
+        // II куски: линия проходит и через тело (y<3 и y>7 внутри тела,
+        // 3<y<7 — дырка) → II = +1 и IE = +1 (правильный переход)
+        assert_eq!(m.ii(), 1, "кусок в теле полигона есть");
+        assert_eq!(m.ie(), 1, "кусок в дырке/снаружи есть");
+        // только дырка: короткая линия целиком в дырке
+        let in_hole = vec![tp(4.0, 4.0), tp(6.0, 6.0)];
+        let m = relate_line_polygon(&in_hole, &p).unwrap();
+        assert!(m.disjoint(), "линия в дырке: {}", m.bal_string());
+        assert_eq!(m.ie(), 1, "внутренность линии во внешности (дырке)");
+        assert_eq!(m.ii(), -1);
+        // согласованность с кольцевым кейсом: relate_line_ring == обёртка
+        let ring_only = vec![ring(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])];
+        let cross = vec![tp(-2.0, 5.0), tp(12.0, 5.0)];
+        let a = relate_line_ring(&cross, &ring_only[0]).unwrap();
+        let b = relate_line_polygon(&cross, &ring_only).unwrap();
+        assert_eq!(a, b);
+        assert!(a.crosses() || a.intersects());
+        // ошибки
+        assert!(relate_line_polygon(&cross, &[]).is_err());
+    }
+
+    #[test]
+    fn collection_mixed_semantics() {
+        let poly_b = poly(&[&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]]);
+        // A = коллекция {точка внутри, линия накрест}
+        let a = Geometry::Collection(vec![
+            Geometry::Point(tp(2.0, 2.0)),
+            Geometry::Line(vec![tp(5.0, -2.0), tp(5.0, 12.0)]),
+        ]);
+        let b = Geometry::Polygon(poly_b.clone());
+        let m = relate_geometry(&a, &b).unwrap();
+        // II: линия даёт +1 (кусок внутри), точка дала бы 0 — max = +1
+        assert_eq!(m.ii(), 1, "доминирует линейная внутренность");
+        assert!(m.intersects());
+        assert!(!m.disjoint());
+        assert_eq!(m.ie(), 1, "линия выглядывает");
+        // транспонированная симметрия
+        let t = relate_geometry(&b, &a).unwrap();
+    assert_eq!(transpose(&m), t, "коллекция×полигон симметрична");
+        // B = та же фигура одиночным полигоном: {полигон} == полигон
+        let single = Geometry::Collection(vec![Geometry::Polygon(poly_b.clone())]);
+        let m1 = relate_geometry(&single, &b).unwrap();
+        let m2 = relate_geometry(&b, &b).unwrap();
+        assert_eq!(m1, m2, "коллекция из одного == сама геометрия");
+        // полностью снаружи: disjoint
+        let out = Geometry::Collection(vec![
+            Geometry::Point(tp(20.0, 20.0)),
+            Geometry::Line(vec![tp(15.0, 15.0), tp(16.0, 16.0)]),
+        ]);
+        let m = relate_geometry(&out, &b).unwrap();
+        assert!(m.disjoint(), "вся коллекция снаружи: {}", m.bal_string());
+        // точка внутри + точка снаружи: intersects, но не within
+        let mixed = Geometry::Collection(vec![
+            Geometry::Point(tp(2.0, 2.0)),
+            Geometry::Point(tp(20.0, 20.0)),
+        ]);
+        let m = relate_geometry(&mixed, &b).unwrap();
+        assert!(m.intersects());
+        assert!(!m.within());
+        assert_eq!(m.ii(), 0, "точечная внутренность");
+        // вложенная коллекция
+        let nested = Geometry::Collection(vec![Geometry::Collection(vec![
+            Geometry::Point(tp(2.0, 2.0)),
+        ])]);
+        let m = relate_geometry(&nested, &b).unwrap();
+        assert!(m.within(), "вложенная коллекция из точки внутри");
+        // пустая коллекция — ошибка
+        let empty = Geometry::Collection(vec![]);
+        assert!(relate_geometry(&empty, &b).is_err());
+        assert!(relate_geometry(&b, &empty).is_err());
+    }
+
+    #[test]
+    fn collection_point_line_cross() {
+        // коллекция точка+линия против линии: сквозное отверстие не нужно —
+        // точка НА линии + линия Х-образно
+        let la = vec![tp(0.0, 0.0), tp(4.0, 4.0)];
+        let a = Geometry::Collection(vec![
+            Geometry::Line(la.clone()),
+            Geometry::Point(tp(1.0, 1.0)), // на линии A
+        ]);
+        let lb = Geometry::Line(vec![tp(0.0, 4.0), tp(4.0, 0.0)]);
+        let m = relate_geometry(&a, &lb).unwrap();
+        // рёбра пересекаются накрест в (2,2) — точечное II от пары линий;
+        // точка (1,1) снаружи B
+        assert!(m.intersects());
+        assert_eq!(m.ii(), 0, "X-пересечение линий — точка");
+        // точка (1,1) на линии A, но вне B: IE от точки — 0 (dim точки)
+        // + линия A выглядывает: IE = max(0, +1) = +1
+        assert_eq!(m.ie(), 1);
+    }
 }
+

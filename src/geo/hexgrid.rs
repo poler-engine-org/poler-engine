@@ -300,6 +300,116 @@ pub fn world_address_res(t: &Trits) -> Result<usize, String> {
     Ok((n - 9) / 2)
 }
 
+// ─────────────── res→2: полный адрес с любого уровня (Сессия-17) ───────────────
+//
+// Сессия-15 построила механику дробления на ОДИН уровень (children/parent,
+// +2 трита). Сессия-17 замыкает цикл координаты ⇄ адрес на ЛЮБОМ уровне:
+//
+//   ячейка res-2 (q, r) ──два родителя вверх──▶ (q₀, r₀) + уточнения
+//   (i₁,j₁), (i₂,j₂) ──спираль res-0──▶ s ──грань──▶ 9 тритов
+//   ──+refine(i₁,j₁)+refine(i₂,j₂)──▶ 13 тритов
+//
+// Каноническая глубина — res 2 (адрес 13 тритов); механика допускает
+// до MAX_RES = 6 (17 тритов, масштаб решётки 3⁶ = 729 — с запасом i64).
+// Ограничение одно честное: res-0 предок должен лежать в диске R ≤ 13
+// (6-тритная спираль).
+
+/// Каноническая глубина Сессии-17: res 2 = адрес 13 тритов.
+pub const CANON_RES: usize = 2;
+/// Предел механики адресов: 9 + 2·6 = 17 тритов.
+pub const MAX_RES: usize = 6;
+
+/// Все потомки ячейки на уровне `res` (9^res ячеек, res ≤ MAX_RES).
+/// res 0 → сама ячейка; res 1 → 9 детей; res 2 → 81 внук.
+pub fn h3_descendants(q: i64, r: i64, res: usize) -> Result<Vec<(i64, i64)>, String> {
+    if res > MAX_RES {
+        return Err(format!(
+            "hex: res = {res} > {MAX_RES} (адрес ≤ 9 + 2·{MAX_RES} = {} тритов)",
+            9 + 2 * MAX_RES
+        ));
+    }
+    let mut cells = vec![(q, r)];
+    for _ in 0..res {
+        let mut next = Vec::with_capacity(cells.len() * 9);
+        for &(cq, cr) in &cells {
+            next.extend(h3_children(cq, cr));
+        }
+        cells = next;
+    }
+    Ok(cells)
+}
+
+/// Мировой адрес ячейки (q, r) НА УРОВНЕ res: грань (3 трита) +
+/// спираль res-0 родителя (6 тритов) + res уточняющих пар (2 трита
+/// каждая). res 2 → 13 тритов. Путь родителей наверх — чистая
+/// сбалансированная тройка, как у `h3_parent`.
+pub fn world_address(face: usize, q: i64, r: i64, res: usize) -> Result<Trits, String> {
+    if face >= 20 {
+        return Err(format!("hex: грань {face} вне икосаэдра (0..19)"));
+    }
+    if res > MAX_RES {
+        return Err(format!(
+            "hex: res = {res} > {MAX_RES} — адрес ≤ {} тритов",
+            9 + 2 * MAX_RES
+        ));
+    }
+    // поднимаемся res уровней: уточнения собираются СВЕРХУ ВНИЗ,
+    // в адрес кладутся СНИЗУ ВВЕРХ (первая пара — первый уровень)
+    let mut refinements: Vec<(i64, i64)> = Vec::with_capacity(res);
+    let (mut cq, mut cr) = (q, r);
+    for _ in 0..res {
+        let ((pq, pr), ij) = h3_parent(cq, cr);
+        refinements.push(ij);
+        (cq, cr) = (pq, pr);
+    }
+    // res-0 родитель должен попасть в 6-тритную спираль
+    let s = axial_to_spiral(cq, cr)?;
+    let mut t = world_trit_id(face, s)?;
+    for &(i, j) in refinements.iter().rev() {
+        t = child_world_address(&t, i, j)?;
+    }
+    debug_assert_eq!(t.len(), 9 + 2 * res);
+    Ok(t)
+}
+
+/// Обратный к [`world_address`]: адрес + ожидаемое разрешение →
+/// (грань, q, r на уровне res). Пары уточнения применяются слева
+/// направо: q ← 3q + i.
+///
+/// res задаётся ЯВНО: `Trits::parse` обрезает ведущие нули (грани 4..19
+/// кодируются с нулевой старшей тройкой), длина разобранного адреса
+/// ненадёжна — источник длины только строка-оригинал.
+pub fn world_address_parse(t: &Trits, res: usize) -> Result<(usize, i64, i64), String> {
+    if res > MAX_RES {
+        return Err(format!(
+            "hex: res = {res} > {MAX_RES} (механика Сессии-17)"
+        ));
+    }
+    let want_len = 9 + 2 * res;
+    let mut digits = t.digits.clone();
+    if digits.len() > want_len {
+        return Err(format!(
+            "hex: адрес {:?} длиннее {want_len} тритов для res {res}",
+            t.digits
+        ));
+    }
+    while digits.len() < want_len {
+        digits.insert(0, 0);
+    }
+    // база 9 тритов + res пар уточнения
+    let base: Vec<i8> = digits[..9].to_vec();
+    let (face, s) = world_trit_parse(&Trits { digits: base })?;
+    let (mut q, mut r) = spiral_to_axial(s)?;
+    for lvl in 0..res {
+        let pair = &digits[9 + 2 * lvl..9 + 2 * lvl + 2];
+        let (i, j) = parse_refine(&Trits {
+            digits: pair.to_vec(),
+        })?;
+        (q, r) = (3 * q + i, 3 * r + j);
+    }
+    Ok((face, q, r))
+}
+
 // ─────────────── икосаэдр H3: 20 граней золотого сечения ───────────────
 
 /// 12 вершин икосаэдра (0, ±1, ±φ) на описанной сфере R = √(1+φ²) ≈ 1.902
@@ -575,6 +685,87 @@ mod tests {
         assert!(hex_neighbors((0, 0)).contains(&(0, 1)));
         assert!(hex_neighbors((0, 0)).contains(&(1, 0)));
         assert!(hex_neighbors((0, 0)).contains(&(1, -1)));
+    }
+
+    #[test]
+    fn world_address_res2_roundtrip() {
+        // координаты ⇄ адрес на res 0/1/2/3 — полный цикл
+        for (face, q, r) in [
+            (7usize, 2i64, -3i64),
+            (0, 0, 0),
+            (19, -5, 7),
+            (4, 9, 9), // грань с нулевой старшей тройкой
+            (13, 3, 1),
+        ] {
+            for res in [0usize, 1, 2, 3] {
+                // поднимаем res уровней — res-0 предок должен попасть в R13
+                let (mut pq, mut pr) = (q, r);
+                for _ in 0..res {
+                    let ((a, b), _) = h3_parent(pq, pr);
+                    (pq, pr) = (a, b);
+                }
+                if hex_distance((0, 0), (pq, pr)) > MAX_DISK_RADIUS {
+                    continue; // вне спирали — ошибка отдельно проверена
+                }
+                let t = world_address(face, q, r, res).unwrap();
+                assert_eq!(t.len(), 9 + 2 * res, "res {res}: {t:?}");
+                let (f2, q2, r2) = world_address_parse(&t, res).unwrap();
+                assert_eq!((f2, q2, r2), (face, q, r), "res {res} roundtrip");
+            }
+        }
+        // res 2 → ровно 13 тритов, res-0 → 9
+        assert_eq!(
+            world_address(7, 2, -3, CANON_RES).unwrap().len(),
+            13,
+            "канон Сессии-17: 13 тритов"
+        );
+        assert_eq!(world_address(7, 2, -3, 0).unwrap().len(), 9);
+        // координаты res-2 (9q+i)·3+j адресуются честно
+        let q2 = 3 * 3 * 2 + 1; // i₁=+1, i₂=+... строим снизу
+        let r2 = 3 * 3 * -3 - 1;
+        let t = world_address(7, q2, r2, 2).unwrap();
+        let (_, qq, rr) = world_address_parse(&t, 2).unwrap();
+        assert_eq!((qq, rr), (q2, r2), "res-2 координаты roundtrip");
+        // ошибки: res за пределом, грань, далёкая res-0 клетка
+        assert!(world_address(7, 0, 0, MAX_RES + 1).is_err());
+        assert!(world_address(20, 0, 0, 2).is_err());
+        assert!(world_address(7, 400, 400, 2).is_err());
+        // разбор: адрес длиннее заявленного res / res за пределом
+        let t13 = world_address(7, 2, -3, 2).unwrap();
+        assert!(world_address_parse(&t13, 1).is_err());
+        assert!(world_address_parse(&t13, MAX_RES + 1).is_err());
+    }
+
+    #[test]
+    fn descendants_tile_and_center_path() {
+        // 81 внук res-2, все уникальны, соседи не пересекаются
+        let d00 = h3_descendants(0, 0, 2).unwrap();
+        assert_eq!(d00.len(), 81, "9² = 81");
+        let mut sorted = d00.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 81, "уникальные");
+        let d10 = h3_descendants(1, 0, 2).unwrap();
+        let mut all = d00.clone();
+        all.extend(d10.iter().cloned());
+        let mut s2 = all.clone();
+        s2.sort();
+        s2.dedup();
+        assert_eq!(s2.len(), 162, "семьи соседей не пересекаются");
+        // res 1 == h3_children
+        let d1 = h3_descendants(2, -3, 1).unwrap();
+        assert_eq!(d1, h3_children(2, -3).to_vec());
+        // res 0 — сама ячейка
+        assert_eq!(h3_descendants(5, 5, 0).unwrap(), vec![(5, 5)]);
+        // центр-потомок res-2 остаётся в (9q, 9r)
+        assert!(d00.contains(&(0, 0)));
+        let d22 = h3_descendants(2, 2, 2).unwrap();
+        assert!(d22.contains(&(18, 18)), "центр 9·(2,2)");
+        // границы: res-2 потомки (0,0) занимают [−4, +4], потомки (1,0) — [5, 13]
+        assert!(d00.contains(&(-4, -4)) && d00.contains(&(4, 4)));
+        assert!(d10.contains(&(5, -4)) && d10.contains(&(13, 4)));
+        // ошибка res > MAX_RES
+        assert!(h3_descendants(0, 0, MAX_RES + 1).is_err());
     }
 
     #[test]

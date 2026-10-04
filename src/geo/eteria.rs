@@ -21,7 +21,9 @@
 //! один seed даёт один и тот же мир от запуска к запуску.
 
 use crate::calc::logprob::{lpsum_lns, LogProb};
-use crate::geo::hexgrid::{axial_to_spiral, face_of_direction, hex_disk, world_trit_id};
+use crate::geo::hexgrid::{
+    axial_to_spiral, face_of_direction, hex_disk, world_address, world_trit_id,
+};
 
 /// Биомы Этерии: (имя, цвет SVG). Фредерит — лор проекта
 /// (фредеритовые поля из geo/mod.rs, Сессия-12).
@@ -266,8 +268,13 @@ pub fn boltzmann_report(seed: u64, radius: i64, scale: f64) -> Result<String, St
             let share = LogProb::from_ln(lns[i] - z.ln())?;
             let s = axial_to_spiral(c.q, c.r)?;
             let wid = world_trit_id(face, s)?;
+            // Сессия-17: центр-потомок res-2 (9q, 9r) — адрес 13 тритов:
+            // та же ячейка, но на канонической глубине иерархии H3
+            let wid13 = world_address(face, 9 * c.q, 9 * c.r, 2)
+                .map(|t| t.to_string_bal())
+                .unwrap_or_else(|_| "— вне спирали".into());
             Ok(format!(
-                "  ({:+}, {:+}) {} · h = {:.3} · P = {} · доля = {} · s = {} · мир 9 тритов: {}",
+                "  ({:+}, {:+}) {} · h = {:.3} · P = {} · доля = {} · s = {} · мир 9 тритов: {} · res-2 (13 тритов): {}",
                 c.q,
                 c.r,
                 BIOMES[c.biome].0,
@@ -275,7 +282,8 @@ pub fn boltzmann_report(seed: u64, radius: i64, scale: f64) -> Result<String, St
                 p.fmt10(),
                 share.fmt10(),
                 s,
-                wid.to_string_bal()
+                wid.to_string_bal(),
+                wid13
             ))
         })
         .collect::<Result<Vec<String>, String>>()?;
@@ -435,6 +443,26 @@ pub fn tin_boltz_report(seed: u64, n: usize, scale: f64) -> Result<String, Strin
         }
     }
 
+    // изолинии (Сессия-17): медианный уровень — marching squares по
+    // height_at (тот же 27-дерево) против ТОЧНОГО сечения треугольников
+    let (mut zlo, mut zhi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &h in &z {
+        zlo = zlo.min(h);
+        zhi = zhi.max(h);
+    }
+    let level = (zlo + zhi) / 2.0;
+    let ms = crate::geo::marchsq::tin_isolines(&tin, &z, level, 64)?;
+    let ex = crate::geo::marchsq::tin_isolines_exact(&tin, &z, level)?;
+    let iso_line = format!(
+        "изолинии (сессия-17): уровень {:.3} — marching squares {} ветвей · длина {:.0} \
+         против точно {} · {:.0} квантов (27-дерево: height_at трит-путём)",
+        level,
+        ms.len(),
+        crate::geo::marchsq::total_length(&ms),
+        ex.len(),
+        crate::geo::marchsq::total_length(&ex)
+    );
+
     Ok([
         format!(
             "Этерия · TIN Делоне · {} вершин золотого посева · {} треугольников · \
@@ -464,6 +492,7 @@ pub fn tin_boltz_report(seed: u64, n: usize, scale: f64) -> Result<String, Strin
              max |Δh| = {:.4}",
             max_dev
         ),
+        iso_line,
         "топ-вершины (минимум энергии):".to_string(),
     ]
     .into_iter()
@@ -569,6 +598,28 @@ mod tests {
         // ошибки валидации
         assert!(boltzmann_report(7, 8, 0.0).is_err());
         assert!(boltzmann_report(7, 12, 1e5).is_err());
+    }
+
+    #[test]
+    fn boltzmann_reports_session17() {
+        // res-2 адрес в гекс-отчёте: 13 тритов центр-потомка топ-ячейки
+        let rep = boltzmann_report(7, 8, 1e5).unwrap();
+        assert!(rep.contains("res-2 (13 тритов)"), "адрес res-2: {rep}");
+        // длина адреса в самом деле 13 тритов
+        let cells = hex_cells(7, 8).unwrap();
+        let face = sector_face(7).unwrap();
+        let top = cells
+            .iter()
+            .max_by(|a, b| a.h.partial_cmp(&b.h).unwrap())
+            .unwrap();
+        let wid13 = world_address(face, 9 * top.q, 9 * top.r, 2).unwrap();
+        assert_eq!(wid13.len(), 13);
+        assert!(rep.contains(&wid13.to_string_bal()), "адрес в отчёте: {rep}");
+        // изолинии в TIN-отчёте
+        let rep = tin_boltz_report(7, 64, 1e5).unwrap();
+        assert!(rep.contains("изолинии (сессия-17)"), "строка изолиний: {rep}");
+        assert!(rep.contains("marching squares"), "{rep}");
+        assert!(rep.contains("против точно"), "{rep}");
     }
 
     #[test]

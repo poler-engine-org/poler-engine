@@ -2715,6 +2715,215 @@ pub fn tin_svg(
     Ok(out)
 }
 
+
+// ─────────────── изолинии поверх TIN (Сессия-17) ───────────────
+
+/// SVG-карта изолиний поверх рельефа TIN: биомные треугольники (как
+/// `tin_svg`) + изолинии marching squares тёмными полилиниями + подписи
+/// уровней с белым ореолом (грабля-23-аудит: кламп в канву, анти-
+/// перекрытие ≥ 34 px между подписями, максимум 8 уровней).
+///
+/// `levels` — пары (уровень, цепочки изолиний в квантах решётки TIN).
+pub fn isolines_svg(
+    tin: &crate::geo::delaunay::Tin,
+    z: &[f64],
+    levels: &[(f64, Vec<crate::geo::marchsq::Isoline>)],
+    title_text: &str,
+    note: &str,
+) -> Result<String, String> {
+    use crate::geo::eteria::{biome_index, BIOMES};
+    use crate::geo::marchsq::Isoline;
+    if tin.tris.is_empty() {
+        return Err("viz_isolines: триангуляция пуста — ≥ 3 неколлинеарных точек".into());
+    }
+    if z.len() != tin.pts.len() {
+        return Err(format!(
+            "viz_isolines: высот {} ≠ вершин {}",
+            z.len(),
+            tin.pts.len()
+        ));
+    }
+    if levels.is_empty() {
+        return Err("viz_isolines: уровни пусты — изолиний не будет".into());
+    }
+    if levels.len() > 8 {
+        return Err(format!(
+            "viz_isolines: уровней {} > 8 (читаемость карты)",
+            levels.len()
+        ));
+    }
+    const W: f64 = 640.0;
+    // bbox → плот с сохранением пропорций (как tin_svg)
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(x, y) in &tin.pts {
+        x0 = x0.min(x as f64);
+        x1 = x1.max(x as f64);
+        y0 = y0.min(y as f64);
+        y1 = y1.max(y as f64);
+    }
+    let avail_w = W - 64.0;
+    let avail_h = 430.0;
+    let sx = avail_w / (x1 - x0 + 1.0).max(1.0);
+    let sy = avail_h / (y1 - y0 + 1.0).max(1.0);
+    let s = sx.min(sy);
+    let px = |x: f64| (x - x0) * s + (W - (x1 - x0) * s) / 2.0;
+    let py = |y: f64| (y - y0) * s + (430.0 - (y1 - y0) * s) / 2.0 + 34.0;
+
+    let (zmin, zmax) = z.iter().cloned().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+        (a.min(v), b.max(v))
+    });
+    let flat = zmax <= zmin;
+    let tri_t = |t: &[usize; 3]| -> f64 {
+        if flat {
+            0.5
+        } else {
+            (t.iter().map(|&v| z[v]).sum::<f64>() / 3.0 - zmin) / (zmax - zmin)
+        }
+    };
+
+    // биомы треугольников (для окраса и легенды)
+    let mut counts = [0usize; 6];
+    let mut biome_of: Vec<usize> = Vec::with_capacity(tin.tris.len());
+    for t in &tin.tris {
+        let b = biome_index(tri_t(t).clamp(0.0, 1.0));
+        counts[b] += 1;
+        biome_of.push(b);
+    }
+
+    // легенда биомов «■ имя ×N»
+    let items: Vec<(usize, String)> = (0..BIOMES.len())
+        .filter(|&b| counts[b] > 0)
+        .map(|b| (b, format!("{} ×{}", BIOMES[b].0, counts[b])))
+        .collect();
+    let item_w = |t: &str| text_w(t, 11.0) + 26.0;
+    let mut legend_rows: Vec<Vec<(usize, String, f64)>> = vec![Vec::new()];
+    let mut row_w = 30.0;
+    for (b, t) in items {
+        let w = item_w(&t);
+        if row_w + w > W - 20.0 && !legend_rows.last().unwrap().is_empty() {
+            legend_rows.push(Vec::new());
+            row_w = 30.0;
+        }
+        legend_rows.last_mut().unwrap().push((b, t, row_w));
+        row_w += w;
+    }
+    let legend_h = legend_rows.len() as f64 * 17.0 + 6.0;
+
+    let plot_h = (y1 - y0) * s + 8.0;
+    let notes = vec![Note::new(note, 10.0, C_MUTED)];
+    let notes_y = 34.0 + plot_h + legend_h + 18.0;
+    let h = (notes_y + notes_height(&notes, 30.0, W) + 8.0).ceil() as u32;
+
+    let mut out = svg_open(W as u32, h);
+    out.push_str(&title(title_text, W as u32));
+    out.push_str(&format!(
+        "<rect x=\"16\" y=\"30\" width=\"{:.0}\" height=\"{:.0}\" fill=\"#f8fafc\" \
+         stroke=\"{}\" stroke-width=\"0.6\"/>\n",
+        W - 32.0,
+        plot_h + 8.0,
+        C_GRID
+    ));
+    // рельеф: биомные треугольники
+    let mut polygons = 0usize;
+    for (ti, t) in tin.tris.iter().enumerate() {
+        let mut pts = String::new();
+        for &v in t {
+            let (x, y) = tin.pts[v];
+            pts.push_str(&format!("{:.1},{:.1} ", px(x as f64), py(y as f64)));
+        }
+        out.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"{}\" stroke=\"#ffffff\" stroke-width=\"0.7\"/>\n",
+            pts.trim_end(),
+            BIOMES[biome_of[ti]].1
+        ));
+        polygons += 1;
+    }
+    // изолинии: тёмные полилинии поверх рельефа
+    let mut lines_drawn = 0usize;
+    let mut pts_drawn = 0usize;
+    for (_, chains) in levels {
+        for l in chains {
+            if l.pts.len() < 2 {
+                continue;
+            }
+            let mut pts = String::new();
+            for &(x, y) in &l.pts {
+                pts.push_str(&format!("{:.1},{:.1} ", px(x), py(y)));
+            }
+            let closed = l.pts.first() == l.pts.last();
+            let tag = if closed { "polygon" } else { "polyline" };
+            // замкнутые — polygon (без дубля последней точки)
+            let pts = if closed {
+                l.pts[..l.pts.len() - 1]
+                    .iter()
+                    .map(|&(x, y)| format!("{:.1},{:.1} ", px(x), py(y)))
+                    .collect::<String>()
+            } else {
+                pts
+            };
+            out.push_str(&format!(
+                "<{tag} points=\"{}\" fill=\"none\" stroke=\"#0f172a\" \
+                 stroke-width=\"1.3\" opacity=\"0.92\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>\n",
+                pts.trim_end()
+            ));
+            lines_drawn += 1;
+            pts_drawn += l.pts.len();
+        }
+    }
+    debug_assert!(lines_drawn > 0 || polygons > 0);
+    // подписи уровней: самая длинная цепь каждого уровня, середина,
+    // ореол, кламп в канву, анти-перекрытие (грабля-23)
+    let mut placed: Vec<(f64, f64)> = Vec::new();
+    let plot_bottom = 34.0 + plot_h;
+    let mut labels = 0usize;
+    for (level, chains) in levels {
+        if chains.is_empty() {
+            continue;
+        }
+        let longest: &Isoline = chains
+            .iter()
+            .max_by_key(|l| l.pts.len())
+            .unwrap();
+        let mid = longest.pts[longest.pts.len() / 2];
+        let (mut lx, mut ly) = (px(mid.0), py(mid.1) - 4.0);
+        lx = lx.clamp(40.0, W - 40.0);
+        ly = ly.clamp(44.0, plot_bottom - 6.0);
+        if placed.iter().any(|&(ox, oy)| {
+            ((ox - lx) * (ox - lx) + (oy - ly) * (oy - ly)).sqrt() < 34.0
+        }) {
+            continue; // перекрытие — уровень останется без подписи (честно)
+        }
+        placed.push((lx, ly));
+        out.push_str(&halo_text(lx, ly, 10.0, "middle", "#0f172a", &num(*level)));
+        labels += 1;
+    }
+    // легенда биомов
+    for (ri, row) in legend_rows.iter().enumerate() {
+        let y = 34.0 + plot_h + 14.0 + ri as f64 * 17.0;
+        for &(b, ref t, x) in row {
+            out.push_str(&format!(
+                "<rect x=\"{x:.0}\" y=\"{y:.0}\" width=\"11\" height=\"11\" fill=\"{}\" \
+                 stroke=\"#ffffff\"/>\n",
+                BIOMES[b].1
+            ));
+            out.push_str(&format!(
+                "<text x=\"{:.0}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\">{}</text>\n",
+                x + 15.0,
+                y + 9.5,
+                C_TEXT,
+                esc(t)
+            ));
+        }
+    }
+    let (block, _) = notes_svg(&notes, 30.0, W, notes_y);
+    out.push_str(&block);
+    out.push_str("</svg>");
+    debug_assert!(polygons == tin.tris.len());
+    debug_assert!(labels <= levels.len());
+    let _ = pts_drawn;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

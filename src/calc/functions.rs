@@ -192,6 +192,196 @@ fn polygon_arg(
         .collect()
 }
 
+/// Геометрия смешанной размерности (сессия-17): разбор значения в
+/// [`crate::geo::de9im::Geometry`] на решётке k.
+///
+/// Распознавание: матрица 1×2 — точка; 2×2 — отрезок-линия; ≥3×2 —
+/// кольцо-полигон (конвенция `de9im`); `line(…)` — открытая ломаная;
+/// `poly(…)`/список матриц — полигон с дырками; `gc(…)` — коллекция
+/// (вложенность допустима — разбирается рекурсивно).
+fn parse_geometry_value(
+    v: &Value,
+    k: u8,
+    name: &str,
+) -> Result<crate::geo::de9im::Geometry, String> {
+    use crate::geo::de9im::Geometry;
+    match v {
+        Value::Matrix(m) => {
+            if m.cols != 2 || m.rows < 1 {
+                return Err(format!(
+                    "{name}: геометрия — матрица Nx2, получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            let mut pts = Vec::with_capacity(m.rows);
+            for r in 0..m.rows {
+                pts.push((m.get(r, 0).re, m.get(r, 1).re));
+            }
+            let pts = quantize_ring(&pts, k).map_err(|e| format!("{name}: {e}"))?;
+            match m.rows {
+                1 => Ok(Geometry::Point(pts[0].clone())),
+                2 => Ok(Geometry::Line(pts)),
+                _ => Ok(Geometry::Polygon(vec![pts])),
+            }
+        }
+        Value::List(items) if !items.is_empty() => match items.first() {
+            Some(Value::Str(tag)) if tag == "line" => {
+                if items.len() != 2 {
+                    return Err(format!(
+                        "{name}: line(…) — помеченный список [\"line\", матрица]"
+                    ));
+                }
+                match &items[1] {
+                    Value::Matrix(m) if m.cols == 2 && m.rows >= 2 => {
+                        let mut pts = Vec::with_capacity(m.rows);
+                        for r in 0..m.rows {
+                            pts.push((m.get(r, 0).re, m.get(r, 1).re));
+                        }
+                        Ok(Geometry::Line(
+                            quantize_ring(&pts, k).map_err(|e| format!("{name}: {e}"))?,
+                        ))
+                    }
+                    other => Err(format!(
+                        "{name}: line(…) — матрица Nx2 (≥ 2 вершин), получено {other}"
+                    )),
+                }
+            }
+            Some(Value::Str(tag)) if tag == "gc" => {
+                let mut comps = Vec::with_capacity(items.len() - 1);
+                for it in &items[1..] {
+                    comps.push(parse_geometry_value(it, k, name)?);
+                }
+                if comps.is_empty() {
+                    return Err(format!("{name}: пустая коллекция"));
+                }
+                Ok(Geometry::Collection(comps))
+            }
+            Some(Value::Matrix(_)) => {
+                // poly(…): список колец (первое — внешнее)
+                let mut rings = Vec::with_capacity(items.len());
+                for (j, it) in items.iter().enumerate() {
+                    match it {
+                        Value::Matrix(m) if m.cols == 2 && m.rows >= 3 => {
+                            let mut pts = Vec::with_capacity(m.rows);
+                            for r in 0..m.rows {
+                                pts.push((m.get(r, 0).re, m.get(r, 1).re));
+                            }
+                            rings.push(
+                                quantize_ring(&pts, k)
+                                    .map_err(|e| format!("{name}: кольцо {}: {e}", j + 1))?,
+                            );
+                        }
+                        other => {
+                            return Err(format!(
+                                "{name}: кольцо {} полигона — матрица Nx2 (≥ 3), получено {other}",
+                                j + 1
+                            ))
+                        }
+                    }
+                }
+                Ok(Geometry::Polygon(rings))
+            }
+            _ => Err(format!(
+                "{name}: геометрия — матрица Nx2, line(…), poly(…) или gc(…)"
+            )),
+        },
+        other => Err(format!(
+            "{name}: геометрия — матрица Nx2, line(…), poly(…) или gc(…), получено {other}"
+        )),
+    }
+}
+
+/// Аргумент-геометрия (сессия-17) для de9im_gc.
+fn geometry_arg(
+    args: &[Value],
+    i: usize,
+    name: &str,
+    k: u8,
+) -> Result<crate::geo::de9im::Geometry, String> {
+    match args.get(i) {
+        Some(v) => parse_geometry_value(v, k, name),
+        None => Err(format!("{name}: не хватает аргументов")),
+    }
+}
+
+/// Структурная валидация без квантования (для конструктора gc).
+fn validate_geometry_shape(v: &Value, name: &str) -> Result<(), String> {
+    match v {
+        Value::Matrix(m) => {
+            if m.cols != 2 || m.rows < 1 {
+                return Err(format!(
+                    "матрица Nx2 (точка/линия/кольцо), получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            Ok(())
+        }
+        Value::List(items) if !items.is_empty() => match items.first() {
+            Some(Value::Str(tag)) if tag == "line" => {
+                if items.len() == 2 {
+                    match &items[1] {
+                        Value::Matrix(m) if m.cols == 2 && m.rows >= 2 => Ok(()),
+                        other => Err(format!("line(…) — Nx2 ≥ 2 вершин, получено {other}")),
+                    }
+                } else {
+                    Err("line(…) — помеченный список [\"line\", матрица]".into())
+                }
+            }
+            Some(Value::Str(tag)) if tag == "gc" => {
+                if items.len() < 2 {
+                    return Err("пустая коллекция".into());
+                }
+                for it in &items[1..] {
+                    validate_geometry_shape(it, name)?;
+                }
+                Ok(())
+            }
+            Some(Value::Matrix(_)) => {
+                for (j, it) in items.iter().enumerate() {
+                    match it {
+                        Value::Matrix(m) if m.cols == 2 && m.rows >= 3 => {}
+                        other => {
+                            return Err(format!(
+                                "кольцо {} — матрица Nx2 (≥ 3), получено {other}",
+                                j + 1
+                            ))
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("матрица Nx2, line(…), poly(…) или gc(…)".into()),
+        },
+        other => Err(format!(
+            "матрица Nx2, line(…), poly(…) или gc(…), получено {other}"
+        )),
+    }
+}
+
+/// Описание геометрии для отчёта de9im_gc.
+fn describe_geometry(g: &crate::geo::de9im::Geometry) -> String {
+    use crate::geo::de9im::Geometry;
+    match g {
+        Geometry::Point(_) => "точка".into(),
+        Geometry::Line(l) => format!("линия ({} вершин)", l.len()),
+        Geometry::Polygon(r) => {
+            format!("полигон ({} колец, дырок {})", r.len(), r.len() - 1)
+        }
+        Geometry::Collection(cs) => {
+            let (mut pts, mut lns, mut polys, mut colls) = (0usize, 0, 0, 0);
+            for c in cs {
+                match c {
+                    Geometry::Point(_) => pts += 1,
+                    Geometry::Line(_) => lns += 1,
+                    Geometry::Polygon(_) => polys += 1,
+                    Geometry::Collection(_) => colls += 1,
+                }
+            }
+            format!("коллекция [точек {pts} · линий {lns} · полигонов {polys} · коллекций {colls}]")
+        }
+    }
+}
+
 /// Complex → Value: вещественный результат остаётся числом (нулевая
 /// регрессия отображения), комплексный — Complex (цикл O).
 fn complex_to_value(c: Complex) -> Value {
@@ -430,6 +620,9 @@ pub fn is_function(name: &str) -> bool {
         | "tin" | "eteria_tin" | "h3children" | "h3parent" | "de9im_ll"
         // кристалл рельефа (сессия-16): ускорение BW, viz_tin, полигоны с дырками
         | "eteria_tin_pts" | "viz_tin" | "poly" | "de9im_poly"
+        // три горизонта (сессия-17): изолинии TIN, H3 res→2, GeometryCollection
+        | "tin_isolines" | "viz_isolines" | "h3addr" | "h3cell"
+        | "line" | "gc" | "de9im_gc"
         // единицы/температура
         | "degC" | "degF"
         // астрономия
@@ -462,6 +655,8 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 | "spatial27"
                 // полигон с дырками — список колец целиком (сессия-16)
                 | "poly" | "de9im_poly"
+                // коллекции и уровни-списки — целиком (сессия-17)
+                | "gc" | "de9im_gc" | "tin_isolines" | "viz_isolines"
         ) {
             return map_over_lists(name, args);
         }
@@ -1800,6 +1995,427 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let note = format!("{} ячеек · трит-спираль H3 · сессия-14", m.rows);
             Ok(Value::Str(viz::hex_svg(&cells, &title_text, &note)?))
         }
+        // ---------- три горизонта (сессия-17) ----------
+        "tin_isolines" => {
+            // tin_isolines(точки Nx3[, уровни][, сетка][, k]): изолинии
+            // TIN — marching squares по height_at + ТОЧНЫЙ эталон
+            // (сечение треугольников) с аудитом длин.
+            let m = matrix_arg(args, 0)?;
+            if m.cols != 3 || m.rows < 3 {
+                return Err(format!(
+                    "tin_isolines: точки — матрица Nx3 [x, y, высота] (≥ 3), \
+                     получено {}×{} — изолинии требуют высот",
+                    m.rows, m.cols
+                ));
+            }
+            // уровни: умолчание — 5 равномерных (1/6..5/6 диапазона);
+            // число — столько равномерных; список — явные уровни
+            let levels_arg: Option<Vec<f64>> = match args.get(1) {
+                None => None,
+                Some(Value::Scalar(v)) => {
+                    if !(*v >= 1.0 && *v <= 20.0 && v.fract() == 0.0) {
+                        return Err(format!(
+                            "tin_isolines: уровней ∈ [1, 20] (целое) либо список, получено {v}"
+                        ));
+                    }
+                    Some(Vec::new()) // маркер «равномерные» — заполняется после zmin/zmax
+                }
+                Some(Value::List(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for it in items {
+                        match it {
+                            Value::Scalar(v) => out.push(*v),
+                            other => {
+                                return Err(format!(
+                                    "tin_isolines: уровень — число, получено {other}"
+                                ))
+                            }
+                        }
+                    }
+                    if out.is_empty() {
+                        return Err("tin_isolines: список уровней пуст".into());
+                    }
+                    Some(out)
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "tin_isolines: уровни — число либо список чисел, получено {other}"
+                    ))
+                }
+            };
+            let n_levels = match &levels_arg {
+                Some(v) if v.is_empty() => 5usize,
+                Some(v) => v.len(),
+                None => 5usize,
+            };
+            let grid = match args.get(2) {
+                None => 96.0,
+                Some(Value::Scalar(v)) if *v >= 16.0 && *v <= 384.0 && v.fract() == 0.0 => *v,
+                Some(other) => {
+                    return Err(format!(
+                        "tin_isolines: сетка ∈ [16, 384] ячеек на сторону, получено {other}"
+                    ))
+                }
+            };
+            let k = match args.get(3) {
+                None => 10u8,
+                Some(Value::Scalar(v)) if *v >= 1.0 && *v <= 14.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "tin_isolines: решётка k ∈ [1, 14], получено {other}"
+                    ))
+                }
+            };
+            let mut pts_i: Vec<(i64, i64)> = Vec::with_capacity(m.rows);
+            let mut z: Vec<f64> = Vec::with_capacity(m.rows);
+            for r in 0..m.rows {
+                let (x, y) = (m.get(r, 0).re, m.get(r, 1).re);
+                let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+                    .map_err(|e| format!("tin_isolines: квантование ({x}, {y}): {e}"))?;
+                pts_i.push((tp.x.to_i64(), tp.y.to_i64()));
+                z.push(m.get(r, 2).re);
+            }
+            let mut tin = crate::geo::delaunay::delaunay(&pts_i)
+                .map_err(|e| format!("tin_isolines: {e}"))?;
+            crate::geo::delaunay::verify_delaunay(&tin)
+                .map_err(|e| format!("tin_isolines: {e}"))?;
+            let (idx_objs, idx_nodes) = tin
+                .build_spatial27()
+                .map_err(|e| format!("tin_isolines: {e}"))?;
+            let (zmin, zmax) =
+                z.iter()
+                    .cloned()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                        (a.min(v), b.max(v))
+                    });
+            let levels: Vec<f64> = match levels_arg {
+                Some(explicit) if !explicit.is_empty() => explicit,
+                _ => (1..=n_levels)
+                    .map(|i| zmin + (zmax - zmin) * i as f64 / (n_levels as f64 + 1.0))
+                    .collect(),
+            };
+            let mut rows = Vec::with_capacity(levels.len());
+            for lev in &levels {
+                let ms = crate::geo::marchsq::tin_isolines(&tin, &z, *lev, grid as usize)
+                    .map_err(|e| format!("tin_isolines: {e}"))?;
+                let ex = crate::geo::marchsq::tin_isolines_exact(&tin, &z, *lev)
+                    .map_err(|e| format!("tin_isolines: {e}"))?;
+                let lm = crate::geo::marchsq::total_length(&ms);
+                let le = crate::geo::marchsq::total_length(&ex);
+                let dev = if le > 1e-12 {
+                    (lm - le).abs() / le * 100.0
+                } else if lm > 1e-12 {
+                    f64::INFINITY
+                } else {
+                    0.0
+                };
+                rows.push(format!(
+                    "  уровень {:.3}: MS {} ветвей · {:.1} квантов · точно {} · {:.1} · Δ {}%",
+                    lev,
+                    ms.len(),
+                    lm,
+                    ex.len(),
+                    le,
+                    if dev.is_finite() { format!("{dev:.1}") } else { "∞".into() }
+                ));
+            }
+            Ok(Value::Str(format!(
+                "изолинии TIN · marching squares по height_at + точное сечение · {} вершин · {} треугольников · сетка {}×{} · 27-дерево: \
+                 {idx_objs} конвертов · {idx_nodes} узлов\n{}\nэталон: сечение треугольников \
+                 плоскостью z = уровень — цепочки watertight, длины сходятся к MS",
+                tin.pts.len(),
+                tin.tris.len(),
+                grid,
+                grid,
+                rows.join("\n")
+            )))
+        }
+        "viz_isolines" => {
+            // viz_isolines(точки Nx3[, уровни][, k][, "заголовок"]):
+            // SVG-карта — биомы TIN + изолинии marching squares.
+            let m = matrix_arg(args, 0)?;
+            if m.cols != 3 || m.rows < 3 {
+                return Err(format!(
+                    "viz_isolines: точки — матрица Nx3 [x, y, высота] (≥ 3), получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            let levels_arg: Option<Vec<f64>> = match args.get(1) {
+                None => None,
+                Some(Value::Scalar(v)) => {
+                    if !(*v >= 1.0 && *v <= 12.0 && v.fract() == 0.0) {
+                        return Err(format!(
+                            "viz_isolines: уровней ∈ [1, 12] (целое) либо список, получено {v}"
+                        ));
+                    }
+                    Some(Vec::new())
+                }
+                Some(Value::List(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for it in items {
+                        match it {
+                            Value::Scalar(v) => out.push(*v),
+                            other => {
+                                return Err(format!(
+                                    "viz_isolines: уровень — число, получено {other}"
+                                ))
+                            }
+                        }
+                    }
+                    if out.is_empty() || out.len() > 8 {
+                        return Err("viz_isolines: уровней — от 1 до 8".into());
+                    }
+                    Some(out)
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "viz_isolines: уровни — число либо список, получено {other}"
+                    ))
+                }
+            };
+            let n_levels = match &levels_arg {
+                Some(v) if v.is_empty() => 5usize,
+                Some(v) => v.len(),
+                None => 5usize,
+            };
+            let k = match args.get(2) {
+                None => 10u8,
+                Some(Value::Scalar(v)) if *v >= 1.0 && *v <= 14.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "viz_isolines: решётка k ∈ [1, 14], получено {other}"
+                    ))
+                }
+            };
+            let title_text = match args.get(3) {
+                Some(Value::Str(s)) => s.clone(),
+                None => "TIN · изолинии рельефа".to_string(),
+                Some(other) => {
+                    return Err(format!(
+                        "viz_isolines: заголовок — строка, получено {other}"
+                    ))
+                }
+            };
+            let mut pts_i: Vec<(i64, i64)> = Vec::with_capacity(m.rows);
+            let mut z: Vec<f64> = Vec::with_capacity(m.rows);
+            for r in 0..m.rows {
+                let (x, y) = (m.get(r, 0).re, m.get(r, 1).re);
+                let tp = crate::geo::trit_coord::TritPoint::quantize(x, y, k)
+                    .map_err(|e| format!("viz_isolines: квантование ({x}, {y}): {e}"))?;
+                pts_i.push((tp.x.to_i64(), tp.y.to_i64()));
+                z.push(m.get(r, 2).re);
+            }
+            let mut tin = crate::geo::delaunay::delaunay(&pts_i)
+                .map_err(|e| format!("viz_isolines: {e}"))?;
+            crate::geo::delaunay::verify_delaunay(&tin)
+                .map_err(|e| format!("viz_isolines: {e}"))?;
+            let (idx_objs, idx_nodes) = tin
+                .build_spatial27()
+                .map_err(|e| format!("viz_isolines: {e}"))?;
+            let (zmin, zmax) =
+                z.iter()
+                    .cloned()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                        (a.min(v), b.max(v))
+                    });
+            let levels: Vec<f64> = match levels_arg {
+                Some(explicit) if !explicit.is_empty() => explicit,
+                _ => (1..=n_levels)
+                    .map(|i| zmin + (zmax - zmin) * i as f64 / (n_levels as f64 + 1.0))
+                    .collect(),
+            };
+            // изолинии: marching squares по height_at (27-дерево), сетка 96
+            let mut level_lines = Vec::with_capacity(levels.len());
+            let mut branches = 0usize;
+            for lev in &levels {
+                let chains = crate::geo::marchsq::tin_isolines(&tin, &z, *lev, 96)
+                    .map_err(|e| format!("viz_isolines: {e}"))?;
+                branches += chains.len();
+                level_lines.push((*lev, chains));
+            }
+            let note = format!(
+                "{} вершин · {} треугольников · изолинии: {} уровней · {} ветвей · \
+                 marching squares по height_at · 27-дерево: {} узлов",
+                tin.pts.len(),
+                tin.tris.len(),
+                levels.len(),
+                branches,
+                idx_nodes
+            );
+            Ok(Value::Str(viz::isolines_svg(
+                &tin, &z, &level_lines, &title_text, &note,
+            )?))
+        }
+        "h3addr" => {
+            // h3addr(face, q, r[, res]): мировой адрес ячейки НА уровне res
+            // (умолчание 2 — канон Сессии-17, 13 тритов).
+            if args.len() < 3 || args.len() > 4 {
+                return Err(format!(
+                    "h3addr: h3addr(face, q, r[, res]) — 3 или 4 аргумента, получено {}",
+                    args.len()
+                ));
+            }
+            let face = num_arg_si(args, 0, name, "грань")?;
+            if !(0.0..=19.0).contains(&face) || face.fract() != 0.0 {
+                return Err(format!("h3addr: грань ∈ [0, 19], получено {face}"));
+            }
+            let q = num_arg_si(args, 1, name, "q")?;
+            let r = num_arg_si(args, 2, name, "r")?;
+            if q.fract() != 0.0 || r.fract() != 0.0 {
+                return Err("h3addr: q, r — целые осевые координаты".into());
+            }
+            let res = match args.get(3) {
+                None => crate::geo::hexgrid::CANON_RES as f64,
+                Some(_) => num_arg_si(args, 3, name, "res")?,
+            };
+            if !(0.0..=6.0).contains(&res) || res.fract() != 0.0 {
+                return Err(format!(
+                    "h3addr: res ∈ [0, 6] (канон Сессии-17 — 2, адрес 13 тритов), получено {res}"
+                ));
+            }
+            let res = res as usize;
+            let (fq, qr, rr) = (face as usize, q as i64, r as i64);
+            let t = crate::geo::hexgrid::world_address(fq, qr, rr, res)
+                .map_err(|e| format!("h3addr: {e}"))?;
+            // путь родителей для отчёта: res-0 координаты + пары уточнений
+            let (mut pq, mut pr) = (qr, rr);
+            let mut path = Vec::with_capacity(res);
+            for _ in 0..res {
+                let ((a, b), ij) = crate::geo::hexgrid::h3_parent(pq, pr);
+                path.push(ij);
+                (pq, pr) = (a, b);
+            }
+            let s = crate::geo::hexgrid::axial_to_spiral(pq, pr)
+                .map_err(|e| format!("h3addr: {e}"))?;
+            // roundtrip — доказательство в самом отчёте
+            let (f2, q2, r2) = crate::geo::hexgrid::world_address_parse(&t, res)
+                .map_err(|e| format!("h3addr: {e}"))?;
+            let same = (f2, q2, r2) == (fq, qr, rr);
+            // адрес с разделителями: грань · спираль · уточнения
+            let bal = t.to_string_bal();
+            let seg = format!(
+                "{} · {} · {}",
+                &bal[..3],
+                &bal[3..9],
+                (0..res)
+                    .map(|i| &bal[9 + 2 * i..9 + 2 * i + 2])
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            );
+            let path_str = path
+                .iter()
+                .rev()
+                .map(|&(i, j)| format!("({i:+}, {j:+})"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(Value::Str(format!(
+                "грань {}/20 · res {} · адрес {} тритов: {}\nструктура: {seg}\n                 спираль res-0: s = {s} → ({pq:+}, {pr:+}) · уточнения (снизу вверх): {path_str}\n                 roundtrip: ({qr:+}, {rr:+}) → адрес → ({q2:+}, {r2:+}) — {}",
+                fq + 1,
+                res,
+                t.len(),
+                bal,
+                if same { "сходится" } else { "РАСХОДИТСЯ" },
+            )))
+        }
+        "h3cell" => {
+            // h3cell("адрес"): разбор мирового адреса — грань, res,
+            // спираль, путь уточнений, координаты ячейки на её уровне.
+            let addr = str_arg(args, 0)?;
+            // длина строки-оригинала — единственный источник res:
+            // Trits::parse обрезает ведущие нули (грани 4..19)
+            let n_chars = addr.chars().count();
+            if n_chars < 9 || n_chars % 2 == 0 {
+                return Err(format!(
+                    "h3cell: адрес — нечётное число тритов ≥ 9 (9 + 2·res), \
+                     получено {n_chars} символов"
+                ));
+            }
+            let res = (n_chars - 9) / 2;
+            if res > crate::geo::hexgrid::MAX_RES {
+                return Err(format!(
+                    "h3cell: res = {res} > {} (механика Сессии-17)",
+                    crate::geo::hexgrid::MAX_RES
+                ));
+            }
+            let t = Trits::parse(&addr).map_err(|e| format!("h3cell: {e}"))?;
+            let (face, q, r) = crate::geo::hexgrid::world_address_parse(&t, res)
+                .map_err(|e| format!("h3cell: {e}"))?;
+            // путь родителей: res-0 + пары уточнений
+            let (mut pq, mut pr) = (q, r);
+            let mut path = Vec::with_capacity(res);
+            for _ in 0..res {
+                let ((a, b), ij) = crate::geo::hexgrid::h3_parent(pq, pr);
+                path.push(ij);
+                (pq, pr) = (a, b);
+            }
+            let s = crate::geo::hexgrid::axial_to_spiral(pq, pr)
+                .map_err(|e| format!("h3cell: {e}"))?;
+            let path_str = path
+                .iter()
+                .rev()
+                .map(|&(i, j)| format!("({i:+}, {j:+})"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(Value::Str(format!(
+                "адрес {} тритов · res {} · грань {}/20\nспираль res-0: s = {s} → ({pq:+}, {pr:+})\n                 уточнения (снизу вверх): {}\nячейка res-{res}: ({q:+}, {r:+})",
+                9 + 2 * res,
+                res,
+                face + 1,
+                if path_str.is_empty() { "— (res 0)" } else { &path_str },
+            )))
+        }
+        "line" => {
+            // line(точки Nx2): открытая ломаная для gc/de9im_gc.
+            let m = matrix_arg(args, 0)?;
+            if m.cols != 2 || m.rows < 2 {
+                return Err(format!(
+                    "line: ломаная — матрица Nx2 (≥ 2 вершин), получено {}×{}",
+                    m.rows, m.cols
+                ));
+            }
+            Ok(Value::List(vec![Value::Str("line".into()), Value::Matrix(m)]))
+        }
+        "gc" => {
+            // gc(геометрия, …): GeometryCollection — коллекция разной
+            // размерности (точки/линии/полигоны) для de9im_gc.
+            if args.is_empty() {
+                return Err("gc: коллекция — хотя бы одна геометрия".into());
+            }
+            for (i, a) in args.iter().enumerate() {
+                validate_geometry_shape(a, "gc")
+                    .map_err(|e| format!("gc: элемент {}: {e}", i + 1))?;
+            }
+            let mut items = Vec::with_capacity(args.len() + 1);
+            items.push(Value::Str("gc".into()));
+            items.extend(args.iter().cloned());
+            Ok(Value::List(items))
+        }
+        "de9im_gc" => {
+            // de9im_gc(A, B[, k]): relate геометрий ПРОИЗВОЛЬНОЙ
+            // размерности — точки/линии/полигоны/коллекции (union OGC).
+            let k = match args.get(2) {
+                None => 6u8,
+                Some(Value::Scalar(v)) if *v >= 0.0 && *v <= 12.0 => *v as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "de9im_gc: масштаб k ∈ [0, 12] — число, получено {other}"
+                    ))
+                }
+            };
+            let a = geometry_arg(args, 0, "de9im_gc", k)?;
+            let b = geometry_arg(args, 1, "de9im_gc", k)?;
+            let m = crate::geo::de9im::relate_geometry(&a, &b)
+                .map_err(|e| format!("de9im_gc: {e}"))?;
+            let preds = m.predicate_names().join(", ");
+            Ok(Value::Str(format!(
+                "{} · код {} · предикаты: {}\nA: {} · B: {}",
+                m.bal_string(),
+                m.trit_code(),
+                if preds.is_empty() { "—" } else { &preds },
+                describe_geometry(&a),
+                describe_geometry(&b),
+            )))
+        }
         // ---------- триты ----------
         "trits" => {
             let v = one_arg(args, name)?;
@@ -2069,6 +2685,21 @@ pub fn catalog(filter: &str) -> String {
             "poly(кольцо, дырка1, …) — полигон с дырками: первое кольцо внешнее, остальные — дырки",
             "de9im_poly(A, B[, k]) — relate полигон×полигон: A и B — кольцо Nx2 или poly(…)",
             "дырка = внешность: B в дырке A → disjoint · B = дырка A → touches · идентичные → equals",
+        ]),
+        ("три горизонта (сессия-17)", &[
+            "tin_isolines(точки Nx3[, уровни][, сетка][, k]) — изолинии TIN: marching squares по height_at",
+            "уровни — число равномерных (умолчание 5) или список; сетка ∈ [16, 384] ячеек на сторону",
+            "эталон в отчёте: ТОЧНОЕ сечение треугольников плоскостью z = уровень — цепочки watertight",
+            "аудит честности: длина MS сходится к точной (Δ%); планарный рельеф — совпадение побитово",
+            "viz_isolines(точки Nx3[, уровни][, k][, \"заголовок\"]) — SVG: биомы TIN + изолинии с подписями",
+            "viz_isolines(eteria_tin_pts(7, 256)) — карта изолиний Этерии конвейером одной строкой",
+            "h3addr(face, q, r[, res]) — мировой адрес ячейки НА уровне res (умолчание 2 = 13 тритов)",
+            "h3addr строит адрес снизу вверх: родители → спираль res-0 → +2 трита на уровень · roundtrip в отчёте",
+            "h3cell(\"адрес\") — разбор: грань, res, спираль, путь уточнений, координаты уровня",
+            "res→2: 81 внук на ячейку, центр-потомок (9q, 9r); координаты ⇄ адрес на любом уровне ≤ 6",
+            "line(точки Nx2) — открытая ломаная · poly(кольца…) — полигон · gc(…) — GeometryCollection",
+            "de9im_gc(A, B[, k]) — relate СМЕШАННЫХ размерностей: union-семантика OGC, dim(∪) = max dim",
+            "матрица: точка → 0, линия/площадь → +1; дырки = внешность; коллекция из одного == сама геометрия",
         ]),
     ];
     let mut out = String::new();
@@ -3093,4 +3724,212 @@ mod tests {
         assert!(call("de9im_poly", &[s(1.0), s(2.0)]).is_err());
         assert!(call("poly", &[]).is_err());
     }
+    // ===== Сессия-17: три горизонта =====
+
+    #[test]
+    fn tin_isolines_report_and_errors() {
+        // пирамида: замкнутая изолиния 0.5
+        let pts = mat(&[
+            vec![0.0, 0.0, 0.0],
+            vec![8.0, 0.0, 0.0],
+            vec![8.0, 8.0, 0.0],
+            vec![0.0, 8.0, 0.0],
+            vec![4.0, 4.0, 1.0],
+        ]);
+        match call(
+            "tin_isolines",
+            &[pts.clone(), Value::List(vec![Value::Scalar(0.5)])],
+        )
+        .unwrap()
+        {
+            Value::Str(rep) => {
+                assert!(rep.contains("уровень 0.500"), "{rep}");
+                assert!(rep.contains("marching squares"), "{rep}");
+                assert!(rep.contains("точно"), "{rep}");
+                assert!(rep.contains("Δ"), "{rep}");
+                assert!(rep.contains("watertight"), "{rep}");
+            }
+            other => panic!("tin_isolines: {other:?}"),
+        }
+        // авто-уровни (число) + сетка
+        match call("tin_isolines", &[pts.clone(), s(3.0), s(16.0)]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("уровень"), "{rep}");
+                assert!(rep.contains("сетка 16×16"), "{rep}");
+            }
+            other => panic!("tin_isolines авто: {other:?}"),
+        }
+        // ошибки: Nx2 (нет высот), уровней 0, сетка мимо, уровень не число
+        let pts2 = mat(&[vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 0.0]]);
+        assert!(call("tin_isolines", &[pts2]).is_err());
+        assert!(call("tin_isolines", &[pts.clone(), s(0.0)]).is_err());
+        assert!(call("tin_isolines", &[pts.clone(), s(5.0), s(8.0)]).is_err());
+        assert!(call(
+            "tin_isolines",
+            &[pts.clone(), Value::List(vec![Value::Str("x".into())])]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn viz_isolines_svg_pipeline() {
+        // конвейер одной строкой: посев → Муха → TIN → изолинии → SVG
+        let pts = match call("eteria_tin_pts", &[s(7.0), s(64.0)]).unwrap() {
+            Value::Matrix(m) => m,
+            other => panic!("eteria_tin_pts: {other:?}"),
+        };
+        match call("viz_isolines", &[Value::Matrix(pts.clone())]).unwrap() {
+            Value::Str(svg) => {
+                assert!(svg.starts_with("<svg"));
+                assert!(svg.contains("изолинии"), "{svg}");
+                assert!(
+                    svg.contains("<polyline") || svg.contains("<polygon"),
+                    "изолинии нарисованы"
+                );
+                assert!(svg.contains("marching squares"), "{svg}");
+                let n_iso = svg.matches("<polyline").count();
+                assert!(n_iso > 0, "полилиний: {n_iso}");
+            }
+            other => panic!("viz_isolines: {other:?}"),
+        }
+        // число уровней + решётка + заголовок
+        match call(
+            "viz_isolines",
+            &[
+                Value::Matrix(pts.clone()),
+                s(3.0),
+                s(10.0),
+                Value::Str("Мой мир".into()),
+            ],
+        )
+        .unwrap()
+        {
+            Value::Str(svg) => assert!(svg.contains("Мой мир")),
+            other => panic!("viz_isolines кастом: {other:?}"),
+        }
+        // явные уровни списком
+        let lvls = Value::List(vec![Value::Scalar(0.4), Value::Scalar(0.6)]);
+        assert!(call("viz_isolines", &[Value::Matrix(pts.clone()), lvls]).is_ok());
+        // ошибки: уровней 0, > 12, Nx2
+        assert!(call("viz_isolines", &[Value::Matrix(pts.clone()), s(0.0)]).is_err());
+        assert!(call("viz_isolines", &[Value::Matrix(pts.clone()), s(13.0)]).is_err());
+        let flat = mat(&[vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 0.0]]);
+        assert!(call("viz_isolines", &[flat]).is_err());
+    }
+
+    #[test]
+    fn h3addr_h3cell_roundtrip() {
+        // h3addr: умолчание res 2 → 13 тритов
+        match call("h3addr", &[s(7.0), s(2.0), s(-3.0)]).unwrap() {
+            Value::Str(t) => {
+                assert!(t.contains("13 тритов"), "{t}");
+                assert!(t.contains("res 2"), "{t}");
+                assert!(t.contains("сходится"), "{t}");
+                assert!(t.contains("грань 8/20"), "{t}");
+                assert!(t.contains("уточнения"), "{t}");
+            }
+            other => panic!("h3addr: {other:?}"),
+        }
+        // res 0 → 9 тритов; res 1 → 11; res 3 → 15 (механика дальше канона)
+        for (res, want) in [(0.0, "9 тритов"), (1.0, "11 тритов"), (3.0, "15 тритов")] {
+            match call("h3addr", &[s(7.0), s(2.0), s(-3.0), s(res)]).unwrap() {
+                Value::Str(t) => assert!(t.contains(want), "res {res}: {t}"),
+                other => panic!("h3addr res {res}: {other:?}"),
+            }
+        }
+        // h3cell: адрес из hexgrid напрямую (грань 4 — нулевая старшая тройка)
+        let t = crate::geo::hexgrid::world_address(4, 9, 9, 2).unwrap();
+        let addr = t.to_string_bal();
+        assert_eq!(addr.chars().count(), 13);
+        match call("h3cell", &[Value::Str(addr.clone())]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("res 2"), "{rep}");
+                assert!(rep.contains("грань 5/20"), "{rep}");
+                assert!(rep.contains("ячейка res-2: (+9, +9)"), "{rep}");
+                assert!(rep.contains("уточнения"), "{rep}");
+            }
+            other => panic!("h3cell: {other:?}"),
+        }
+        // короткий адрес res 0 (клетка в пределах спирали R13)
+        let t0 = crate::geo::hexgrid::world_address(4, 2, -3, 0).unwrap();
+        match call("h3cell", &[Value::Str(t0.to_string_bal())]).unwrap() {
+            Value::Str(rep) => assert!(rep.contains("res 0"), "{rep}"),
+            other => panic!("h3cell res0: {other:?}"),
+        }
+        // ошибки: грань 20, res 9, кривая строка, чётная длина
+        assert!(call("h3addr", &[s(20.0), s(0.0), s(0.0)]).is_err());
+        assert!(call("h3addr", &[s(7.0), s(0.0), s(0.0), s(9.0)]).is_err());
+        assert!(call("h3cell", &[Value::Str("abc".into())]).is_err());
+        assert!(call("h3cell", &[Value::Str("101".into())]).is_err());
+        assert!(call("h3cell", &[Value::Str("1010101010".into())]).is_err());
+    }
+
+    #[test]
+    fn de9im_gc_mixed_collections() {
+        let poly_b = ring_of(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        let point_in = ring_of(&[(2.0, 2.0)]);
+        let line_cross = mat(&[vec![5.0, -2.0], vec![5.0, 12.0]]);
+        // line() конструктор + gc() коллекция {точка, линия} vs полигон
+        let line_val = call("line", &[line_cross]).unwrap();
+        let gc_a = call("gc", &[point_in.clone(), line_val]).unwrap();
+        match call("de9im_gc", &[gc_a.clone(), poly_b.clone()]).unwrap() {
+            Value::Str(t) => {
+                assert!(t.contains("intersects"), "{t}");
+                assert!(t.contains("коллекция [точек 1 · линий 1"), "{t}");
+                assert!(t.contains("полигон (1 колец"), "{t}");
+            }
+            other => panic!("de9im_gc: {other:?}"),
+        }
+        // транспонированная симметрия на уровне отчёта: код совпадает
+        // (матрица A×B и B×A взаимно транспонированы — код может
+        // отличаться, проверяем предикаты обоих направлений)
+        match call("de9im_gc", &[poly_b.clone(), gc_a.clone()]).unwrap() {
+            Value::Str(t) => assert!(t.contains("intersects"), "обратное: {t}"),
+            other => panic!("de9im_gc reverse: {other:?}"),
+        }
+        // одиночная коллекция == сама геометрия
+        let gc_ring = call("gc", &[poly_b.clone()]).unwrap();
+        let s1 = match call("de9im_gc", &[gc_ring, poly_b.clone()]).unwrap() {
+            Value::Str(t) => t.lines().next().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        let s2 = match call("de9im_poly", &[poly_b.clone(), poly_b.clone()]).unwrap() {
+            Value::Str(t) => t.lines().next().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            s1.split(" · предикаты").next(),
+            s2.split(" · предикаты").next(),
+            "gc(один полигон) == сам полигон"
+        );
+        // вся коллекция снаружи — disjoint
+        let far_pt = ring_of(&[(20.0, 20.0)]);
+        let far_line = mat(&[vec![15.0, 15.0], vec![16.0, 16.0]]);
+        // gc(полигон с дыркой + линия в дырке) vs B-в-дырке — disjoint
+        let outer = ring_of(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        let hole = ring_of(&[(3.0, 3.0), (7.0, 3.0), (7.0, 7.0), (3.0, 7.0)]);
+        let poly_hole = call("poly", &[outer, hole]).unwrap();
+        let in_hole_line = mat(&[vec![3.4, 3.2], vec![3.4, 6.8]]);
+        let in_hole_line = call("line", &[in_hole_line]).unwrap();
+        let b_in_hole = ring_of(&[(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]);
+        let gc_hole = call("gc", &[poly_hole, in_hole_line]).unwrap();
+        match call("de9im_gc", &[gc_hole, b_in_hole]).unwrap() {
+            Value::Str(t) => assert!(t.contains("disjoint"), "B в дырке: {t}"),
+            other => panic!("{other:?}"),
+        }
+        // точка снаружи + линия снаружи
+        let far_line2 = call("line", &[far_line]).unwrap();
+        let gc_far = call("gc", &[far_pt, far_line2]).unwrap();
+        match call("de9im_gc", &[gc_far, poly_b.clone()]).unwrap() {
+            Value::Str(t) => assert!(t.contains("disjoint"), "всё снаружи: {t}"),
+            other => panic!("{other:?}"),
+        }
+        // ошибки: пустая gc, line из 1 точки, скаляр вместо геометрии
+        assert!(call("gc", &[]).is_err());
+        assert!(call("line", &[ring_of(&[(1.0, 1.0)])]).is_err());
+        assert!(call("de9im_gc", &[s(1.0), poly_b.clone()]).is_err());
+        // gc из скаляра — ошибка валидации формы
+        assert!(call("gc", &[s(1.0)]).is_err());
+    }
 }
+
