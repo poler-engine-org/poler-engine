@@ -124,6 +124,14 @@ enum MolModeArg {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum PdbModeArg {
+    /// Паспорт макромолекулы: цепочки, состав, вторичная структура.
+    Info,
+    /// Поиск карманов связывания (лигандный + слепой grid-burial).
+    Pocket,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum HarvestModeArg {
     /// Секции: ±context строк вокруг совпадений, слияние перекрытий.
     Sections,
@@ -555,6 +563,58 @@ struct Cli {
     /// Начальный режим --view-mol: ball | vdw | wire [default: ball].
     #[arg(long = "mol-mode", value_enum, default_value_t = MolModeArg::Ball, requires = "view_mol")]
     mol_mode: MolModeArg,
+
+    /// v0.75.0: PDB-МАКРОМОЛЕКУЛЫ — паспорт или поиск карманов.
+    /// Примеры: --pdb 3ptb.pdb; --pdb 1crn.pdb --pdb-mode pocket
+    #[arg(
+        long = "pdb",
+        value_name = "FILE",
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "dock", "view_complex"]
+    )]
+    pdb_file: Option<String>,
+
+    /// Режим --pdb: info | pocket [default: info].
+    #[arg(long = "pdb-mode", value_enum, default_value_t = PdbModeArg::Info, requires = "pdb_file")]
+    pdb_mode: PdbModeArg,
+
+    /// v0.75.0: ГИБКИЙ ДОКИНГ — SMILES-лиганд в PDB-белок.
+    /// Примеры: --dock "NC(=N)c1ccccc1" 3ptb.pdb;
+    ///          --dock "NC(=N)c1ccccc1" apo.pdb --pocket blind;
+    ///          --dock кофеин x.pdb --pocket 12.3,4.5,-6.7 --dock-out pose.pdb
+    #[arg(
+        long = "dock",
+        value_name = "SMILES FILE",
+        num_args = 2,
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "view_complex"]
+    )]
+    dock: Option<Vec<String>>,
+
+    /// Карман докинга: auto (по кристаллическому лиганду, redocking) |
+    /// blind (слепой grid-burial) | x,y,z (точка, Å) [default: auto].
+    #[arg(long = "pocket", value_name = "auto|blind|x,y,z", default_value = "auto", requires = "dock")]
+    pocket: String,
+
+    /// Записать лучшую позу как PDB (HETATM LIG) — для --view-complex.
+    #[arg(long = "dock-out", value_name = "FILE", requires = "dock")]
+    dock_out: Option<String>,
+
+    /// Прогонов MC/SA [default: 12].
+    #[arg(long = "dock-runs", default_value_t = 12, requires = "dock")]
+    dock_runs: usize,
+
+    /// Шагов Метрополиса на прогон [default: 2200].
+    #[arg(long = "dock-steps", default_value_t = 2200, requires = "dock")]
+    dock_steps: usize,
+
+    /// v0.75.0: ИНТЕРАКТИВНЫЙ 3D-ВИЗОР БЕЛОК-ЛИГАНДНОГО КОМПЛЕКСА —
+    /// CA-трейс по классам остатков, боковые цепи кармана, лиганд CPK,
+    /// ВдВ-поверхность. Пример: --view-complex 3ptb.pdb
+    #[arg(
+        long = "view-complex",
+        value_name = "FILE",
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "dock"]
+    )]
+    view_complex: Option<String>,
 
     /// TUI Dashboard на ratatui (панели: chat + ввод | notes + sources).
     /// Tab — смена фокуса, Esc — выход. Команды как в --shell.
@@ -2397,6 +2457,25 @@ fn run(cli: Cli) -> ExitCode {
     // v0.74.0: интерактивный 3D/4D-визор молекул
     if let Some(mol) = cli.view_mol.as_deref() {
         return view_mol_command(mol, cli.mol_mode);
+    }
+
+    // v0.75.0: PDB-макромолекулы / докинг / визор комплекса
+    if let Some(f) = cli.pdb_file.as_deref() {
+        return pdb_command(f, cli.pdb_mode);
+    }
+    if let Some(args) = cli.dock.as_deref() {
+        let [smi, file] = [args[0].as_str(), args[1].as_str()];
+        return dock_command(
+            smi,
+            file,
+            &cli.pocket,
+            cli.dock_out.as_deref(),
+            cli.dock_runs,
+            cli.dock_steps,
+        );
+    }
+    if let Some(f) = cli.view_complex.as_deref() {
+        return view_complex_command(f);
     }
 
     if let Some(cmd) = cli.exec.as_deref() {
@@ -7543,6 +7622,171 @@ fn view_mol_command(input: &str, mode: MolModeArg) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("--view-mol: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ─── v0.75.0: PDB-макромолекулы, гибкий докинг, визор комплекса ─────────
+
+fn pdb_command(file: &str, mode: PdbModeArg) -> ExitCode {
+    use poler_engine::chem::pdb::{macro_passport, pocket_blind, pocket_from_ligand, MacroMol};
+    let mm = match MacroMol::from_file(file) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("--pdb: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match mode {
+        PdbModeArg::Info => {
+            println!("{}", macro_passport(&mm, file));
+            ExitCode::SUCCESS
+        }
+        PdbModeArg::Pocket => {
+            // 1) карманы по лигандам
+            for lri in mm.ligand_residues() {
+                let p = pocket_from_ligand(&mm, lri);
+                let r = &mm.residues[lri];
+                println!(
+                    "Карман по лиганду {}{} ({}): центр ({:.2}, {:.2}, {:.2}) Å, радиус {:.1} Å, {} атомов рецептора.",
+                    r.name_str(),
+                    if r.chain == 0 { '_' } else { r.chain as char },
+                    (r.atoms.1 - r.atoms.0),
+                    p.center[0],
+                    p.center[1],
+                    p.center[2],
+                    p.radius,
+                    p.atoms.len()
+                );
+                let names: Vec<String> = p
+                    .residues
+                    .iter()
+                    .map(|&ri| {
+                        let rr = &mm.residues[ri];
+                        format!(
+                            "{}{}{}",
+                            rr.name_str(),
+                            if rr.chain == 0 { '_' } else { rr.chain as char },
+                            rr.seq
+                        )
+                    })
+                    .collect();
+                println!("  Остатки: {}", names.join(", "));
+            }
+            // 2) слепой карман
+            match pocket_blind(&mm) {
+                Ok(p) => {
+                    println!(
+                        "Слепой карман (grid-burial 1.5 Å): центр ({:.2}, {:.2}, {:.2}) Å, {} атомов, {} остатков.",
+                        p.center[0],
+                        p.center[1],
+                        p.center[2],
+                        p.atoms.len(),
+                        p.residues.len()
+                    );
+                    let names: Vec<String> = p
+                        .residues
+                        .iter()
+                        .map(|&ri| {
+                            let rr = &mm.residues[ri];
+                            format!(
+                                "{}{}{}",
+                                rr.name_str(),
+                                if rr.chain == 0 { '_' } else { rr.chain as char },
+                                rr.seq
+                            )
+                        })
+                        .collect();
+                    println!("  Остатки: {}", names.join(", "));
+                }
+                Err(e) => println!("Слепой поиск: {e}"),
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn dock_command(
+    smiles: &str,
+    file: &str,
+    pocket: &str,
+    dock_out: Option<&str>,
+    runs: usize,
+    steps: usize,
+) -> ExitCode {
+    use poler_engine::chem::dock::{dock_text, write_dock_pdb, DockParams, PocketSpec};
+    use poler_engine::chem::pdb::MacroMol;
+    let mm = match MacroMol::from_file(file) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("--dock: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spec = match pocket.trim() {
+        "auto" | "" => PocketSpec::Auto,
+        "blind" => PocketSpec::Blind,
+        xyz => {
+            let parts: Vec<f64> = xyz
+                .split(',')
+                .map(|s| s.trim().parse::<f64>())
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .filter(|v| v.len() == 3)
+                .unwrap_or_default();
+            if parts.is_empty() {
+                eprintln!(
+                    "--pocket: «{xyz}» не распознан (ожидается auto | blind | x,y,z)"
+                );
+                return ExitCode::FAILURE;
+            }
+            PocketSpec::Point([parts[0], parts[1], parts[2]], 10.0)
+        }
+    };
+    let params = DockParams {
+        runs: runs.max(1).min(64),
+        steps: steps.max(100).min(50_000),
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    match poler_engine::chem::dock::dock(smiles, &mm, &params, &spec) {
+        Ok(res) => {
+            println!("{}", dock_text(&res, smiles));
+            if let Some(out) = dock_out {
+                match poler_engine::chem::dock::prepare_ligand(smiles) {
+                    Ok(lig) => match write_dock_pdb(out, &lig, &res.best_positions, &res) {
+                        Ok(()) => println!("\nПоза записана: {out} (см. --view-complex {out})"),
+                        Err(e) => eprintln!("--dock-out: {e}"),
+                    },
+                    Err(e) => eprintln!("--dock-out: {e}"),
+                }
+            }
+            let _ = t0;
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("--dock: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn view_complex_command(file: &str) -> ExitCode {
+    use poler_engine::chem::pdb::MacroMol;
+    use poler_engine::chem::view::{build_complex_scene, run_complex_interactive};
+    let mm = match MacroMol::from_file(file) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("--view-complex: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sc = build_complex_scene(&mm);
+    match run_complex_interactive(&sc) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("--view-complex: {e}");
             ExitCode::FAILURE
         }
     }

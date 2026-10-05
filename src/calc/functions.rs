@@ -638,6 +638,8 @@ pub fn is_function(name: &str) -> bool {
         | "hf"
         // лестница молекул (v0.74.0): SMILES → 3D → био-контур
         | "chem_smiles" | "chem_3d" | "bio_eval"
+        // белки и докинг (v0.75.0): PDB → карман → гибкая поза
+        | "pdb_info" | "dock"
         // log-домен в матрицах (v0.74.0): logdet/lsolve за пределами f64
         | "logdet" | "lsolve"
         // геодезия/навигация
@@ -809,7 +811,7 @@ pub fn smiles_passport(g: &crate::chem::MoleculeGraph, input: &str) -> String {
         dominant,
         arch_counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(", ")
     ));
-    s.push_str("Подробнее: chem_3d(\"…\") — 3D-конформер; bio_eval(лиганд, мишень) — био-контур связывания; --view-mol — интерактивный 3D/4D-визор.");
+    s.push_str("Подробнее: chem_3d(\"…\") — 3D-конформер; bio_eval(лиганд, мишень) — био-контур связывания; pdb_info(файл.pdb) — паспорт белка; dock(лиганд, файл.pdb) — гибкий докинг; --view-mol / --view-complex — интерактивные визоры.");
     s
 }
 
@@ -2924,6 +2926,21 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let res = crate::chem::binding_report(&ligand, &target)?;
             Ok(Value::Str(crate::chem::binding_text(&res)))
         }
+        "pdb_info" => {
+            need(args, 1, name)?;
+            let path = expect_str(&args[0], name, "путь к PDB/mmCIF-файлу")?;
+            let mm = crate::chem::pdb::MacroMol::from_file(&path)?;
+            Ok(Value::Str(crate::chem::pdb::macro_passport(&mm, &path)))
+        }
+        "dock" => {
+            need(args, 2, name)?;
+            let smiles = expect_str(&args[0], name, "лиганд (SMILES или имя)")?;
+            let path = expect_str(&args[1], name, "путь к PDB-белку")?;
+            let mm = crate::chem::pdb::MacroMol::from_file(&path)?;
+            let params = crate::chem::dock::DockParams::default();
+            let res = crate::chem::dock::dock(&smiles, &mm, &params, &crate::chem::dock::PocketSpec::Auto)?;
+            Ok(Value::Str(crate::chem::dock::dock_text(&res, &smiles)))
+        }
         "logdet" => {
             need(args, 1, name)?;
             let m = matrix_arg(args, 0)?;
@@ -3154,6 +3171,8 @@ pub fn catalog(filter: &str) -> String {
             "chem_smiles(\"CC(=O)Oc1ccccc1C(=O)O\") — паспорт молекулы из SMILES: топология, кольца, дескрипторы Липински, заряды Гастайгера",
             "chem_3d(\"кофеин\") — 3D-конформер: длины связей, габариты, гибридизации sp/sp²/sp³, планарность колец",
             "bio_eval(\"дофамин\", \"серотонин\") — био-контур: позы, E_vdW/E_HB/E_elec, ΔG и Kd в лог-домене, 27-дерево, DE-9IM",
+            "pdb_info(\"3ptb.pdb\") — паспорт белка: цепочки, состав, вторичная структура, NET-заряд",
+            "dock(\"NC(=N)c1ccccc1\", \"3ptb.pdb\") — гибкий докинг в PDB-карман: MC/SA, кручения трит-секторами, Kd, redocking-RMSD",
             "logdet(A) — определитель в лог-домене: sign, ln|det|, тритная глубина, cond_∞ — за пределами f64",
             "lsolve(A, b) — LU-решение с эквилибровкой строк: матрицы с разбросом 1e-12…1e12",
         ]),

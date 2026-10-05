@@ -707,3 +707,544 @@ mod tests {
         assert!(text.contains("--view-mol"));
     }
 }
+
+// ═══ v0.75.0: визор белок-лигандного комплекса ═════════════════════════
+
+/// Сфера сцены (общий рендер для комплексов).
+pub struct SceneSphere {
+    pub pos: [f64; 3],
+    /// Радиус в Å.
+    pub radius: f64,
+    pub color: (u8, u8, u8),
+}
+
+/// Линия сцены (трейс/связи/дисульфиды).
+pub struct SceneLine {
+    pub a: [f64; 3],
+    pub b: [f64; 3],
+    pub color: (u8, u8, u8),
+}
+
+/// Режимы визора комплекса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplexMode {
+    /// CA-трейс белка + лиганд CPK.
+    Trace,
+    /// Трейс + боковые цепи кармана + лиганд CPK.
+    Pocket,
+    /// Space-filling ВдВ-поверхность белка + лиганд CPK.
+    Vdw,
+}
+
+impl ComplexMode {
+    pub fn next(self) -> ComplexMode {
+        match self {
+            ComplexMode::Trace => ComplexMode::Pocket,
+            ComplexMode::Pocket => ComplexMode::Vdw,
+            ComplexMode::Vdw => ComplexMode::Trace,
+        }
+    }
+
+    pub fn name_ru(self) -> &'static str {
+        match self {
+            ComplexMode::Trace => "CA-трейс",
+            ComplexMode::Pocket => "карман",
+            ComplexMode::Vdw => "ВдВ-поверхность",
+        }
+    }
+}
+
+/// Собранная сцена комплекса: трейс/карман/поверхность/лиганды.
+pub struct ComplexScene {
+    pub trace_lines: Vec<SceneLine>,
+    pub ca_spheres: Vec<SceneSphere>,
+    pub pocket_lines: Vec<SceneLine>,
+    pub pocket_spheres: Vec<SceneSphere>,
+    pub vdw_spheres: Vec<SceneSphere>,
+    pub ligand_lines: Vec<SceneLine>,
+    pub ligand_spheres: Vec<SceneSphere>,
+    pub n_residues: usize,
+    pub n_ligand_atoms: usize,
+    pub pocket_names: Vec<String>,
+    pub title: String,
+}
+
+/// Связь по расстоянию (внутри остатка/лиганда): d ≤ r_i + r_j + 0.45 Å.
+fn infer_bonds(atoms: &[(usize, [f64; 3])], radii: &dyn Fn(usize) -> f64) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..atoms.len() {
+        for j in (i + 1)..atoms.len() {
+            let d = {
+                let dx = atoms[i].1[0] - atoms[j].1[0];
+                let dy = atoms[i].1[1] - atoms[j].1[1];
+                let dz = atoms[i].1[2] - atoms[j].1[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            };
+            if d <= radii(i) + radii(j) + 0.45 {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// Собрать сцену из макромолекулы: белок + лиганды (HETATM не-воды).
+pub fn build_complex_scene(mm: &crate::chem::pdb::MacroMol) -> ComplexScene {
+    use crate::chem::pdb::{ResClass, ResKind};
+
+    let mut sc = ComplexScene {
+        trace_lines: Vec::new(),
+        ca_spheres: Vec::new(),
+        pocket_lines: Vec::new(),
+        pocket_spheres: Vec::new(),
+        vdw_spheres: Vec::new(),
+        ligand_lines: Vec::new(),
+        ligand_spheres: Vec::new(),
+        n_residues: 0,
+        n_ligand_atoms: 0,
+        pocket_names: Vec::new(),
+        title: mm.title.clone(),
+    };
+
+    // Центрирование: сдвиг всех координат к центроиду CA (камера в нуле)
+    let mut centroid = [0.0f64; 3];
+    let mut n_ca = 0usize;
+    for (ri, r) in mm.residues.iter().enumerate() {
+        if r.kind != ResKind::Protein {
+            continue;
+        }
+        if let Some(ca) = mm.residue_atom(ri, "CA") {
+            centroid[0] += mm.atoms[ca].pos[0];
+            centroid[1] += mm.atoms[ca].pos[1];
+            centroid[2] += mm.atoms[ca].pos[2];
+            n_ca += 1;
+        }
+    }
+    if n_ca > 0 {
+        for k in 0..3 {
+            centroid[k] /= n_ca as f64;
+        }
+    }
+    let shift = |p: [f64; 3]| -> [f64; 3] {
+        [p[0] - centroid[0], p[1] - centroid[1], p[2] - centroid[2]]
+    };
+
+    // ВдВ-поверхность: все тяжёлые атомы белка
+    for a in &mm.atoms {
+        if a.het || a.elem_str() == "H" {
+            continue;
+        }
+        sc.vdw_spheres.push(SceneSphere {
+            pos: shift(a.pos),
+            radius: vdw_radius(a.elem_str()),
+            color: cpk_color(a.elem_str()),
+        });
+    }
+
+    // CA-трейс по цепочкам
+    let mut prev: Option<(u8, [f64; 3], ResClass)> = None;
+    for (ri, r) in mm.residues.iter().enumerate() {
+        if r.kind != ResKind::Protein {
+            continue;
+        }
+        sc.n_residues += 1;
+        let cls = mm.res_class(ri);
+        if let Some(ca) = mm.residue_atom(ri, "CA") {
+            let p = shift(mm.atoms[ca].pos);
+            sc.ca_spheres.push(SceneSphere {
+                pos: p,
+                radius: 0.62,
+                color: cls.color(),
+            });
+            if let Some((pc, pp, _pcls)) = prev {
+                if pc == r.chain {
+                    sc.trace_lines.push(SceneLine {
+                        a: pp,
+                        b: p,
+                        color: dim(cls.color()),
+                    });
+                }
+            }
+            prev = Some((r.chain, p, cls));
+        } else {
+            prev = None;
+        }
+    }
+
+    // Лиганды: атомы + связи по расстоянию
+    let lig_res: Vec<usize> = mm.ligand_residues();
+    let mut lig_atom_idx: Vec<usize> = Vec::new();
+    for &lri in &lig_res {
+        for ai in mm.residue_atom_ids(lri) {
+            lig_atom_idx.push(ai);
+        }
+    }
+    sc.n_ligand_atoms = lig_atom_idx.len();
+    let lig_pos: Vec<(usize, [f64; 3])> = lig_atom_idx
+        .iter()
+        .map(|&ai| (ai, shift(mm.atoms[ai].pos)))
+        .collect();
+    let cov_of = |ai: usize| covalent_radius(mm.atoms[ai].elem_str());
+    let bonds = infer_bonds(&lig_pos, &|k| cov_of(lig_pos[k].0));
+    for (k, &(ai, p)) in lig_pos.iter().enumerate() {
+        sc.ligand_spheres.push(SceneSphere {
+            pos: p,
+            radius: if mm.atoms[ai].elem_str() == "H" { 0.24 } else { 0.85 },
+            color: cpk_color(mm.atoms[ai].elem_str()),
+        });
+    }
+    for &(i, j) in &bonds {
+        sc.ligand_lines.push(SceneLine {
+            a: lig_pos[i].1,
+            b: lig_pos[j].1,
+            color: dim(cpk_color(mm.atoms[lig_pos[i].0].elem_str())),
+        });
+    }
+
+    // Карман: остатки в 8 Å от лигандов; боковые цепи — каркасом
+    if !lig_atom_idx.is_empty() {
+        let mut pocket_res: Vec<usize> = Vec::new();
+        for r in mm.residues.iter().enumerate() {
+            let (ri, rr) = r;
+            if rr.kind != ResKind::Protein {
+                continue;
+            }
+            'atoms: for ai in mm.residue_atom_ids(ri) {
+                for &lj in &lig_atom_idx {
+                    let d = {
+                        let dx = mm.atoms[ai].pos[0] - mm.atoms[lj].pos[0];
+                        let dy = mm.atoms[ai].pos[1] - mm.atoms[lj].pos[1];
+                        let dz = mm.atoms[ai].pos[2] - mm.atoms[lj].pos[2];
+                        (dx * dx + dy * dy + dz * dz).sqrt()
+                    };
+                    if d <= 8.0 {
+                        pocket_res.push(ri);
+                        break 'atoms;
+                    }
+                }
+            }
+        }
+        let mut named: Vec<String> = Vec::new();
+        for &ri in &pocket_res {
+            let rr = &mm.residues[ri];
+            named.push(format!(
+                "{}{}{}",
+                rr.name_str(),
+                if rr.chain == 0 { '_' } else { rr.chain as char },
+                rr.seq
+            ));
+            // боковая цепь: всё кроме N/CA/C/O/OXT
+            let atoms: Vec<(usize, [f64; 3])> = mm
+                .residue_atom_ids(ri)
+                .into_iter()
+                .filter(|&ai| {
+                    let nm = mm.atoms[ai].name_str();
+                    !matches!(nm, "N" | "CA" | "C" | "O" | "OXT") && mm.atoms[ai].elem_str() != "H"
+                })
+                .map(|ai| (ai, shift(mm.atoms[ai].pos)))
+                .collect();
+            let cls_color = mm.res_class(ri).color();
+            for &(ai, p) in &atoms {
+                sc.pocket_spheres.push(SceneSphere {
+                    pos: p,
+                    radius: 0.45,
+                    color: cls_color,
+                });
+            }
+            // связи внутри боковой цепи
+            let pbonds = infer_bonds(&atoms, &|k| cov_of(atoms[k].0));
+            for &(i, j) in &pbonds {
+                sc.pocket_lines.push(SceneLine {
+                    a: atoms[i].1,
+                    b: atoms[j].1,
+                    color: dim(cls_color),
+                });
+            }
+            // связь CB→CA (визуальная непрерывность)
+            if let (Some(ca), Some(cb)) = (mm.residue_atom(ri, "CA"), mm.residue_atom(ri, "CB")) {
+                sc.pocket_lines.push(SceneLine {
+                    a: shift(mm.atoms[ca].pos),
+                    b: shift(mm.atoms[cb].pos),
+                    color: dim(cls_color),
+                });
+            }
+        }
+        // дедуп имён (остаток мог добавиться один раз — уже уникально)
+        sc.pocket_names = named;
+    }
+
+    // Дисульфиды — золотые линии
+    for &(a, b) in &mm.ssbonds {
+        sc.trace_lines.push(SceneLine {
+            a: shift(mm.atoms[a].pos),
+            b: shift(mm.atoms[b].pos),
+            color: (250, 190, 60),
+        });
+    }
+
+    sc
+}
+
+fn dim(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    (
+        (c.0 as u32 * 70 / 100) as u8,
+        (c.1 as u32 * 70 / 100) as u8,
+        (c.2 as u32 * 70 / 100) as u8,
+    )
+}
+
+/// Общий рендер сцены из сфер и линий (z-буфер, ламберт, полублоки).
+pub fn render_complex_frame(
+    sc: &ComplexScene,
+    mode: ComplexMode,
+    cam: &Camera,
+    width: usize,
+    rows: usize,
+    color: bool,
+) -> String {
+    let h = rows * 2;
+    let mut canvas = Canvas::new(width, h);
+
+    // границы сцены
+    let mut r_max = 1.5f64;
+    let mut extend = |p: [f64; 3]| {
+        let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if r > r_max {
+            r_max = r;
+        }
+    };
+    for s in &sc.ca_spheres {
+        extend(s.pos);
+    }
+    for s in &sc.ligand_spheres {
+        extend(s.pos);
+    }
+    if mode == ComplexMode::Vdw {
+        for s in &sc.vdw_spheres {
+            extend(s.pos);
+        }
+    }
+    let scale = (width.min(h) as f64) / (2.4 * r_max) * cam.zoom;
+    let cx = width as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let (sy, cyw) = (cam.yaw.sin(), cam.yaw.cos());
+    let (sp, cp) = (cam.pitch.sin(), cam.pitch.cos());
+    let project = |p: [f64; 3]| -> (f64, f64, f64) {
+        let xr = p[0] * cyw + p[2] * sy;
+        let zr = -p[0] * sy + p[2] * cyw;
+        let yr = p[1] * cp - zr * sp;
+        let zr2 = p[1] * sp + zr * cp;
+        (cx + xr * scale, cy - yr * scale, zr2)
+    };
+
+    let draw_sphere = |canvas: &mut Canvas, pos: [f64; 3], radius: f64, base: (u8, u8, u8)| {
+        let (sx, syc, zc) = project(pos);
+        let r = (radius * scale).max(1.2);
+        let ir = r.ceil() as i64;
+        for dy in -ir..=ir {
+            for dxx in -ir..=ir {
+                let d2 = (dxx * dxx + dy * dy) as f64;
+                if d2 > r * r {
+                    continue;
+                }
+                let zf = zc + (r * r - d2).sqrt();
+                let (nx, ny) = (dxx as f64 / r, dy as f64 / r);
+                let nz = (1.0 - (nx * nx + ny * ny).min(1.0)).sqrt();
+                let l_dot = (-0.4 * nx - 0.6 * ny + 0.7 * nz).max(0.0);
+                let shade = 0.45 + 0.55 * l_dot;
+                let c = (
+                    (base.0 as f64 * shade).min(255.0) as u8,
+                    (base.1 as f64 * shade).min(255.0) as u8,
+                    (base.2 as f64 * shade).min(255.0) as u8,
+                );
+                canvas.set((sx as i64) + dxx, (syc as i64) + dy, zf, c);
+            }
+        }
+    };
+
+    // 1. линии
+    let lines: &[SceneLine] = match mode {
+        ComplexMode::Trace => &sc.trace_lines,
+        ComplexMode::Pocket => &sc.trace_lines,
+        ComplexMode::Vdw => &[],
+    };
+    for l in lines {
+        let (x1, y1, z1) = project(l.a);
+        let (x2, y2, z2) = project(l.b);
+        draw_line(&mut canvas, x1, y1, z1, x2, y2, z2, l.color);
+    }
+    if mode == ComplexMode::Pocket {
+        for l in &sc.pocket_lines {
+            let (x1, y1, z1) = project(l.a);
+            let (x2, y2, z2) = project(l.b);
+            draw_line(&mut canvas, x1, y1, z1, x2, y2, z2, l.color);
+        }
+        for s in &sc.pocket_spheres {
+            draw_sphere(&mut canvas, s.pos, s.radius, s.color);
+        }
+    }
+
+    // 2. сферы
+    let spheres: &[SceneSphere] = match mode {
+        ComplexMode::Trace | ComplexMode::Pocket => &sc.ca_spheres,
+        ComplexMode::Vdw => &sc.vdw_spheres,
+    };
+    for s in spheres {
+        draw_sphere(&mut canvas, s.pos, s.radius, s.color);
+    }
+    // лиганд поверх
+    for l in &sc.ligand_lines {
+        let (x1, y1, z1) = project(l.a);
+        let (x2, y2, z2) = project(l.b);
+        draw_line(&mut canvas, x1, y1, z1, x2, y2, z2, l.color);
+    }
+    for s in &sc.ligand_spheres {
+        draw_sphere(&mut canvas, s.pos, s.radius, s.color);
+    }
+
+    canvas_to_ansi(&canvas, color, false)
+}
+
+/// Одиночный кадр комплекса (не-TTY).
+pub fn render_complex_single(sc: &ComplexScene, mode: ComplexMode, color: bool) -> String {
+    let frame = render_complex_frame(sc, mode, &Camera::default(), 68, 24, color);
+    let mut out = String::new();
+    let title_short: String = sc.title.chars().take(48).collect();
+    out.push_str(&format!(
+        "── Комплекс: {} · {} остатков · {} атомов лиганда · режим: {} ──\n",
+        if title_short.is_empty() { "белок" } else { &title_short },
+        sc.n_residues,
+        sc.n_ligand_atoms,
+        mode.name_ru()
+    ));
+    if !sc.pocket_names.is_empty() {
+        out.push_str(&format!(
+            "Карман ({} остатков): {}\n",
+            sc.pocket_names.len(),
+            sc.pocket_names
+                .iter()
+                .take(16)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out.push_str(&frame);
+    out.push_str(
+        "Интерактивно: poler-engine --view-complex <file.pdb> (вращение стрелками/hjkl, зум +/-, m режим: трейс/карман/ВдВ)\n",
+    );
+    out
+}
+
+/// Интерактивный TUI-цикл визора комплекса.
+pub fn run_complex_interactive(sc: &ComplexScene) -> Result<(), String> {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::{execute, terminal};
+
+    if !atty_check() {
+        print!("{}", render_complex_single(sc, ComplexMode::Pocket, false));
+        return Ok(());
+    }
+
+    terminal::enable_raw_mode().map_err(|e| format!("raw mode: {e}"))?;
+    let mut cleanup = || -> std::io::Result<()> {
+        execute!(
+            std::io::stdout(),
+            terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )?;
+        terminal::disable_raw_mode()
+    };
+    if execute!(std::io::stdout(), terminal::EnterAlternateScreen, crossterm::cursor::Hide).is_err()
+    {
+        let _ = cleanup();
+        return Err("не удалось войти в alternate screen".into());
+    }
+
+    let mut cam = Camera {
+        yaw: 0.7,
+        pitch: 0.42,
+        zoom: 1.0,
+    };
+    let mut mode = ComplexMode::Pocket;
+    let (mut w, mut h) = terminal::size().map_err(|e| format!("size: {e}"))?;
+    let result = (|| -> Result<(), String> {
+        loop {
+            let rows = h.saturating_sub(4).max(8) as usize;
+            let cols = w.saturating_sub(2).max(20) as usize;
+            let frame = render_complex_frame(sc, mode, &cam, cols, rows, true);
+            let status = format!(
+                " {} · {} · {} остатков · лиганд {} атомов · карман {} · yaw {:+.0}° pitch {:+.0}° zoom {:.2} ",
+                if sc.title.is_empty() { "комплекс" } else { sc.title.as_str() },
+                mode.name_ru(),
+                sc.n_residues,
+                sc.n_ligand_atoms,
+                sc.pocket_names.len(),
+                cam.yaw.to_degrees(),
+                cam.pitch.to_degrees(),
+                cam.zoom
+            );
+            let help =
+                " ←→↑↓/hjkl: вращение · +/-: зум · m: режим (трейс/карман/ВдВ) · r: сброс · q: выход ";
+            let mut out = String::new();
+            out.push_str("\x1b[H\x1b[2J");
+            out.push_str(&format!("\x1b[1m\x1b[38;2;180;220;255m{status}\x1b[0m\n"));
+            out.push_str(&frame);
+            out.push_str(&format!("\x1b[38;2;140;140;160m{help}\x1b[0m\r"));
+            print!("{out}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            let timeout = std::time::Duration::from_millis(33);
+            match crossterm::event::poll(timeout) {
+                Ok(true) => loop {
+                    match crossterm::event::read() {
+                        Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
+                            match code {
+                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                KeyCode::Char('c')
+                                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    return Ok(())
+                                }
+                                KeyCode::Left | KeyCode::Char('h') => cam.yaw -= 0.18,
+                                KeyCode::Right | KeyCode::Char('l') => cam.yaw += 0.18,
+                                KeyCode::Up | KeyCode::Char('k') => cam.pitch += 0.14,
+                                KeyCode::Down | KeyCode::Char('j') => cam.pitch -= 0.14,
+                                KeyCode::Char('+') | KeyCode::Char('=') => cam.zoom *= 1.15,
+                                KeyCode::Char('-') | KeyCode::Char('_') => cam.zoom /= 1.15,
+                                KeyCode::Char('m') => mode = mode.next(),
+                                KeyCode::Char('r') => {
+                                    cam = Camera {
+                                        yaw: 0.7,
+                                        pitch: 0.42,
+                                        zoom: 1.0,
+                                    };
+                                }
+                                _ => {}
+                            }
+                            if let Ok(true) =
+                                crossterm::event::poll(std::time::Duration::from_millis(0))
+                            {
+                                continue;
+                            }
+                            break;
+                        }
+                        Ok(Event::Resize(nw, nh)) => {
+                            w = nw;
+                            h = nh;
+                            break;
+                        }
+                        Ok(_) => break,
+                        Err(e) => return Err(format!("событие: {e}")),
+                    }
+                },
+                Ok(false) => {}
+                Err(e) => return Err(format!("poll: {e}")),
+            }
+        }
+    })();
+
+    let _ = cleanup();
+    result
+}
