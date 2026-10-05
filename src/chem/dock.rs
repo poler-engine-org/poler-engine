@@ -295,6 +295,9 @@ pub struct PocketField {
     pub nonpolar: Vec<bool>,
     /// Донорные H: (индекс донора в поле, позиция H).
     pub donor_h: Vec<(usize, [f64; 3])>,
+    /// Индексы атомов-источников в mm (для обновления поля при induced fit,
+    // контур C); параллелен pos.
+    pub src: Vec<usize>,
     /// Статистика 27-дерева (объектов, узлов, высота).
     pub tree27: (usize, usize, u8),
     /// Число атомов поля.
@@ -373,6 +376,7 @@ pub fn build_field(
         acceptor,
         nonpolar,
         donor_h,
+        src: atoms,
         tree27: index.stats,
     }
 }
@@ -671,13 +675,13 @@ pub fn apply_state(lig: &LigandPrep, st: &PoseState) -> Vec<[f64; 3]> {
 
 // ─── RNG (детерминированный) ────────────────────────────────────────────
 
-struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Rng(if seed == 0 { 0x9E3779B97F4A7C15 } else { seed })
     }
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -685,10 +689,10 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-    fn f64(&mut self) -> f64 {
+    pub(crate) fn f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
-    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+    pub(crate) fn range(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.f64()
     }
     /// Случайная точка в сфере радиуса r.
@@ -710,7 +714,7 @@ impl Rng {
 }
 
 /// FNV-1a хэш (сид).
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         h ^= b as u64;

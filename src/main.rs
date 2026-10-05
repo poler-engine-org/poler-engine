@@ -635,6 +635,12 @@ struct Cli {
     #[arg(long = "dock-steps", default_value_t = 2200, requires = "dock")]
     dock_steps: usize,
 
+    /// v0.78.0: INDUCED FIT — гибкость боковых цепей кармана при
+    /// докинге (контур C): раунд жёсткий докинг → MC-релаксация χ
+    /// (трит-секторы 13⅓°) → редокинг; ≤3 раунда.
+    #[arg(long = "induced", default_value_t = false, requires = "dock")]
+    dock_induced: bool,
+
     /// v0.77.0: УЛЬТРА-СКРИНИНГ БИБЛИОТЕК (контур B) — SDF/.smi-библиотека
     /// в активный карман: каскад пре-фильтры → быстрый MC (JIT-ядро A3) →
     /// полный докинг топ-N. Карман строится один раз на все лиганды.
@@ -2533,6 +2539,7 @@ fn run(cli: Cli) -> ExitCode {
             cli.dock_out.as_deref(),
             cli.dock_runs,
             cli.dock_steps,
+            cli.dock_induced,
         );
     }
 
@@ -7793,6 +7800,7 @@ fn dock_command(
     dock_out: Option<&str>,
     runs: usize,
     steps: usize,
+    induced: bool,
 ) -> ExitCode {
     use poler_engine::chem::dock::{dock_text, write_dock_pdb, DockParams, PocketSpec};
     use poler_engine::chem::pdb::MacroMol;
@@ -7829,6 +7837,39 @@ fn dock_command(
         ..Default::default()
     };
     let t0 = std::time::Instant::now();
+    // v0.78.0: induced fit (контур C) — гибкость боковых цепей кармана
+    if induced {
+        use poler_engine::chem::induced_fit::{induced_fit, induced_fit_text, InducedFitParams};
+        let ip = InducedFitParams {
+            dock: params,
+            ..Default::default()
+        };
+        return match induced_fit(smiles, &mm, &ip, &spec) {
+            Ok(res) => {
+                println!("{}", induced_fit_text(&res, smiles));
+                if let Some(out) = dock_out {
+                    match poler_engine::chem::dock::prepare_ligand(smiles) {
+                        Ok(lig) => {
+                            match write_dock_pdb(out, &lig, &res.final_res.best_positions, &res.final_res)
+                            {
+                                Ok(()) => {
+                                    println!("\nПоза записана: {out} (см. --view-complex {out})")
+                                }
+                                Err(e) => eprintln!("--dock-out: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("--dock-out: {e}"),
+                    }
+                }
+                let _ = t0;
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("--dock --induced: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match poler_engine::chem::dock::dock(smiles, &mm, &params, &spec) {
         Ok(res) => {
             println!("{}", dock_text(&res, smiles));

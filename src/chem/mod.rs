@@ -29,6 +29,8 @@ pub mod pharma;
 pub mod pdb;
 pub mod dock;
 pub mod sdf;
+pub mod rotamer;
+pub mod induced_fit;
 pub mod screen;
 pub mod smiles;
 pub mod view;
