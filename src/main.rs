@@ -613,14 +613,15 @@ struct Cli {
         long = "dock",
         value_name = "SMILES FILE",
         num_args = 2,
-        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "view_complex"]
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "view_complex", "screen"]
     )]
     dock: Option<Vec<String>>,
 
-    /// Карман докинга: auto (по кристаллическому лиганду, redocking) |
-    /// blind (слепой grid-burial) | x,y,z (точка, Å) [default: auto].
-    #[arg(long = "pocket", value_name = "auto|blind|x,y,z", default_value = "auto", requires = "dock")]
-    pocket: String,
+    /// Карман докинга/скрининга: auto (по кристаллическому лиганду,
+    /// redocking) | blind (слепой grid-burial) | x,y,z (точка, Å)
+    /// [default: auto].
+    #[arg(long = "pocket", value_name = "auto|blind|x,y,z")]
+    pocket: Option<String>,
 
     /// Записать лучшую позу как PDB (HETATM LIG) — для --view-complex.
     #[arg(long = "dock-out", value_name = "FILE", requires = "dock")]
@@ -633,6 +634,33 @@ struct Cli {
     /// Шагов Метрополиса на прогон [default: 2200].
     #[arg(long = "dock-steps", default_value_t = 2200, requires = "dock")]
     dock_steps: usize,
+
+    /// v0.77.0: УЛЬТРА-СКРИНИНГ БИБЛИОТЕК (контур B) — SDF/.smi-библиотека
+    /// в активный карман: каскад пре-фильтры → быстрый MC (JIT-ядро A3) →
+    /// полный докинг топ-N. Карман строится один раз на все лиганды.
+    /// Примеры: --screen lib.sdf 3ptb.pdb;
+    ///          --screen lib.smi x.pdb --pocket blind --screen-top 5 --workers 8
+    #[arg(
+        long = "screen",
+        value_name = "LIB FILE",
+        num_args = 2,
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "view_complex", "jit_mode"]
+    )]
+    screen: Option<Vec<String>>,
+
+    /// Топ-N лигандов в полный докинг (стадия 3) и в таблицу
+    /// [default: 10% библиотеки, минимум 1]. (--top занят поисковым
+    /// слоем движка — флаг называется --screen-top).
+    #[arg(long = "screen-top", default_value_t = 0, requires = "screen")]
+    screen_top: usize,
+
+    /// Воркеров скрининга [default: все ядра].
+    #[arg(long = "workers", default_value_t = 0, requires = "screen")]
+    screen_workers: usize,
+
+    /// JSON-отчёт скрининга (hits.json).
+    #[arg(long = "screen-out", value_name = "FILE", requires = "screen")]
+    screen_out: Option<String>,
 
     /// v0.75.0: ИНТЕРАКТИВНЫЙ 3D-ВИЗОР БЕЛОК-ЛИГАНДНОГО КОМПЛЕКСА —
     /// CA-трейс по классам остатков, боковые цепи кармана, лиганд CPK,
@@ -2501,11 +2529,29 @@ fn run(cli: Cli) -> ExitCode {
         return dock_command(
             smi,
             file,
-            &cli.pocket,
+            cli.pocket.as_deref().unwrap_or("auto"),
             cli.dock_out.as_deref(),
             cli.dock_runs,
             cli.dock_steps,
         );
+    }
+
+    // ─── v0.77.0: --screen — ультра-скрининг библиотек (контур B) ────────
+    if let Some(args) = cli.screen.as_deref() {
+        let [lib, file] = [args[0].as_str(), args[1].as_str()];
+        return screen_command(
+            lib,
+            file,
+            cli.pocket.as_deref().unwrap_or("auto"),
+            cli.screen_top,
+            cli.screen_workers,
+            cli.screen_out.as_deref(),
+        );
+    }
+    // --pocket без --dock/--screen — явная ошибка (раньше требовал dock)
+    if cli.pocket.is_some() && cli.dock.is_none() && cli.screen.is_none() {
+        eprintln!("--pocket: работает вместе с --dock или --screen");
+        return ExitCode::FAILURE;
     }
     if let Some(f) = cli.view_complex.as_deref() {
         return view_complex_command(f);
@@ -7820,6 +7866,102 @@ fn view_complex_command(file: &str) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("--view-complex: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ─── v0.77.0: --screen — ультра-скрининг библиотек (контур B) ────────────
+
+/// `--screen LIB.sdf|LIB.smi PROTEIN.pdb [--pocket auto|blind|x,y,z]
+/// [--top N] [--workers K] [--screen-out hits.json]`:
+/// каскад пре-фильтры → быстрый MC (JIT) → полный докинг топ-N.
+fn screen_command(
+    lib: &str,
+    file: &str,
+    pocket: &str,
+    top: usize,
+    workers: usize,
+    out: Option<&str>,
+) -> ExitCode {
+    use poler_engine::chem::dock::PocketSpec;
+    use poler_engine::chem::pdb::MacroMol;
+    use poler_engine::chem::screen::{screen_json, screen_library, screen_text, ScreenOptions};
+    use poler_engine::chem::sdf::read_library;
+
+    let t0 = std::time::Instant::now();
+    let (entries, skipped) = match read_library(lib) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("--screen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if entries.is_empty() {
+        eprintln!("--screen: библиотека «{lib}» пуста (0 валидных записей)");
+        return ExitCode::FAILURE;
+    }
+    for s in skipped.iter().take(10) {
+        eprintln!("пропуск: {s}");
+    }
+    if skipped.len() > 10 {
+        eprintln!("… и ещё {} пропущенных записей", skipped.len() - 10);
+    }
+    let mm = match MacroMol::from_file(file) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("--screen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spec = match pocket.trim() {
+        "auto" | "" => PocketSpec::Auto,
+        "blind" => PocketSpec::Blind,
+        xyz => {
+            let parts: Vec<f64> = xyz
+                .split(',')
+                .map(|s| s.trim().parse::<f64>())
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .filter(|v| v.len() == 3)
+                .unwrap_or_default();
+            if parts.is_empty() {
+                eprintln!(
+                    "--pocket: «{xyz}» не распознан (ожидается auto | blind | x,y,z)"
+                );
+                return ExitCode::FAILURE;
+            }
+            PocketSpec::Point([parts[0], parts[1], parts[2]], 10.0)
+        }
+    };
+    let opts = ScreenOptions {
+        workers,
+        top,
+        ..Default::default()
+    };
+    eprintln!(
+        "--screen: {} записей · {} · {} карман",
+        entries.len(),
+        lib,
+        pocket.trim()
+    );
+    match screen_library(&entries, &mm, &spec, &opts) {
+        Ok(res) => {
+            println!("{}", screen_text(&res, top));
+            for e in res.errors.iter().take(10) {
+                eprintln!("ошибка: {e}");
+            }
+            if let Some(path) = out {
+                match std::fs::write(path, screen_json(&res)) {
+                    Ok(()) => println!("\nJSON-отчёт записан: {path}"),
+                    Err(e) => eprintln!("--screen-out: {e}"),
+                }
+            }
+            let _ = t0;
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("--screen: {e}");
             ExitCode::FAILURE
         }
     }

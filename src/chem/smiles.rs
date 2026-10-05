@@ -325,6 +325,49 @@ pub fn parse_smiles(smiles: &str) -> Result<MoleculeGraph, String> {
     Ok(graph)
 }
 
+/// Пересчитать неявные водороды для графа НЕ из SMILES (SDF и т.п.).
+///
+/// Семантика — как в `parse_smiles`: атомы с `h_explicit` не трогаются
+/// (их H авторитетен — например, поглощенные явные H из SDF); для
+/// остальных — по валентности, с тем же правилом ароматических
+/// гетероатомов (пиридин: 0 H; пиррол обязан нести явный H).
+/// Текущий `h_count` — нижняя граница (max, не замена).
+pub fn infer_h_counts(g: &mut MoleculeGraph) {
+    for i in 0..g.atoms.len() {
+        if g.atoms[i].h_explicit {
+            continue;
+        }
+        let sym = g.atoms[i].symbol.clone();
+        if g.atoms[i].aromatic && matches!(sym.as_str(), "N" | "O" | "S" | "P" | "Se" | "As") {
+            g.atoms[i].h_count = 0;
+            continue;
+        }
+        if !matches!(
+            sym.as_str(),
+            "B" | "C" | "N" | "O" | "P" | "S" | "F" | "Cl" | "Br" | "I"
+        ) {
+            g.atoms[i].h_count = 0;
+            continue;
+        }
+        let sigma_sum: f64 = g
+            .bonds
+            .iter()
+            .filter(|b| b.a == i || b.b == i)
+            .map(|b| b.order.value())
+            .sum();
+        let target = default_valence(&sym, g.atoms[i].charge, sigma_sum);
+        let h = (target - sigma_sum).round();
+        if h > g.atoms[i].h_count as f64 && h <= 9.0 {
+            g.atoms[i].h_count = h as u8;
+        }
+    }
+}
+
+/// Пересчитать SSSR-кольца графа (для графов не из SMILES).
+pub fn compute_rings(g: &mut MoleculeGraph) {
+    g.rings = sssr(g);
+}
+
 impl Parser {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
@@ -417,11 +460,15 @@ impl Parser {
         let upper = first.to_ascii_uppercase();
         let mut symbol = String::new();
         symbol.push(upper);
-        // Двухбуквенные органического субсета: Cl, Br (в т.ч. cl/br)
+        // Двухбуквенные органического субсета: Cl, Br (в т.ч. cl/br).
+        // ВАЖНО: вторая буква в валидном SMILES — строчная, кандидат
+        // собирается с сохранением регистра («Cl»≠«CL»: старый баг
+        // давал «CL» и хлор/бром никогда не разбирались — ловится
+        // тестом halogen_smiles_regression).
         if matches!(upper, 'C' | 'B') {
             if let Some(second) = self.peek() {
-                let candidate = format!("{upper}{}", second.to_ascii_uppercase());
-                if (second == 'l' || second == 'r') && (candidate == "Cl" || candidate == "Br") {
+                let candidate = format!("{upper}{second}");
+                if candidate == "Cl" || candidate == "Br" {
                     symbol = candidate;
                     self.pos += 1;
                 }
@@ -884,6 +931,22 @@ pub fn logp_estimate(g: &MoleculeGraph) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn halogen_smiles_regression() {
+        // Регрессия контура B (2026-10-06): кандидат двухбуквенного
+        // элемента собирался капслоком («CL»≠«Cl») — хлор и бром в
+        // SMILES никогда не разбирались. Проверяем разбор + формулы.
+        let cl = parse_smiles("Clc1ccccc1").unwrap();
+        assert_eq!(cl.hill_formula(), "C6H5Cl");
+        assert_eq!(cl.atoms.iter().filter(|a| a.symbol == "Cl").count(), 1);
+        let br = parse_smiles("Brc1ccccc1").unwrap();
+        assert_eq!(br.hill_formula(), "C6H5Br");
+        // смешанный случай: C-Cl связь и «cl»-ароматика не путаются
+        let two = parse_smiles("ClCCBr").unwrap();
+        assert_eq!(two.hill_formula(), "C2H4BrCl");
+        assert_eq!(two.bonds.len(), 3);
+    }
 
     #[test]
     fn parse_water() {

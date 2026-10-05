@@ -13,6 +13,10 @@
 //!   скоринг (LJ + кулон + направленные H-связи + липофильная рампа +
 //!   десольватация), MC/SA с трит-квантованными кручениями, ансамбль
 //!   в лог-домене, redocking-RMSD.
+//! * [`sdf`] — SDF/MOL V2000-библиотеки лигандов: парсер с поглощением
+//!   H (координаты сохраняются), писатель, `.smi` (контур B).
+//! * [`screen`] — каскадный ультра-скрининг библиотек: пре-фильтры →
+//!   быстрый MC (JIT-ядро) → полный докинг; rayon + детерминизм (B).
 //! * [`view`] — интерактивные 3D/4D-визоры (орбитальная камера, CPK,
 //!   шаростержневой / Ван-дер-Ваальс / каркас, кручение связей;
 //!   комплексы белок-лиганд: CA-трейс / карман / ВдВ-поверхность).
@@ -24,10 +28,12 @@ pub mod geom3d;
 pub mod pharma;
 pub mod pdb;
 pub mod dock;
+pub mod sdf;
+pub mod screen;
 pub mod smiles;
 pub mod view;
 
-pub use geom3d::{embed, hybridization, Conformer, Hybrid};
+pub use geom3d::{conformer_from_positions, embed, hybridization, Conformer, Hybrid};
 pub use pharma::{binding_report, binding_text, gasteiger, BindingResult, GasteigerCharges};
 pub use smiles::{
     descriptors, logp_estimate, parse_smiles, BondOrder, Descriptors, MoleculeGraph,

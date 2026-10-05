@@ -420,6 +420,180 @@ pub fn embed(g: &MoleculeGraph) -> Result<Conformer, String> {
     })
 }
 
+// ─── Конформер из внешних координат (SDF, контур B) ─────────────────────
+
+/// Построить конформер из ЗАДАННЫХ тяжёлых координат (SDF-путь).
+///
+/// * `heavy_pos` — координаты тяжёлых атомов графа (порядок `g.atoms`),
+///   принимаются как есть (SDF-конформер приоритетнее укладчика, без
+///   релаксации — доверяем файлу);
+/// * `explicit_h[i]` — координаты явных H атома i из SDF (используются
+///   первыми); недостающие до `h_count` H строятся конусом по
+///   гибридизации (sp³: 109.5°, sp²: 120°, sp: линейно) — детерминированно.
+pub fn conformer_from_positions(
+    g: &MoleculeGraph,
+    heavy_pos: &[[f64; 3]],
+    explicit_h: &[Vec<[f64; 3]>],
+) -> Result<Conformer, String> {
+    if g.atoms.is_empty() {
+        return Err("пустой молекулярный граф".into());
+    }
+    if heavy_pos.len() != g.atoms.len() {
+        return Err(format!(
+            "координат {} ≠ атомов {} (SDF-путь)",
+            heavy_pos.len(),
+            g.atoms.len()
+        ));
+    }
+    for p in heavy_pos {
+        if !p.iter().all(|v| v.is_finite()) {
+            return Err("нечисловые координаты (NaN/inf) в SDF".into());
+        }
+    }
+
+    // Узлы: тяжёлые + H-веер каждого атома (нумерация как в embed)
+    let mut nodes: Vec<ConfNode> = Vec::with_capacity(g.atoms.len() * 2);
+    let mut heavy_map: Vec<usize> = Vec::with_capacity(g.atoms.len());
+    // H-позиции атома i: явные из файла, затем сгенерированные
+    let mut h_pos: Vec<Vec<[f64; 3]>> = Vec::with_capacity(g.atoms.len());
+    for (i, a) in g.atoms.iter().enumerate() {
+        heavy_map.push(nodes.len());
+        nodes.push(ConfNode {
+            symbol: a.symbol.clone(),
+            z: a.z,
+            is_h: a.symbol == "H",
+        });
+        let mut hp: Vec<[f64; 3]> = Vec::with_capacity(a.h_count as usize);
+        if i < explicit_h.len() {
+            for p in explicit_h[i].iter().take(a.h_count as usize) {
+                if p.iter().all(|v| v.is_finite()) {
+                    hp.push(*p);
+                }
+            }
+        }
+        // недостающие H — конус по гибридизации
+        let missing = (a.h_count as usize).saturating_sub(hp.len());
+        if missing > 0 {
+            let cone = h_cone_dirs(g, i, heavy_pos, missing);
+            let bl = bond_length(&a.symbol, "H", BondOrder::Single);
+            for d in cone {
+                let p = [
+                    heavy_pos[i][0] + d[0] * bl,
+                    heavy_pos[i][1] + d[1] * bl,
+                    heavy_pos[i][2] + d[2] * bl,
+                ];
+                hp.push(p);
+            }
+        }
+        for _ in 0..(a.h_count as usize) {
+            nodes.push(ConfNode {
+                symbol: "H".into(),
+                z: 1,
+                is_h: true,
+            });
+        }
+        h_pos.push(hp);
+    }
+
+    // Связи: тяжёлые⇄тяжёлые (из графа) + тяжёлый⇄H
+    let mut bonds: Vec<ConfBond> = Vec::with_capacity(g.bonds.len() + g.atoms.len() * 2);
+    for b in &g.bonds {
+        bonds.push(ConfBond {
+            a: heavy_map[b.a],
+            b: heavy_map[b.b],
+            order: b.order,
+            target: bond_length(&g.atoms[b.a].symbol, &g.atoms[b.b].symbol, b.order),
+        });
+    }
+    let mut node = 0usize;
+    for (i, a) in g.atoms.iter().enumerate() {
+        node += 1; // тяжёлый узел
+        for _ in 0..(a.h_count as usize) {
+            let bl = bond_length(&a.symbol, "H", BondOrder::Single);
+            bonds.push(ConfBond {
+                a: heavy_map[i],
+                b: node,
+                order: BondOrder::Single,
+                target: bl,
+            });
+            node += 1;
+        }
+    }
+
+    // Позиции: тяжёлые + H (явные/конус)
+    let mut positions: Vec<[f64; 3]> = Vec::with_capacity(nodes.len());
+    for i in 0..g.atoms.len() {
+        positions.push(heavy_pos[i]);
+        for p in &h_pos[i] {
+            positions.push(*p);
+        }
+    }
+
+    Ok(Conformer {
+        nodes,
+        bonds,
+        positions,
+        heavy: g.atoms.len(),
+        heavy_map,
+        relaxed: false,
+    })
+}
+
+/// Направления `m` недостающих H атома i: конус вокруг биссектрисы
+/// тяжёлых соседей. Полуугол — из VSEPR-равномерности: сумма ВСЕХ
+/// направлений связей идеальной геометрии равна нулю → cos α = |Σn|/m.
+/// Проверки: CH₂ (2 соседа) → α=54.74° (H–H 109.47°); CH₃ (1 сосед) →
+/// α=70.53° (H–H 120°); ароматический CH → α=0 (биссектриса в плоскости
+/// кольца); =CH₂ (1 сосед, sp²) → α=60°. Гибридизация следует из геометрии.
+fn h_cone_dirs(g: &MoleculeGraph, i: usize, heavy_pos: &[[f64; 3]], m: usize) -> Vec<[f64; 3]> {
+    // направления к тяжёлым соседям
+    let mut nbr_dirs: Vec<[f64; 3]> = Vec::new();
+    for (w, _) in g.neighbors(i) {
+        let d = sub(heavy_pos[w], heavy_pos[i]);
+        let n = norm(d);
+        if n > 1e-9 {
+            nbr_dirs.push(scale(d, 1.0 / n));
+        }
+    }
+    // ось конуса: против суммы направлений к соседям (биссектриса H)
+    let mut sum = [0.0f64; 3];
+    for d in &nbr_dirs {
+        sum = add(sum, *d);
+    }
+    let sn = norm(sum);
+    let c = if sn > 1e-6 {
+        scale(sum, -1.0 / sn)
+    } else {
+        // изолированный атом (k=0) — детерминированная ось +X
+        [1.0, 0.0, 0.0]
+    };
+    // VSEPR: cos α = |Σn| / m (зажать в [0,1] от неидеальных структур)
+    let cos_a = (sn / m as f64).clamp(0.0, 1.0);
+    let alpha = cos_a.acos();
+    // ортонормальный базис ⊥ c
+    let ref_dir = nbr_dirs
+        .first()
+        .copied()
+        .unwrap_or([0.0, 1.0, 0.0]);
+    let mut e1 = sub(ref_dir, scale(c, dot(ref_dir, c)));
+    if norm(e1) < 1e-6 {
+        e1 = sub([0.0, 0.0, 1.0], scale(c, c[2]));
+        if norm(e1) < 1e-6 {
+            e1 = sub([1.0, 0.0, 0.0], scale(c, c[0]));
+        }
+    }
+    e1 = scale(e1, 1.0 / norm(e1));
+    let e2 = cross(c, e1);
+    // m направлений по конусу (β равномерно; при m=1 → α=0, dir = c)
+    (0..m)
+        .map(|j| {
+            let beta = std::f64::consts::TAU * j as f64 / m as f64;
+            let radial = add(scale(e1, beta.cos()), scale(e2, beta.sin()));
+            add(scale(c, alpha.cos()), scale(radial, alpha.sin()))
+        })
+        .collect()
+}
+
 fn node_atom_idx(heavy_map: &[usize], node: usize) -> Option<usize> {
     heavy_map.iter().position(|&h| h == node)
 }

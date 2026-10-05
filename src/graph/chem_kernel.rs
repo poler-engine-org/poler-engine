@@ -14,7 +14,7 @@
 //! - `r2c = max(dx²+dy²+dz², 0.35²)` — эквивалент `r.max(0.35)` в квадрате;
 //! - маска CUTOFF: `r2c ≤ 100`; мёртвая группа (все 4 полосы) пропускается
 //!   целиком (jz) — экономит divpd на ~половине групп;
-//! - `u = 1/max(r2c, маска→1.0)`; кулон `= kqi·q·u` (u = 1/r²);
+//! - `u = 1/max(max(r2c, 0.5625·rij²), маска→1.0)`; кулон `= kqi·q·u`
 //! - LJ: `x² = rij²·u`, `x⁶=(x²)³`, `x¹²=(x⁶)²` — БЕЗ sqrt (х²-домен!);
 //! - липофильная рампа: sqrt только в окне 3.2–4.5 Å (vsqrtpd);
 //! - H-связи — скалярные циклы по SoA с полным угловым фактором.
@@ -49,6 +49,8 @@ const R_CLAMP2: f64 = 0.35 * 0.35;
 const C_2025: f64 = 4.5 * 4.5;
 const C_1024: f64 = 3.2 * 3.2;
 const C_05184: f64 = 0.72 * 0.72;
+/// Квадрат контактного пола кулона: r_eff ≥ 0.75·rij (контур B5).
+const C_064: f64 = 0.75 * 0.75;
 const RDA2_MAX: f64 = 4.2 * 4.2;
 const RHA2_MAX: f64 = 3.5 * 3.5;
 const RHA2_MIN: f64 = 2.2 * 2.2;
@@ -189,7 +191,9 @@ fn emit_vcmppd_reg(b: &mut Vec<u8>, pred: u8) {
 /// vblendvpd ymm1, ymm7(src1=ones), ymm0(src2=r2c), ymm3(mask).
 /// src1 ОБЯЗАН быть регистром (VEX.vvvv); выбор по ЗНАКОВОМУ биту маски
 /// (vcmppd даёт all-ones/all-zeros — корректно). Верифицировано как
-/// C4 E3 45 4B C8 30.
+/// C4 E3 45 4B C8 30. (С контура B5 ядро использует вариант
+/// ymm2 ← blend(ones, ymm1=r2f) — см. emit_group_block.)
+#[allow(dead_code)]
 fn emit_vblendvpd(b: &mut Vec<u8>) {
     b.extend_from_slice(&[0xC4, 0xE3, 0x45, 0x4B, 0xC8, 0x30]);
 }
@@ -445,7 +449,7 @@ struct Offs {
     fx: i32, fy: i32, fz: i32, q: i32, rj: i32, srj: i32, np: i32,
     ri: i32, eps: i32, kqi: i32,
     ones: i32, cut2: i32, clamp: i32, c2025: i32, c1024: i32,
-    cap8: i32, c05184: i32, c45: i32, m13: i32, zero4: i32, one4: i32,
+    cap8: i32, c05184: i32, c064: i32, c45: i32, m13: i32, zero4: i32, one4: i32,
     lipo4: i32, sign: i32,
 }
 
@@ -494,10 +498,23 @@ fn emit_group_block(
     b.extend_from_slice(&[0x48, 0x01, 0xC2]); // add rdx, rax
     *inst += 8;
 
-    // u = 1/max(r2c, маска→1.0): ones перезаряжаются (ymm7 затирается rj)
+    // ПОЛ кулона (контур B5): r2f = max(r2c, 0.5625·rij²) → ymm1.
+    // Ниже 80% контакта кулон сатурируется — без пола вознаграждал
+    // столкновения (LJ там и так capped 8). Верифицированные кодировки:
+    // C5 FD 5F CA = vmaxpd ymm1, ymm0, ymm2.
+    emit_vmovupd_rbx_r10(b, 2, o.rj);
+    emit_vop_rr_mem(b, 0x58, 2, o.ri); // rij
+    emit_vrr(b, 0x59, 2, 2); // rij²
+    emit_vop_rr_mem(b, 0x59, 2, o.c064); // 0.5625·rij²
+    b.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0xCA]); // vmaxpd ymm1, ymm0, ymm2
+    *inst += 5;
+
+    // u = 1/(маска ? r2f : 1.0): ones перезаряжаются (ymm7 затирается rj)
     emit_vmovupd_const(b, o.ones); // ymm7 = ones
-    emit_vblendvpd(b); // ymm1 = маска(знак) ? r2c(ymm0) : 1.0(ymm7)
-    b.extend_from_slice(&[0xC5, 0xC5, 0x5E, 0xC9]); // vdivpd ymm1, ymm7, ymm1
+    // vblendvpd ymm2, ymm7(ones), ymm1(r2f), ymm3(маска)
+    b.extend_from_slice(&[0xC4, 0xE3, 0x45, 0x4B, 0xD1, 0x30]);
+    // vdivpd ymm1, ymm7, ymm2
+    b.extend_from_slice(&[0xC5, 0xC5, 0x5E, 0xCA]);
     *inst += 3;
 
     // кулон ПЕРЕД LJ (u живёт в ymm1): coul = kqi·q·u → ymm2
@@ -601,6 +618,7 @@ pub fn compile_scoring_kernel(lig: &LigandPrep, field: &PocketField) -> Result<J
     let o_c1024 = vconst(&mut blob, C_1024);
     let o_cap8 = vconst(&mut blob, LJ_CAP);
     let o_c05184 = vconst(&mut blob, C_05184);
+    let o_c064 = vconst(&mut blob, C_064);
     let o_c45 = vconst(&mut blob, 4.5);
     let o_m13 = vconst(&mut blob, 1.3);
     let o_zero4 = vconst(&mut blob, 0.0);
@@ -774,6 +792,7 @@ pub fn compile_scoring_kernel(lig: &LigandPrep, field: &PocketField) -> Result<J
                 c1024: o_c1024 as i32,
                 cap8: o_cap8 as i32,
                 c05184: o_c05184 as i32,
+                c064: o_c064 as i32,
                 c45: o_c45 as i32,
                 m13: o_m13 as i32,
                 zero4: o_zero4 as i32,
@@ -1226,18 +1245,23 @@ pub fn jit_scoring_reference(lig: &LigandPrep, field: &PocketField, pos: &[[f64;
                     clashes += 1;
                 }
             }
-            // кулон и LJ по полосам (порядок как в кодгене: coul, потом LJ)
+            // кулон и LJ по полосам (порядок как в кодгене: coul, потом LJ).
+            // ПОЛ кулона (B5): u = 1/max(r2c, 0.5625·rij²) — сатурация ниже
+            // 80% контакта; LJ на под-контактных дистанциях и так capped 8,
+            // длинные дистанции не затронуты
             for j in 0..4 {
                 let k = g * 4 + j;
-                let r2_safe = if mask[j] { r2c[j] } else { 1.0 };
+                let rij = ri + frj(k);
+                let floor2 = C_064 * (rij * rij);
+                let r2f = if r2c[j] > floor2 { r2c[j] } else { floor2 };
+                let r2_safe = if mask[j] { r2f } else { 1.0 };
                 let u = 1.0 / r2_safe;
-                // кулон: kqi·q·u (ε(r)=4r: K·qi·q/(4·r²))
+                // кулон: kqi·q·u (ε(r)=4r: K·qi·q/(4·r²), пол — выше)
                 let coul_raw = fq(k) * u * kqi;
                 let contrib_e = if mask[j] { coul_raw } else { 0.0 };
                 acc_elec[g % 2][j] = acc_elec[g % 2][j] + contrib_e;
 
                 // LJ x²-домен: x² = rij²·u; x⁶ = (x²)³; x¹² = (x⁶)²
-                let rij = ri + frj(k);
                 let rij2 = rij * rij;
                 let x2 = rij2 * u;
                 let t = x2 * x2;

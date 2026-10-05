@@ -125,6 +125,12 @@ fn is_amide_bond(g: &MoleculeGraph, bi: usize) -> bool {
 pub fn prepare_ligand(smiles: &str) -> Result<LigandPrep, String> {
     let g = super::resolve_input(smiles)?;
     let conf = super::geom3d::embed(&g)?;
+    prepare_ligand_conf(g, conf)
+}
+
+/// Подготовить лиганд из готового графа и конформера
+/// (SDF-путь: конформер файла приоритетнее укладчика, канон ступени B1).
+pub fn prepare_ligand_conf(g: MoleculeGraph, conf: Conformer) -> Result<LigandPrep, String> {
     let n_nodes = conf.nodes.len();
 
     // Центроид в ноль
@@ -435,14 +441,22 @@ pub fn score_pose(lig: &LigandPrep, field: &PocketField, pos: &[[f64; 3]]) -> Sc
                     t.clashes += 1;
                 }
             }
+            // КОНТАКТНЫЙ ПОЛ: r_eff = max(r, 0.75·rij). Ниже 75% суммы
+            // ВдВ-радиусов кулон сатурируется (LJ там и так capped 8) —
+            // без пола кулон ВОЗНАГРАЖДАЛ столкновения (до −45 кДж/пара
+            // на под-контактных дистанциях, MC выбирал мусорные позы с
+            // 19 клатшами; поймано enrichment-критерием контура B5,
+            // закрыто тестом clash_coulomb_saturation).
+            let r_eff = if r < 0.75 * rij { 0.75 * rij } else { r };
             // LJ 12-6 soft-core (как pharma.rs)
             let eps = 0.42 * (ri * rj).sqrt() / 1.6;
-            let x = rij / r;
+            let x = rij / r_eff;
             let lj = 4.0 * eps * (x.powi(12) - x.powi(6));
             t.e_vdw += lj.min(LJ_CAP);
             // Кулон: дистанционно-зависимый диэлектрик ε(r) = 4r
-            // (стандарт докинг-полей: экранировка растёт с расстоянием)
-            t.e_elec += K_ELEC * qi * field.q[k] / (EPS_R * r * r);
+            // (стандарт докинг-полей: экранировка растёт с расстоянием),
+            // контактный пол — см. выше
+            t.e_elec += K_ELEC * qi * field.q[k] / (EPS_R * r_eff * r_eff);
             // Липофильная рампа: неполярный × неполярный
             if nonpolar_i && field.nonpolar[k] && (3.2..=4.5).contains(&r) {
                 let f = ((4.5 - r) / 1.3).clamp(0.0, 1.0);
@@ -713,6 +727,9 @@ pub struct PoseSummary {
     pub energy: f64,
     pub size: usize,
     pub torsions: Vec<f64>,
+    /// RMSD представителя кластера к лучшей позе, Å (None у лучшего) —
+    /// мера разнообразия поз (кластер-RMSD скрининга, контур B).
+    pub diversity: Option<f64>,
 }
 
 /// Итог докинга.
@@ -838,10 +855,25 @@ fn cluster_poses(
         }
     }
     reps.into_iter()
-        .map(|(e, t, size)| PoseSummary {
+        .zip(rep_pos.iter())
+        .enumerate()
+        .map(|(i, ((e, t, size), rp))| PoseSummary {
             energy: e,
-            size,
             torsions: t,
+            size,
+            diversity: if i == 0 {
+                None
+            } else {
+                // RMSD к представителю лучшего кластера (тяжёлые атомы)
+                let mut s = 0.0f64;
+                for &ni in &heavy {
+                    let dx = rp[ni][0] - rep_pos[0][ni][0];
+                    let dy = rp[ni][1] - rep_pos[0][ni][1];
+                    let dz = rp[ni][2] - rep_pos[0][ni][2];
+                    s += dx * dx + dy * dy + dz * dz;
+                }
+                Some((s / heavy.len().max(1) as f64).sqrt())
+            },
         })
         .collect()
 }
@@ -998,13 +1030,35 @@ fn polish(
 
 /// Главный вход: докинг SMILES-лиганда в белок из PDB.
 pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec) -> Result<DockResult, String> {
-    let t_start = std::time::Instant::now();
     let lig = prepare_ligand(smiles)?;
     if lig.conf.heavy_map.is_empty() {
         return Err("лиганд без тяжёлых атомов".into());
     }
+    let ctx = prepare_dock_context(mm, spec)?;
+    dock_prepared(mm, &ctx, &lig, smiles, params)
+}
 
-    // Рецептор
+/// Контекст докинга: всё, что зависит только от белка и кармана.
+/// Строится ОДИН раз и переиспользуется всеми лигандами скрининга
+/// (контур B — главный источник скорости: PocketField в Arc, только чтение).
+pub struct DockContext {
+    /// United-заряды рецептора (по всем атомам mm).
+    pub charges: Vec<f64>,
+    /// Реконструированные донорные H.
+    pub donors: Vec<super::pdb::DonorH>,
+    /// 27-дерево рецептора.
+    pub index: ProteinIndex,
+    /// Карман связывания.
+    pub pocket: Pocket,
+    /// Плоское SoA-поле кармана (общее для всех лигандов).
+    pub field: PocketField,
+    /// Кристаллический лиганд (эталон RMSD, redocking) — пуст вне Auto.
+    pub crystal_atoms: Vec<super::pdb::PdbAtom>,
+}
+
+/// Собрать контекст докинга: рецептор, заряды, доноры, 27-дерево, карман,
+/// поле. Лиганд-независимая часть `dock()`.
+pub fn prepare_dock_context(mm: &MacroMol, spec: &PocketSpec) -> Result<DockContext, String> {
     let receptor = mm.receptor_atoms();
     if receptor.is_empty() {
         return Err("в PDB нет атомов рецептора (белок/ионы)".into());
@@ -1033,10 +1087,50 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
     // Поле кармана (tree27 → плоские массивы)
     let field = build_field(mm, &index, &charges, &donors, pocket.center, pocket.radius + 2.0);
 
+    // Эталон RMSD
+    let crystal_atoms: Vec<super::pdb::PdbAtom> = crystal_lig
+        .map(|l| {
+            mm.residue_atom_ids(l)
+                .into_iter()
+                .filter(|&i| mm.atoms[i].elem_str() != "H")
+                .map(|i| mm.atoms[i])
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(DockContext {
+        charges,
+        donors,
+        index,
+        pocket,
+        field,
+        crystal_atoms,
+    })
+}
+
+/// Докинг готового лиганда в готовый контекст (ядро `dock()`, контур B).
+/// `seed_key` — ключ детерминизма сида: SMILES или имя SDF-записи;
+/// результат НЕ зависит от порядка/числа вызовов (сид = FNV(seed_key|карман)).
+pub fn dock_prepared(
+    mm: &MacroMol,
+    ctx: &DockContext,
+    lig: &LigandPrep,
+    seed_key: &str,
+    params: &DockParams,
+) -> Result<DockResult, String> {
+    let t_start = std::time::Instant::now();
+    if lig.conf.heavy_map.is_empty() {
+        return Err("лиганд без тяжёлых атомов".into());
+    }
+    let field = &ctx.field;
+    let pocket = &ctx.pocket;
+    let crystal_atoms = &ctx.crystal_atoms;
+    let index = &ctx.index;
+
     // JIT-ядро скоринга (контур A3): таблицы кармана → машинный код.
     // Прозрачный откат: без AVX2/малого поля остаётся score_pose.
     let jit_kernel: Option<crate::graph::chem_kernel::JitScoringKernel> = if params.jit {
-        crate::graph::chem_kernel::compile_scoring_kernel(&lig, &field).ok()
+        crate::graph::chem_kernel::compile_scoring_kernel(lig, field).ok()
     } else {
         None
     };
@@ -1054,28 +1148,17 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
                     *v = 0.0;
                 }
                 k.exec_into(pos, y);
-                k.terms_from_y(&lig, y)
+                k.terms_from_y(lig, y)
             }
-            None => score_pose(&lig, &field, pos),
+            None => score_pose(lig, field, pos),
         }
     };
-
-    // Эталон RMSD
-    let crystal_atoms: Vec<super::pdb::PdbAtom> = crystal_lig
-        .map(|l| {
-            mm.residue_atom_ids(l)
-                .into_iter()
-                .filter(|&i| mm.atoms[i].elem_str() != "H")
-                .map(|i| mm.atoms[i])
-                .collect()
-        })
-        .unwrap_or_default();
 
     // Сид
     let seed = if params.seed != 0 {
         params.seed
     } else {
-        fnv1a(format!("{}|{}|{}", smiles, pocket.method, pocket.radius).as_bytes())
+        fnv1a(format!("{}|{}|{}", seed_key, pocket.method, pocket.radius).as_bytes())
     };
 
     let mut n_evals = 0usize;
@@ -1104,7 +1187,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
                 .map(|_| rng.range(-std::f64::consts::PI, std::f64::consts::PI))
                 .collect(),
         };
-        let mut pos = apply_state(&lig, &st);
+        let mut pos = apply_state(lig, &st);
         let mut terms = score_of(&pos, &mut y_buf);
         n_evals += 1;
         let mut cur_obj = terms.objective();
@@ -1154,7 +1237,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
             if dist(cand.center, pocket.center) > pocket.radius + 1.5 {
                 continue;
             }
-            let cand_pos = apply_state(&lig, &cand);
+            let cand_pos = apply_state(lig, &cand);
             let cand_terms = score_of(&cand_pos, &mut y_buf);
             n_evals += 1;
             let new_obj = cand_terms.objective();
@@ -1183,7 +1266,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
     if let Some(mut st) = best_state.take() {
         let mut pos = best_positions.clone();
         let mut e = best_obj;
-        polish(&lig, &field, jit_kernel.as_ref(), &mut y_buf, &mut st, &mut pos, &mut e, &mut n_evals);
+        polish(lig, field, jit_kernel.as_ref(), &mut y_buf, &mut st, &mut pos, &mut e, &mut n_evals);
         best_state = Some(st);
         best_positions = pos;
         best_obj = e;
@@ -1201,7 +1284,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
     ensemble.push((best.objective(), best_positions.clone(), best_state.as_ref().map(|s| s.torsions.clone()).unwrap_or_default()));
     ensemble.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     ensemble.truncate(64);
-    let clusters = cluster_poses(&lig, &ensemble);
+    let clusters = cluster_poses(lig, &ensemble);
 
     // Лог-домен ансамбля
     let ln_z = {
@@ -1212,7 +1295,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
     let dg_ensemble = -RT * (ln_z - (n_poses as f64).ln());
 
     // RMSD
-    let rmsd = rmsd_to_crystal(&lig, &best_positions, &crystal_atoms);
+    let rmsd = rmsd_to_crystal(lig, &best_positions, crystal_atoms);
 
     // Kd
     let delta_g = best.delta_g;
@@ -1566,6 +1649,52 @@ HETATM   24  N2  BEN A  10       0.000   0.000   7.500  1.00 12.00           N
         assert!(t_clash.e_vdw > t_far.e_vdw, "клэш должен отталкивать");
         assert!(t_clash.clashes >= 1);
         assert_eq!(t_far.clashes, 0);
+    }
+
+    /// Регрессия контура B5 (2026-10-06): кулон без контактного пола
+    /// ВОЗНАГРАЖДАЛ столкновения — O⁻-лиганд, вжатый в положительные
+    /// united-заряды, набирал до −45 кДж/пара на под-контактных
+    /// дистанциях, MC выбирал позы с 19 клатшами (вератрол E_elec=−808
+    /// при 19 конфликтах). Пол r_eff = max(r, 0.75·rij) сатурирует кулон,
+    /// LJ и так capped 8 → клэш перестаёт окупаться.
+    #[test]
+    fn clash_coulomb_saturation() {
+        let mm = super::super::pdb::parse_pdb(mini_pdb()).unwrap();
+        // фенол: O несёт Gasteiger ≈ −0.55 — электростатически жадный
+        let lig = prepare_ligand("Oc1ccccc1").unwrap();
+        let receptor = mm.receptor_atoms();
+        let charges = receptor_charges(&mm);
+        let donors = reconstruct_donors(&mm);
+        let index = ProteinIndex::build(&mm, &receptor);
+        let field = build_field(&mm, &index, &charges, &donors, [0.0, 0.0, 0.0], 12.0);
+        // атом поля с максимальным положительным зарядом — приманка
+        let (kmax, qmax) = field
+            .q
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        assert!(*qmax > 0.0, "заряд-приманка обязан быть положительным");
+        // O — точно на приманке (r = 0!), остальной лиганд — далеко
+        let mut pos = lig.base.clone();
+        for (ni, p) in pos.iter_mut().enumerate() {
+            if ni == lig.conf.heavy_map[0] {
+                *p = field.pos[kmax];
+            } else {
+                p[0] += 40.0;
+            }
+        }
+        let t = score_pose(&lig, &field, &pos);
+        // БЕЗ пола единственная пара O(r=0)·(+q) давала
+        // K·(−0.55·q)/(4·r²) → −∞; с полом вклад пары ограничен
+        // величиной на контакте 0.75·rij ≈ −9 кДж. Порог −60 отделяет
+        // сатурированный кулон (≈ −30..−50 с окружением) от взрыва.
+        assert!(
+            t.e_elec > -60.0,
+            "кулон на клэш-дистанциях обязан сатурироваться: e_elec = {}",
+            t.e_elec
+        );
+        assert!(t.clashes >= 1, "поза вжата — клэши обязаны считаться");
     }
 
     #[test]

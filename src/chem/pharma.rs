@@ -527,7 +527,9 @@ pub fn binding_report_graphs(
     })
 }
 
-fn molar_mass_of(g: &MoleculeGraph) -> f64 {
+/// Молярная масса графа (тяжёлые + неявные H), г/моль.
+/// Публична для пре-фильтров скрининга (контур B): масса нужна до докинга.
+pub fn molar_mass_of(g: &MoleculeGraph) -> f64 {
     let mut m = 0.0;
     for a in &g.atoms {
         m += crate::universal_chem::get_element_by_symbol(&a.symbol)
