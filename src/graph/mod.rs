@@ -13,6 +13,7 @@ pub use flyops::{
     PropagateStep, RotorPair,
 };
 pub use graph_asm::{
-    CompiledMachineGraph, ComputeEdge, GraphMachineCompiler, ModelComputeGraph, WeightKind,
+    CompiledMachineGraph, ComputeEdge, DataflowCompiler, DataflowEdge, DataflowGraph,
+    GraphMachineCompiler, LayerSpec, ModelComputeGraph, NodeAct, Reducer, WeightKind,
 };
 
