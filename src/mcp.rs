@@ -875,6 +875,7 @@ impl McpServer {
             "poler_hw" => self.tool_hw(&args),
             "poler_quantum" => self.tool_quantum(&args),
             "poler_scivoice" => self.tool_scivoice(&args),
+            "poler_jit" => self.tool_jit(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -2665,6 +2666,113 @@ impl McpServer {
             .to_string()),
         }
     }
+    /// v0.76.0: poler_jit — «голос» внутреннего компилятора для внешних агентов.
+    ///
+    /// mode="bench": компилирует случайный matvec-граф (сид-детерминизм) в
+    /// машинный код x86_64 и проверяет бит-в-бит против эталона — тот же
+    /// инвариант, что в тестах A1. mode="linker": CausalLinker с подсаженным
+    /// дефектом — внешние агенты слышат речь компилятора-арбитра.
+    fn tool_jit(&self, args: &Value) -> Result<String, String> {
+        use crate::graph::graph_asm::{
+            DataflowCompiler, DataflowGraph, NodeAct, Reducer, WeightKind,
+        };
+        use crate::triune::jit_loop::ExecutableKernel;
+
+        let mode = args.get("mode").and_then(|m| m.as_str()).unwrap_or("bench");
+        match mode {
+            "bench" => {
+                let rows = args.get("rows").and_then(|v| v.as_u64()).unwrap_or(64).clamp(2, 256) as usize;
+                let cols = args.get("cols").and_then(|v| v.as_u64()).unwrap_or(48).clamp(2, 256) as usize;
+                let lcg = |s: &mut u64| {
+                    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((*s >> 33) as i32 as f32 / i32::MAX as f32)
+                };
+                let mut g = DataflowGraph::new(cols, 0.02);
+                g.add_layer(rows, NodeAct::Identity, Reducer::Sum);
+                let mut s = 0xC0FFEEu64;
+                let mut w = Vec::with_capacity(rows * cols);
+                for _ in 0..rows * cols {
+                    w.push(lcg(&mut s));
+                }
+                for i in 0..rows {
+                    for j in 0..cols {
+                        g.add_edge(0, j, i, WeightKind::F32(w[i * cols + j]));
+                    }
+                }
+                let x: Vec<f32> = (0..cols).map(|_| lcg(&mut s)).collect();
+                let compiled = DataflowCompiler::compile_x86_64(&g, "mcp_jit")?;
+                let kern = ExecutableKernel::load(&compiled.machine_bytes)?;
+                let ref_y = crate::graph::graph_asm::dataflow_reference_eval(&g, &x)?;
+                let mut y = vec![0.0f32; rows];
+                unsafe { kern.call_raw(x.as_ptr(), y.as_mut_ptr()) };
+                let bitexact = ref_y.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits());
+                let out = json!({
+                    "mode": "bench",
+                    "graph": {"inputs": cols, "outputs": rows, "edges": g.active_edges(),
+                              "vacuum_pct": (g.sparsity_ratio() * 100.0)},
+                    "machine_code": {"instructions": compiled.instruction_count,
+                                     "bytes": compiled.machine_bytes.len(),
+                                     "bytes_per_weight": compiled.machine_bytes.len() as f32 / g.active_edges().max(1) as f32},
+                    "bitexact_ieee754": bitexact,
+                    "wx": "PROT_READ|PROT_EXEC (W^X: запись и исполнение никогда вместе)",
+                    "weights_in_code": "вес = immediate-операнд инструкции (mov eax,<f32>→movd→mulss); триты ±1 → addss/subss No-Mul"
+                });
+                Ok(out.to_string())
+            }
+            "linker" => {
+                use crate::graph::causal_linker::{
+                    link, ModuleSpec, PipelineLink, PipelineSpec,
+                };
+                let defect = args.get("defect").and_then(|d| d.as_str()).unwrap_or("none");
+                // конвейер-образец: источник → слой → потребитель
+                let mut layer = ModuleSpec::linear("dense", 9, 4, Vec::new());
+                for j in 0..9 {
+                    layer.edges.push(((0, j), (0, j % 4), WeightKind::F32(0.2)));
+                }
+                let mut consumer = ModuleSpec::linear("sink", 4, 2, Vec::new());
+                for j in 0..4 {
+                    consumer.edges.push(((0, j), (0, j % 2), WeightKind::Trit { val: 1, scale: 1.0 }));
+                }
+                let modules = vec![ModuleSpec::source("src", 9), layer, consumer];
+                let links = vec![
+                    PipelineLink { from_module: 0, from_port: 0, to_module: 1, to_port: 0 },
+                    PipelineLink { from_module: 1, from_port: 0, to_module: 2, to_port: 0 },
+                ];
+                let mut spec = PipelineSpec { modules, links };
+                match defect {
+                    "width" => spec.modules[1].outputs[0].width = 6, // 9 vs 6 — сужение
+                    "kind" => spec.modules[2].inputs[0].kind = crate::graph::causal_linker::PortKind::TritVector { depth: 3 },
+                    "depth" => {
+                        spec.modules[1].outputs[0].kind = crate::graph::causal_linker::PortKind::TritVector { depth: 2 };
+                        spec.modules[2].inputs[0].kind = crate::graph::causal_linker::PortKind::TritVector { depth: 5 };
+                    }
+                    "norm" => spec.modules[2].inputs[0].norm_unit = true,
+                    "alloc" => spec.modules[1].hot_allocations = 3,
+                    "wx" => spec.modules[1].wx_compliant = false,
+                    _ => {}
+                }
+                let out = match link(&spec) {
+                    Ok(linked) => json!({
+                        "mode": "linker",
+                        "defect": defect,
+                        "verdict": "linked",
+                        "speech": linked.report.speech(),
+                        "runtime_stages": linked.runtime_stages.iter().map(|s| json!({"module": s.module, "purpose": s.purpose, "width": s.width})).collect::<Vec<_>>(),
+                        "graph_layers": linked.graph.layers.iter().map(|l| json!({"width": l.width, "act": format!("{:?}", l.act)})).collect::<Vec<_>>()
+                    }),
+                    Err(report) => json!({
+                        "mode": "linker",
+                        "defect": defect,
+                        "verdict": "rejected",
+                        "speech": report.speech()
+                    }),
+                };
+                Ok(out.to_string())
+            }
+            other => Err(format!("неизвестный mode: {other} (bench | linker)")),
+        }
+    }
+
 
     /// v0.48.0: poler_hw — зонд скрытых параметров ПК (JSON).
     fn tool_hw(&self, _args: &Value) -> Result<String, String> {
@@ -3668,6 +3776,27 @@ mode=\"read\" — научное чтение текста/формулы; mode=
                     "mode": {"type": "string", "enum": ["read", "hf", "molecule", "bio"], "default": "read", "description": "read — научное чтение; hf — RHF/STO-3G; molecule — паспорт SMILES; bio — связывание"}
                 },
                 "required": ["text"]
+            }
+        }),
+        json!({
+            "name": "poler_jit",
+            "description": "ВНУТРЕННИЙ КОМПИЛЯТОР (v0.76.0, контур A): «голос» движка, \
+математически просчитывающий соединение модулей. mode=\"bench\" — JIT-компиляция \
+случайного matvec-графа в машинный код x86_64 (веса-иммедиаты WeightsInCode, \
+триты No-Mul, W^X) с бит-в-бит проверкой против эталона и замером времени; \
+mode=\"linker\" — CausalLinker: верификация стыков конвейера (ширина/тип/\
+трит-глубина/норма/аллокации/W^X) с диагнозом на естественном русском и \
+автопочинкой адаптерами. Примеры: {\"mode\":\"bench\",\"rows\":32}; \
+{\"mode\":\"linker\",\"defect\":\"width\"}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["bench", "linker"], "default": "bench", "description": "bench — JIT-бенчмарк; linker — диагноз стыков"},
+                    "rows": {"type": "integer", "default": 64, "minimum": 2, "maximum": 256, "description": "строк matvec"},
+                    "cols": {"type": "integer", "default": 48, "minimum": 2, "maximum": 256, "description": "столбцов matvec"},
+                    "defect": {"type": "string", "enum": ["none", "width", "kind", "depth", "norm", "alloc", "wx"], "default": "none", "description": "подсаженный дефект для демонстрации речи линковщика"}
+                },
+                "required": ["mode"]
             }
         }),
         json!({

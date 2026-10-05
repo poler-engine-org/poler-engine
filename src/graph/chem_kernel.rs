@@ -378,11 +378,21 @@ pub struct JitScoringKernel {
 }
 
 impl JitScoringKernel {
-    /// Оценить позу: вызвать машинный код и собрать ScoreTerms.
-    pub fn score(&self, lig: &LigandPrep, pos: &[[f64; 3]]) -> ScoreTerms {
-        let n_slots = 8 + 2 * self.n_heavy;
-        let mut y = vec![0.0f64; n_slots];
+    /// Число y-слотов (выход + скретч).
+    pub fn n_slots(&self) -> usize {
+        8 + 2 * self.n_heavy
+    }
+
+    /// Выполнить ядро в ПЕРЕИСПОЛЬЗУЕМЫЙ буфер (zero-alloc в MC-цикле!).
+    /// `y` обязан иметь `n_slots()` элементов и быть занулённым
+    /// (аккумуляторы e_hb/e_desolv и hb-флаги дорабатываются поверх).
+    pub fn exec_into(&self, pos: &[[f64; 3]], y: &mut [f64]) {
+        debug_assert_eq!(y.len(), self.n_slots());
         unsafe { self.kernel.call_raw_f64(pos.as_ptr() as *const f64, y.as_mut_ptr()) };
+    }
+
+    /// Собрать ScoreTerms из y-слотов после exec_into.
+    pub fn terms_from_y(&self, lig: &LigandPrep, y: &[f64]) -> ScoreTerms {
         let mut t = ScoreTerms {
             e_vdw: y[0],
             e_elec: y[1],
@@ -394,10 +404,30 @@ impl JitScoringKernel {
             hbonds: y[7] as usize,
             ..Default::default()
         };
-        t.e_tors = TORSION_ENTROPY * self.n_rot.min(12) as f64;
+        t.e_tors = TORSION_ENTROPY * lig.n_rot.min(12) as f64;
         t.delta_g = t.e_vdw + t.e_hb + t.e_elec + t.e_lipo + t.e_desolv + t.e_tors;
         t
     }
+
+    /// Оценить позу: вызвать машинный код и собрать ScoreTerms.
+    pub fn score(&self, lig: &LigandPrep, pos: &[[f64; 3]]) -> ScoreTerms {
+        let mut y = vec![0.0f64; self.n_slots()];
+        self.exec_into(pos, &mut y);
+        self.terms_from_y(lig, &y)
+    }
+
+    /// Устаревшая форма (внутренняя).
+    #[allow(dead_code)]
+    fn score_legacy(&self, lig: &LigandPrep, pos: &[[f64; 3]]) -> ScoreTerms {
+        self.score(lig, pos)
+    }
+
+    #[allow(dead_code)]
+    fn unused(&self, lig: &LigandPrep) -> ScoreTerms {
+        let _ = lig;
+        ScoreTerms::default()
+    }
+
 }
 
 /// Неполярный тяжёлый атом лиганда (тот же предикат, что в score_pose).

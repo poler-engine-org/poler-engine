@@ -132,6 +132,16 @@ enum PdbModeArg {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum JitModeArg {
+    /// Бенчмарк JIT vs reference: бит-в-бит IEEE-754 + время.
+    Bench,
+    /// Человекочитаемый asm-листинг машинного кода ядра.
+    Asm,
+    /// Печать DataflowGraph: слои, активации, вакуум.
+    Graph,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum HarvestModeArg {
     /// Секции: ±context строк вокруг совпадений, слияние перекрытий.
     Sections,
@@ -563,6 +573,24 @@ struct Cli {
     /// Начальный режим --view-mol: ball | vdw | wire [default: ball].
     #[arg(long = "mol-mode", value_enum, default_value_t = MolModeArg::Ball, requires = "view_mol")]
     mol_mode: MolModeArg,
+
+    /// v0.76.0: ВНУТРЕННИЙ КОМПИЛЯТОР (контур A). bench — JIT vs reference
+    /// на случайном графе (бит-в-бит, время); asm — человекочитаемый листинг
+    /// машинного кода ядра; graph — печать DataflowGraph с вакуумом.
+    #[arg(
+        long = "jit",
+        value_name = "bench|asm|graph",
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "dock", "view_complex"]
+    )]
+    jit_mode: Option<JitModeArg>,
+
+    /// Размер matvec для --jit bench: строки [default: 64].
+    #[arg(long = "jit-rows", default_value_t = 64, requires = "jit_mode")]
+    jit_rows: usize,
+
+    /// Размер matvec для --jit bench: столбцы [default: 48].
+    #[arg(long = "jit-cols", default_value_t = 48, requires = "jit_mode")]
+    jit_cols: usize,
 
     /// v0.75.0: PDB-МАКРОМОЛЕКУЛЫ — паспорт или поиск карманов.
     /// Примеры: --pdb 3ptb.pdb; --pdb 1crn.pdb --pdb-mode pocket
@@ -2463,6 +2491,11 @@ fn run(cli: Cli) -> ExitCode {
     if let Some(f) = cli.pdb_file.as_deref() {
         return pdb_command(f, cli.pdb_mode);
     }
+    // ─── v0.76.0: --jit — внутренний компилятор (контур A) ─────────────────
+    if let Some(mode) = cli.jit_mode {
+        return jit_command(mode, cli.jit_rows, cli.jit_cols);
+    }
+
     if let Some(args) = cli.dock.as_deref() {
         let [smi, file] = [args[0].as_str(), args[1].as_str()];
         return dock_command(
@@ -7788,6 +7821,108 @@ fn view_complex_command(file: &str) -> ExitCode {
         Err(e) => {
             eprintln!("--view-complex: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+// ─── v0.76.0: --jit — внутренний компилятор (контур A) ────────────────────
+
+/// `--jit bench|asm|graph [--jit-rows N --jit-cols N]`:
+/// «голос» компилятора наружу — бенчмарк, листинг, граф.
+fn jit_command(mode: JitModeArg, rows: usize, cols: usize) -> ExitCode {
+    use poler_engine::graph::graph_asm::{
+        DataflowCompiler, DataflowGraph, NodeAct, Reducer, WeightKind,
+    };
+    use poler_engine::triune::jit_loop::ExecutableKernel;
+
+    // детерминированный случайный matvec-граф (сид-детерминизм канона)
+    let lcg = |s: &mut u64| {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as i32 as f32 / i32::MAX as f32)
+    };
+    let mut g = DataflowGraph::new(cols, 0.02);
+    g.add_layer(rows, NodeAct::Identity, Reducer::Sum);
+    let mut s = 0xC0FFEEu64;
+    let mut w = Vec::with_capacity(rows * cols);
+    for _ in 0..rows * cols {
+        w.push(lcg(&mut s));
+    }
+    for i in 0..rows {
+        for j in 0..cols {
+            g.add_edge(0, j, i, WeightKind::F32(w[i * cols + j]));
+        }
+    }
+    let compiled = match DataflowCompiler::compile_x86_64(&g, "jit_bench_graph") {
+        Ok(c) => c,
+        Err(e) => {
+            println!("компиляция не удалась: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let x: Vec<f32> = (0..cols).map(|_| lcg(&mut s)).collect();
+
+    match mode {
+        JitModeArg::Bench => {
+            let kern = match ExecutableKernel::load(&compiled.machine_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    println!("загрузка RX: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // бит-в-бит проверка
+            let ref_y = poler_engine::graph::graph_asm::dataflow_reference_eval(&g, &x).unwrap();
+            let mut y = vec![0.0f32; rows];
+            unsafe { kern.call_raw(x.as_ptr(), y.as_mut_ptr()) };
+            let mut mismatches = 0usize;
+            for (a, b) in ref_y.iter().zip(&y) {
+                if a.to_bits() != b.to_bits() {
+                    mismatches += 1;
+                }
+            }
+            println!("граф {cols}→{rows}: {} рёбер, вакуум {:.1}%", g.active_edges(), g.sparsity_ratio() * 100.0);
+            println!("инструкций: {}; код: {} Б ({} Б/весу)", compiled.instruction_count, compiled.machine_bytes.len(),
+                compiled.machine_bytes.len() as f32 / g.active_edges().max(1) as f32);
+            println!("бит-в-бит IEEE-754: {}", if mismatches == 0 { "OK ✓".to_string() } else { format!("{mismatches} расхождений!") });
+            // бенчмарк: JIT vs наивный цикл
+            let n = 100_000usize;
+            let t0 = std::time::Instant::now();
+            let mut acc = 0.0f32;
+            for _ in 0..n {
+                unsafe { kern.call_raw(x.as_ptr(), y.as_mut_ptr()) };
+                acc += y[0];
+            }
+            let jit_us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                for i in 0..rows {
+                    let mut a = 0.0f32;
+                    for j in 0..cols {
+                        a += x[j] * w[i * cols + j];
+                    }
+                    y[i] = a;
+                }
+                acc += y[0];
+            }
+            let naive_us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+            println!("JIT: {jit_us:.2} мкс/вызов vs наивный цикл: {naive_us:.2} мкс → {:.2}× (sink {acc:.4})",
+                naive_us / jit_us.max(1e-9));
+            println!("W^X: код на PROT_READ|PROT_EXEC странице (запись → исполнение, никогда вместе)");
+            ExitCode::SUCCESS
+        }
+        JitModeArg::Asm => {
+            println!("{}", compiled.asm_listing);
+            ExitCode::SUCCESS
+        }
+        JitModeArg::Graph => {
+            println!("DataflowGraph «jit_bench_graph»");
+            println!("  входов: {cols}, слоёв: {}", g.layers.len());
+            for (li, l) in g.layers.iter().enumerate() {
+                println!("  слой {}: ширина {}, активация {:?}, редьюсер {:?}", li + 1, l.width, l.act, l.reduce);
+            }
+            println!("  рёбер: {} (вакуум {:.1}%)", g.active_edges(), g.sparsity_ratio() * 100.0);
+            println!("  машинный код: {} инструкций, {} Б", compiled.instruction_count, compiled.machine_bytes.len());
+            ExitCode::SUCCESS
         }
     }
 }

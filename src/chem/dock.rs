@@ -763,6 +763,9 @@ pub struct DockParams {
     pub t0: f64,
     /// Конечная kT.
     pub t1: f64,
+    /// JIT-ядро скоринга (контур A3): AVX2-машинный код, таблицы кармана
+    /// вшиты в исполняемую страницу. Без AVX2/малого поля — прозрачный откат.
+    pub jit: bool,
 }
 
 impl Default for DockParams {
@@ -773,6 +776,7 @@ impl Default for DockParams {
             seed: 0,
             t0: 12.0,
             t1: 0.4,
+            jit: true,
         }
     }
 }
@@ -887,6 +891,8 @@ pub fn rmsd_to_crystal(
 fn polish(
     lig: &LigandPrep,
     field: &PocketField,
+    kernel: Option<&crate::graph::chem_kernel::JitScoringKernel>,
+    y_buf: &mut [f64],
     st: &mut PoseState,
     pos: &mut Vec<[f64; 3]>,
     cur_e: &mut f64,
@@ -903,7 +909,16 @@ fn polish(
                     let delta = sgn * k as f64 * TORS_SECTOR;
                     st.torsions[ti] = base + delta;
                     let cand = apply_state(lig, st);
-                    let t = score_pose(lig, field, &cand);
+                    let t = match kernel {
+                    Some(k) => {
+                        for v in y_buf.iter_mut() {
+                            *v = 0.0;
+                        }
+                        k.exec_into(&cand, y_buf);
+                        k.terms_from_y(lig, y_buf)
+                    }
+                    None => score_pose(lig, field, &cand),
+                };
                     *evals += 1;
                     if t.objective() < best.0 {
                         best = (t.objective(), delta);
@@ -930,7 +945,16 @@ fn polish(
                     st.center[2] + sgn * ax[2] * 0.25,
                 ];
                 let cand = apply_state(lig, st);
-                let t = score_pose(lig, field, &cand);
+                let t = match kernel {
+                    Some(k) => {
+                        for v in y_buf.iter_mut() {
+                            *v = 0.0;
+                        }
+                        k.exec_into(&cand, y_buf);
+                        k.terms_from_y(lig, y_buf)
+                    }
+                    None => score_pose(lig, field, &cand),
+                };
                 *evals += 1;
                 if t.objective() < *cur_e {
                     *cur_e = t.objective();
@@ -946,7 +970,16 @@ fn polish(
             let m = rot_matrix(axis, 4.0f64.to_radians());
             st.rot = mat_mul(&m, &st.rot);
             let cand = apply_state(lig, st);
-            let t = score_pose(lig, field, &cand);
+            let t = match kernel {
+                    Some(k) => {
+                        for v in y_buf.iter_mut() {
+                            *v = 0.0;
+                        }
+                        k.exec_into(&cand, y_buf);
+                        k.terms_from_y(lig, y_buf)
+                    }
+                    None => score_pose(lig, field, &cand),
+                };
             *evals += 1;
             if t.objective() < *cur_e {
                 *cur_e = t.objective();
@@ -1000,6 +1033,33 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
     // Поле кармана (tree27 → плоские массивы)
     let field = build_field(mm, &index, &charges, &donors, pocket.center, pocket.radius + 2.0);
 
+    // JIT-ядро скоринга (контур A3): таблицы кармана → машинный код.
+    // Прозрачный откат: без AVX2/малого поля остаётся score_pose.
+    let jit_kernel: Option<crate::graph::chem_kernel::JitScoringKernel> = if params.jit {
+        crate::graph::chem_kernel::compile_scoring_kernel(&lig, &field).ok()
+    } else {
+        None
+    };
+    // единая точка скоринга: JIT или интерпретатор; y-буфер ПЕРЕИСПОЛЬЗУЕТСЯ
+    // (zero-alloc в MC-цикле; kernel пишет поверх, слоты 3/4 и hb-флаги
+    // аккумулируются от нуля — перезануляем перед вызовом)
+    let mut y_buf: Vec<f64> = jit_kernel
+        .as_ref()
+        .map(|k| vec![0.0f64; k.n_slots()])
+        .unwrap_or_default();
+    let score_of = |pos: &Vec<[f64; 3]>, y: &mut Vec<f64>| -> ScoreTerms {
+        match &jit_kernel {
+            Some(k) => {
+                for v in y.iter_mut() {
+                    *v = 0.0;
+                }
+                k.exec_into(pos, y);
+                k.terms_from_y(&lig, y)
+            }
+            None => score_pose(&lig, &field, pos),
+        }
+    };
+
     // Эталон RMSD
     let crystal_atoms: Vec<super::pdb::PdbAtom> = crystal_lig
         .map(|l| {
@@ -1045,7 +1105,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
                 .collect(),
         };
         let mut pos = apply_state(&lig, &st);
-        let mut terms = score_pose(&lig, &field, &pos);
+        let mut terms = score_of(&pos, &mut y_buf);
         n_evals += 1;
         let mut cur_obj = terms.objective();
         ensemble.push((cur_obj, pos.clone(), st.torsions.clone()));
@@ -1095,7 +1155,7 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
                 continue;
             }
             let cand_pos = apply_state(&lig, &cand);
-            let cand_terms = score_pose(&lig, &field, &cand_pos);
+            let cand_terms = score_of(&cand_pos, &mut y_buf);
             n_evals += 1;
             let new_obj = cand_terms.objective();
             let de = new_obj - cur_obj;
@@ -1123,18 +1183,18 @@ pub fn dock(smiles: &str, mm: &MacroMol, params: &DockParams, spec: &PocketSpec)
     if let Some(mut st) = best_state.take() {
         let mut pos = best_positions.clone();
         let mut e = best_obj;
-        polish(&lig, &field, &mut st, &mut pos, &mut e, &mut n_evals);
+        polish(&lig, &field, jit_kernel.as_ref(), &mut y_buf, &mut st, &mut pos, &mut e, &mut n_evals);
         best_state = Some(st);
         best_positions = pos;
         best_obj = e;
-        let terms = score_pose(&lig, &field, &best_positions);
+        let terms = score_of(&best_positions, &mut y_buf);
         n_evals += 1;
         best_terms = terms;
         ensemble.push((best_obj, best_positions.clone(), best_state.as_ref().unwrap().torsions.clone()));
     }
 
-    // Финальный скоринг лучшей позы
-    let best = score_pose(&lig, &field, &best_positions);
+    // Финальный скоринг лучшей позы (JIT-ядро, если доступно)
+    let best = score_of(&best_positions, &mut y_buf);
     n_evals += 1;
 
     // Кластеры
@@ -1545,6 +1605,7 @@ HETATM   24  N2  BEN A  10       0.000   0.000   7.500  1.00 12.00           N
             seed: 42,
             t0: 8.0,
             t1: 0.3,
+            jit: false, // интерпретатор: тест проверяет канон v0.75
         };
         let res = dock("NC(=O)c1ccccc1", &mm, &params, &PocketSpec::Auto).unwrap();
         assert_eq!(res.pocket_method, "лиганд");
