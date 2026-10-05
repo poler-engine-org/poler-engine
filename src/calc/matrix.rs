@@ -208,6 +208,148 @@ impl Matrix {
         Ok(det)
     }
 
+    /// LU-разложение с частичным выбором ведущего (Дулиттл, компактное).
+    ///
+    /// Возвращает (компактная L\U, перестановка строк, знак перестановки).
+    /// L — нижняя унитреугольная, U — верхняя треугольная: A = P·L·U.
+    pub fn lu(&self) -> Result<(Matrix, Vec<usize>, f64), String> {
+        if !self.is_square() {
+            return Err("LU только для квадратных матриц".into());
+        }
+        let n = self.rows;
+        let mut a = self.data.clone();
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut sign = 1.0f64;
+        for col in 0..n {
+            // Ведущий элемент
+            let mut piv = col;
+            let mut best = a[piv * n + col].abs();
+            for r in col + 1..n {
+                let v = a[r * n + col].abs();
+                if v > best {
+                    best = v;
+                    piv = r;
+                }
+            }
+            if best < 1e-300 {
+                return Err(format!(
+                    "LU: вырожденный столбец {col} (ведущий |{best:.2e}| < 1e-300)"
+                ));
+            }
+            if piv != col {
+                for j in 0..n {
+                    a.swap(piv * n + j, col * n + j);
+                }
+                perm.swap(piv, col);
+                sign = -sign;
+            }
+            let d = a[col * n + col];
+            for r in col + 1..n {
+                let k = a[r * n + col].div(d);
+                a[r * n + col] = k;
+                if k != Complex::ZERO {
+                    for j in col + 1..n {
+                        a[r * n + j] = a[r * n + j].sub(k.mul(a[col * n + j]));
+                    }
+                }
+            }
+        }
+        Ok((Matrix { rows: n, cols: n, data: a }, perm, sign))
+    }
+
+    /// Определитель в ЛОГ-ДОМЕНЕ: (знак ±1 (0 — точно сингулярно), ln|det|).
+    ///
+    /// Для матриц с |det| за пределами f64 (~1e±308) обычный `det`
+    /// обнуляется/переполняется — здесь значение удерживается аналитически:
+    /// ln|det| = Σ ln|u_ii|. Тритная глубина: |det| = 3^(−d) при |det| < 1.
+    pub fn logdet(&self) -> Result<(f64, f64), String> {
+        let (lu_m, _perm, sign) = self.lu()?;
+        let n = lu_m.rows;
+        let mut ln_abs = 0.0f64;
+        let mut sign_total = sign;
+        for i in 0..n {
+            let u = lu_m.data[i * n + i];
+            let a = u.abs();
+            if a == 0.0 {
+                return Ok((0.0, f64::NEG_INFINITY));
+            }
+            ln_abs += a.ln();
+            // Знак диагонального элемента (вещественный случай)
+            if u.re < 0.0 {
+                sign_total = -sign_total;
+            }
+        }
+        Ok((sign_total, ln_abs))
+    }
+
+    /// Оценка обусловленности cond_∞ = ||A||∞ · ||A⁻¹||∞ (через LU-решения).
+    pub fn cond_inf(&self) -> Result<f64, String> {
+        if !self.is_square() {
+            return Err("cond только для квадратных матриц".into());
+        }
+        let n = self.rows;
+        let norm_a = self.norm_inf();
+        if norm_a == 0.0 {
+            return Ok(f64::INFINITY);
+        }
+        // ||A⁻¹||∞ = max по строкам суммы |x_ij|; столбцы A⁻¹ — решения A x = e_i
+        let mut inv_cols: Vec<Vec<Complex>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut e = vec![Complex::ZERO; n];
+            e[i] = Complex::ONE;
+            inv_cols.push(self.solve_lu(&e)?);
+        }
+        let mut norm_inv = 0.0f64;
+        for r in 0..n {
+            let row_sum: f64 = (0..n).map(|c| inv_cols[c][r].abs()).sum();
+            norm_inv = norm_inv.max(row_sum);
+        }
+        Ok(norm_a * norm_inv)
+    }
+
+    /// Решение A·x = b через LU с эквилибровкой строк (log-устойчиво).
+    ///
+    /// Строки масштабируются своими ∞-нормами до разложения — матрицы с
+    /// разбросом порядков (1e-12 … 1e12) решаются без потери точности.
+    pub fn solve_lu(&self, b: &[Complex]) -> Result<Vec<Complex>, String> {
+        if !self.is_square() {
+            return Err("solve_lu только для квадратных матриц".into());
+        }
+        let n = self.rows;
+        if b.len() != n {
+            return Err(format!("solve_lu: размер b ({}) ≠ n ({n})", b.len()));
+        }
+        // Эквилибровка
+        let mut scale = vec![1.0f64; n];
+        let mut eq = self.clone();
+        for r in 0..n {
+            let row_max: f64 = (0..n).map(|c| eq.data[r * n + c].abs()).fold(0.0, f64::max);
+            if row_max > 0.0 {
+                let f = 1.0 / row_max;
+                scale[r] = f;
+                for c in 0..n {
+                    eq.data[r * n + c] = eq.data[r * n + c].scale(f);
+                }
+            }
+        }
+        let (lu_m, perm, _sign) = eq.lu()?;
+        let mut beq: Vec<Complex> = perm.iter().map(|&p| b[p].scale(scale[p])).collect();
+        // Прямая подстановка (L)
+        for i in 0..n {
+            for j in 0..i {
+                beq[i] = beq[i].sub(lu_m.data[i * n + j].mul(beq[j]));
+            }
+        }
+        // Обратная подстановка (U)
+        for i in (0..n).rev() {
+            for j in i + 1..n {
+                beq[i] = beq[i].sub(lu_m.data[i * n + j].mul(beq[j]));
+            }
+            beq[i] = beq[i].div(lu_m.data[i * n + i]);
+        }
+        Ok(beq)
+    }
+
     /// Обратная матрица: Гаусс–Жордан с выбором ведущего.
     pub fn inv(&self) -> Result<Matrix, String> {
         if !self.is_square() {

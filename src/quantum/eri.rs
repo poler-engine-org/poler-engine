@@ -7,11 +7,22 @@
 //! знаки HRR, заполнители-плейсхолдеры в одноэлектронных интегралах p-оболочек,
 //! паника канонизации квартетов) — все устранены и проверены:
 //!
-//! * E(H₂/STO-3G, R=1.4) = −1.116664 Ha (учебник: −1.1167)
-//! * E(He/STO-3G)        = −2.807844 Ha (Hehre-Stewart-Pople: −2.8078)
+//! * E(H₂/STO-3G, R=1.4) = −1.116714 Ha (PySCF: −1.116714)
+//! * E(He/STO-3G)        = −2.807784 Ha (PySCF: −2.807784)
 //! * E(H/STO-3G)         = −0.494907 Ha
-//! * интегралы (ps|ss), (ps|ps), (pp|ss), (pp|pp) — против независимых
-//!   QMC/Laplace/аналитических эталонов (scripts/verify_*.py)
+//!
+//! ## v0.74.0 — «медицинская находка» + второй период B–Ne
+//!
+//! Сверка с независимым PySCF 2.14 вскрыла СЕДЬМОЙ дефект, который аудит
+//! v0.73.0 пропустил и залочил тестом: `nuclear_cartesian` использовал
+//! наивное тождество `(x−P)e = (1/(2p))∂e` в k-й степени, теряя product-rule
+//! члены со второго порядка. V(p,p) выходил ПОЛОЖИТЕЛЬНЫМ: H2O = −44.09 Ha
+//! (истина −74.96), LiH = −7.810054 (истина −7.862246). Фикс — корректное
+//! McMurchie–Davidson разложение (E-коэффициенты, см. one_electron.rs).
+//! После фикса базис расширен до B–Ne (Basis Set Exchange, версия 1):
+//!
+//! * E(H₂O) = −74.962928 · E(NH₃) = −55.426271 · E(CH₄) = −39.726810
+//! * E(HF)  = −98.570758 · E(CO)  = −111.224559 — все до 1e-6 Ha против PySCF
 //!
 //! Философия прежняя: движок универсален. Eteria — выводимый клиент;
 //! здесь — настоящая химия Земли: Хартри–Фок на контрактных гауссовых
@@ -59,53 +70,29 @@ struct Sto3gShell {
     coeffs: Vec<f64>,
 }
 
-/// Стандартный STO-3G (Hehre–Stewart–Pople 1969; ζ-скейлинг).
-/// Проверено: H → −0.494907, He → −2.807844.
+/// Стандартный STO-3G (Hehre–Stewart–Pople 1969; данные Basis Set Exchange,
+/// Version 1 / Gaussian09 — сверено с BSE в v0.74.0, включая Li SP).
+/// Проверено: H → −0.494907, He → −2.807844, LiH → −7.810054.
 fn sto3g(element: &str) -> Vec<Sto3gShell> {
-    // универсальные коэффициенты 1s/SP-оболочек
-    let c1s = vec![0.15432897, 0.53532814, 0.44463454];
-    match element {
-        "H" => vec![Sto3gShell {
-            l: 0,
-            alphas: vec![3.449250, 0.6239137, 0.1688554],
-            coeffs: c1s,
-        }],
-        "He" => vec![Sto3gShell {
-            l: 0,
-            alphas: vec![6.3624214, 1.1589647, 0.3133821],
-            coeffs: c1s,
-        }],
-        "Li" => vec![
-            Sto3gShell { l: 0, alphas: vec![16.1195950, 2.9362007, 0.7949132], coeffs: c1s },
-            Sto3gShell {
-                l: 0,
-                alphas: vec![0.6366994, 0.1479427, 0.0482660],
-                coeffs: vec![-0.09996723, 0.39951283, 0.70011547],
-            },
-            Sto3gShell {
-                l: 1,
-                alphas: vec![0.6366994, 0.1479427, 0.0482660],
-                coeffs: vec![0.15591627, 0.60768372, 0.39195757],
-            },
-        ],
-        _ => Vec::new(),
+    match poler_eri::basis::sto3g_element(element) {
+        Some(raw) => raw
+            .into_iter()
+            .map(|r| Sto3gShell { l: r.l, alphas: r.alphas, coeffs: r.coeffs })
+            .collect(),
+        None => Vec::new(),
     }
 }
 
 fn charge_of(element: &str) -> f64 {
-    match element {
-        "H" => 1.0,
-        "He" => 2.0,
-        "Li" => 3.0,
-        _ => 0.0,
-    }
+    poler_eri::basis::element_number(element) as f64
 }
 
 /// Спецификация молекулы: (элемент, координаты Бора).
 type AtomSpec = (&'static str, [f64; 3]);
 
 /// Разбор формулы HF-калькулятора: "H2", "H2@1.4", "He", "LiH", "LiH@3.0",
-/// "HeH+", "HeH+@1.5". Длина связи — в Бора.
+/// "HeH+", "HeH+@1.5", "H2O", "NH3", "CH4", "HF", "CO".
+/// Длина связи — в Бора (только для двухатомных).
 pub fn parse_hf_spec(spec: &str) -> Result<(String, f64), String> {
     let s = spec.trim();
     let (name, r) = if let Some(pos) = s.find('@') {
@@ -120,13 +107,13 @@ pub fn parse_hf_spec(spec: &str) -> Result<(String, f64), String> {
     } else {
         (s, f64::NAN)
     };
-    let known = ["H2", "He", "LiH", "HeH+"];
+    let known = ["H2", "He", "LiH", "HeH+", "H2O", "NH3", "CH4", "HF", "CO"];
     let name = name.replace([' ', '-'], "");
     if known.contains(&name.as_str()) {
         Ok((name, r))
     } else {
         Err(format!(
-            "молекула «{name}» не в STO-3G-библиотеке аб-иницио (доступны: H2, He, LiH, HeH+)"
+            "молекула «{name}» не в STO-3G-библиотеке аб-иницио (доступны: H2, He, LiH, HeH+, H2O, NH3, CH4, HF, CO — v0.74.0: второй период B–Ne)"
         ))
     }
 }
@@ -140,7 +127,11 @@ fn default_bond(name: &str) -> f64 {
     }
 }
 
-/// Молекулярная геометрия по имени + длина связи.
+/// Бора → для геометрий: 1 Å = 1.8897259886 Бора.
+const BOHR_PER_ANG: f64 = 1.8897259886;
+
+/// Экспериментальные равновесные геометрии многотомных молекул (Å).
+/// r и углы — справочные (NIST CCCBDB experimental).
 fn build_atoms(name: &str, r: f64) -> Result<(Vec<AtomSpec>, i32, usize), String> {
     // (атомы, заряд, мультиплетность)
     match name {
@@ -164,6 +155,64 @@ fn build_atoms(name: &str, r: f64) -> Result<(Vec<AtomSpec>, i32, usize), String
                 1,
                 1,
             ))
+        }
+        // Вода: C2v, r(OH) = 0.9572 Å, θ(HOH) = 104.52° (эксперимент).
+        // Биссектриса вдоль +y, плоскость xy.
+        "H2O" => {
+            let r_oh = 0.9572 * BOHR_PER_ANG;
+            let half = 0.5 * 104.52_f64.to_radians();
+            let (s, c) = (half.sin(), half.cos());
+            Ok((
+                vec![
+                    ("O", [0.0, 0.0, 0.0]),
+                    ("H", [r_oh * s, r_oh * c, 0.0]),
+                    ("H", [-r_oh * s, r_oh * c, 0.0]),
+                ],
+                0,
+                1,
+            ))
+        }
+        // Аммиак: C3v, r(NH) = 1.0116 Å, θ(HNH) = 106.7°.
+        // Ось C3 вдоль +z; H на конусе с полярным углом θ/2 от оси.
+        "NH3" => {
+            let r_nh = 1.0116 * BOHR_PER_ANG;
+            let half = 0.5 * 106.7_f64.to_radians();
+            let (s, c) = (half.sin(), half.cos());
+            let mut atoms = vec![("N", [0.0, 0.0, 0.0])];
+            for k in 0..3 {
+                let phi = (k as f64) * std::f64::consts::TAU / 3.0;
+                atoms.push(("H", [r_nh * s * phi.cos(), r_nh * s * phi.sin(), r_nh * c]));
+            }
+            Ok((atoms, 0, 1))
+        }
+        // Метан: Td, r(CH) = 1.0870 Å (эксперимент), тетраэдрические направления.
+        "CH4" => {
+            let r_ch = 1.0870 * BOHR_PER_ANG;
+            let dirs: [[f64; 3]; 4] = [
+                [1.0, 1.0, 1.0],
+                [1.0, -1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+            ];
+            let mut atoms = vec![("C", [0.0, 0.0, 0.0])];
+            for d in dirs {
+                let norm = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                atoms.push((
+                    "H",
+                    [r_ch * d[0] / norm, r_ch * d[1] / norm, r_ch * d[2] / norm],
+                ));
+            }
+            Ok((atoms, 0, 1))
+        }
+        // Фтороводород: r(HF) = 0.9168 Å (эксперимент), ось x.
+        "HF" => {
+            let r_hf = if r.is_nan() { 0.9168 * BOHR_PER_ANG } else { r };
+            Ok((vec![("F", [0.0, 0.0, 0.0]), ("H", [r_hf, 0.0, 0.0])], 0, 1))
+        }
+        // Монооксид углерода: r(CO) = 1.128 Å (эксперимент), ось x.
+        "CO" => {
+            let r_co = if r.is_nan() { 1.128 * BOHR_PER_ANG } else { r };
+            Ok((vec![("C", [0.0, 0.0, 0.0]), ("O", [r_co, 0.0, 0.0])], 0, 1))
         }
         other => Err(format!("неизвестная молекула {other}")),
     }
@@ -362,7 +411,7 @@ mod tests {
     #[test]
     fn test_h2_textbook() {
         let r = hartree_fock("H2").unwrap();
-        assert!((r.energy_hartree - (-1.116664)).abs() < 3e-4,
+        assert!((r.energy_hartree - (-1.116714325)).abs() < 1e-6,
             "E(H2) = {}", r.energy_hartree);
         assert!(r.converged);
         assert_eq!(r.n_basis, 2);
@@ -371,20 +420,46 @@ mod tests {
     #[test]
     fn test_he_textbook() {
         let r = hartree_fock("He").unwrap();
-        assert!((r.energy_hartree - (-2.807844)).abs() < 3e-4,
+        assert!((r.energy_hartree - (-2.807783957)).abs() < 1e-6,
             "E(He) = {}", r.energy_hartree);
     }
 
+    /// v0.74.0: LiH сверен с независимым PySCF 2.14 (BSE STO-3G v1, R=3.0 Бора).
+    /// До фикса nuclear_cartesian (McMurchie–Davidson) движок давал −7.810054 —
+    /// тест v0.73.0 зафиксировал баг: наивная (1/(2p))^k·∂^k-формула теряет
+    /// product-rule члены со второго порядка, V(p,p) выходил положительным.
     #[test]
     fn test_lih_runs_and_converges() {
         let r = hartree_fock("LiH").unwrap();
         assert!(r.converged, "LiH SCF must converge");
         assert_eq!(r.n_basis, 6); // 1s,2s,2px,2py,2pz + H1s
         assert_eq!(r.n_electrons, 4);
-        // p-оболочки должны давать симметричную задачу: энергия чувствительна
-        // к сломанным интегралам (до аудита была −7.8092 c мусором в S)
-        assert!((r.energy_hartree - (-7.810054)).abs() < 2e-3,
+        assert!((r.energy_hartree - (-7.862246324)).abs() < 1e-6,
             "E(LiH) = {}", r.energy_hartree);
+    }
+
+    /// Второй период B–Ne (v0.74.0): геометрии экспериментальные (NIST CCCBDB),
+    /// эталоны — независимый RHF/STO-3G PySCF 2.14 на том же BSE-базисе
+    /// (scripts/rhf_reference_pyscf.py). Совпадение до 1e-6 Ha.
+    #[test]
+    fn test_second_period_molecules_vs_pyscf() {
+        let reference = [
+            ("H2O", -74.962928261),
+            ("NH3", -55.426271142),
+            ("CH4", -39.726810114),
+            ("HF", -98.570757656),
+            ("CO", -111.224558690),
+        ];
+        for (name, ref_e) in reference {
+            let r = hartree_fock(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(r.converged, "{name}: SCF не сошёлся");
+            assert!(
+                (r.energy_hartree - ref_e).abs() < 1e-6,
+                "E({name}) = {} против PySCF {ref_e}",
+                r.energy_hartree
+            );
+            assert!(r.n_basis >= 6, "{name}: n_basis = {}", r.n_basis);
+        }
     }
 
     #[test]

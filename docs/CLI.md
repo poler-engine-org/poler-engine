@@ -266,6 +266,8 @@ poler-engine --literary-generate "текст" --literary-no-mul --literary-json
 ## 10. Интерфейсы
 
 ```bash
+poler-engine --view-mol "CC(=O)Oc1ccccc1C(=O)O"   # v0.74.0: живой 3D/4D-визор молекул
+poler-engine --view-mol кофеин --mol-mode vdw     # имена молекул + режимы ball|vdw|wire
 poler-engine --shell                # REPL + Tab-completion
 poler-engine --tui                  # TUI: chat | notes | sources
 poler-engine --gateway              # Terminal Gateway (sandbox-контур)
@@ -282,7 +284,25 @@ poler-engine --license              # статус EULA
 
 MCP-инструменты: `poler_web_search`, `poler_crawl`, `poler_fetch`,
 `poler_search`, `poler_grep`, `poler_chunk`, `poler_box_exec`,
-`poler_box_status`.
+`poler_box_status`, `poler_scivoice` (голос учёного: режимы read/hf/
+molecule/bio — научное чтение, RHF/STO-3G, паспорт SMILES, био-контур).
+
+### 10.1. Лестница молекул (v0.74.0)
+
+```bash
+poler-engine --exec 'calc chem_smiles("кофеин")'      # паспорт: кольца, Липински, Гастайгер
+poler-engine --exec 'calc chem_3d("аспирин")'          # 3D-конформер: длины, гибридизации
+poler-engine --exec 'calc bio_eval("дофамин", "серотонин")'  # ΔG/Kd в лог-домене + DE-9IM
+poler-engine --exec 'calc hf("H2O")'                   # RHF/STO-3G: E = −74.962928 Ha (PySCF-сверка)
+poler-engine --exec 'calc logdet(A)'                   # определитель за пределами f64
+```
+
+`--view-mol` — орбитальная камера прямо в терминале (стрелки/hjkl —
+вращение, `+/-` — зум, `m` — режим, `t` — 4D-кручение σ-связей,
+`[ ]` — скорость, `q` — выход); в пайпе печатает одиночный кадр.
+SMILES-парсер: органический субсет + bracket-атомы + SSSR; базис
+STO-3G расширен до B–Ne (Basis Set Exchange, Li SP сверен — по пути
+найден и устранён дефект nuclear_cartesian: V(p,p) был положительным).
 
 M6 (резидентность): Гиппокамп/WebIndex/кэш файлов живут в RAM между
 запросами (тёплые p99: grep ≤2 мс, knowledge ≈250 мкс на release);

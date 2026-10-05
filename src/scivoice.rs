@@ -301,6 +301,11 @@ pub fn scientist_read(text: &str) -> String {
             "H2" => Some("H2"),
             "LiH" => Some("LiH"),
             "He" => Some("He"),
+            "H2O" => Some("H2O"),
+            "NH3" => Some("NH3"),
+            "CH4" => Some("CH4"),
+            "HF" => Some("HF"),
+            "CO" => Some("CO"),
             _ => None,
         };
         if let Some(spec) = hf_spec {

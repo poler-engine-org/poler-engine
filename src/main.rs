@@ -114,6 +114,16 @@ enum HarvestFormatArg {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum MolModeArg {
+    /// Шаростержневой: сферы ковалентных радиусов + связи.
+    Ball,
+    /// Space-filling: ван-дер-ваальсовы сферы (реальный объём).
+    Vdw,
+    /// Каркас: только связи.
+    Wire,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum HarvestModeArg {
     /// Секции: ±context строк вокруг совпадений, слияние перекрытий.
     Sections,
@@ -529,6 +539,22 @@ struct Cli {
     /// {cmd, ok, exit_code, duration_ms, output} — машиночитаемый конверт.
     #[arg(long = "json", requires = "exec")]
     exec_json: bool,
+
+    /// v0.74.0: ИНТЕРАКТИВНЫЙ 3D/4D-ВИЗОР МОЛЕКУЛ — SMILES или имя
+    /// (кофеин, аспирин, дофамин, серотонин…). Живая орбитальная камера:
+    /// ←→↑↓/hjkl вращение, +/- зум, m режим (шаростержневой/ВдВ/каркас),
+    /// t — 4D-кручение σ-связей, [ ] скорость, q выход. Не-TTY — кадр.
+    /// Примеры: --view-mol "CC(=O)Oc1ccccc1C(=O)O"; --view-mol кофеин
+    #[arg(
+        long = "view-mol",
+        value_name = "SMILES|ИМЯ",
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec"]
+    )]
+    view_mol: Option<String>,
+
+    /// Начальный режим --view-mol: ball | vdw | wire [default: ball].
+    #[arg(long = "mol-mode", value_enum, default_value_t = MolModeArg::Ball, requires = "view_mol")]
+    mol_mode: MolModeArg,
 
     /// TUI Dashboard на ratatui (панели: chat + ввод | notes + sources).
     /// Tab — смена фокуса, Esc — выход. Команды как в --shell.
@@ -2368,6 +2394,11 @@ fn run(cli: Cli) -> ExitCode {
 
     // ---------- poler-shell: интерактивный терминал v0.15.0 ----------
     // ---------- v0.47.0: one-shot --exec для ИИ-агентов ----------
+    // v0.74.0: интерактивный 3D/4D-визор молекул
+    if let Some(mol) = cli.view_mol.as_deref() {
+        return view_mol_command(mol, cli.mol_mode);
+    }
+
     if let Some(cmd) = cli.exec.as_deref() {
         use std::time::Instant;
         let db_path =
@@ -7482,4 +7513,37 @@ fn run_literary(cli: &Cli) -> i32 {
         report.steps
     );
     0
+}
+
+
+// ─── v0.74.0: --view-mol — интерактивный 3D/4D-визор молекул ───────────
+
+fn view_mol_command(input: &str, mode: MolModeArg) -> ExitCode {
+    use poler_engine::chem::{self, view::ViewMode};
+    let g = match chem::resolve_input(input) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("--view-mol: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let conf = match chem::embed(&g) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("--view-mol: 3D-укладка не удалась: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let vmode = match mode {
+        MolModeArg::Ball => ViewMode::BallStick,
+        MolModeArg::Vdw => ViewMode::Vdw,
+        MolModeArg::Wire => ViewMode::Wire,
+    };
+    match poler_engine::chem::view::run_interactive(&conf, &g, &g.hill_formula(), vmode) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("--view-mol: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

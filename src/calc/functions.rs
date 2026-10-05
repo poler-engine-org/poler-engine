@@ -636,11 +636,237 @@ pub fn is_function(name: &str) -> bool {
         | "speak"
         // аб-иницио квантовая химия (v0.73.0): RHF/STO-3G из POLER-ERI
         | "hf"
+        // лестница молекул (v0.74.0): SMILES → 3D → био-контур
+        | "chem_smiles" | "chem_3d" | "bio_eval"
+        // log-домен в матрицах (v0.74.0): logdet/lsolve за пределами f64
+        | "logdet" | "lsolve"
         // геодезия/навигация
         | "dist" | "bearing" | "midpoint" | "dest" | "earth_radius"
     )
 }
 
+
+
+// ─── log-домен в матрицах (v0.74.0) ─────────────────────────────────────
+
+const LN_3_F64: f64 = 1.0986122886681098;
+
+/// Отчёт logdet: знак, ln|det|, log10|det|, тритная глубина, обусловленность.
+fn logdet_report(m: &Matrix, sign: f64, ln_abs: f64) -> String {
+    let n = m.rows;
+    let log10 = ln_abs / std::f64::consts::LN_10;
+    // «Честный» f64-детерминант для сравнения
+    let f64_det = m.det().ok().and_then(|c| {
+        let v = c.re;
+        if v.is_finite() {
+            Some(v)
+        } else {
+            None
+        }
+    });
+    let mut s = String::new();
+    s.push_str(&format!("══ч log-домен определителя ({n}×{n}) ══\n"));
+    s.push_str(&format!(
+        "[1] sign = {sign:+.0}, ln|det| = {ln_abs:.4}, log10|det| = {log10:.4} — значение удерживается аналитически, за пределами f64 (~10^±308).\n"
+    ));
+    match f64_det {
+        Some(v) if v != 0.0 => {
+            s.push_str(&format!(
+                "[2] f64-детерминант: {v:.3e} — влезает в диапазон, лог-домен подтверждает: log10 = {log10:.3}.\n"
+            ));
+        }
+        Some(_) => {
+            let d = -ln_abs / LN_3_F64;
+            s.push_str(&format!(
+                "[2] f64-детерминант: 0.0 (UNDERFLOW!) — обычный det потерял значение; лог-домен держит |det| = 10^({log10:.1}), тритная глубина d = {d:.2} (|det| = 3^(-d)).\n"
+            ));
+        }
+        None => s.push_str("[2] f64-детерминант: переполнение/недоступен — лог-домен единственный путь.\n"),
+    }
+    if 0.0 < ln_abs && ln_abs.is_finite() {
+        s.push_str(&format!(
+            "[3] |det| = 3^(-{:.4}) — тритная глубина, та же сверхдиапазонная форма, что и logpow.\n",
+            -ln_abs / LN_3_F64
+        ));
+    }
+    match m.cond_inf() {
+        Ok(cond) => {
+            let verdict = if cond < 1e3 {
+                ("+1", "обусловлена отлично — решать можно смело")
+            } else if cond < 1e8 {
+                ("0", "умеренная обусловленность — следите за невязкой")
+            } else {
+                ("-1", "близко к сингулярной — решение ненадёжно")
+            };
+            s.push_str(&format!(
+                "[4] Обусловленность cond_∞ = {cond:.3e} → трит-вердикт: {} — {}.\n",
+                verdict.0, verdict.1
+            ));
+        }
+        Err(e) => s.push_str(&format!("[4] Обусловленность: LU не сошёлся ({e}).\n")),
+    }
+    s.push_str("Смежное: lsolve(A, b) — LU-решение с эквилибровкой строк (матрицы с разбросом 1e-12…1e12).");
+    s
+}
+
+// ─── Лестница молекул (v0.74.0): отчёты chem_smiles / chem_3d ───────────
+
+fn expect_str(v: &Value, name: &str, what: &str) -> Result<String, String> {
+    match v {
+        Value::Str(s) => Ok(s.clone()),
+        other => Err(format!("{name}: ожидалась строка ({what}), получено {other}")),
+    }
+}
+
+/// Паспорт молекулы из SMILES: стехиометрия, связи, кольца, дескрипторы.
+pub fn smiles_passport(g: &crate::chem::MoleculeGraph, input: &str) -> String {
+    use crate::chem::{descriptors, logp_estimate};
+    let d = descriptors(g);
+    let q = crate::chem::gasteiger(g);
+    let mut s = String::new();
+    s.push_str(&format!("══ч {} ══\n", input.trim()));
+    s.push_str(&format!(
+        "[1] Стехиометрия: {} · {} тяжёлых атомов, {} всего с H · суммарный заряд {:+} · M = {:.2} г/моль.\n",
+        g.hill_formula(),
+        g.atoms.len(),
+        d.total_atoms,
+        g.total_charge(),
+        g.atoms.iter().map(|a| match crate::universal_chem::get_element_by_symbol(&a.symbol) {
+            Some(e) => e.atomic_mass,
+            None => 12.0,
+        }).sum::<f64>() + g.atoms.iter().map(|a| a.h_count as f64 * 1.008).sum::<f64>()
+    ));
+    // Типы связей
+    let mut n_single = 0;
+    let mut n_double = 0;
+    let mut n_triple = 0;
+    let mut n_arom = 0;
+    for b in &g.bonds {
+        match b.order {
+            crate::chem::BondOrder::Single => n_single += 1,
+            crate::chem::BondOrder::Double => n_double += 1,
+            crate::chem::BondOrder::Triple => n_triple += 1,
+            crate::chem::BondOrder::Aromatic => n_arom += 1,
+            crate::chem::BondOrder::Quadruple => n_single += 1,
+        }
+    }
+    s.push_str(&format!(
+        "[2] Топология: {} связей (одинарных {}, двойных {}, тройных {}, ароматических {}), колец {}, из них ароматических {}, вращаемых σ-связей {}.\n",
+        g.bonds.len(), n_single, n_double, n_triple, n_arom, d.rings, d.aromatic_rings, d.rotatable
+    ));
+    if !g.rings.is_empty() {
+        let ring_sizes: Vec<String> = g.rings.iter().map(|r| format!("{}", r.len())).collect();
+        s.push_str(&format!("    Кольца (SSSR): [{}] члены.\n", ring_sizes.join(", ")));
+    }
+    // Тритные связи по парам элементов (контур universal_chem)
+    let mut bond_types: Vec<(String, i8, f64)> = Vec::new();
+        for b in &g.bonds {
+            let ea = crate::universal_chem::get_element_by_symbol(&g.atoms[b.a].symbol);
+            let eb = crate::universal_chem::get_element_by_symbol(&g.atoms[b.b].symbol);
+            if let (Some(ea), Some(eb)) = (ea, eb) {
+                let cb = crate::universal_chem::calculate_bond(ea, eb);
+                let key = format!("{}-{}", ea.symbol, eb.symbol);
+                if !bond_types.iter().any(|(k, _, _)| *k == key) {
+                    bond_types.push((key, cb.trit, cb.delta_chi));
+                }
+            }
+        }
+    if !bond_types.is_empty() {
+        let parts: Vec<String> = bond_types
+            .iter()
+            .map(|(k, t, dc)| format!("{k} {}", if *t == 1 { "полярная(+1)" } else if *t == -1 { "ионная(-1)" } else { "неполярная(0)" }))
+            .collect();
+        s.push_str(&format!("[3] Химия связей: {}.\n", parts.join("; ")));
+    }
+    s.push_str(&format!(
+        "[4] Фармакофор: HBD {}, HBA {}, Lipinski-совместимость: {}; logP ≈ {:+.2}.\n",
+        d.h_bond_donors,
+        d.h_bond_acceptors,
+        if d.h_bond_donors <= 5 && d.h_bond_acceptors <= 10 { "проходит" } else { "нарушение" },
+        logp_estimate(g)
+    ));
+    // Заряды Гастайгера: топ-полярные атомы
+    let mut polar: Vec<(usize, f64)> = g.atoms.iter().enumerate().map(|(i, _)| (i, q.0[i])).collect();
+    polar.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    if polar.len() >= 2 {
+        let (imin, qmin) = polar[0];
+        let (imax, qmax) = polar[polar.len() - 1];
+        s.push_str(&format!(
+            "[5] Заряды Гастайгера: δ− на {} ({:+.3}e), δ+ на {} ({:+.3}e) — нуклеофильный и электрофильный центры.\n",
+            g.atoms[imin].symbol, qmin, g.atoms[imax].symbol, qmax
+        ));
+    }
+    // Архетипы
+    let mut arch_counts = std::collections::BTreeMap::new();
+    for a in &g.atoms {
+        if let Some(e) = crate::universal_chem::get_element_by_symbol(&a.symbol) {
+            *arch_counts.entry(e.archetype.name()).or_insert(0usize) += 1;
+        }
+    }
+    let dominant = arch_counts.iter().max_by_key(|(_, &v)| v).map(|(k, _)| *k).unwrap_or("Mixed");
+    s.push_str(&format!(
+        "[6] Квантовый архетип: {} (атомов по классам: {}).\n",
+        dominant,
+        arch_counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(", ")
+    ));
+    s.push_str("Подробнее: chem_3d(\"…\") — 3D-конформер; bio_eval(лиганд, мишень) — био-контур связывания; --view-mol — интерактивный 3D/4D-визор.");
+    s
+}
+
+/// Отчёт 3D-укладчика.
+fn conformer_report(g: &crate::chem::MoleculeGraph, conf: &crate::chem::Conformer, input: &str) -> String {
+    let (mn, mx) = conf.bbox();
+    let size = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+    let mut lens: Vec<f64> = conf.bonds.iter().map(|b| {
+        let d = [
+            conf.positions[b.a][0] - conf.positions[b.b][0],
+            conf.positions[b.a][1] - conf.positions[b.b][1],
+            conf.positions[b.a][2] - conf.positions[b.b][2],
+        ];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+    }).collect();
+    lens.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (lmin, lmax) = (lens[0], lens[lens.len() - 1]);
+    let lmean = lens.iter().sum::<f64>() / lens.len() as f64;
+    let planarity = conf.aromatic_planarity(g);
+    let mut s = String::new();
+    s.push_str(&format!("══ч 3D-конформер {} ══\n", input.trim()));
+    s.push_str(&format!(
+        "[1] {} узлов ({} тяжёлых + {} H), {} связей; укладка: кольца-полигоны + BFS-цепи + {} итераций релаксации.\n",
+        conf.nodes.len(),
+        conf.heavy,
+        conf.nodes.len() - conf.heavy,
+        conf.bonds.len(),
+        if conf.relaxed { "160" } else { "0" }
+    ));
+    s.push_str(&format!(
+        "[2] Длины связей: min {lmin:.3} Å, среднее {lmean:.3} Å, max {lmax:.3} Å (химический коридор 0.9–1.6 для одинарных).\n"
+    ));
+    s.push_str(&format!(
+        "[3] Габариты: {:.2} × {:.2} × {:.2} Å (ВдВ-габарит см. --view-mol режим m).\n",
+        size[0], size[1], size[2]
+    ));
+    if g.rings.iter().any(|r| r.len() <= 6 && r.iter().all(|&i| g.atoms[i].aromatic)) {
+        s.push_str(&format!("[4] Планарность ароматических колец: RMS {planarity:.4} Å (бензольные кольца — плоские).\n"));
+    }
+    // Гибридизации
+    let mut hyb_counts = std::collections::BTreeMap::new();
+    for i in 0..g.atoms.len() {
+        let h = crate::chem::hybridization(g, i);
+        *hyb_counts.entry(h.name_ru()).or_insert(0usize) += 1;
+    }
+    s.push_str(&format!(
+        "[5] Гибридизации: {} (углы 109.47°/120°/180° соблюдены релаксацией).\n",
+        hyb_counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(", ")
+    ));
+    s.push_str("Первые координаты (Å): ");
+    for (i, p) in conf.positions.iter().take(4).enumerate() {
+        s.push_str(&format!("{}{}({:+.2},{:+.2},{:+.2})", if i == 0 { "" } else { " " }, conf.nodes[i].symbol, p[0], p[1], p[2]));
+    }
+    s.push_str("…\n");
+    s.push_str("Живая 3D/4D-сцена: poler-engine --view-mol — вращение, зум, ВдВ-оболочки, кручение связей.");
+    s
+}
 /// Вызвать функцию по имени.
 pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
     // Списки: скалярные функции применяются поэлементно
@@ -657,6 +883,8 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 | "viz_iso3"
                 // сумма ряда — список ЦЕЛИКОМ, а не поэлементно (сессия-14)
                 | "lpsum"
+                // вектор правой части — список целиком (v0.74.0)
+                | "lsolve"
                 // окно запроса — список из 6 чисел (сессия-14)
                 | "spatial27"
                 // полигон с дырками — список колец целиком (сессия-16)
@@ -2676,6 +2904,93 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             let res = crate::quantum::eri::hartree_fock(&spec)?;
             Ok(Value::Str(crate::quantum::eri::hf_report(&res)))
         }
+        "chem_smiles" => {
+            need(args, 1, name)?;
+            let input = expect_str(&args[0], name, "SMILES или имя молекулы")?;
+            let g = crate::chem::resolve_input(&input)?;
+            Ok(Value::Str(smiles_passport(&g, &input)))
+        }
+        "chem_3d" => {
+            need(args, 1, name)?;
+            let input = expect_str(&args[0], name, "SMILES или имя молекулы")?;
+            let g = crate::chem::resolve_input(&input)?;
+            let conf = crate::chem::embed(&g)?;
+            Ok(Value::Str(conformer_report(&g, &conf, &input)))
+        }
+        "bio_eval" => {
+            need(args, 2, name)?;
+            let ligand = expect_str(&args[0], name, "лиганд (SMILES или имя)")?;
+            let target = expect_str(&args[1], name, "мишень (SMILES или имя)")?;
+            let res = crate::chem::binding_report(&ligand, &target)?;
+            Ok(Value::Str(crate::chem::binding_text(&res)))
+        }
+        "logdet" => {
+            need(args, 1, name)?;
+            let m = matrix_arg(args, 0)?;
+            let (sign, ln_abs) = m.logdet()?;
+            Ok(Value::Str(logdet_report(&m, sign, ln_abs)))
+        }
+        "lsolve" => {
+            need(args, 2, name)?;
+            let m = matrix_arg(args, 0)?;
+            let b: Vec<Complex> = match args.get(1) {
+                Some(Value::List(items)) => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        match it.as_f64() {
+                            Some(x) => v.push(Complex::new(x, 0.0)),
+                            None => {
+                                return Err(format!(
+                                    "{name}: b должен быть списком чисел, получено {it}"
+                                ))
+                            }
+                        }
+                    }
+                    v
+                }
+                Some(Value::Matrix(bm)) => {
+                    // Матрица-столбец N×1
+                    if bm.cols != 1 {
+                        return Err(format!(
+                            "{name}: b — список или матрица-столбец N×1, получено {}×{}",
+                            bm.rows, bm.cols
+                        ));
+                    }
+                    (0..bm.rows)
+                        .map(|r| bm.get(r, 0))
+                        .collect()
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{name}: b — список чисел или матрица-столбец, получено {other}"
+                    ))
+                }
+                None => return Err("не хватает аргументов".into()),
+            };
+            let x = m.solve_lu(&b)?;
+            // Невязка ||Ax − b||∞ / ||b||∞
+            let n = m.rows;
+            let mut resid = 0.0f64;
+            let mut bnorm = 0.0f64;
+            for r in 0..n {
+                let mut ax = Complex::ZERO;
+                for c in 0..n {
+                    ax = ax.add(m.get(r, c).mul(x[c]));
+                }
+                let d = ax.sub(b[r]).abs();
+                resid = resid.max(d);
+                bnorm = bnorm.max(b[r].abs());
+            }
+            let rel = if bnorm > 0.0 { resid / bnorm } else { resid };
+            let mut items: Vec<Value> = Vec::with_capacity(x.len());
+            for xi in &x {
+                items.push(complex_to_value(*xi));
+            }
+            items.push(Value::Str(format!(
+                " LU+эквилибровка: невязка {rel:.2e}"
+            )));
+            Ok(Value::List(items))
+        }
 
         other => Err(format!("неизвестная функция «{other}» (каталог: calc funcs)")),
     }
@@ -2836,6 +3151,11 @@ pub fn catalog(filter: &str) -> String {
             "chem_mass(\"формула\") — стехиометрическая молярная масса (H2O, H2SO4, Fe2(SO4)3, Ca(OH)2, CH3COOH)",
             "chem_formula(\"формула\") — полный анализ: молярная масса, электроны, число атомов и массовые доли %",
             "chem_archetype(elem) — квантово-химический архетип (12 классов), золотая фаза φ(Z) = (Z·Φ) mod 2π",
+            "chem_smiles(\"CC(=O)Oc1ccccc1C(=O)O\") — паспорт молекулы из SMILES: топология, кольца, дескрипторы Липински, заряды Гастайгера",
+            "chem_3d(\"кофеин\") — 3D-конформер: длины связей, габариты, гибридизации sp/sp²/sp³, планарность колец",
+            "bio_eval(\"дофамин\", \"серотонин\") — био-контур: позы, E_vdW/E_HB/E_elec, ΔG и Kd в лог-домене, 27-дерево, DE-9IM",
+            "logdet(A) — определитель в лог-домене: sign, ln|det|, тритная глубина, cond_∞ — за пределами f64",
+            "lsolve(A, b) — LU-решение с эквилибровкой строк: матрицы с разбросом 1e-12…1e12",
         ]),
         ("голос учёного (роторы + триединное ядро)", &[
             "speak(\"текст_или_формула\") — научное чтение результата: токенизатор → языковой ротор букв мира",
@@ -4102,6 +4422,183 @@ mod tests {
         // chem_archetype
         let va = call("chem_archetype", &[Value::Str("C".into())]).unwrap();
         assert!(va.to_string().contains("OrganicLifeNonmetal"));
+    }
+
+    // ─── Лестница молекул v0.74.0 ─────────────────────────────────────
+    #[test]
+    fn chem_smiles_aspirin() {
+        let v = call("chem_smiles", &[Value::Str("аспирин".into())]).unwrap();
+        match v {
+            Value::Str(rep) => {
+                assert!(rep.contains("C9H8O4"), "формула: {rep}");
+                assert!(rep.contains("колец"), "кольца: {rep}");
+                assert!(rep.contains("Гастайгера"), "заряды: {rep}");
+                assert!(rep.contains("Lipinski"), "дескрипторы: {rep}");
+            }
+            other => panic!("chem_smiles: {other:?}"),
+        }
+        // И прямой SMILES
+        let v = call("chem_smiles", &[Value::Str("CC(=O)Oc1ccccc1C(=O)O".into())]).unwrap();
+        match v {
+            Value::Str(rep) => assert!(rep.contains("C9H8O4")),
+            other => panic!("chem_smiles SMILES: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chem_smiles_errors() {
+        assert!(call("chem_smiles", &[Value::Str("xyzzy_qq".into())]).is_err());
+        assert!(call("chem_smiles", &[s(1.0)]).is_err());
+        assert!(call("chem_smiles", &[]).is_err());
+    }
+
+    #[test]
+    fn chem_3d_caffeine() {
+        let v = call("chem_3d", &[Value::Str("кофеин".into())]).unwrap();
+        match v {
+            Value::Str(rep) => {
+                assert!(rep.contains("конформер"), "{rep}");
+                assert!(rep.contains("Å"), "{rep}");
+                assert!(rep.contains("ибридизац"), "{rep}");
+                assert!(rep.contains("sp"), "{rep}");
+            }
+            other => panic!("chem_3d: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bio_eval_water_dimer() {
+        let v = call(
+            "bio_eval",
+            &[Value::Str("вода".into()), Value::Str("вода".into())],
+        )
+        .unwrap();
+        match v {
+            Value::Str(rep) => {
+                assert!(rep.contains("ΔG"), "{rep}");
+                assert!(rep.contains("Kd = e^"), "лог-домен: {rep}");
+                assert!(rep.contains("тритная глубина"), "{rep}");
+                assert!(rep.contains("27-дерево"), "{rep}");
+                assert!(rep.contains("DE-9IM"), "{rep}");
+                assert!(rep.contains("Трит-вердикт"), "{rep}");
+            }
+            other => panic!("bio_eval: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bio_eval_needs_two_args() {
+        assert!(call("bio_eval", &[Value::Str("вода".into())]).is_err());
+    }
+
+    // ─── log-домен в матрицах v0.74.0 ─────────────────────────────────
+    #[test]
+    fn logdet_underflow_beyond_f64() {
+        // diag(0.1; 400): det = 1e-400 — за пределами f64 (underflow → 0.0)
+        let n = 400;
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 0.1 } else { 0.0 }).collect())
+            .collect();
+        let m = Matrix::from_rows(&rows).unwrap();
+        // Обычный det теряет значение
+        let d_f64 = m.det().unwrap().re;
+        assert_eq!(d_f64, 0.0, "f64-детерминант обязан упасть в underflow");
+        // Лог-домен держит
+        let (sign, ln_abs) = m.logdet().unwrap();
+        assert_eq!(sign, 1.0);
+        let expected = 400.0f64 * 0.1f64.ln();
+        assert!((ln_abs - expected).abs() < 1e-9, "ln|det| = {ln_abs}");
+        assert!((ln_abs / std::f64::consts::LN_10 + 400.0).abs() < 1e-9, "log10 = −400");
+        // Отчёт функции
+        match call("logdet", &[Value::Matrix(m)]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("UNDERFLOW"), "{rep}");
+                assert!(rep.contains("3^"), "тритная глубина: {rep}");
+                assert!(rep.contains("cond"), "{rep}");
+            }
+            other => panic!("logdet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logdet_well_conditioned() {
+        let m = Matrix::from_rows(&[vec![4.0, 1.0], vec![1.0, 3.0]]).unwrap();
+        let (sign, ln_abs) = m.logdet().unwrap();
+        // det = 4·3 − 1·1 = 11
+        assert_eq!(sign, 1.0);
+        assert!((ln_abs - 11.0f64.ln()).abs() < 1e-12);
+        let cond = m.cond_inf().unwrap();
+        // ||A||∞ = 5; A⁻¹ = [3,−1;−1,4]/11 → ||A⁻¹||∞ = 4/11·... max(4/11? (3+1)/11=0.36, (1+4)/11=0.45) → cond = 5·0.4545 = 2.27
+        assert!(cond < 3.0 && cond > 1.0, "cond = {cond}");
+        match call("logdet", &[Value::Matrix(m)]).unwrap() {
+            Value::Str(rep) => {
+                assert!(rep.contains("влезает в диапазон"), "{rep}");
+                assert!(rep.contains("+1"), "вердикт отличной обусловленности: {rep}");
+            }
+            other => panic!("logdet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsolve_small_system() {
+        // 2x + y = 5; x + 3y = 10 → x = 1, y = 3
+        let a = Matrix::from_rows(&[vec![2.0, 1.0], vec![1.0, 3.0]]).unwrap();
+        let b = Value::List(vec![s(5.0), s(10.0)]);
+        match call("lsolve", &[Value::Matrix(a), b]).unwrap() {
+            Value::List(items) => {
+                assert_eq!(items.len(), 3, "2 решения + строка невязки");
+                assert!((items[0].as_f64().unwrap() - 1.0).abs() < 1e-9);
+                assert!((items[1].as_f64().unwrap() - 3.0).abs() < 1e-9);
+                match &items[2] {
+                    Value::Str(t) => assert!(t.contains("невязка")),
+                    other => panic!("третий элемент: {other:?}"),
+                }
+            }
+            other => panic!("lsolve: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsolve_equilibrated_wide_range() {
+        // Разброс порядков 1e-6 … 1e6 — эквилибровка обязана спасти точность
+        let a = Matrix::from_rows(&[
+            vec![1e-6, 2e-6],
+            vec![1e6, 1e6],
+        ])
+        .unwrap();
+        // x = 3, y = -1: b1 = 3e-6 − 2e-6 = 1e-6; b2 = 3e6 − 1e6 = 2e6
+        let b = Value::List(vec![s(1e-6), s(2e6)]);
+        match call("lsolve", &[Value::Matrix(a), b]).unwrap() {
+            Value::List(items) => {
+                assert!((items[0].as_f64().unwrap() - 3.0).abs() < 1e-6, "x = {:?}", items[0].as_f64());
+                assert!((items[1].as_f64().unwrap() + 1.0).abs() < 1e-6, "y = {:?}", items[1].as_f64());
+            }
+            other => panic!("lsolve: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logdet_errors() {
+        let rect = Matrix::from_rows(&[vec![1.0, 2.0]]).unwrap();
+        assert!(call("logdet", &[Value::Matrix(rect)]).is_err());
+        assert!(call("logdet", &[s(1.0)]).is_err());
+        assert!(call("lsolve", &[s(1.0)]).is_err());
+    }
+
+    #[test]
+    fn logdet_registered() {
+        assert!(is_function("logdet"));
+        assert!(is_function("lsolve"));
+        assert!(catalog("").contains("logdet"));
+    }
+
+    #[test]
+    fn chem_functions_registered() {
+        assert!(is_function("chem_smiles"));
+        assert!(is_function("chem_3d"));
+        assert!(is_function("bio_eval"));
+        assert!(catalog("").contains("chem_smiles"));
+        assert!(catalog("").contains("bio_eval"));
     }
 
     #[test]

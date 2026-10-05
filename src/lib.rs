@@ -133,6 +133,7 @@ pub mod winpe {
     }
 }
 pub mod universal_letters;
+pub mod chem;
 pub mod universal_chem;
 pub mod universal_chem_asm;
 /// FFI-мост к No-Mul .s-роторам (буквы мира + химия), собираемым build.rs

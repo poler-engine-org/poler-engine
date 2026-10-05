@@ -2603,6 +2603,59 @@ impl McpServer {
                 })
                 .to_string())
             }
+            "molecule" => {
+                // v0.74.0: паспорт молекулы из SMILES/имени (лестница молекул)
+                let g = crate::chem::resolve_input(text)?;
+                let d = crate::chem::descriptors(&g);
+                Ok(json!({
+                    "voice": "scivoice",
+                    "mode": "molecule",
+                    "input": text,
+                    "formula": g.hill_formula(),
+                    "heavy_atoms": g.atoms.len(),
+                    "total_atoms": d.total_atoms,
+                    "charge": g.total_charge(),
+                    "rings": d.rings,
+                    "aromatic_rings": d.aromatic_rings,
+                    "rotatable_bonds": d.rotatable,
+                    "h_bond_donors": d.h_bond_donors,
+                    "h_bond_acceptors": d.h_bond_acceptors,
+                    "logp_estimate": crate::chem::logp_estimate(&g),
+                    "ring_sizes": g.rings.iter().map(|r| r.len()).collect::<Vec<_>>(),
+                    "reading": crate::calc::functions::smiles_passport(&g, text)
+                })
+                .to_string())
+            }
+            "bio" => {
+                // v0.74.0: био-контур связывания лиганд ⇄ мишень
+                let target = args
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .ok_or("режим bio требует аргумент target: {\"text\": \"дофамин\", \"target\": \"серотонин\"}")?;
+                let res = crate::chem::binding_report(text, target)?;
+                Ok(json!({
+                    "voice": "scivoice",
+                    "mode": "bio",
+                    "ligand": res.ligand_formula,
+                    "target": res.target_formula,
+                    "delta_g_kj_mol": res.delta_g,
+                    "e_vdw_kj_mol": res.e_vdw,
+                    "e_hbond_kj_mol": res.e_hbond,
+                    "e_elec_kj_mol": res.e_elec,
+                    "entropy_kj_mol": res.e_entropy,
+                    "ln_kd": res.ln_kd,
+                    "log10_kd": res.log10_kd,
+                    "trit_depth_kd": res.trit_depth,
+                    "contacts": res.contacts,
+                    "hbonds": res.hbonds,
+                    "de9im_pattern": res.de9im_pattern,
+                    "de9im_verdict": res.de9im_verdict,
+                    "tree27": {"objects": res.tree27.0, "nodes": res.tree27.1, "height": res.tree27.2},
+                    "trit_verdict": res.trit_verdict,
+                    "reading": crate::chem::binding_text(&res)
+                })
+                .to_string())
+            }
             _ => Ok(json!({
                 "voice": "scivoice",
                 "mode": "read",
@@ -3597,20 +3650,22 @@ unitary (U†U = I), equivalence (две схемы, до глобальной �
         }),
         json!({
             "name": "poler_scivoice",
-            "description": "ГОЛОС УЧЁНОГО (v0.73.0): тот же научный речевой контур, что слышит \
+            "description": "ГОЛОС УЧЁНОГО (v0.74.0): тот же научный речевой контур, что слышит \
 пользователь из calc speak — токенизатор → роторы 104k строк No-Mul x86_64 ASM \
 (языки мира + 118 химических элементов) → триединое ядро → трит-вердикт {-1,0,+1}. \
-Формулы из STO-3G-библиотеки (H2, He, LiH) озвучиваются с секцией ab initio — \
-настоящий Хартри–Фок из POLER-ERI (E_total в Хартри, энергии МО, SCF-итерации; \
-эталоны: E(H2)=-1.116664 Ha, E(He)=-2.807844 Ha). mode=\"read\" — научное чтение \
-текста/формулы; mode=\"hf\" — прямой RHF-расчёт с машиночитаемым JSON. \
+mode=\"read\" — научное чтение текста/формулы; mode=\"hf\" — прямой RHF/STO-3G \
+расчёт (второй период B–Ne: H2, He, LiH, H2O, NH3, CH4, HF, CO; эталоны PySCF \
+до 1e-6 Ha); mode=\"molecule\" — паспорт молекулы из SMILES/имени (кольца, \
+дескрипторы Липински, заряды Гастайгера); mode=\"bio\" — био-контур связывания \
+лиганд⇄мишень (ΔG, Kd в лог-домене с тритной глубиной, 27-дерево, DE-9IM). \
 Примеры: {\"text\":\"C6H12O6\",\"mode\":\"read\"}; {\"text\":\"H2\",\"mode\":\"hf\"}; \
-{\"text\":\"LiH@3.0\",\"mode\":\"hf\"}.",
+{\"text\":\"кофеин\",\"mode\":\"molecule\"}; {\"text\":\"дофамин\",\"target\":\"серотонин\",\"mode\":\"bio\"}.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "текст, формула или молекула (H2, He, LiH, LiH@3.0)"},
-                    "mode": {"type": "string", "enum": ["read", "hf"], "default": "read", "description": "read — научное чтение; hf — прямой RHF/STO-3G расчёт"}
+                    "text": {"type": "string", "description": "текст, формула, SMILES или имя молекулы (кофеин, аспирин, дофамин…)"},
+                    "target": {"type": "string", "description": "мишень для режима bio (SMILES или имя)"},
+                    "mode": {"type": "string", "enum": ["read", "hf", "molecule", "bio"], "default": "read", "description": "read — научное чтение; hf — RHF/STO-3G; molecule — паспорт SMILES; bio — связывание"}
                 },
                 "required": ["text"]
             }
@@ -5693,6 +5748,64 @@ mod scivoice_tool_tests {
     }
 
     #[test]
+    fn molecule_mode_passport() {
+        let v = call(&server(), json!({"text": "кофеин", "mode": "molecule"}));
+        assert_eq!(v["formula"].as_str().unwrap(), "C8H10N4O2");
+        assert_eq!(v["heavy_atoms"].as_i64().unwrap(), 14);
+        assert_eq!(v["aromatic_rings"].as_i64().unwrap(), 0, "кекulé-форма: кольца не помечены");
+        assert_eq!(v["rings"].as_i64().unwrap(), 2);
+        assert_eq!(v["h_bond_acceptors"].as_i64().unwrap(), 6);
+        assert_eq!(v["h_bond_donors"].as_i64().unwrap(), 0);
+        let reading = v["reading"].as_str().unwrap();
+        assert!(reading.contains("C8H10N4O2"));
+    }
+
+    #[test]
+    fn molecule_mode_smiles_direct() {
+        let v = call(
+            &server(),
+            json!({"text": "CC(=O)Oc1ccccc1C(=O)O", "mode": "molecule"}),
+        );
+        assert_eq!(v["formula"].as_str().unwrap(), "C9H8O4");
+        assert_eq!(v["rings"].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn bio_mode_binding_report() {
+        let v = call(
+            &server(),
+            json!({"text": "вода", "target": "вода", "mode": "bio"}),
+        );
+        assert!(v["delta_g_kj_mol"].is_f64());
+        assert!(v["ln_kd"].is_f64());
+        assert!(v["log10_kd"].is_f64());
+        assert!(v["trit_depth_kd"].is_f64());
+        assert!(v["tree27"]["objects"].is_i64());
+        assert!(v["de9im_pattern"].is_string());
+        assert_eq!(v["trit_verdict"].as_i64().unwrap_or(99) == 99, false);
+        let reading = v["reading"].as_str().unwrap();
+        assert!(reading.contains("ΔG"));
+        assert!(reading.contains("Трит-вердикт"));
+    }
+
+    #[test]
+    fn bio_mode_requires_target() {
+        // Ошибка инструмента — JSON-RPC result с isError (текст не JSON)
+        let r = server()
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "poler_scivoice", "arguments": {"text": "вода", "mode": "bio"}}
+            }))
+            .expect("dispatch");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .expect("text есть");
+        assert!(text.contains("ошибка"), "без target — ошибка: {text}");
+        assert_eq!(r.pointer("/result/isError").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
     fn read_mode_speaks_like_scientist() {
         let v = call(&server(), json!({"text": "C6H12O6", "mode": "read"}));
         let reading = v["reading"].as_str().expect("reading есть");
@@ -5709,14 +5822,14 @@ mod scivoice_tool_tests {
             reading.contains("Ab initio RHF/STO-3G"),
             "H2 обязан говорить Хартри–Фоком: {reading}"
         );
-        assert!(reading.contains("-1.116664"));
+        assert!(reading.contains("-1.116714"), "E(H2) после PySCF-сверки: {reading}");
     }
 
     #[test]
     fn hf_mode_returns_machine_readable_json() {
         let v = call(&server(), json!({"text": "H2", "mode": "hf"}));
         let e = v["energy_hartree"].as_f64().expect("energy_hartree есть");
-        assert!((e - (-1.116664)).abs() < 3e-4, "E(H2) = {e}");
+        assert!((e - (-1.116714)).abs() < 3e-4, "E(H2) = {e}");
         assert_eq!(v["n_basis"], json!(2));
         assert_eq!(v["scf_converged"], json!(true));
         let occ = v["occupied_orbital_energies_hartree"]
@@ -5729,7 +5842,7 @@ mod scivoice_tool_tests {
     fn hf_mode_lih_full() {
         let v = call(&server(), json!({"text": "LiH@3.0", "mode": "hf"}));
         let e = v["energy_hartree"].as_f64().expect("energy_hartree есть");
-        assert!((e - (-7.810054)).abs() < 2e-3, "E(LiH) = {e}");
+        assert!((e - (-7.862246)).abs() < 2e-3, "E(LiH) = {e}");
         assert_eq!(v["n_basis"], json!(6));
     }
 

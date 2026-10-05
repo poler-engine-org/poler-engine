@@ -13,10 +13,28 @@
 //! * **Kinetic** — the exact operator identity
 //!   `∇²φ_b = [4β²|r−B|² − (6+4Σb_d)β] φ_b + Σ_d b_d(b_d−1) φ_{b−2e_d}`,
 //!   which reduces T entirely to overlap integrals.
-//! * **Nuclear** — binomial expansion + the Hermite derivative trick
-//!   `(x−P) e^{−p(r−P)²} = (1/(2p)) ∂_P e^{−p(r−P)²}`, with the derivatives
-//!   of the Boys seed Φ(P) = (2π/p) F₀(p|P−C|²) applied through the exact
-//!   structural rule `∂_x [x^m F_j] = m x^{m−1} F_j − 2p x^{m+1} F_{j+1}`.
+//!
+//! # AUDIT (v3.3.0 — «медицинская находка» v0.74.0)
+//!
+//! The v3.2.0-d nuclear attraction used a **naive raw-power Hermite trick**:
+//! `(x−P) e^{−p(r−P)²} = (1/(2p)) ∂_P e^{…}` raised to power k for the moment
+//! `(x−P)^k`. That identity is only valid to FIRST order: differentiating
+//! twice brings a product-rule term (`∂²_P e = 4p²(x−P)² e − 2p e`), so the
+//! pure `(1/(2p))^k ∂^k_P` dictionary silently drops the `−2p·e` part.
+//! Symptom: V(p,p) came out **positive** (+4.43 Ha for O 2p in H2O where the
+//! truth is −10.14 Ha) — every molecule with occupied p orbitals was
+//! catastrophically wrong (H2O: −44.09 vs −74.96 Ha; HF: −26.7 vs −98.6 Ha),
+//! while pure-s systems (H2, He) matched PySCF to 12 digits. The LiH test of
+//! v0.73.0 had locked in the bug (−7.810054 instead of −7.862246).
+//!
+//! **Fix**: proper McMurchie–Davidson expansion in Hermite Gaussians
+//! `D_t = ∂^t_u [e^{−p u²}]`, whose multiplication rule
+//! `u·D_t = −D_{t+1}/(2p) − t·D_{t−1}`
+//! generates the E-coefficient recursion
+//! `E'[s] = X·E[s] − E[s−1]/(2p) − (s+1)·E[s+1]`, and the Coulomb auxiliary
+//! integrals `R_{tuv} = (−1)^{t+u+v} ∂^t_x ∂^u_y ∂^v_z [F₀(p|P−C|²)]`.
+//! Analytic proof case ⟨px|−Z/|r−C||px⟩ at one center: naive → +Zπ/(3p²),
+//! MD → −2πZ/(3p²) = exact spherical result.
 //!
 //! All three reproduce the proven s-type seeds (`overlap_ss`, `kinetic_ss`,
 //! `nuclear_ss`) exactly when a = b = (0,0,0).
@@ -194,8 +212,58 @@ fn boys_derivative(kx: usize, ky: usize, kz: usize, p: f64) -> Vec<BoysTerm> {
     terms
 }
 
-/// Primitive Cartesian nuclear attraction:
+/// McMurchie–Davidson E-coefficients for one dimension.
+///
+/// Expands `(u+X_PA)^i (u+X_PB)^j e^{−p u²}` in the Hermite-Gaussian basis
+/// `D_t = ∂^t_u [e^{−p u²}]` via the multiplication rule
+/// `u·D_t = −D_{t+1}/(2p) − t·D_{t−1}`, which yields the shift recursion.
+/// Returns E[0..=i+j] (impossible t are exactly 0).
+fn md_e_coeffs(i: usize, j: usize, p: f64, x_pa: f64, x_pb: f64) -> Vec<f64> {
+    let mut e: Vec<f64> = vec![1.0]; // (i=0, j=0): Λ = e^{−pu²} = D_0
+    for _ in 0..i {
+        e = md_shift(e, x_pa, p);
+    }
+    for _ in 0..j {
+        e = md_shift(e, x_pb, p);
+    }
+    e
+}
+
+/// One MD shift: multiply Λ = Σ E[t]·D_t by (u + X).
+///
+/// From `(u+X)·D_s = X·D_s − D_{s+1}/(2p) − s·D_{s−1}`:
+/// the contribution of E[s] lands on out[s] (X·E[s]), out[s+1] (−E[s]/(2p))
+/// and out[s−1] (−s·E[s]).
+fn md_shift(e: Vec<f64>, x: f64, p: f64) -> Vec<f64> {
+    let n = e.len();
+    let mut out = vec![0.0f64; n + 1];
+    for (s, val) in e.iter().enumerate() {
+        if *val == 0.0 {
+            continue;
+        }
+        out[s] += x * val;
+        out[s + 1] -= val / (2.0 * p);
+        if s > 0 {
+            out[s - 1] -= s as f64 * val;
+        }
+    }
+    out
+}
+
+/// Primitive Cartesian nuclear attraction (McMurchie–Davidson, v3.3.0):
 /// `−Z_C ∫ (poly) e^{−α r_A² − β r_B²} / |r − C| d³r`.
+///
+/// V = −Z·K_AB·(2π/p)·Σ_{tuv} E^t_{i_x j_x} E^u E^v · R_{tuv},
+/// R_{tuv} = (−1)^{t+u+v} ∂^t_x ∂^u_y ∂^v_z [F₀(p|P−C|²)].
+///
+/// v3.3.0 FIX: прежняя версия раскладывала полином в сырые степени (x−P)^k
+/// и применяла (1/(2p))^k·∂^k — тождество (x−P)e = (1/(2p))∂e верно только
+/// в первом порядке; со второго порядка product rule даёт член −2p·e, который
+/// наивная формула теряет. Симптом: V(p,p) выходил ПОЛОЖИТЕЛЬНЫМ (+4.43 Ha
+/// для O 2p в H2O, истина −10.14 Ha), все молекулы с занятыми p-оболочками
+/// были катастрофически неверны (H2O: −44.09 против −74.96 Ha), а LiH-тест
+/// v0.73.0 зафиксировал баг (−7.810054 вместо −7.862246). Проверено против
+/// PySCF 2.14: H2O/NH3/CH4/HF/CO сходятся до ~1e-9 Ha.
 pub fn nuclear_cartesian(
     ra: &Point,
     rb: &Point,
@@ -207,7 +275,7 @@ pub fn nuclear_cartesian(
     b: [usize; 3],
 ) -> f64 {
     let p = alpha + beta;
-    let rab2 = ra.dist2(rb);
+    let rab2 = ra.dist2(&rb);
     let kab = libm::exp(-alpha * beta * rab2 / p);
     let pc = product_center(ra, rb, alpha, beta);
     let x = pc[0] - rc.0[0];
@@ -215,52 +283,36 @@ pub fn nuclear_cartesian(
     let z = pc[2] - rc.0[2];
     let t_arg = p * (x * x + y * y + z * z);
 
-    // Accumulate over the per-dimension binomial expansions.
+    // E-коэффициенты по каждой оси (Hermite-разложение полинома пары).
+    let ex = md_e_coeffs(a[0], b[0], p, pc[0] - ra.0[0], pc[0] - rb.0[0]);
+    let ey = md_e_coeffs(a[1], b[1], p, pc[1] - ra.0[1], pc[1] - rb.0[1]);
+    let ez = md_e_coeffs(a[2], b[2], p, pc[2] - ra.0[2], pc[2] - rb.0[2]);
+
+    // Σ_{tuv} E^t E^u E^v · (−1)^{t+u+v} · ∂^{t+u+v}[F₀]
     let mut total = 0.0f64;
-    for i0 in 0..=a[0] {
-        for j0 in 0..=b[0] {
-            let w0 = binom(a[0], i0)
-                * binom(b[0], j0)
-                * ipow(pc[0] - ra.0[0], a[0] - i0)
-                * ipow(pc[0] - rb.0[0], b[0] - j0);
-            if w0 == 0.0 {
+    for (t, e_t) in ex.iter().enumerate() {
+        if *e_t == 0.0 {
+            continue;
+        }
+        for (u, e_u) in ey.iter().enumerate() {
+            if *e_u == 0.0 {
                 continue;
             }
-            for i1 in 0..=a[1] {
-                for j1 in 0..=b[1] {
-                    let w1 = binom(a[1], i1)
-                        * binom(b[1], j1)
-                        * ipow(pc[1] - ra.0[1], a[1] - i1)
-                        * ipow(pc[1] - rb.0[1], b[1] - j1);
-                    if w1 == 0.0 {
-                        continue;
-                    }
-                    for i2 in 0..=a[2] {
-                        for j2 in 0..=b[2] {
-                            let w2 = binom(a[2], i2)
-                                * binom(b[2], j2)
-                                * ipow(pc[2] - ra.0[2], a[2] - i2)
-                                * ipow(pc[2] - rb.0[2], b[2] - j2);
-                            if w2 == 0.0 {
-                                continue;
-                            }
-                            let kx = i0 + j0;
-                            let ky = i1 + j1;
-                            let kz = i2 + j2;
-                            let k_all = kx + ky + kz;
-                            let hermite_pref = ipow(1.0 / (2.0 * p), k_all);
-                            let mut val = 0.0f64;
-                            for t in &boys_derivative(kx, ky, kz, p) {
-                                val += t.c
-                                    * ipow(x, t.mx)
-                                    * ipow(y, t.my)
-                                    * ipow(z, t.mz)
-                                    * boys_f(t.j, t_arg);
-                            }
-                            total += w0 * w1 * w2 * hermite_pref * val;
-                        }
-                    }
+            for (v, e_v) in ez.iter().enumerate() {
+                if *e_v == 0.0 {
+                    continue;
                 }
+                let k_all = t + u + v;
+                let sign = if k_all % 2 == 0 { 1.0 } else { -1.0 };
+                let mut val = 0.0f64;
+                for term in &boys_derivative(t, u, v, p) {
+                    val += term.c
+                        * ipow(x, term.mx)
+                        * ipow(y, term.my)
+                        * ipow(z, term.mz)
+                        * boys_f(term.j, t_arg);
+                }
+                total += e_t * e_u * e_v * sign * val;
             }
         }
     }

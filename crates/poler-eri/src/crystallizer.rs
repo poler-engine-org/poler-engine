@@ -46,7 +46,7 @@
 //!
 //! For a non-trivial quartet, the crystallizer produces code like:
 //!
-//! ```rust
+//! ```rust,ignore
 //! const N_OPERANDS: usize = 22;
 //! const N_PREFACTORS: usize = 7;
 //!
