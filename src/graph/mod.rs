@@ -2,6 +2,7 @@
 //! коннектом FLYCSR1 (мозг мухи FlyWire v783) как матрица A.
 
 pub mod causal_linker;
+pub mod chem_kernel;
 pub mod connectome;
 pub mod entity_graph;
 pub mod flyops;

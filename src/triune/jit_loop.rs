@@ -82,10 +82,20 @@ pub struct ExecutableKernel {
 impl ExecutableKernel {
     /// Завантажити машинні байти на виконувану сторінку.
     pub fn load(code: &[u8]) -> Result<Self, String> {
+        Self::load_with_tail(code, 0)
+    }
+
+    /// Код + хвостовий блоб даних (WeightsInCode: таблиці вшиті в
+    /// виконувану сторінку після `ret`); хвіст — читабельні дані.
+    pub fn load_with_tail(code: &[u8], code_len: usize) -> Result<Self, String> {
         if code.is_empty() {
             return Err("пустий машинный код".into());
         }
-        if code[code.len() - 1] != 0xC3 {
+        let eff = if code_len == 0 { code.len() } else { code_len };
+        if eff > code.len() {
+            return Err(format!("code_len {eff} поза межами {}", code.len()));
+        }
+        if code[eff - 1] != 0xC3 {
             return Err("машинный код не заканчивается ret (0xC3)".into());
         }
         let page = page_size();
@@ -104,7 +114,7 @@ impl ExecutableKernel {
         if rc != 0 {
             return Err(format!("mprotect RX: {}", std::io::Error::last_os_error()));
         }
-        Ok(Self { mem, code_len: code.len() })
+        Ok(Self { mem, code_len: eff })
     }
 
     /// Довжина машинного коду в байтах (без паддінгу сторінки).
@@ -124,6 +134,16 @@ impl ExecutableKernel {
     /// (залежить від того, як згенеровано код).
     pub unsafe fn call_raw(&self, x: *const f32, y: *mut f32) {
         let f: MatvecFn = std::mem::transmute(self.mem.as_ptr());
+        f(x, y);
+    }
+
+    /// Прямий виклик для f64-ядер (хімія: A3): ABI `fn(*const f64, *mut f64)`.
+    ///
+    /// ## Safety
+    /// Викликаний код має дотримуватись ABI і не зберігати callee-saved
+    /// регістри поза власною рамкою.
+    pub unsafe fn call_raw_f64(&self, x: *const f64, y: *mut f64) {
+        let f: unsafe extern "C" fn(*const f64, *mut f64) = std::mem::transmute(self.mem.as_ptr());
         f(x, y);
     }
 
