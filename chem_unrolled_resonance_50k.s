@@ -15,6 +15,8 @@ poler_chem_rotor_unrolled_resonance_50k:
     push r13
     push r14
     push r15
+    xorps xmm1, xmm1
+    xorps xmm3, xmm3
 
     # -------------------------------------------------------------
     # ELEMENT [Z=001] H (Hydrogen) | Archetype: OrganicLifeNonmetal
@@ -52484,6 +52486,10 @@ poler_chem_rotor_unrolled_resonance_50k:
     cmovg ebx, eax
     mov [rsi + 468], ebx
 
+    # Epilogue: збереження фазових акумуляторів ротора у вихідний буфер
+    # [rsi+4088] = фазова сума архетипів, [rsi+4092] = Δχ-баланс пар
+    movss dword ptr [rsi+4088], xmm1
+    movss dword ptr [rsi+4092], xmm3
     # Epilogue
     pop r15
     pop r14

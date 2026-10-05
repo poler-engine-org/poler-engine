@@ -1,7 +1,14 @@
-// build.rs — M4: сборка Zig-криптоядра (os/core) для фичи `pnd-ffi`.
+// build.rs — M4: сборка Zig-криптоядра (os/core) для фичи `pnd-ffi`
+//          + M5: компиляция No-Mul роторов (буквы мира + химия) в libpoler_rotors.a.
 //
-// Без фичи pnd-ffi скрипт — полный no-op: обычная сборка движка
+// Без фичи pnd-ffi Zig-часть — полный no-op: обычная сборка движка
 // не требует Zig-тулчейна (как и до M4).
+//
+// Роторы собираются всегда, когда в системе есть `as` (GNU binutils):
+// два .s-монолита из корня репо → OUT_DIR/*.o → libpoler_rotors.a →
+// статическая линковка + cfg(asm_rotors). Если `as`/`ar` недоступны
+// (нетрадиционная платформа/кросс-компиляция) — движок деградирует
+// на чисто-Rust путь с идентичной семантикой (универсальность важнее скорости).
 //
 // С фичей pnd-ffi порядок разрешения окружения:
 //   1. POLER_CORE_LIB=... — готовая директория с libpoler_core.a
@@ -41,6 +48,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=POLER_CORE_LIB");
     println!("cargo:rerun-if-env-changed=POLER_ZIG");
 
+    build_asm_rotors();
+
     if env::var_os("CARGO_FEATURE_PND_FFI").is_none() {
         return; // фича выключена — нулевые требования к окружению
     }
@@ -67,4 +76,74 @@ fn main() {
 
     println!("cargo:rustc-link-search=native=os/core/zig-out/lib");
     println!("cargo:rustc-link-lib=static=poler_core");
+}
+
+/// M5: No-Mul роторы — две .s-страницы → libpoler_rotors.a → статическая линковка.
+/// При отсутствии `as`/`ar` молча деградирует на Rust-фолбэк (без cfg).
+fn build_asm_rotors() {
+    let rotors = [
+        "archetype_unrolled_resonance_50k.s",
+        "chem_unrolled_resonance_50k.s",
+    ];
+    println!("cargo:rerun-if-changed=archetype_unrolled_resonance_50k.s");
+    println!("cargo:rerun-if-changed=chem_unrolled_resonance_50k.s");
+
+    let out_dir = match env::var_os("OUT_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => return,
+    };
+    let manifest = match env::var_os("CARGO_MANIFEST_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => return,
+    };
+
+    // Целевая платформа: роторы — чистый x86_64; на иных таргетах — Rust-фолбэк.
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_x86_64 = target.contains("x86_64") || target.starts_with("x86_64");
+    let is_host_build = env::var("HOST").map(|h| h == target).unwrap_or(true);
+    if !is_x86_64 {
+        println!("cargo:warning=роторы .s — только x86_64 (TARGET={target}); використовується Rust-фолбэк");
+        return;
+    }
+    let _ = is_host_build; // `as` не знает таргет-префикс — для нативной x86_64 сборки этого достаточно
+
+    let mut objs: Vec<PathBuf> = Vec::with_capacity(rotors.len());
+    for rel in rotors {
+        let src = manifest.join(rel);
+        if !src.is_file() {
+            println!("cargo:warning=ротор не найден: {} — Rust-фолбэк", src.display());
+            return;
+        }
+        let obj = out_dir.join(rel).with_extension("o");
+        let status = Command::new("as")
+            .arg(&src)
+            .arg("-o")
+            .arg(&obj)
+            .status();
+        match status {
+            Ok(st) if st.success() => objs.push(obj),
+            _ => {
+                println!("cargo:warning=`as` не зібрав {rel} — Rust-фолббек");
+                return;
+            }
+        }
+    }
+
+    let lib = out_dir.join("libpoler_rotors.a");
+    let mut cmd = Command::new("ar");
+    cmd.arg("crs").arg(&lib);
+    for o in &objs {
+        cmd.arg(o);
+    }
+    match cmd.status() {
+        Ok(st) if st.success() => {}
+        _ => {
+            println!("cargo:warning=`ar` не зібрав libpoler_rotors.a — Rust-фолббек");
+            return;
+        }
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=poler_rotors");
+    println!("cargo:rustc-cfg=asm_rotors");
 }

@@ -620,6 +620,8 @@ def generate_rust_chem_asm_module():
 //! 2. Генерує розгорнуті асемблерні блоки (Unrolled Jump Tables & Direct Register Flow)
 //!    без жодних циклів і множень (No-Mul, addss, subss, cmov, movd, test, lea).
 //! 3. Потоково записує 50 000+ рядків прямо на диск за мілісекунди.
+//! 4. Пролог обнуляє фазові акумулятори (xorps), епілог повертає їх у вихідний
+//!    буфер: [rsi+4088] = фазова сума архетипів, [rsi+4092] = Δχ-баланс пар.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -672,6 +674,9 @@ impl ChemArchetypeAsmGenerator {
         emit!("    push r13");
         emit!("    push r14");
         emit!("    push r15");
+        // Обнулення фазових акумуляторів ротора (без цього накопичується сміття регістрів)
+        emit!("    xorps xmm1, xmm1");
+        emit!("    xorps xmm3, xmm3");
 
         // Генерація розгорнутих блоків для всіх 118 елементів
         for (idx, elem) in PERIODIC_TABLE.iter().enumerate() {
@@ -744,6 +749,10 @@ impl ChemArchetypeAsmGenerator {
         }
 
         emit!("");
+        emit!("    # Epilogue: збереження фазових акумуляторів ротора у вихідний буфер");
+        emit!("    # [rsi+4088] = фазова сума архетипів, [rsi+4092] = Δχ-баланс пар");
+        emit!("    movss dword ptr [rsi+4088], xmm1");
+        emit!("    movss dword ptr [rsi+4092], xmm3");
         emit!("    # Epilogue");
         emit!("    pop r15");
         emit!("    pop r14");
@@ -798,6 +807,9 @@ def generate_asm_file_direct(path, min_lines=52000):
         emit("    push r13")
         emit("    push r14")
         emit("    push r15")
+        # Обнулення фазових акумуляторів ротора (без цього накопичується сміття регістрів)
+        emit("    xorps xmm1, xmm1")
+        emit("    xorps xmm3, xmm3")
 
         for idx, elem in enumerate(RAW_ELEMENTS):
             z, sym, name, name_ru, mass, en, grp, per, blk, rcov, rvdw, ie, ec, arch = elem
@@ -861,6 +873,10 @@ def generate_asm_file_direct(path, min_lines=52000):
                 emit(f"    mov [rsi + {(pair_idx * 4) % 4096}], ebx")
 
         emit()
+        emit("    # Epilogue: збереження фазових акумуляторів ротора у вихідний буфер")
+        emit("    # [rsi+4088] = фазова сума архетипів, [rsi+4092] = Δχ-баланс пар")
+        emit("    movss dword ptr [rsi+4088], xmm1")
+        emit("    movss dword ptr [rsi+4092], xmm3")
         emit("    # Epilogue")
         emit("    pop r15")
         emit("    pop r14")

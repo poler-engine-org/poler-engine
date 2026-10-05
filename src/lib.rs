@@ -135,6 +135,10 @@ pub mod winpe {
 pub mod universal_letters;
 pub mod universal_chem;
 pub mod universal_chem_asm;
+/// FFI-мост к No-Mul .s-роторам (буквы мира + химия), собираемым build.rs
+pub mod asm_rotors;
+/// Голос учёного: токенизатор → роторы → химия → триединое ядро
+pub mod scivoice;
 
 /// E1/v0.31.0: идеальный исполнитель команд — Zig-ядро
 /// (os/core/poler_exec.zig, raw-syscall слой) + безопасная обвязка.

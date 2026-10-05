@@ -632,6 +632,8 @@ pub fn is_function(name: &str) -> bool {
         | "planet_lon" | "planet_dist" | "sunrise" | "sunset"
         // квантовая химия (118 элементов, архетипы, тритные связи, формулы)
         | "chem_elem" | "chem_bond" | "chem_mass" | "chem_formula" | "chem_archetype"
+        // голос учёного (сессия-18): роторы + триединое ядро
+        | "speak"
         // геодезия/навигация
         | "dist" | "bearing" | "midpoint" | "dest" | "earth_radius"
     )
@@ -2634,6 +2636,16 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
                 elem.symbol, elem.name, elem.archetype.name(), elem.archetype.description(), elem.phase_phi
             )))
         }
+        "speak" => {
+            need(args, 1, name)?;
+            let text = match &args[0] {
+                Value::Str(s) => s.clone(),
+                other => return Err(format!(
+                    "{name}: ожидался текст или формула (строка), получено {other}"
+                )),
+            };
+            Ok(Value::Str(crate::scivoice::scientist_read(&text)))
+        }
 
         other => Err(format!("неизвестная функция «{other}» (каталог: calc funcs)")),
     }
@@ -2794,6 +2806,11 @@ pub fn catalog(filter: &str) -> String {
             "chem_mass(\"формула\") — стехиометрическая молярная масса (H2O, H2SO4, Fe2(SO4)3, Ca(OH)2, CH3COOH)",
             "chem_formula(\"формула\") — полный анализ: молярная масса, электроны, число атомов и массовые доли %",
             "chem_archetype(elem) — квантово-химический архетип (12 классов), золотая фаза φ(Z) = (Z·Φ) mod 2π",
+        ]),
+        ("голос учёного (роторы + триединное ядро)", &[
+            "speak(\"текст_или_формула\") — научное чтение результата: токенизатор → языковой ротор букв мира",
+            "(104k строк No-Mul ASM) → химротор 118 элементов → триединое ядро; трит-вердикт {-1,0,+1}",
+            "примеры: speak(\"C6H12O6\") · speak(\"H2O\") · speak(\"энергия резонанса фазы\")",
         ]),
     ];
     let mut out = String::new();
@@ -4049,6 +4066,23 @@ mod tests {
         // chem_archetype
         let va = call("chem_archetype", &[Value::Str("C".into())]).unwrap();
         assert!(va.to_string().contains("OrganicLifeNonmetal"));
+    }
+
+    #[test]
+    fn speak_scientist_voice() {
+        // Глюкоза: полный контур — стехиометрия + связи + роторы + ядро
+        let v = call("speak", &[Value::Str("C6H12O6".into())]).unwrap();
+        let text = v.to_string();
+        assert!(text.contains("180"), "молярная масса обязана быть в фразе: {text}");
+        assert!(text.contains("Трит-вердикт"));
+        assert!(text.contains("ротор"), "контур роторов обязателен: {text}");
+
+        // Проза без формулы — языковой контур без химии
+        let v2 = call("speak", &[Value::Str("резонанс фазы".into())]).unwrap();
+        assert!(v2.to_string().contains("Языковой контур"));
+
+        // Не-строка — внятная ошибка
+        assert!(call("speak", &[s(1.0)]).is_err());
     }
 }
 
