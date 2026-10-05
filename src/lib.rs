@@ -133,6 +133,8 @@ pub mod winpe {
     }
 }
 pub mod universal_letters;
+pub mod universal_chem;
+pub mod universal_chem_asm;
 
 /// E1/v0.31.0: идеальный исполнитель команд — Zig-ядро
 /// (os/core/poler_exec.zig, raw-syscall слой) + безопасная обвязка.

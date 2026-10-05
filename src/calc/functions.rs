@@ -630,6 +630,8 @@ pub fn is_function(name: &str) -> bool {
         | "moon_lon" | "moon_lat" | "moon_dist" | "moon_phase" | "moon_illum"
         | "moon_age" | "moon_ra" | "moon_dec"
         | "planet_lon" | "planet_dist" | "sunrise" | "sunset"
+        // квантовая химия (118 элементов, архетипы, тритные связи, формулы)
+        | "chem_elem" | "chem_bond" | "chem_mass" | "chem_formula" | "chem_archetype"
         // геодезия/навигация
         | "dist" | "bearing" | "midpoint" | "dest" | "earth_radius"
     )
@@ -2566,7 +2568,92 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "earth_radius" => Ok(Value::Scalar(geodesy::earth_radius_km(one_arg(args, name)?))),
 
+        // ---------- квантовая химия и 118 элементов ----------
+        "chem_elem" => {
+            need(args, 1, name)?;
+            let elem = resolve_chem_element(&args[0], name)?;
+            Ok(Value::Str(format!(
+                "[{}] {} ({}) · Z={} · A={:.4} г/моль · χ={:.2} · Блок {:?} · Гр.{} Пер.{} · {:?}",
+                elem.symbol, elem.name_ru, elem.name, elem.z, elem.atomic_mass, elem.electronegativity,
+                elem.block, elem.group, elem.period, elem.archetype
+            )))
+        }
+        "chem_bond" => {
+            need(args, 2, name)?;
+            let elem_a = resolve_chem_element(&args[0], name)?;
+            let elem_b = resolve_chem_element(&args[1], name)?;
+            let bond = crate::universal_chem::calculate_bond(elem_a, elem_b);
+            let type_str = match bond.bond_type {
+                crate::universal_chem::BondType::NonPolarCovalent => "Неполярный ковалентный",
+                crate::universal_chem::BondType::PolarCovalent => "Полярный ковалентный",
+                crate::universal_chem::BondType::Ionic => "Ионный",
+                crate::universal_chem::BondType::Metallic => "Металлический",
+                crate::universal_chem::BondType::Inert => "Инертный/благородный газ",
+            };
+            let trit_char = match bond.trit {
+                -1 => "− (акцептор/ион)",
+                0 => "0 (симметричный)",
+                1 => "+ (донор/полярный)",
+                _ => "?",
+            };
+            Ok(Value::Str(format!(
+                "{}-{} · Тип: {} · Трит: {} · Δχ = {:.2} · Длина ≈ {:.1} пм · Фазовый резонанс cos(Δφ) = {:.4}",
+                elem_a.symbol, elem_b.symbol, type_str, trit_char, bond.delta_chi, bond.estimated_length_pm, bond.phase_resonance
+            )))
+        }
+        "chem_mass" => {
+            need(args, 1, name)?;
+            let formula = match &args[0] {
+                Value::Str(s) => s.as_str(),
+                other => return Err(format!("{name}: ожидалась формула (строка), получено {other}")),
+            };
+            let mol = crate::universal_chem::parse_chemical_formula(formula)
+                .map_err(|e| format!("{name}: {e}"))?;
+            Ok(Value::Scalar(mol.molar_mass))
+        }
+        "chem_formula" => {
+            need(args, 1, name)?;
+            let formula = match &args[0] {
+                Value::Str(s) => s.as_str(),
+                other => return Err(format!("{name}: ожидалась формула (строка), получено {other}")),
+            };
+            let mol = crate::universal_chem::parse_chemical_formula(formula)
+                .map_err(|e| format!("{name}: {e}"))?;
+            let counts_str: Vec<String> = mol.counts.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            let fractions_str: Vec<String> = mol.mass_fractions.iter().map(|(k, v)| format!("{k}: {:.2}%", v * 100.0)).collect();
+            Ok(Value::Str(format!(
+                "Формула {} · M = {:.4} г/моль · e⁻ = {} · Состав: [{}] · Массовые доли: [{}]",
+                formula, mol.molar_mass, mol.total_electrons, counts_str.join(", "), fractions_str.join(", ")
+            )))
+        }
+        "chem_archetype" => {
+            need(args, 1, name)?;
+            let elem = resolve_chem_element(&args[0], name)?;
+            Ok(Value::Str(format!(
+                "[{}] {} · Архетип: {} · Описание: {} · Золотая фаза φ(Z) = {:.4} рад",
+                elem.symbol, elem.name, elem.archetype.name(), elem.archetype.description(), elem.phase_phi
+            )))
+        }
+
         other => Err(format!("неизвестная функция «{other}» (каталог: calc funcs)")),
+    }
+}
+
+fn resolve_chem_element(v: &Value, name: &str) -> Result<&'static crate::universal_chem::Element, String> {
+    match v {
+        Value::Scalar(z) => {
+            if *z >= 1.0 && *z <= 118.0 && z.fract() == 0.0 {
+                crate::universal_chem::get_element_by_z(*z as u8)
+                    .ok_or_else(|| format!("{name}: элемент с Z={z} не найден"))
+            } else {
+                Err(format!("{name}: Z — целое число от 1 до 118, получено {z}"))
+            }
+        }
+        Value::Str(s) => {
+            crate::universal_chem::get_element_by_symbol(s)
+                .ok_or_else(|| format!("{name}: неизвестный химический символ «{s}»"))
+        }
+        other => Err(format!("{name}: ожидался символ элемента (строка) или атомный номер Z (число), получено {other}")),
     }
 }
 
@@ -2700,6 +2787,13 @@ pub fn catalog(filter: &str) -> String {
             "line(точки Nx2) — открытая ломаная · poly(кольца…) — полигон · gc(…) — GeometryCollection",
             "de9im_gc(A, B[, k]) — relate СМЕШАННЫХ размерностей: union-семантика OGC, dim(∪) = max dim",
             "матрица: точка → 0, линия/площадь → +1; дырки = внешность; коллекция из одного == сама геометрия",
+        ]),
+        ("квантовая химия (118 элементов)", &[
+            "chem_elem(Z_или_символ) — паспорт элемента: Z, молярная масса, электроотрицательность, блок, архетип",
+            "chem_bond(elem1, elem2) — тип связи (ковалентный/ионный/металлический), трит {-1,0,+1}, фазовый резонанс",
+            "chem_mass(\"формула\") — стехиометрическая молярная масса (H2O, H2SO4, Fe2(SO4)3, Ca(OH)2, CH3COOH)",
+            "chem_formula(\"формула\") — полный анализ: молярная масса, электроны, число атомов и массовые доли %",
+            "chem_archetype(elem) — квантово-химический архетип (12 классов), золотая фаза φ(Z) = (Z·Φ) mod 2π",
         ]),
     ];
     let mut out = String::new();
@@ -3930,6 +4024,31 @@ mod tests {
         assert!(call("de9im_gc", &[s(1.0), poly_b.clone()]).is_err());
         // gc из скаляра — ошибка валидации формы
         assert!(call("gc", &[s(1.0)]).is_err());
+    }
+
+    #[test]
+    fn chem_functions_calls() {
+        // chem_elem по символу и Z
+        let v1 = call("chem_elem", &[Value::Str("Fe".into())]).unwrap();
+        assert!(v1.to_string().contains("Железо") && v1.to_string().contains("Z=26"));
+        let v2 = call("chem_elem", &[s(1.0)]).unwrap();
+        assert!(v2.to_string().contains("Водород") && v2.to_string().contains("Z=1"));
+
+        // chem_bond
+        let vb = call("chem_bond", &[Value::Str("Na".into()), Value::Str("Cl".into())]).unwrap();
+        assert!(vb.to_string().contains("Ионный") && vb.to_string().contains("−"));
+
+        // chem_mass
+        let vm = call("chem_mass", &[Value::Str("H2SO4".into())]).unwrap();
+        assert!(close(vm.as_f64().unwrap(), 98.078, 0.05));
+
+        // chem_formula
+        let vf = call("chem_formula", &[Value::Str("Fe2(SO4)3".into())]).unwrap();
+        assert!(vf.to_string().contains("M = 399.8") && vf.to_string().contains("Fe:2"));
+
+        // chem_archetype
+        let va = call("chem_archetype", &[Value::Str("C".into())]).unwrap();
+        assert!(va.to_string().contains("OrganicLifeNonmetal"));
     }
 }
 

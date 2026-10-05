@@ -1440,7 +1440,9 @@ fn run_selftest() -> i32 {
             full.push_str(&row.join(","));
             full.push('\n');
         }
-        let path = "/home/z/my-project/scripts/api_reform/selftest_dense_40.csv";
+        let tmp = std::env::temp_dir().join("poler_api_selftest_dense_40.csv");
+        let path_str = tmp.to_string_lossy();
+        let path = path_str.as_ref();
         let _ = fs::write(path, &full);
         match compute_matrix(&format!("file:{}", path), true) {
             Ok(r) => {

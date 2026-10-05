@@ -29,10 +29,17 @@ cp scripts/geo_research/geo.poler "$STAGE/geo.poler"
 
 #    + рантайм glibc (payload динамический: rootfs-коробка — tmpfs без ОС,
 #    PT_INTERP=/lib64/ld-linux-x86-64.so.2 ищет либы по мультиарх-путям)
-mkdir -p "$STAGE/lib64" "$STAGE/lib/x86_64-linux-gnu"
+mkdir -p "$STAGE/lib64" "$STAGE/usr/lib" "$STAGE/lib/x86_64-linux-gnu" "$STAGE/lib"
 cp -L /lib64/ld-linux-x86-64.so.2 "$STAGE/lib64/" 2>/dev/null || true
 for lib in libgcc_s.so.1 libm.so.6 libc.so.6; do
-    cp -L "/lib/x86_64-linux-gnu/$lib" "$STAGE/lib/x86_64-linux-gnu/" 2>/dev/null || true
+    for dir in /usr/lib /lib64 /lib /lib/x86_64-linux-gnu; do
+        if [ -f "$dir/$lib" ]; then
+            cp -L "$dir/$lib" "$STAGE/usr/lib/" 2>/dev/null || true
+            cp -L "$dir/$lib" "$STAGE/lib64/" 2>/dev/null || true
+            cp -L "$dir/$lib" "$STAGE/lib/" 2>/dev/null || true
+            break
+        fi
+    done
 done
 
 # 2. ПОСТОЯННЫЙ АРХИВАТОР: каталог → .poler (пофайловая таблица, права 755)

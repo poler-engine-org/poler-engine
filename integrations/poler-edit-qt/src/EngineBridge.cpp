@@ -23,7 +23,12 @@ QString EngineBridge::enginePath()
     if (!env.isEmpty() && QFile::exists(QString::fromLocal8Bit(env))) {
         return QString::fromLocal8Bit(env);
     }
-    // 2) PATH (у пользователя движок в ~/.local/bin — он в PATH).
+    // 2) Суверенный пользовательский бинарник (~/.local/bin/poler-engine)
+    const QString localUserPath = QDir::homePath() + "/.local/bin/poler-engine";
+    if (QFile::exists(localUserPath)) {
+        return localUserPath;
+    }
+    // 3) PATH
     const QString inPath = QStandardPaths::findExecutable("poler-engine");
     if (!inPath.isEmpty()) {
         return inPath;
