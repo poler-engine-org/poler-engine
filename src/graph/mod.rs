@@ -1,6 +1,7 @@
 //! Граф сущностей (Entity-Relation Graph) с K-hop обходом;
 //! коннектом FLYCSR1 (мозг мухи FlyWire v783) как матрица A.
 
+pub mod causal_linker;
 pub mod connectome;
 pub mod entity_graph;
 pub mod flyops;
