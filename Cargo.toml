@@ -14,7 +14,7 @@
 # ============================================================
 [workspace]
 resolver = "2"
-members = ["crates/pqc", "crates/pqw", "crates/reader", "crates/poler-ffi"]
+members = ["crates/pqc", "crates/pqw", "crates/reader", "crates/poler-ffi", "crates/poler-eri"]
 
 # Наследуемые метаданные pqc/pqw (манифесты крейтов используют
 # version.workspace = true и пр.). Квантовое ядро живёт на своей
@@ -28,7 +28,7 @@ authors = ["Kotokvit <213886740+Kotokvit@users.noreply.github.com>"]
 
 [package]
 name = "poler-engine"
-version = "0.72.0"
+version = "0.73.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["POLER Engineering Core"]
@@ -59,6 +59,9 @@ path = "src/main.rs"
 pnd-ffi = []
 
 [dependencies]
+# v0.73.0: POLER-ERI — квантово-химическое ядро (RHF/STO-3G) из Drive-архива,
+# аудит + 6 багфиксов см. crates/poler-eri/src/{eri_rys,shell_driver,one_electron,eri_direct}.rs
+poler-eri = { path = "crates/poler-eri" }
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"
 memmap2 = "0.9"

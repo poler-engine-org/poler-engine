@@ -634,6 +634,8 @@ pub fn is_function(name: &str) -> bool {
         | "chem_elem" | "chem_bond" | "chem_mass" | "chem_formula" | "chem_archetype"
         // голос учёного (сессия-18): роторы + триединое ядро
         | "speak"
+        // аб-иницио квантовая химия (v0.73.0): RHF/STO-3G из POLER-ERI
+        | "hf"
         // геодезия/навигация
         | "dist" | "bearing" | "midpoint" | "dest" | "earth_radius"
     )
@@ -2646,6 +2648,34 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value, String> {
             };
             Ok(Value::Str(crate::scivoice::scientist_read(&text)))
         }
+        "hf" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(format!(
+                    "{name}: ожидается 1-2 аргумента: hf(\"H2\") или hf(\"H2\", 1.4), получено {}",
+                    args.len()
+                ));
+            }
+            let spec = match &args[0] {
+                Value::Str(s) => s.clone(),
+                other => return Err(format!(
+                    "{name}: ожидалась молекула (строка вида \"H2\" или \"LiH@3.0\"), получено {other}"
+                )),
+            };
+            // опциональная длина связи вторым аргументом (Бора)
+            let spec = if args.len() >= 2 {
+                let r = match &args[1] {
+                    Value::Scalar(r) => *r,
+                    other => return Err(format!(
+                        "{name}: длина связи должна быть числом (Бора), получено {other}"
+                    )),
+                };
+                format!("{spec}@{r}")
+            } else {
+                spec
+            };
+            let res = crate::quantum::eri::hartree_fock(&spec)?;
+            Ok(Value::Str(crate::quantum::eri::hf_report(&res)))
+        }
 
         other => Err(format!("неизвестная функция «{other}» (каталог: calc funcs)")),
     }
@@ -2811,6 +2841,12 @@ pub fn catalog(filter: &str) -> String {
             "speak(\"текст_или_формула\") — научное чтение результата: токенизатор → языковой ротор букв мира",
             "(104k строк No-Mul ASM) → химротор 118 элементов → триединое ядро; трит-вердикт {-1,0,+1}",
             "примеры: speak(\"C6H12O6\") · speak(\"H2O\") · speak(\"энергия резонанса фазы\")",
+        ]),
+        ("аб-иницио квантовая химия (RHF/STO-3G)", &[
+            "hf(\"молекула\"[, R_Бор]) — полный Хартри–Фок из POLER-ERI: E_total, ε_MO, SCF-итерации",
+            "молекулы: H2 (R=1.4), He, LiH (R=3.0), HeH+ (R=1.4632); длина связи в Бора",
+            "эталоны: E(H2)=−1.116664 Ha (учебник −1.1167) · E(He)=−2.807844 Ha (HSP-1969 −2.8078)",
+            "примеры: hf(\"H2\") · hf(\"LiH\", 3.0) · hf(\"HeH+\")",
         ]),
     ];
     let mut out = String::new();

@@ -293,16 +293,54 @@ pub fn scientist_read(text: &str) -> String {
         .map(|j| format!("{}:{:+}", ARCHETYPE_NAMES[j], r.arch_signature[j]))
         .take(6)
         .collect();
+    // [4] Ab initio (v0.73.0): если распознанная молекула входит в STO-3G-библиотеку —
+    // говорим настоящим Хартри–Фоком (POLER-ERI), не оценкой, а расчётом.
+    let mut has_hf = false;
+    if let Some(c) = &r.chem {
+        let hf_spec = match c.formula.as_str() {
+            "H2" => Some("H2"),
+            "LiH" => Some("LiH"),
+            "He" => Some("He"),
+            _ => None,
+        };
+        if let Some(spec) = hf_spec {
+            if let Ok(res) = crate::quantum::eri::hartree_fock(spec) {
+                has_hf = true;
+                let homo = res
+                    .occupied_orbital_energies
+                    .last()
+                    .copied()
+                    .unwrap_or(0.0);
+                parts.push(format!(
+                    "[4] Ab initio RHF/STO-3G {}: полная энергия E = {:.6} Хартри ({:.4} эВ); {} базисных функций, {} электронов; SCF {} за {} итераций; HOMO ε = {:.4} Ха.",
+                    res.molecule,
+                    res.energy_hartree,
+                    res.energy_hartree * 27.211386245988,
+                    res.n_basis,
+                    res.n_electrons,
+                    if res.converged { "сошёлся" } else { "не сошёлся" },
+                    res.iterations,
+                    homo
+                ));
+            }
+        }
+    }
+
+    let lang_idx = if r.chem.is_some() {
+        if has_hf { 5 } else { 4 }
+    } else {
+        1
+    };
     let lang_part = if sig_view.is_empty() {
         format!(
             "[{}] Языковой контур: {} знаков, сигнатура нейтральна (все триты 0).",
-            if r.chem.is_some() { 4 } else { 1 },
+            lang_idx,
             r.letters
         )
     } else {
         format!(
             "[{}] Языковой контур: {} знаков; доминирует {} ({:+}), подавлен {} ({:+}); когерентность Phi = {:.2}.",
-            if r.chem.is_some() { 4 } else { 1 },
+            lang_idx,
             r.letters,
             ARCHETYPE_NAMES[r.dominant_arch],
             r.arch_signature[r.dominant_arch],
@@ -320,7 +358,11 @@ pub fn scientist_read(text: &str) -> String {
         let sync = r.triune_synchrony.map(|s| format!(", синхронность вихря {:.2}", s)).unwrap_or_default();
         parts.push(format!(
             "[{}] Триединое ядро: «{}»{}.",
-            if r.chem.is_some() { 5 } else { 2 },
+            if r.chem.is_some() {
+                if has_hf { 6 } else { 5 }
+            } else {
+                2
+            },
             phrase,
             sync
         ));

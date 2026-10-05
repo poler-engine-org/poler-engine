@@ -6,6 +6,7 @@
 pub use pqc_core as core;
 pub use pqw_core as weights;
 
+pub mod eri;
 pub mod crystallizer;
 pub mod meta_compiler;
 

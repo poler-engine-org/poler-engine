@@ -409,7 +409,7 @@ fn is_calc_tool(msg: &Value) -> bool {
     msg.get("method").and_then(|m| m.as_str()) == Some("tools/call")
         && matches!(
             msg.pointer("/params/name").and_then(|v| v.as_str()),
-            Some("poler_calc" | "poler_hw" | "poler_quantum")
+            Some("poler_calc" | "poler_hw" | "poler_quantum" | "poler_scivoice")
         )
 }
 
@@ -874,6 +874,7 @@ impl McpServer {
             "poler_calc" => self.tool_calc(&args),
             "poler_hw" => self.tool_hw(&args),
             "poler_quantum" => self.tool_quantum(&args),
+            "poler_scivoice" => self.tool_scivoice(&args),
             other => Err(format!("неизвестный инструмент: {other}")),
         };
         match call {
@@ -2565,6 +2566,53 @@ impl McpServer {
         Ok(calc.eval_structured(expr).to_string())
     }
 
+    /// v0.73.0: poler_scivoice — «голос учёного» для внешних агентов.
+    ///
+    /// Тот же речевой контур, что слышит пользователь из `calc speak`:
+    /// токенизатор → роторы 104k No-Mul ASM (языки мира + 118 элементов) →
+    /// триединое ядро → трит-вердикт. Для формул из STO-3G-библиотеки
+    /// (H2, He, LiH) голос добавляет секцию ab initio RHF/STO-3G —
+    /// настоящий Хартри–Фок из POLER-ERI (E_total, ε_MO, SCF-итерации).
+    /// mode="hf" — прямой расчёт с машиночитаемым JSON-отчётом.
+    fn tool_scivoice(&self, args: &Value) -> Result<String, String> {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("аргумент text обязателен: {\"text\": \"C6H12O6\"}")?;
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("read");
+        match mode {
+            "hf" => {
+                let res = crate::quantum::eri::hartree_fock(text)?;
+                Ok(json!({
+                    "voice": "scivoice",
+                    "mode": "hf",
+                    "molecule": res.molecule,
+                    "method": res.method,
+                    "energy_hartree": res.energy_hartree,
+                    "energy_ev": res.energy_hartree * 27.211386245988,
+                    "e_nuc_hartree": res.e_nuc,
+                    "n_basis": res.n_basis,
+                    "n_electrons": res.n_electrons,
+                    "occupied_orbital_energies_hartree": res.occupied_orbital_energies,
+                    "scf_converged": res.converged,
+                    "scf_iterations": res.iterations,
+                    "reading": crate::quantum::eri::hf_report(&res)
+                })
+                .to_string())
+            }
+            _ => Ok(json!({
+                "voice": "scivoice",
+                "mode": "read",
+                "text": text,
+                "reading": crate::scivoice::scientist_read(text)
+            })
+            .to_string()),
+        }
+    }
+
     /// v0.48.0: poler_hw — зонд скрытых параметров ПК (JSON).
     fn tool_hw(&self, _args: &Value) -> Result<String, String> {
         let report = crate::calc::hardware::probe();
@@ -3545,6 +3593,26 @@ unitary (U†U = I), equivalence (две схемы, до глобальной �
                     "up_to_global_phase": {"type": "boolean", "default": false, "description": "Эквивалентность до глобальной фазы"}
                 },
                 "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "poler_scivoice",
+            "description": "ГОЛОС УЧЁНОГО (v0.73.0): тот же научный речевой контур, что слышит \
+пользователь из calc speak — токенизатор → роторы 104k строк No-Mul x86_64 ASM \
+(языки мира + 118 химических элементов) → триединое ядро → трит-вердикт {-1,0,+1}. \
+Формулы из STO-3G-библиотеки (H2, He, LiH) озвучиваются с секцией ab initio — \
+настоящий Хартри–Фок из POLER-ERI (E_total в Хартри, энергии МО, SCF-итерации; \
+эталоны: E(H2)=-1.116664 Ha, E(He)=-2.807844 Ha). mode=\"read\" — научное чтение \
+текста/формулы; mode=\"hf\" — прямой RHF-расчёт с машиночитаемым JSON. \
+Примеры: {\"text\":\"C6H12O6\",\"mode\":\"read\"}; {\"text\":\"H2\",\"mode\":\"hf\"}; \
+{\"text\":\"LiH@3.0\",\"mode\":\"hf\"}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "текст, формула или молекула (H2, He, LiH, LiH@3.0)"},
+                    "mode": {"type": "string", "enum": ["read", "hf"], "default": "read", "description": "read — научное чтение; hf — прямой RHF/STO-3G расчёт"}
+                },
+                "required": ["text"]
             }
         }),
         json!({
@@ -5586,5 +5654,102 @@ mod quantum_tool_tests {
             json!({"action": "verify", "check": "teleport"}),
         );
         assert!(v2["noise"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod scivoice_tool_tests {
+    use super::*;
+
+    fn server() -> McpServer {
+        McpServer::new(9223, 10, PathBuf::from("/nonexistent-poler-scivoice-test.db"))
+    }
+
+    fn call(srv: &McpServer, arguments: Value) -> Value {
+        let r = srv
+            .dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "poler_scivoice", "arguments": arguments}
+            }))
+            .expect("dispatch не падает");
+        let text = r
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .expect("text есть");
+        serde_json::from_str(text).expect("валидный JSON инструмента")
+    }
+
+    #[test]
+    fn manifest_declares_poler_scivoice() {
+        let m = tools_manifest();
+        let t = m
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("poler_scivoice"))
+            .expect("poler_scivoice в манифесте");
+        let props = t.pointer("/inputSchema/properties").unwrap();
+        assert!(props.to_string().contains("mode"));
+        let required = t.pointer("/inputSchema/required").unwrap();
+        assert!(required.to_string().contains("text"));
+    }
+
+    #[test]
+    fn read_mode_speaks_like_scientist() {
+        let v = call(&server(), json!({"text": "C6H12O6", "mode": "read"}));
+        let reading = v["reading"].as_str().expect("reading есть");
+        assert!(reading.contains("Научное чтение"));
+        assert!(reading.contains("Химротор"));
+        assert!(reading.contains("Трит-вердикт"));
+    }
+
+    #[test]
+    fn read_mode_ab_initio_section_for_h2() {
+        let v = call(&server(), json!({"text": "H2"}));
+        let reading = v["reading"].as_str().expect("reading есть");
+        assert!(
+            reading.contains("Ab initio RHF/STO-3G"),
+            "H2 обязан говорить Хартри–Фоком: {reading}"
+        );
+        assert!(reading.contains("-1.116664"));
+    }
+
+    #[test]
+    fn hf_mode_returns_machine_readable_json() {
+        let v = call(&server(), json!({"text": "H2", "mode": "hf"}));
+        let e = v["energy_hartree"].as_f64().expect("energy_hartree есть");
+        assert!((e - (-1.116664)).abs() < 3e-4, "E(H2) = {e}");
+        assert_eq!(v["n_basis"], json!(2));
+        assert_eq!(v["scf_converged"], json!(true));
+        let occ = v["occupied_orbital_energies_hartree"]
+            .as_array()
+            .expect("энергии МО — массив");
+        assert_eq!(occ.len(), 1);
+    }
+
+    #[test]
+    fn hf_mode_lih_full() {
+        let v = call(&server(), json!({"text": "LiH@3.0", "mode": "hf"}));
+        let e = v["energy_hartree"].as_f64().expect("energy_hartree есть");
+        assert!((e - (-7.810054)).abs() < 2e-3, "E(LiH) = {e}");
+        assert_eq!(v["n_basis"], json!(6));
+    }
+
+    #[test]
+    fn text_argument_is_required() {
+        let r = server().dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "poler_scivoice", "arguments": {}}
+        }));
+        // dispatch возвращает Option<Value>; ошибка инструмента отражается
+        // полем isError в ответе
+        match r {
+            Some(resp) => {
+                let is_err = resp
+                    .pointer("/result/isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                assert!(is_err, "без text инструмент обязан вернуть isError: {resp}");
+            }
+            None => panic!("dispatch не должен молча исчезать"),
+        }
     }
 }

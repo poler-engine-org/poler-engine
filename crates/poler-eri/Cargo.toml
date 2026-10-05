@@ -1,0 +1,13 @@
+[package]
+name = "poler-eri"
+version = "3.2.0"
+edition = "2021"
+description = "POLER-ERI: Quantum-Inspired ERI Meta-Compiler with R1CS + Crystallization + Archetype Algebra"
+readme = "README.md"
+
+[dependencies]
+libm = "0.2"
+
+[[bin]]
+name = "poler-eri"
+path = "src/bin/poler_eri.rs"
