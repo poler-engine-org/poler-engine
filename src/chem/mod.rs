@@ -17,6 +17,12 @@
 //!   H (координаты сохраняются), писатель, `.smi` (контур B).
 //! * [`screen`] — каскадный ультра-скрининг библиотек: пре-фильтры →
 //!   быстрый MC (JIT-ядро) → полный докинг; rayon + детерминизм (B).
+//! * [`periodic`] + [`formula`] + [`stoich`] — фундамент точной химии:
+//!   таблица Менделеева (IUPAC 2021), парсер формул (гидраты),
+//!   балансировщик уравнений (рациональный Гаусс) (контур D).
+//! * [`curriculum`] + [`curriculum_nl`] — задачник 5–9 класса как
+//!   бенчмарк Curriculum Learning: 187 задач с ответами независимой
+//!   Python-реализации + разбор русских формулировок (SciVoice) (D).
 //! * [`view`] — интерактивные 3D/4D-визоры (орбитальная камера, CPK,
 //!   шаростержневой / Ван-дер-Ваальс / каркас, кручение связей;
 //!   комплексы белок-лиганд: CA-трейс / карман / ВдВ-поверхность).
@@ -34,6 +40,15 @@ pub mod induced_fit;
 pub mod screen;
 pub mod smiles;
 pub mod view;
+pub mod periodic;
+pub mod formula;
+pub mod stoich;
+pub mod curriculum;
+pub mod curriculum_nl;
+
+pub use formula::parse_formula;
+pub use stoich::{parse_equation, Equation};
+pub use curriculum::{report_text, run_grade, solve, tasks};
 
 pub use geom3d::{conformer_from_positions, embed, hybridization, Conformer, Hybrid};
 pub use pharma::{binding_report, binding_text, gasteiger, BindingResult, GasteigerCharges};

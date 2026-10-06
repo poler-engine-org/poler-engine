@@ -641,6 +641,26 @@ struct Cli {
     #[arg(long = "induced", default_value_t = false, requires = "dock")]
     dock_induced: bool,
 
+    /// v0.79.0: ЗАДАЧНИК «CURRICULUM LEARNING» (контур D) — школьная
+    /// химия 5–9 класса как бенчмарк: 187 задач с эталонными ответами
+    /// независимой Python-реализации (двойная запись MVR). Без значения —
+    /// все классы; --curriculum 8 — только 8-й.
+    /// Примеры: --curriculum; --curriculum 8; --curriculum --curriculum-text
+    #[arg(
+        long = "curriculum",
+        value_name = "GRADE",
+        num_args = 0..=1,
+        default_missing_value = "0",
+        conflicts_with_all = ["shell", "tui", "mcp", "mcp_http", "web_search", "crawl", "web_stats", "impact", "exec", "view_mol", "pdb_file", "view_complex", "dock", "screen", "jit_mode"]
+    )]
+    curriculum: Option<String>,
+
+    /// Режим SciVoice: задачи решаются ИЗ РУССКОГО ТЕКСТА формулировки
+    /// (разбор → структурированный ввод → решение), а не из готового
+    /// JSON-ввода. Требует --curriculum.
+    #[arg(long = "curriculum-text", requires = "curriculum")]
+    curriculum_text: bool,
+
     /// v0.77.0: УЛЬТРА-СКРИНИНГ БИБЛИОТЕК (контур B) — SDF/.smi-библиотека
     /// в активный карман: каскад пре-фильтры → быстрый MC (JIT-ядро A3) →
     /// полный докинг топ-N. Карман строится один раз на все лиганды.
@@ -2554,6 +2574,20 @@ fn run(cli: Cli) -> ExitCode {
             cli.screen_workers,
             cli.screen_out.as_deref(),
         );
+    }
+
+    // ─── v0.79.0: --curriculum — задачник Curriculum Learning (контур D) ─
+    if let Some(g) = cli.curriculum.as_deref() {
+        let grade = g.trim().parse::<u8>().ok();
+        let grade = match grade {
+            Some(n @ 5..=9) => Some(n),
+            Some(0) => None,
+            _ => {
+                eprintln!("--curriculum: класс должен быть 5–9 (или пусто = все)");
+                return ExitCode::FAILURE;
+            }
+        };
+        return curriculum_command(grade, cli.curriculum_text);
     }
     // --pocket без --dock/--screen — явная ошибка (раньше требовал dock)
     if cli.pocket.is_some() && cli.dock.is_none() && cli.screen.is_none() {
@@ -7909,6 +7943,33 @@ fn view_complex_command(file: &str) -> ExitCode {
             eprintln!("--view-complex: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+// ─── v0.79.0: --curriculum — задачник Curriculum Learning (контур D) ──────
+
+/// `--curriculum [GRADE] [--curriculum-text]`: прогон школьного задачника
+/// 5–9 класса (187 задач, двойная запись MVR: эталоны посчитаны независимой
+/// Python-реализацией). `--curriculum-text` — режим SciVoice: задача
+/// решается из русского текста формулировки, а не из готового JSON-ввода.
+/// Код возврата: 0 — все решены, 1 — есть провалы (CI-семантика).
+fn curriculum_command(grade: Option<u8>, from_text: bool) -> ExitCode {
+    use poler_engine::chem::curriculum::{report_text, run_grade};
+
+    let t0 = std::time::Instant::now();
+    let reps = run_grade(grade, from_text);
+    let n: usize = reps.iter().map(|r| r.total).sum();
+    let p: usize = reps.iter().map(|r| r.passed).sum();
+    let dt = t0.elapsed().as_millis();
+    print!("{}", report_text(&reps, from_text));
+    println!("═══ Время: {dt} мс · {n} задач · решено {p} ═══");
+    if reps.is_empty() {
+        eprintln!("--curriculum: класс не найден в корпусе");
+        ExitCode::FAILURE
+    } else if p == n {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
