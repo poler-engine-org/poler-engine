@@ -24,6 +24,7 @@ static CMD_HINTS: &[(&str, &str)] = &[
     ("sync", "sync vcs [gh|gl|gt|gix|all] [OWNER]"),
     ("crawl", "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]"),
     ("impact", "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]"),
+    ("feed", "feed <PATH> --for <understand|edit> -q <QUERY> [--budget N] [--json]"),
     ("gh", "gh search|repos|commits|issues ... (GitHub REST)"),
     ("gl", "gl search|repos|commits|issues ... (GitLab REST v4)"),
     ("gt", "gt search|repos|commits|issues ... (Gitea REST)"),

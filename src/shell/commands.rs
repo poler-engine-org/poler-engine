@@ -25,6 +25,7 @@ use crate::sources;
 use crate::vcs::VcsAdapter;
 
 use super::agentenv;
+use super::feed;
 use super::help;
 use super::state::ShellState;
 use super::wincompat::{self, WinTranslation};
@@ -124,6 +125,8 @@ pub fn dispatch(state: &mut ShellState, line: &str) -> CmdResult {
         // v0.15.1: нативные команды crawl/impact внутри шелла
         "crawl" => cmd_crawl(state, args),
         "impact" => cmd_impact(state, args),
+        // v0.80.0: контекст-шлюз под действие (манифест п.11)
+        "feed" => feed::cmd_feed(state, args),
         // v0.16.0: Unified VCS & Data Mesh — нативные адаптеры GitHub/GitLab/Gitea/gix
         "gh" => cmd_gh(state, args),
         "gl" => cmd_gl(state, args),

@@ -80,6 +80,7 @@ pub fn all_entries() -> Vec<HelpEntry> {
 
         HelpEntry { group: HelpGroup::Crawl, cmd: "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]", short: "Обхід URL → web-index.db (CDP+Chromium)" },
         HelpEntry { group: HelpGroup::Impact, cmd: "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]", short: "AIDDE impact-паспорт символу в кодовій базі" },
+        HelpEntry { group: HelpGroup::Impact, cmd: "feed <PATH> --for <understand|edit> -q <QUERY> [--budget N] [--json]", short: "Контекст-шлюз: пакет по энергии под действие (v0.80.0)" },
 
         HelpEntry { group: HelpGroup::Vcs, cmd: "gh search <Q> [--top N]", short: "Пошук по коду GitHub (треба $GITHUB_TOKEN)" },
         HelpEntry { group: HelpGroup::Vcs, cmd: "gh repos <USER>", short: "Список репозиторіїв користувача GitHub" },
@@ -235,7 +236,7 @@ pub fn help_topic(name: &str) -> String {
     //    Если name — это одна "команда-родитель" (gh/gl/gt/gix/sources/notes/...),
     //    покажем все её подкоманды.
     let parent_cmds = [
-        "search", "web", "stats", "sync", "set", "crawl", "impact",
+        "search", "web", "stats", "sync", "set", "crawl", "impact", "feed",
         "gh", "gl", "gt", "gix", "notes", "sources", "version", "quit", "help",
         "calc", "hw", "quantum", "qm", "p3", "game",
     ];
@@ -465,6 +466,18 @@ fn format_entry_detail(e: &HelpEntry) -> String {
             s.push_str("  Гібридний пошук по веб+локал: PageRank + lexical + temporal.\n");
             s.push_str("  Текст можна виділити мишею → Ctrl+Y → буфер\n");
             s.push_str("  (OSC 52 — працює і через SSH/tmux). Вставка — Ctrl+Shift+V.\n");
+        }
+        "feed <PATH> --for <understand|edit> -q <QUERY> [--budget N] [--json]" => {
+            s.push_str("ПРИКЛАДИ:\n");
+            s.push_str("  feed ./book --for understand -q \"Нокс\" --budget 6000\n");
+            s.push_str("  feed ./src --for edit -q cmd_search --budget 4000 --json\n");
+            s.push_str("  poler-engine --exec 'feed . --for understand -q \"архитектура\" --json'\n\n");
+            s.push_str("РЕЖИМИ:\n");
+            s.push_str("  understand — СКЕЛЕТ: высокоэнергетичные узлы + K-hop (для понимания)\n");
+            s.push_str("  edit — цели по ε возрастанию (периферия первой) + AIDDE impact\n\n");
+            s.push_str("ОЦІНКА ТОКЕНІВ:\n");
+            s.push_str("  Письменность-осознанная (Script из universal_letters): CJK ≈ 1\n");
+            s.push_str("  токен/символ, кириллица ≈ 3 символа/токен, латиница ≈ 4 символа/токен.\n");
         }
         "sources add <value> [--kind file|url|repo] [--label \"...\"]" => {
             s.push_str("ПРИКЛАДИ:\n");

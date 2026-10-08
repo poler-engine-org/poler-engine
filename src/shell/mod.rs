@@ -31,6 +31,7 @@ pub mod commands;
 pub mod completer;
 pub mod confirm;
 pub mod doc_browser;
+pub mod feed;
 pub mod help;
 pub mod mouse;
 pub mod state;
