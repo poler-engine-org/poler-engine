@@ -109,6 +109,7 @@ pub mod render;
 pub mod scene;
 pub mod texture;
 pub mod transform;
+pub mod vocal;
 pub mod vortex;
 pub mod water;
 pub mod window;

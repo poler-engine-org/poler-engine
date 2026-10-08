@@ -600,6 +600,13 @@ fn game_usage() -> String {
         "    opts: --size N(64..1024, степень 2) --style vortex|kolmogorov|fbm|white|all",
         "          --seed N --modes N --octaves N --keep F --eps E --out-dir DIR",
         "          --amp-trits T --phase-trits P --json",
+        "game vocal [opts]             — Y+ «Голосовые нейроны»: живая речь → рост",
+        "    полосных нейронов + STDP-синапсы (триты GF(3)), БЕЗ текста/фонем/ASR:",
+        "    связки/дыхание/резонанс/турбулентность; фазовые траектории гортани,",
+        "    SSN-вихрь на краю хаоса, PQW-граф (сжатие ×1000+)",
+        "    opts: --dir DIR и/или --in F.wav [F2 ...] --json J --graph G.pqw",
+        "          --tsv T --matrix M --max-neurons N(8..4096) --births-per-file K(0..64)",
+        "          --seed S --prominence F(1..32) --min-dyn-db F(0..36)",
         "честность: детерминизм бит-в-бит (state/audio/crystal/texture/frame/vortex-hash), ω=√(GM)/r^1.5",
     ]
     .join("\n")
@@ -797,6 +804,7 @@ fn cmd_game(raw: &str) -> CmdResult {
         "vortex" => cmd_game_vortex(args),
         "water" => cmd_game_water(args),
         "asset" => cmd_game_asset(args),
+        "vocal" => cmd_game_vocal(args),
         other => CmdResult::Done(format!(
             "game: неизвестная подкоманда `{other}`\n\n{}",
             game_usage()
@@ -2399,6 +2407,327 @@ fn game_window_loop(
         elapsed_s: t0.elapsed().as_secs_f64(),
         closed,
     })
+}
+
+/// `game vocal`: Y+ «Голосовые нейроны» — живая речь → рост полосных нейронов
+/// и STDP-синапсов в тритах GF(3). БЕЗ текста, фонем и ASR: только сырой
+/// аудиопоток (связки, дыхание, резонансные полости, турбулентность).
+///
+/// `game vocal --dir DIR [--in F.wav ...] [--json J] [--graph G.pqw]
+///            [--tsv T] [--matrix M] [--max-neurons N] [--births-per-file K]
+///            [--seed S] [--prominence F] [--min-dyn-db F]`
+fn cmd_game_vocal(args: &[String]) -> CmdResult {
+    use crate::game::asset::read_wav;
+    use crate::game::vocal::{VocalConfig, VocalSession};
+    use std::path::PathBuf;
+
+    let usage = || {
+        CmdResult::Done(
+            "game vocal: рост голосовых нейронов из живой речи (без текста/ASR)\n\
+             \x20 absorb --in F.wav [F2.wav ...] и/или --dir DIR\n\
+             \x20 [--json OUT.json] [--graph OUT.pqw] [--tsv OUT.tsv] [--matrix OUT.tsv]\n\
+             \x20 [--max-neurons N(8..4096)] [--births-per-file K(0..64)]\n\
+             \x20 [--seed S] [--prominence F(1..32)] [--min-dyn-db F(0..36)]"
+                .to_string(),
+        )
+    };
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut json_out: Option<PathBuf> = None;
+    let mut graph_out: Option<PathBuf> = None;
+    let mut tsv_out: Option<PathBuf> = None;
+    let mut matrix_out: Option<PathBuf> = None;
+    let mut cfg = VocalConfig::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let take_path = |i: &mut usize, args: &[String]| -> Option<PathBuf> {
+            let v = args.get(*i + 1)?.clone();
+            *i += 2;
+            Some(PathBuf::from(v))
+        };
+        match args[i].as_str() {
+            "--in" => {
+                let Some(p) = take_path(&mut i, args) else {
+                    return CmdResult::Done("game vocal: --in F.wav [F2 ...]".into());
+                };
+                inputs.push(p);
+                // соседние не-флаги — продолжение списка файлов
+                while let Some(a) = args.get(i) {
+                    if a.starts_with("--") {
+                        break;
+                    }
+                    inputs.push(PathBuf::from(a.clone()));
+                    i += 1;
+                }
+            }
+            "--dir" => {
+                let Some(d) = take_path(&mut i, args) else {
+                    return CmdResult::Done("game vocal: --dir DIR".into());
+                };
+                match std::fs::read_dir(&d) {
+                    Ok(rd) => {
+                        let mut wavs: Vec<PathBuf> = rd
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+                            .collect();
+                        wavs.sort();
+                        if wavs.is_empty() {
+                            return CmdResult::Done(format!(
+                                "game vocal: в {} нет WAV-файлов",
+                                d.display()
+                            ));
+                        }
+                        inputs.extend(wavs);
+                    }
+                    Err(e) => {
+                        return CmdResult::Done(format!("game vocal: каталог {}: {e}", d.display()))
+                    }
+                }
+            }
+            "--json" => json_out = take_path(&mut i, args),
+            "--graph" => graph_out = take_path(&mut i, args),
+            "--tsv" => tsv_out = take_path(&mut i, args),
+            "--matrix" => matrix_out = take_path(&mut i, args),
+            "--max-neurons" => match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) if (8..=4096).contains(&v) => {
+                    cfg.max_neurons = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game vocal: --max-neurons N(8..4096)".into()),
+            },
+            "--births-per-file" => match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                Some(v) if (0..=64).contains(&v) => {
+                    cfg.births_per_file = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game vocal: --births-per-file K(0..64)".into()),
+            },
+            "--seed" => match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => {
+                    cfg.vortex_seed = v;
+                    i += 2;
+                }
+                None => return CmdResult::Done("game vocal: --seed N".into()),
+            },
+            "--prominence" => match args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if (1.0..=32.0).contains(&v) => {
+                    cfg.peak_prominence = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game vocal: --prominence F(1..32)".into()),
+            },
+            "--min-dyn-db" => match args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if (0.0..=36.0).contains(&v) => {
+                    cfg.min_dyn_db = v;
+                    i += 2;
+                }
+                _ => return CmdResult::Done("game vocal: --min-dyn-db F(0..36)".into()),
+            },
+            _ => return usage(),
+        }
+    }
+    if inputs.is_empty() {
+        return usage();
+    }
+
+    let t0 = std::time::Instant::now();
+    let mut session: Option<VocalSession> = None;
+    let mut lines: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+    let mut total_dur = 0.0f64;
+    let mut n_files = 0usize;
+    for (fi, path) in inputs.iter().enumerate() {
+        let wav = match read_wav(path) {
+            Ok(w) => w,
+            Err(e) => {
+                lines.push(format!("  [{fi}] ПРОПУСК {}: {e}", path.display()));
+                skipped += 1;
+                continue;
+            }
+        };
+        let src_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if session.is_none() {
+            session = Some(VocalSession::new(wav.fs, cfg.clone()));
+        }
+        let Some(s) = session.as_mut() else {
+            unreachable!("сессия создана выше");
+        };
+        if wav.fs != s.fs {
+            lines.push(format!(
+                "  [{fi}] ПРОПУСК {}: fs {} ≠ {}",
+                path.display(),
+                wav.fs,
+                s.fs
+            ));
+            skipped += 1;
+            continue;
+        }
+        let r = s.ingest_file(&wav, src_bytes);
+        total_dur += r.dur_s;
+        n_files += 1;
+        lines.push(format!(
+            "  [{fi:02}] {:40} {:6.1} с | нейронов {:3} (+{}) | F0 {:5.0} Гц ({:.0}% озв.) | джиттер {:.1}% | движок: {} дуг, ×{:.0}",
+            path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            r.dur_s,
+            r.neurons_after,
+            r.births,
+            if r.f0_mean_hz > 0.0 { r.f0_mean_hz } else { 0.0 },
+            r.voiced_pct,
+            r.jitter_pct,
+            r.engine.synapses_576,
+            r.engine.compression_x
+        ));
+    }
+    let Some(mut s) = session else {
+        return CmdResult::Done("game vocal: ни одного валидного WAV".into());
+    };
+    let rep = s.finalize();
+    let pqw = s.graph_to_pqw().unwrap_or_default();
+    let dt = t0.elapsed().as_secs_f64();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Y+ «Голосовые нейроны»: живая речь впитана без текста/ASR\n\
+         файлов: {} (пропущено {}) | {}\n",
+        n_files,
+        skipped,
+        lines.join("\n")
+    ));
+    out.push_str(&format!(
+        "\n--- НАРАЩИВАНИЕ ---\nпосев 24 полосы движка → {} нейронов (+{} рождений)\n",
+        rep.neurons_final, rep.births_total
+    ));
+    for b in s.births.iter().take(24) {
+        out.push_str(&format!(
+            "  рождение: файл {:02}, кадр {:06}, {:.0}–{:.0} Гц ({})\n",
+            b.file, b.frame, b.lo_hz, b.hi_hz, b.reason
+        ));
+    }
+    out.push_str(&format!(
+        "\n--- СИНАПСЫ (STDP, триты GF(3)) ---\n\
+         дуг ≥0.04: {} (автопетли {}) | СИЛЬНЫЕ |G|≥0.3: {} (кросс {}) | плотность кросс {:.1}%\n\
+         триты −1/0/+1 = {}/{}/{} | σ={:.3}\n",
+        rep.stdp_arcs,
+        rep.stdp_self_loops,
+        rep.stdp_strong,
+        rep.stdp_strong_cross,
+        rep.stdp_strong_density * 100.0,
+        rep.stdp_trits.0,
+        rep.stdp_trits.1,
+        rep.stdp_trits.2,
+        rep.stdp_sigma
+    ));
+    for (a, b, g) in rep.stdp_top.iter().take(6) {
+        out.push_str(&format!("  {a:6.0} → {b:6.0}  G={g:+.2}\n"));
+    }
+    if !rep.stdp_hubs.is_empty() {
+        let hubs: Vec<String> = rep
+            .stdp_hubs
+            .iter()
+            .map(|(hz, o, i)| format!("{hz:.0}Гц({o}/{i})"))
+            .collect();
+        out.push_str(&format!("  хабы (out/in): {}\n", hubs.join(" ")));
+    }
+    out.push_str(&format!(
+        "\n--- СВЯЗКИ И ГОРТАНЬ ---\n\
+         F0 среднее {:.1} Гц | джиттер {:.2}% | шиммер {:.2} дБ | форманты F1/F2/F3 = {:.0}/{:.0}/{:.0} Гц\n\
+         скорость фазы связок: {:.0} рад/с (~2π·F0)\n",
+        rep.f0_mean_hz,
+        rep.jitter_pct,
+        rep.shimmer_db,
+        rep.formants_hz.0,
+        rep.formants_hz.1,
+        rep.formants_hz.2,
+        rep.band_phase_vel_mean_radps
+    ));
+    out.push_str(&format!(
+        "\n--- ВИХРЬ SSN (край хаоса, {} шагов) ---\n\
+         с голосом : активность {:.1}% | C={:.2} | S={:.2} | E/I={:.1} | DA={:.2} 5HT={:.2} NE={:.2}\n\
+         базлайн   : активность {:.1}% | C={:.2} | S={:.2} | E/I={:.1}\n\
+         вердикт: {}\n",
+        rep.vortex_steps,
+        rep.vortex_voice.activity * 100.0,
+        rep.vortex_voice.criticality,
+        rep.vortex_voice.synchrony,
+        rep.vortex_voice.ei,
+        rep.vortex_voice.da,
+        rep.vortex_voice.ht,
+        rep.vortex_voice.ne,
+        rep.vortex_idle.activity * 100.0,
+        rep.vortex_idle.criticality,
+        rep.vortex_idle.synchrony,
+        rep.vortex_idle.ei,
+        rep.vortex_verdict
+    ));
+    out.push_str(&format!(
+        "\n--- СЖАТИЕ ---\nсырой PCM {} Б → PQW-граф {} Б (×{:.0}) | время {:.1} с ({:.1}× RT)\n",
+        rep.src_bytes,
+        pqw.len(),
+        rep.src_bytes as f64 / pqw.len().max(1) as f64,
+        dt,
+        total_dur / dt.max(0.001)
+    ));
+    let mut arts: Vec<String> = Vec::new();
+    if let Some(p) = &graph_out {
+        match std::fs::write(p, &pqw) {
+            Ok(()) => arts.push(format!("граф → {}", p.display())),
+            Err(e) => out.push_str(&format!("game vocal: запись {}: {e}\n", p.display())),
+        }
+    }
+    if let Some(p) = &json_out {
+        let j = format!(
+            "{{\"files\": {}, \"skipped\": {}, \"neurons_final\": {}, \"births_total\": {}, \"stdp_arcs\": {}, \"stdp_strong_cross\": {}, \"f0_mean_hz\": {:.2}, \"jitter_pct\": {:.3}, \"shimmer_db\": {:.3}, \"formants_hz\": [{:.0},{:.0},{:.0}], \"vortex\": {{\"activity\": {:.4}, \"criticality\": {:.4}, \"synchrony\": {:.4}, \"ei\": {:.3}, \"da\": {:.3}, \"ne\": {:.3}, \"ht\": {:.3}}}, \"pqw_graph_bytes\": {}, \"runtime_s\": {:.1}}}",
+            n_files, skipped, rep.neurons_final, rep.births_total, rep.stdp_arcs,
+            rep.stdp_strong_cross, rep.f0_mean_hz, rep.jitter_pct, rep.shimmer_db,
+            rep.formants_hz.0, rep.formants_hz.1, rep.formants_hz.2,
+            rep.vortex_voice.activity, rep.vortex_voice.criticality,
+            rep.vortex_voice.synchrony, rep.vortex_voice.ei, rep.vortex_voice.da,
+            rep.vortex_voice.ne, rep.vortex_voice.ht, pqw.len(), dt
+        );
+        match std::fs::write(p, j) {
+            Ok(()) => arts.push(format!("метрики → {}", p.display())),
+            Err(e) => out.push_str(&format!("game vocal: запись {}: {e}\n", p.display())),
+        }
+    }
+    if let Some(p) = &tsv_out {
+        let mut t = String::from("file\tenergy_db\tvoiced\tf0_hz\tphase_rad\tactivity\tcriticality\tsynchrony\tei\tda\tne\n");
+        for row in s.traces() {
+            let cols: Vec<String> = row.iter().map(|v| format!("{v:.4}")).collect();
+            t.push_str(&cols.join("\t"));
+            t.push('\n');
+        }
+        match std::fs::write(p, t) {
+            Ok(()) => arts.push(format!("треки → {}", p.display())),
+            Err(e) => out.push_str(&format!("game vocal: запись {}: {e}\n", p.display())),
+        }
+    }
+    if let Some(p) = &matrix_out {
+        let g = s.graph_matrix();
+        let n = s.neurons().len();
+        if g.len() == n * n && n > 0 {
+            let mut m = String::from("from_hz");
+            for b in s.neurons() {
+                m.push_str(&format!("\t{:.0}", crate::game::vocal::bin_hz_pub(b.lo, s.fs)));
+            }
+            m.push('\n');
+            for (i, b) in s.neurons().iter().enumerate() {
+                m.push_str(&format!("{:.0}", crate::game::vocal::bin_hz_pub(b.lo, s.fs)));
+                for j in 0..n {
+                    m.push_str(&format!("\t{:.4}", g[i * n + j]));
+                }
+                m.push('\n');
+            }
+            match std::fs::write(p, m) {
+                Ok(()) => arts.push(format!("матрица STDP → {}", p.display())),
+                Err(e) => out.push_str(&format!("game vocal: запись {}: {e}\n", p.display())),
+            }
+        }
+    }
+    if !arts.is_empty() {
+        out.push_str(&arts.join("\n"));
+        out.push('\n');
+    }
+    CmdResult::Done(out)
 }
 
 /// `game input-demo`: U1–U4 — скрипт событий → кадры + хеши (без окна).
