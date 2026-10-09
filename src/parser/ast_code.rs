@@ -242,6 +242,62 @@ pub fn extract_enclosing_scope(source: &str, byte_offset: usize, lang: CodeLang)
     }
 }
 
+/// Диапазон сигнатуры над открывающей скобкой (C-стиль, `{` на
+/// собственной строке): (старт байт, конец байт — до строки со скобкой).
+/// Сигнатура — часть «функции целиком»: без неё скоуп — тело без
+/// контракта. Поднимается от строки со скобкой вверх ≤10 строк, пока
+/// строки «похожи на сигнатуру»; носитель имени — самая верхняя строка,
+/// распознанная как полная сигнатура либо открывашка многострочной
+/// (кончается на `(`). Управляющие конструкции (if/while/switch…)
+/// отфильтрованы контрольными словами в `c_signature_name`.
+fn signature_span(source: &str, open_line_start: usize) -> Option<(usize, usize)> {
+    let open_line = source[open_line_start..].lines().next()?;
+    if !open_line.trim_start().starts_with('{') {
+        return None; // сигнатура на строке со скобкой (Rust-стиль) — уже в скоупе
+    }
+    let mut parts: Vec<usize> = Vec::new(); // старты строк-частей сигнатуры
+    let mut pos = open_line_start;
+    for _ in 0..10 {
+        if pos == 0 {
+            break;
+        }
+        let prev_end = pos - 1; // позиция '\n'
+        let prev_start = line_start(source, prev_end);
+        let line = source[prev_start..].lines().next().unwrap_or("");
+        if !is_signature_part(line) {
+            break;
+        }
+        parts.push(prev_start);
+        pos = prev_start;
+    }
+    // верхняя строка-носитель имени: полная сигнатура или `(`-открывашка
+    for &start in parts.iter().rev() {
+        let line = source[start..].lines().next().unwrap_or("");
+        if c_signature_name(line).is_some() || line.trim_end().ends_with('(') {
+            return Some((start, open_line_start));
+        }
+    }
+    None
+}
+
+/// Похоже ли строка на часть сигнатуры над `{`: аргумент/продолжение
+/// (кончается на `(`, `,`, `)`) либо распознанная однострочная сигнатура.
+fn is_signature_part(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty()
+        || t.starts_with('}')
+        || t.starts_with('#')
+        || t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with('*')
+        || t.ends_with(';')
+        || t.ends_with('{')
+    {
+        return false;
+    }
+    t.ends_with('(') || t.ends_with(',') || t.ends_with(')') || c_signature_name(line).is_some()
+}
+
 /// Лёгкая локализация скоупа (без клонирования текста): байтовый диапазон
 /// либо `None` для файлового уровня. Вызывается на каждое совпадение.
 pub fn locate_scope(source: &str, byte_offset: usize, lang: CodeLang) -> Option<(usize, usize)> {
@@ -254,12 +310,16 @@ pub fn locate_scope(source: &str, byte_offset: usize, lang: CodeLang) -> Option<
 }
 
 /// Материализация скоупа по границам (текст + сигнатура): один раз на
-/// уникальный скоуп.
+/// уникальный скоуп. Начало поднимается к строкам сигнатуры над `{`
+/// (C-стиль) — «функция целиком» включает её контракт.
 pub fn materialize_scope(source: &str, begin: usize, end: usize) -> CodeScope {
     let end = end.min(source.len()).max(begin);
-    let scope_begin = line_start(source, begin);
+    let brace_line_start = line_start(source, begin);
+    let scope_begin = signature_span(source, brace_line_start)
+        .map(|(s, _)| s)
+        .unwrap_or(brace_line_start);
     let scope_text = source[scope_begin..end].trim().to_string();
-    let (scope_type, name) = find_signature(source, scope_begin);
+    let (scope_type, name) = find_signature(source, brace_line_start);
     CodeScope {
         scope_type: scope_type.to_string(),
         name,
@@ -562,6 +622,18 @@ fn find_signature(source: &str, open_pos: usize) -> (&'static str, Option<String
             return (ty, name);
         }
     }
+    // C-стиль: тип имя(аргументы) без ключевого слова fn/def — строки
+    // сигнатуры над `{` склеиваются (многострочные сигнатуры).
+    if let Some((sig_start, sig_end)) = signature_span(source, open_line_start) {
+        let joined: String = source[sig_start..sig_end]
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(name) = c_signature_name(&joined) {
+            return ("function", Some(name));
+        }
+    }
     ("block", None)
 }
 
@@ -749,5 +821,46 @@ mod tests {
         assert_eq!(detect_lang(Path::new("/a/b/main.rs")), CodeLang::Brace);
         assert_eq!(detect_lang(Path::new("/a/b/app.py")), CodeLang::Python);
         assert_eq!(detect_lang(Path::new("/a/b/chapter.md")), CodeLang::Plain);
+    }
+
+    #[test]
+    fn c_style_signature_is_part_of_scope() {
+        // C-стиль: `{` на собственной строке — сигнатура (контракт функции)
+        // входит в «функцию целиком», иначе скоуп — тело без контракта
+        // (стресс-кейс libgit2: движок обязан подавать сигнатуру + фокус).
+        let src = "/* doc comment */\nint git_repository_open(git_repository **out, const char *path, int flags)\n{\n    return open_it(out, path, flags);\n}\n";
+        let sc = scope_at(src, "open_it");
+        assert_eq!(sc.name.as_deref(), Some("git_repository_open"));
+        assert!(
+            sc.text.starts_with("int git_repository_open"),
+            "сигнатура открывает скоуп: {}",
+            sc.text
+        );
+        assert!(sc.text.contains("{"));
+        assert!(sc.text.contains("open_it"));
+        assert_eq!(sc.start_line, 2, "start_line на сигнатуре: {}", sc.start_line);
+        // док-коммент НЕ втягивается (только строки сигнатуры)
+        assert!(!sc.text.contains("doc comment"));
+    }
+
+    #[test]
+    fn c_multiline_signature_fully_in_scope() {
+        let src = "static int call_foo(\n    int a,\n    const char *b)\n{\n    return do_call(a, b);\n}\n";
+        let sc = scope_at(src, "do_call");
+        assert!(
+            sc.text.starts_with("static int call_foo("),
+            "многострочная сигнатура целиком: {}",
+            sc.text
+        );
+        assert!(sc.text.contains("const char *b)"));
+    }
+
+    #[test]
+    fn rust_same_line_signature_unchanged() {
+        // Rust-стиль: сигнатура на строке со скобкой — поведение прежнее,
+        // дублирования строк сигнатуры нет.
+        let src = "fn alpha() {\n    let z = 9;\n}\n";
+        let sc = scope_at(src, "z =");
+        assert_eq!(sc.text.matches("fn alpha").count(), 1);
     }
 }

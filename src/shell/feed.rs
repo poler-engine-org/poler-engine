@@ -29,6 +29,10 @@
 //! символ, кириллица ≈ 3 символа на токен, прочее ≈ 4 символа на токен.
 //! Без словарей — чистая аналитика, в духе движка.
 //!
+//! Мега-скоуп, не влезающий в бюджет, НЕ подаётся целиком и НЕ режется
+//! по живому: пакет получает сигнатуру + фокальные окна вокруг хитов,
+//! разрывы помечены честными маркерами «N строк укрыто».
+//!
 //! Синтаксис (poler-shell / `--exec`):
 //! ```text
 //! feed <PATH> --for understand --query "<тема|сущность|символ>" [--budget N] [--relations N] [--json]
@@ -84,6 +88,15 @@ const DEFAULT_BUDGET: usize = 8000;
 const DEFAULT_RELATIONS: usize = 40;
 /// Максимум upstream/downstream строк в человекочитаемой карте.
 const IMPACT_DISPLAY_ROWS: usize = 12;
+/// Радиусы фокального окна вокруг хита (строк до/после) — от щедрого
+/// к минимальному: сжатие сначала пробует широкие окна.
+const FOCUS_RADII: &[usize] = &[6, 4, 3, 2, 1];
+/// Токен-надбавка на JSON-поля сжатого элемента (объект `compressed`).
+const COMPRESS_NOTE_TOKENS: usize = 16;
+/// Конверт impact-паспорта (target/danger/счётчики) + точка определения.
+const IMPACT_BASE_TOKENS: usize = 34;
+/// Резерв на один элемент пакета при обрезке impact-списков (мин. сжатый вид).
+const MIN_ITEM_RESERVE: usize = 160;
 
 // ---------------------------------------------------------------------------
 // Оценка токенов (письменность-осознанная, без словарей)
@@ -110,6 +123,203 @@ pub fn estimate_tokens(text: &str) -> usize {
         }
     }
     cjk + (cyr + 2) / 3 + (other + 3) / 4
+}
+
+/// Токен-стоимость одной строки impact-списка (символ + файл + пунктуация).
+fn impact_entry_tokens(name: &str, file: &str) -> usize {
+    estimate_tokens(&format!("{name} {file}")) + 4
+}
+
+// ---------------------------------------------------------------------------
+// Сжатие мега-скоупа: сигнатура + локальный фокус
+// ---------------------------------------------------------------------------
+
+/// Сжатый вид мега-скоупа (болезнь №2 стресс-теста libgit2: 5269/3000 ток).
+///
+/// Движок не режет цель правки по живому и не подаёт мега-функцию целиком:
+/// пакет получает сигнатуру (контракт) и фокальные окна вокруг хитов
+/// (цель правки всегда внутри окон), разрывы — честные маркеры.
+struct ScopeCompression {
+    /// Сигнатура + фокальные окна + маркеры пропуска.
+    text: String,
+    /// Число фокальных окон вокруг хитов (0 — хиты внутри сигнатуры).
+    windows: usize,
+    /// Строк полного скоупа, укрытых маркерами.
+    skipped_lines: usize,
+    /// Оценка токенов полного скоупа (до сжатия).
+    full_tokens: usize,
+    /// Хиты не найдены буквально (psi-резонанс и т.п.) — сигнатура + финал.
+    fallback: bool,
+}
+
+/// Конец сигнатуры прозы: первые 2 непустые строки (заголовок + зачин).
+fn prose_sig_end(lines: &[&str]) -> usize {
+    let mut end = 0usize;
+    let mut nonempty = 0usize;
+    for (i, l) in lines.iter().enumerate() {
+        if !l.trim().is_empty() {
+            nonempty += 1;
+            end = i + 1;
+            if nonempty == 2 {
+                break;
+            }
+        }
+    }
+    end
+}
+
+/// Склеивает регионы в текст: между ними — маркеры «N строк укрыто»
+/// (`/* … */` для кода, `[…]` для прозы). Возвращает (текст, укрыто строк).
+fn assemble_regions(lines: &[&str], regions: &[(usize, usize)], is_code: bool) -> (String, usize) {
+    let mut text = String::new();
+    let mut skipped = 0usize;
+    let mut prev_end: Option<usize> = None;
+    for &(s, e) in regions {
+        if let Some(pe) = prev_end {
+            let gap = s.saturating_sub(pe + 1);
+            if gap > 0 {
+                skipped += gap;
+                if is_code {
+                    text.push_str(&format!("    /* … {gap} строк укрыто … */\n"));
+                } else {
+                    text.push_str(&format!("[… {gap} строк укрыто …]\n"));
+                }
+            }
+        }
+        for l in &lines[s..=e] {
+            text.push_str(l);
+            text.push('\n');
+        }
+        prev_end = Some(e);
+    }
+    if let Some(pe) = prev_end {
+        let tail = lines.len().saturating_sub(pe + 1);
+        if tail > 0 {
+            skipped += tail;
+            if is_code {
+                text.push_str(&format!(
+                    "    /* … {tail} строк укрыто (до конца скоупа) … */\n"
+                ));
+            } else {
+                text.push_str(&format!("[… {tail} строк укрыто (до конца скоупа) …]\n"));
+            }
+        }
+    }
+    (text, skipped)
+}
+
+/// Сжимает мега-скоуп до «сигнатура + локальный фокус».
+///
+/// Вместо функции на тысячи строк пакет получает: (1) сигнатуру — для
+/// кода строки до первой `{` включительно (контракт функции), (2) окна
+/// вокруг каждого хита запроса — цель правки всегда внутри окон,
+/// (3) закрывающую строку кода; разрывы помечены честными маркерами.
+/// Если бюджет меньше минимального окна — подаётся минимальный вид
+/// (радиус 1, одно окно) и пакет честно флагает `over_budget`.
+fn compress_scope(scope: &str, terms: &[String], max_tokens: usize) -> ScopeCompression {
+    let full_tokens = estimate_tokens(scope);
+    let lines: Vec<&str> = scope.lines().collect();
+    if lines.is_empty() {
+        return ScopeCompression {
+            text: scope.to_string(),
+            windows: 0,
+            skipped_lines: 0,
+            full_tokens,
+            fallback: true,
+        };
+    }
+    let n_lines = lines.len();
+    // Стиль маркеров: код → /* … */, проза → […]
+    let is_code = scope.matches(';').count() + scope.matches('{').count() >= 4;
+    // Сигнатура: для кода — до первой `{` (≤15 строк), для прозы — 2 непустые.
+    let sig_end = if is_code {
+        lines
+            .iter()
+            .enumerate()
+            .take(15)
+            .find(|(_, l)| l.contains('{'))
+            .map(|(i, _)| i + 1)
+            .unwrap_or_else(|| prose_sig_end(&lines))
+    } else {
+        prose_sig_end(&lines)
+    };
+    // Хиты: строки с любым термом запроса (регистронезависимо), вне сигнатуры.
+    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            let low = l.to_lowercase();
+            *i >= sig_end
+                && lower_terms
+                    .iter()
+                    .any(|t| t.len() >= 2 && low.contains(t.as_str()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    // Закрывающая строка кода (видно и тело, и закрытие — валидность).
+    let close_line = if is_code {
+        (sig_end..n_lines).rev().find(|&i| lines[i].contains('}'))
+    } else {
+        None
+    };
+
+    // Радиусы 6→1; если и радиус 1 не лезет — роняем хвостовые окна
+    // (цель правки важнее полноты охвата, маркеры честны).
+    let regions_for = |radius: usize, cap: usize| -> (Vec<(usize, usize)>, usize) {
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        if sig_end > 0 {
+            regions.push((0, sig_end - 1));
+        }
+        let mut windows = 0usize;
+        for &h in &hits {
+            if windows >= cap {
+                break;
+            }
+            let start = h.saturating_sub(radius).max(sig_end);
+            let end = (h + radius).min(n_lines - 1);
+            if let Some(last) = regions.last_mut() {
+                if start <= last.1 + 2 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            regions.push((start, end));
+            windows += 1;
+        }
+        if let Some(c) = close_line {
+            if c >= sig_end {
+                match regions.last_mut() {
+                    Some(last) if c <= last.1 + 2 => last.1 = last.1.max(c),
+                    _ => regions.push((c, c)),
+                }
+            }
+        }
+        (regions, windows)
+    };
+
+    let mut candidates: Vec<(usize, usize)> =
+        FOCUS_RADII.iter().map(|&r| (r, usize::MAX)).collect();
+    candidates.push((1, 8));
+    candidates.push((1, 4));
+    candidates.push((1, 2));
+    candidates.push((1, 1));
+    for &(radius, cap) in &candidates {
+        let (regions, windows) = regions_for(radius, cap);
+        let (text, skipped) = assemble_regions(&lines, &regions, is_code);
+        let fits = estimate_tokens(&text) + COMPRESS_NOTE_TOKENS <= max_tokens;
+        let minimal = radius == 1 && cap == 1;
+        if fits || minimal {
+            return ScopeCompression {
+                text,
+                windows,
+                skipped_lines: skipped,
+                full_tokens,
+                fallback: hits.is_empty(),
+            };
+        }
+    }
+    unreachable!("кандидат (радиус 1, одно окно) всегда терминирует цикл")
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +370,18 @@ struct FeedItem<'a> {
     tokens: usize,
     /// Только для edit-режима: вердикт по перцентилю энергии.
     verdict: Option<&'static str>,
+    /// Сжатие мега-скоупа (сигнатура + фокальные окна), если применялось.
+    compression: Option<ScopeCompression>,
+}
+
+impl FeedItem<'_> {
+    /// Текст скоупа элемента пакета: сжатый, если сжатие применялось.
+    fn scope_text(&self) -> &str {
+        match &self.compression {
+            Some(c) => c.text.as_str(),
+            None => self.anchor.scene.enclosing_scope.as_str(),
+        }
+    }
 }
 
 /// Внутренний прогон движка: пул якорей под запрос.
@@ -325,33 +547,95 @@ pub fn run_feed(
     };
     let impact = impact_pack.as_ref().map(|(r, _)| r);
     let def_count = impact_pack.as_ref().map(|(_, c)| *c).unwrap_or(0);
-    let impact_cost = impact
-        .map(|r| {
-            // 34 = конверт impact-паспорта + точка определения
-            let mut t = 34usize;
-            for d in r.structural_relations.upstream_dependents.iter() {
-                t += estimate_tokens(&format!("{} {}", d.caller, d.file)) + 4;
+    // -------- impact: обрезка списков под бюджет --------
+    // Паспорт с 200+ потребителями дороже самого кода: счётчики полные
+    // (граф знает всех — это дёшево и честно), списки режутся под кап
+    // бюджета, upstream первыми («кто сломается» важнее всего).
+    let (up_shown, down_shown, impact_cost) = match impact {
+        None => (usize::MAX, usize::MAX, 0usize),
+        Some(r) => {
+            let full = IMPACT_BASE_TOKENS
+                + r
+                    .structural_relations
+                    .upstream_dependents
+                    .iter()
+                    .map(|d| impact_entry_tokens(&d.caller, &d.file))
+                    .sum::<usize>()
+                + r
+                    .structural_relations
+                    .downstream_dependencies
+                    .iter()
+                    .map(|d| impact_entry_tokens(&d.callee, &d.file))
+                    .sum::<usize>();
+            let cap = budget
+                .saturating_sub(ENVELOPE_TOKENS + rel_cost + MIN_ITEM_RESERVE)
+                .min(full);
+            if full <= cap {
+                (usize::MAX, usize::MAX, full)
+            } else {
+                let mut t = IMPACT_BASE_TOKENS;
+                // upstream — 70% списочного резерва («кто сломается»
+                // важнее), downstream — остаток, чтобы зависимости
+                // не обнулялись при тесном бюджете.
+                let up_budget = if r.structural_relations.downstream_dependencies.is_empty() {
+                    cap
+                } else {
+                    IMPACT_BASE_TOKENS + (cap - IMPACT_BASE_TOKENS) * 7 / 10
+                };
+                let mut up = 0usize;
+                for d in r.structural_relations.upstream_dependents.iter() {
+                    let c = impact_entry_tokens(&d.caller, &d.file);
+                    if t + c > up_budget {
+                        break;
+                    }
+                    t += c;
+                    up += 1;
+                }
+                let mut down = 0usize;
+                for d in r.structural_relations.downstream_dependencies.iter() {
+                    let c = impact_entry_tokens(&d.callee, &d.file);
+                    if t + c > cap {
+                        break;
+                    }
+                    t += c;
+                    down += 1;
+                }
+                (up, down, t)
             }
-            for d in r.structural_relations.downstream_dependencies.iter() {
-                t += estimate_tokens(&format!("{} {}", d.callee, d.file)) + 4;
-            }
-            t
-        })
-        .unwrap_or(0);
+        }
+    };
 
     // -------- жадное заполнение бюджета --------
     let mut spent = ENVELOPE_TOKENS + rel_cost + impact_cost;
     let mut selected: Vec<FeedItem> = Vec::new();
     for (pos, &i) in items_order.iter().enumerate() {
-        let cost = estimate_tokens(&pool[i].scene.enclosing_scope) + ITEM_META_TOKENS;
+        let a = &pool[i];
+        let full_cost = estimate_tokens(&a.scene.enclosing_scope) + ITEM_META_TOKENS;
+        // Мега-скоуп первого якоря: сигнатура + локальный фокус, а не весь
+        // мега-файл целиком (стресс-тест libgit2: 5269/3000 ток). Цель
+        // правки остаётся в пакете — внутри фокальных окон вокруг хитов.
+        let (cost, compression) = if selected.is_empty() && spent + full_cost > budget {
+            let max_item = budget.saturating_sub(spent + ITEM_META_TOKENS + COMPRESS_NOTE_TOKENS);
+            let mut terms: Vec<String> =
+                query.split_whitespace().map(str::to_string).collect();
+            if !terms.iter().any(|t| t.eq_ignore_ascii_case(&a.token)) {
+                terms.push(a.token.clone());
+            }
+            let c = compress_scope(&a.scene.enclosing_scope, &terms, max_item);
+            let cost = estimate_tokens(&c.text) + ITEM_META_TOKENS + COMPRESS_NOTE_TOKENS;
+            (cost, Some(c))
+        } else {
+            (full_cost, None)
+        };
         if !selected.is_empty() && spent + cost > budget {
             continue; // не влезает — пробуем следующие (они могут быть короче)
         }
         spent += cost;
         selected.push(FeedItem {
-            anchor: &pool[i],
+            anchor: a,
             tokens: cost,
             verdict: verdicts.as_ref().map(|v| v[pos]),
+            compression,
         });
     }
 
@@ -360,8 +644,9 @@ pub fn run_feed(
     } else {
         0.0
     };
-    // Честная пометка: первый якорь подаётся полностью даже сквозь бюджет
-    // (в edit-режиме резать цель правки нельзя) — если он один его переполняет.
+    // Честная пометка: мега-скоуп первого якоря сжимается до сигнатуры +
+    // фокальных окон (цель правки — внутри окон); превышение означает,
+    // что даже сжатый вид не влез (бюджет меньше минимального окна).
     let over_budget = spent > budget;
 
     if json {
@@ -376,7 +661,7 @@ pub fn run_feed(
                     "resonance": round2(a.resonance),
                     "subjects": a.scene.subjects,
                     "tokens": it.tokens,
-                    "scope": a.scene.enclosing_scope,
+                    "scope": it.scope_text(),
                 });
                 if let Some(l) = &a.scene.location {
                     v["location"] = json!(l);
@@ -386,6 +671,16 @@ pub fn run_feed(
                 }
                 if let Some(verdict) = it.verdict {
                     v["density_verdict"] = json!(verdict);
+                }
+                if let Some(c) = &it.compression {
+                    v["compressed"] = json!({
+                        "applied": true,
+                        "windows": c.windows,
+                        "skipped_lines": c.skipped_lines,
+                        "full_tokens": c.full_tokens,
+                        "fallback": c.fallback,
+                        "note": "мега-скоуп подан сжато: сигнатура + фокальные окна вокруг хитов",
+                    });
                 }
                 v
             })
@@ -424,17 +719,27 @@ pub fn run_feed(
                 "definition_sites": def_count,
                 "note": definition_note(def_count),
             });
-            packet["impact"] = json!({
+            let up_total = r.structural_relations.upstream_dependents.len();
+            let down_total = r.structural_relations.downstream_dependencies.len();
+            let up_n = up_shown.min(up_total);
+            let down_n = down_shown.min(down_total);
+            let mut impact_json = json!({
                 "target": r.target_function,
                 "file": r.file,
                 "lines": r.lines,
                 "danger_level_if_modified": r.danger_level_if_modified,
+                "upstream_total": up_total,
+                "upstream_shown": up_n,
                 "upstream_dependents": r.structural_relations.upstream_dependents
                     .iter()
+                    .take(up_n)
                     .map(|d| json!({"caller": d.caller, "file": d.file}))
                     .collect::<Vec<_>>(),
+                "downstream_total": down_total,
+                "downstream_shown": down_n,
                 "downstream_dependencies": r.structural_relations.downstream_dependencies
                     .iter()
+                    .take(down_n)
                     .map(|d| json!({"callee": d.callee, "file": d.file}))
                     .collect::<Vec<_>>(),
                 "triage_alerts": r.heuristic_triage_alerts
@@ -442,6 +747,12 @@ pub fn run_feed(
                     .map(|a| json!({"marker": a.marker, "description": a.description}))
                     .collect::<Vec<_>>(),
             });
+            if up_n < up_total || down_n < down_total {
+                impact_json["truncated"] = json!(true);
+                impact_json["note"] =
+                    json!("списки обрезаны под токен-бюджет; счётчики полные — граф знает всех");
+            }
+            packet["impact"] = impact_json;
         }
         packet["advice"] = json!(advice_text(
             mode,
@@ -612,9 +923,15 @@ fn render_card(
     ));
     if over_budget {
         out.push_str(
-            "⚠ Первый якорь превышает бюджет и подан полностью (цель правки не режется):\n\
+            "⚠ Первый якорь даже в сжатом виде (сигнатура + фокальные окна) превышает бюджет:\n\
              подними --budget либо уточни запрос для меньших скоупов.\n",
         );
+    } else if let Some(c) = selected.first().and_then(|it| it.compression.as_ref()) {
+        out.push_str(&format!(
+            "ℹ Мега-скоуп первого якоря подан сжато: сигнатура + {} фокальных окон вокруг хитов\n\
+             ({} строк укрыто маркерами, полный размер {} ток). Цель правки — внутри окон.\n",
+            c.windows, c.skipped_lines, c.full_tokens
+        ));
     }
     out.push_str(&format!(
         "Энергия пула: медиана ε={:.1} · Q3 ε={:.1} · max ε={:.1}\n",
@@ -646,7 +963,7 @@ fn render_card(
                 }
                 out.push_str(&format!(
                     "\n```text\n{}\n```\n",
-                    a.scene.enclosing_scope
+                    it.scope_text()
                 ));
             }
         }
@@ -667,7 +984,7 @@ fn render_card(
                 }
                 out.push_str(&format!(
                     "\n```text\n{}\n```\n",
-                    a.scene.enclosing_scope
+                    it.scope_text()
                 ));
             }
         }
@@ -693,6 +1010,12 @@ fn render_card(
         ));
         for d in r.structural_relations.upstream_dependents.iter().take(IMPACT_DISPLAY_ROWS) {
             out.push_str(&format!("   • {} ({})\n", d.caller, d.file));
+        }
+        if r.structural_relations.upstream_dependents.len() > IMPACT_DISPLAY_ROWS {
+            out.push_str(&format!(
+                "   … и ещё {} (полный список знает граф: impact <PATH> <SYM>)\n",
+                r.structural_relations.upstream_dependents.len() - IMPACT_DISPLAY_ROWS
+            ));
         }
         out.push_str(&format!(
             "⬇ downstream ({}):\n",
@@ -1080,5 +1403,140 @@ mod tests {
             "много точек: {:?}",
             definition_note(5)
         );
+    }
+
+    #[test]
+    fn feed_mega_function_compressed_to_signature_and_focus() {
+        // Болезнь №2 стресс-теста libgit2: функция на тысячи строк НЕ подаётся
+        // целиком сквозь бюджет — пакет получает сигнатуру + фокальное окно
+        // вокруг хита, разрывы помечены честными маркерами.
+        let d = temp_dir("mega");
+        let mut src = String::new();
+        src.push_str(
+            "int git_repository_open(git_repository **out, const char *path, int flags)\n{\n",
+        );
+        for i in 0..120 {
+            src.push_str(&format!(
+                "    int filler_{i} = compute_step_{i}(flags) + {i}; /* шум */\n"
+            ));
+        }
+        src.push_str("    return validate_and_open(out, path, flags);\n");
+        src.push_str("}\n");
+        std::fs::write(d.join("repo.c"), src).unwrap();
+        // Полный скоуп ≈ 124 строки не влезает в 500 ток; сжатый вид — влезает.
+        let js = run_feed(&d, FeedMode::Edit, "validate_and_open", 500, 40, true);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("JSON");
+        assert_eq!(v["over_budget"], false, "сжатый вид влез в бюджет: {js}");
+        assert!(
+            v["spent_tokens"].as_u64().unwrap() <= 500,
+            "бюджет уважен: {js}"
+        );
+        let it = &v["items"][0];
+        assert_eq!(
+            it["compressed"]["applied"],
+            true,
+            "сжатие применено: {js}"
+        );
+        let scope = it["scope"].as_str().unwrap();
+        assert!(
+            scope.contains("int git_repository_open"),
+            "сигнатура в скоупе: {scope}"
+        );
+        assert!(
+            scope.contains("validate_and_open"),
+            "фокус-хит внутри окна: {scope}"
+        );
+        assert!(scope.contains("укрыто"), "маркеры пропуска: {scope}");
+        assert!(
+            scope.trim_end().ends_with('}'),
+            "закрывающая скобка видна: {scope}"
+        );
+        assert!(
+            it["compressed"]["skipped_lines"].as_u64().unwrap() > 50,
+            "мега-объём честно укрыт: {js}"
+        );
+        // Карта: пометка о сжатии вместо паники «превышает бюджет».
+        let card = run_feed(&d, FeedMode::Edit, "validate_and_open", 500, 40, false);
+        assert!(card.contains("фокальных окон"), "пометка в карте: {card}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn feed_mega_chapter_compressed_for_understand() {
+        // Проза: глава длиннее бюджета подаётся заголовком + фокальным окном
+        // вокруг смыслообразующего упоминания (Darcy-кейс).
+        let d = temp_dir("mega-prose");
+        let mut txt = String::from("# Глава 1\n\n");
+        for i in 0..80 {
+            txt.push_str(&format!(
+                "Абзац номер {i} повествует о погоде и окрестностях Лонгборна.\n\n"
+            ));
+        }
+        txt.push_str("Дарси принёс чашку кофе и молча смотрел в окно.\n\n");
+        for i in 0..40 {
+            txt.push_str(&format!(
+                "Дальнейший абзац {i} — о миссис Беннет и её планах на неделю.\n\n"
+            ));
+        }
+        std::fs::write(d.join("novel.md"), txt).unwrap();
+        let js = run_feed(&d, FeedMode::Understand, "Дарси", 400, 40, true);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("JSON");
+        assert_eq!(v["over_budget"], false, "сжатая глава влезла: {js}");
+        assert!(
+            v["spent_tokens"].as_u64().unwrap() <= 400,
+            "бюджет уважен: {js}"
+        );
+        let it = &v["items"][0];
+        assert_eq!(
+            it["compressed"]["applied"],
+            true,
+            "сжатие применено: {js}"
+        );
+        let scope = it["scope"].as_str().unwrap();
+        assert!(
+            scope.contains("Дарси принёс"),
+            "фокус-окно вокруг хита: {scope}"
+        );
+        assert!(scope.contains("укрыто"), "маркеры пропуска: {scope}");
+        let card = run_feed(&d, FeedMode::Understand, "Дарси", 400, 40, false);
+        assert!(card.contains("фокальных окон"), "пометка в карте: {card}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn feed_impact_lists_trimmed_to_budget() {
+        // Паспорт с 60 потребителями не съедает пакет (остаток болезни №2
+        // стресс-теста: 200 upstream × длинные пути = 6710 ток при бюджете
+        // 3000): счётчики полные, списки обрезаны под кап бюджета.
+        let d = temp_dir("impact-trim");
+        let mut src = String::from("int target_fn(void)\n{\n    return 1;\n}\n\n");
+        for i in 0..60 {
+            src.push_str(&format!(
+                "int caller_{i:02}(void)\n{{\n    return target_fn() + {i};\n}}\n\n"
+            ));
+        }
+        std::fs::write(d.join("big.c"), src).unwrap();
+        let js = run_feed(&d, FeedMode::Edit, "target_fn", 400, 5, true);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("JSON");
+        let im = &v["impact"];
+        let total = im["upstream_total"].as_u64().unwrap();
+        assert!(total >= 60, "полный счётчик честен: {js}");
+        let shown = im["upstream_shown"].as_u64().unwrap();
+        assert!(
+            (1..total).contains(&shown),
+            "список обрезан, но не пуст: {js}"
+        );
+        assert_eq!(
+            im["upstream_dependents"].as_array().unwrap().len() as u64,
+            shown,
+            "длина списка = shown: {js}"
+        );
+        assert_eq!(im["truncated"], true, "пометка обрезки: {js}");
+        assert!(
+            v["spent_tokens"].as_u64().unwrap() <= 400,
+            "бюджет уважен: {js}"
+        );
+        assert_eq!(v["over_budget"], false, "нет переполнения: {js}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

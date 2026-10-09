@@ -64,6 +64,52 @@ const PRONOUNS: &[&str] = &[
     "и", "the", "this", "that", "these", "those", "it", "he", "she", "they", "we", "you",
 ];
 
+/// Английские закрытые классы: предлоги, союзы, артикли, местоимения,
+/// вспомогательные глаголы, частицы + ключевые слова C-семейства и титулы
+/// (проза XIX века). Эти слова НИКОГДА не сущности — даже с заглавной
+/// буквы («If»/«With» из комментариев, «In»/«On» после глагола —
+/// стресс-кейс libgit2 + Pride and Prejudice). Это грамматика языка
+/// (~170 слов), а не морфологический словарь — «ноль словарей» не
+/// нарушается: закрытый класс, как [`PREPOSITIONS`] и [`PRONOUNS`].
+const ENG_STOPWORDS: &[&str] = &[
+    // предлоги
+    "in", "on", "at", "by", "for", "with", "from", "of", "to", "into", "onto", "upon", "about",
+    "around", "through", "during", "before", "after", "since", "until", "till", "against",
+    "between", "among", "amongst", "beside", "besides", "behind", "beyond", "above", "below",
+    "over", "under", "beneath", "underneath", "toward", "towards", "within", "without",
+    "across", "along", "amid", "near", "past", "per", "via", "despite", "except", "inside",
+    "outside", "unto", "up", "down", "off", "out",
+    // союзы и связующие наречия
+    "and", "or", "but", "nor", "so", "yet", "both", "either", "neither", "however", "therefore",
+    "thus", "hence", "moreover", "furthermore", "meanwhile", "otherwise", "instead", "because",
+    "although", "though", "unless", "whereas", "whether", "if", "than", "when", "where", "why",
+    "how", "what", "which", "who", "whom", "whose", "while", "lest",
+    // артикли и детерминативы
+    "a", "an", "the", "this", "that", "these", "those", "such", "some", "any", "no", "every",
+    "each", "all", "few", "many", "several", "most", "other", "another", "own", "same", "much",
+    "less", "certain", "none", "like",
+    // предлог-союзы, пропущенные в первом проходе
+    "as", "his",
+    // местоимения и вспомогательные глаголы
+    "i", "me", "him", "us", "them", "my", "mine", "your", "yours", "her", "hers", "our", "ours",
+    "their", "theirs", "myself", "yourself", "himself", "herself", "itself", "ourselves",
+    "themselves", "whoever", "one", "is", "are", "was", "were", "be", "been", "being", "am",
+    "has", "have", "had", "having", "does", "do", "did", "will", "would", "shall", "should",
+    "can", "could", "may", "might", "must", "ought", "not", "never", "always", "often",
+    "sometimes", "usually", "rarely", "seldom", "now", "then", "here", "there", "very", "too",
+    "also", "only", "just", "even", "still", "again", "once", "perhaps", "maybe", "indeed",
+    "almost", "already",
+    // ключевые слова C-семейства (шум из комментариев и документации)
+    "else", "switch", "case", "default", "break", "continue", "return", "goto", "do", "sizeof",
+    "typedef", "struct", "union", "enum", "extern", "static", "const", "volatile", "register",
+    "auto", "inline", "define", "include", "ifdef", "ifndef", "endif", "elif", "pragma", "undef",
+    "defined", "void", "int", "char", "long", "short", "double", "float", "unsigned", "signed",
+    "null", "true", "false", "bool",
+    // титулы (заголовки/обращения в англоязычной прозе)
+    "mr", "mrs", "ms", "miss", "lady", "sir", "lord", "dr", "dame", "madam", "madame",
+    "chapter", "volume",
+];
+
 const VERB_SUFFIXES: &[&str] = &[
     "ает", "ует", "ирует", "ывает", "ивает", "зует", "ует", "ет", "ит", "ат", "ят", "ут", "ют",
     "ила", "ала", "ела", "ула", "ыла", "ла", "ло", "ли", "лась", "лся", "ась", "ись", "ешь",
@@ -90,6 +136,8 @@ static PRONOUN_SET: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| PRONOUNS.iter().copied().collect());
 static ENG_VERB_SET: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ENG_VERBS.iter().copied().collect());
+static STOP_SET: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| ENG_STOPWORDS.iter().copied().collect());
 
 static NUMBER_UNIT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d+([.,]\d+)?(°[CFK]|%|км|кг|мс|мм|см|м|с|ч|К|В|А|Гц|МВт|кВт|т|г)$").unwrap());
@@ -108,6 +156,10 @@ pub(crate) const CALL_KEYWORDS: &[&str] = &[
     "async", "await", "where", "as", "in", "ref", "const", "static", "type", "dyn", "box",
     "break", "continue", "def", "class", "lambda", "try", "catch", "except", "switch", "case",
     "new", "delete", "sizeof", "typeof", "and", "or", "not", "elif", "with", "yield", "pass",
+    // C/C++: управляющие и препроцессорные конструкции с «(...)» — не вызовы
+    "do", "goto", "default", "defined", "__attribute__", "_Generic", "_Static_assert",
+    "ifdef", "ifndef", "endif", "include", "define", "undef", "pragma", "error", "warning",
+    "line",
 ];
 
 // ---------------------------------------------------------------------------
@@ -180,6 +232,11 @@ fn is_prep(w: &str) -> bool {
 fn is_poss(w: &str) -> bool {
     POSS_SET.contains(w)
 }
+/// Закрытый класс английского (регистронезависимо): предлоги/союзы/
+/// артикли/местоимения/aux + C-ключевые слова — не сущность никогда.
+fn is_stopword(w: &str) -> bool {
+    STOP_SET.contains(w)
+}
 fn is_adjective(w: &str) -> bool {
     ADJ_SUFFIXES.iter().any(|s| w.ends_with(s)) && w.len() > 3
 }
@@ -244,6 +301,9 @@ fn build_lexicon(
         let w = &words[i];
         if w.raw.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
             && !is_pronoun(&w.lower)
+            && !is_stopword(&w.lower)
+            && !is_prep(&w.lower)
+            && !is_poss(&w.lower)
             && w.raw.chars().all(|c| c.is_alphabetic())
         {
             let mut seq = vec![w.raw.clone()];
@@ -251,6 +311,9 @@ fn build_lexicon(
             while j < words.len()
                 && seq.len() < 3
                 && words[j].raw.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_stopword(&words[j].lower)
+                && !is_prep(&words[j].lower)
+                && !is_poss(&words[j].lower)
                 && words[j].raw.chars().all(|c| c.is_alphabetic())
             {
                 seq.push(words[j].raw.clone());
@@ -334,17 +397,21 @@ fn find_entity_spans(
             i += len;
             continue;
         }
-        // 3) заглавное слово (не местоимение): mid-sentence — сильное,
-        //    в начале предложения — слабое
+        // 3) заглавное слово (не местоимение/стоп-слово/предлог):
+        //    mid-sentence — сильное, в начале предложения — слабое
         let c = words[i].raw.chars().next();
         if c.map(|c| c.is_uppercase()).unwrap_or(false)
             && !is_pronoun(&words[i].lower)
+            && !is_stopword(&words[i].lower)
+            && !is_prep(&words[i].lower)
             && words[i].raw.chars().all(|ch| ch.is_alphabetic())
         {
             let mut len = 1usize;
             while i + len < words.len()
                 && len < 3
                 && words[i + len].raw.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_stopword(&words[i + len].lower)
+                && !is_prep(&words[i + len].lower)
                 && words[i + len].raw.chars().all(|ch| ch.is_alphabetic())
             {
                 len += 1;
@@ -398,14 +465,24 @@ fn verb_centered_predicate(middle: &[W]) -> Option<String> {
 
     let vpos = core.iter().position(|w| is_verb_like(&w.lower));
     let Some(v) = vpos else {
-        // без глагола: сырые слова середины (cap 3)
-        return Some(
-            core.iter()
-                .take(3)
-                .map(|w| w.lower.clone())
-                .collect::<Vec<_>>()
-                .join("_"),
-        );
+        // без глагола: содержательные слова середины (cap 3); предлоги,
+        // притяжательные и стоп-слова в предикат не идут — иначе
+        // рождаются «stood_near_them»-подобные свалки
+        let parts: Vec<String> = core
+            .iter()
+            .filter(|w| {
+                !is_prep(&w.lower)
+                    && !is_poss(&w.lower)
+                    && !is_pronoun(&w.lower)
+                    && !is_stopword(&w.lower)
+            })
+            .take(3)
+            .map(|w| w.lower.clone())
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        return Some(parts.join("_"));
     };
 
     let mut parts: Vec<String> = vec![core[v].lower.clone()];
@@ -505,7 +582,10 @@ fn resolve_object(words: &[W], from: usize) -> Option<String> {
             {
                 break;
             }
-            if nw.raw.chars().all(|c| c.is_alphabetic() || c == '-') {
+            if nw.raw.chars().all(|c| c.is_alphabetic() || c == '-')
+                && !is_pronoun(&nw.lower)
+                && !is_stopword(&nw.lower)
+            {
                 phrase.push(nw.raw.clone());
             }
             if phrase.len() >= 2 {
@@ -665,13 +745,25 @@ pub fn extract_triples(
 }
 
 /// Извлекает тройки из кода: вызовы (call graph) и импорты.
+///
+/// Упоминание функции в комментарии или строковом литерале — НЕ вызов:
+/// захваты [`CALL_RE`] внутри спанов комментариев/строк (лексический
+/// сканер [`crate::parser::ast_code::string_comment_spans`]) отбрасываются.
 pub fn extract_code_triples(scope_text: &str, scope_name: Option<&str>, file_stem: &str) -> Vec<Triple> {
     let mut out: Vec<Triple> = Vec::new();
     let owner = scope_name.unwrap_or(file_stem);
 
+    // слова из комментариев/строк не попадают в call graph
+    let noise = crate::parser::ast_code::string_comment_spans(scope_text);
+    let in_noise =
+        |b: usize| noise.iter().any(|&(s, e)| b >= s && b < e);
+
     for caps in CALL_RE.captures_iter(scope_text) {
         let callee = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         if callee.is_empty() || CALL_KEYWORDS.contains(&callee) {
+            continue;
+        }
+        if caps.get(1).is_some_and(|m| in_noise(m.start())) {
             continue;
         }
         out.push(Triple::new(owner, "вызывает", callee));
@@ -809,5 +901,83 @@ mod tests {
         let text = "Первое. Второе предложение! Третье?\nЧетвёртое: с двоеточием. Пятое 3.14 число.";
         let sents = split_sentences(text);
         assert_eq!(sents.len(), 5, "{sents:?}");
+    }
+
+    #[test]
+    fn english_function_words_never_become_entities() {
+        // Стресс-кейс Pride and Prejudice: предлоги с заглавной
+        // («In», «On», «With», «If») не становятся ни объектом, ни
+        // субъектом, ни частью предиката.
+        let scope = "Darcy brought his coffee-cup in. Darcy stood near them. \
+                     If the weather held, they walked on. With the news, Jane smiled. \
+                     Darcy visited Pemberley with Elizabeth.";
+        let scene = SceneContext {
+            chapter: "Chapter 3".into(),
+            temporal_metric: None,
+            location: None,
+            subjects: vec![],
+            enclosing_scope: scope.into(),
+            metric_tag: None,
+            subject_names: vec!["Darcy".into()],
+            subject_pairs: vec![],
+        };
+        let triples = extract_triples(scope, &scene, &["darcy".to_string()]);
+        for t in &triples {
+            assert!(
+                !matches!(
+                    t.object.trim(),
+                    "In" | "On" | "With" | "If" | "At" | "By" | "For" | "Near" | "Them"
+                ),
+                "стоп-слово как объект: {t:?}"
+            );
+            assert!(
+                !matches!(t.subject.trim(), "In" | "On" | "With" | "If" | "Them"),
+                "стоп-слово как субъект: {t:?}"
+            );
+            assert!(
+                !t.predicate
+                    .split('_')
+                    .any(|p| matches!(p, "in" | "on" | "with" | "if" | "them" | "near")),
+                "стоп-слово внутри предиката: {t:?}"
+            );
+        }
+        // живая SVO-тройка остаётся (Darcy → Pemberley)
+        assert!(
+            triples.iter().any(|t| t.subject == "Darcy" && t.object == "Pemberley"),
+            "настоящая тройка на месте: {triples:?}"
+        );
+    }
+
+    #[test]
+    fn c_comment_mentions_and_preprocessor_are_not_calls() {
+        // Упоминание в док-комментарии — не вызов; defined/__attribute__
+        // и ключевые слова — не callees; живой вызов остаётся.
+        let src = "/* If you want to retry, call git_repository_close(out) \
+                   when done with the repository. */\n\
+                   #if defined(_WIN32)\n\
+                   static int open_repo(git_repository **out, const char *path)\n\
+                   {\n\
+                       __attribute__((unused)) int x = 0;\n\
+                       return git_repository_open(out, path, 0);\n\
+                   }\n\
+                   #endif\n";
+        let triples = extract_code_triples(src, Some("open_repo"), "repo");
+        let flat: Vec<String> = triples
+            .iter()
+            .map(|t| format!("{}|{}|{}", t.subject, t.predicate, t.object))
+            .collect();
+        assert!(
+            flat.iter().any(|s| s == "open_repo|вызывает|git_repository_open"),
+            "живой вызов в графе: {flat:?}"
+        );
+        assert!(
+            !flat.iter().any(|s| s.contains("git_repository_close")),
+            "упоминание в комментарии не вызов: {flat:?}"
+        );
+        assert!(!flat.iter().any(|s| s.contains("defined")), "defined не callee: {flat:?}");
+        assert!(
+            !flat.iter().any(|s| s.contains("__attribute__")),
+            "__attribute__ не callee: {flat:?}"
+        );
     }
 }

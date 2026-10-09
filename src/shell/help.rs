@@ -80,7 +80,7 @@ pub fn all_entries() -> Vec<HelpEntry> {
 
         HelpEntry { group: HelpGroup::Crawl, cmd: "crawl <URL> [--depth N] [--max M] [--cross] [--delay-ms N]", short: "Обхід URL → web-index.db (CDP+Chromium)" },
         HelpEntry { group: HelpGroup::Impact, cmd: "impact <PATH> <SYMBOL> [--depth N] [--cache <DB>]", short: "AIDDE impact-паспорт символу в кодовій базі" },
-        HelpEntry { group: HelpGroup::Impact, cmd: "feed <PATH> --for <understand|edit> -q <QUERY> [--budget N] [--json]", short: "Контекст-шлюз: пакет по энергии под действие (v0.80.0)" },
+        HelpEntry { group: HelpGroup::Impact, cmd: "feed <PATH> --for <understand|edit> -q <QUERY> [--budget N] [--json]", short: "Контекст-шлюз: пакет по энергии под действие (v0.81.0)" },
 
         HelpEntry { group: HelpGroup::Vcs, cmd: "gh search <Q> [--top N]", short: "Пошук по коду GitHub (треба $GITHUB_TOKEN)" },
         HelpEntry { group: HelpGroup::Vcs, cmd: "gh repos <USER>", short: "Список репозиторіїв користувача GitHub" },
@@ -475,6 +475,9 @@ fn format_entry_detail(e: &HelpEntry) -> String {
             s.push_str("РЕЖИМИ:\n");
             s.push_str("  understand — СКЕЛЕТ: высокоэнергетичные узлы + K-hop (для понимания)\n");
             s.push_str("  edit — цели по ε возрастанию (разреженные зоны первыми) + AIDDE impact\n\n");
+            s.push_str("МЕГА-СКОПИ:\n");
+            s.push_str("  Скоуп, не влезающий в бюджет, подаётся сжато: сигнатура +\n");
+            s.push_str("  фокальные окна вокруг хитов (маркеры «N строк укрыто» честны).\n\n");
             s.push_str("ОЦІНКА ТОКЕНІВ:\n");
             s.push_str("  Письменность-осознанная (Script из universal_letters): CJK ≈ 1\n");
             s.push_str("  токен/символ, кириллица ≈ 3 символа/токен, латиница ≈ 4 символа/токен.\n");
