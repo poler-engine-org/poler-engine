@@ -399,19 +399,27 @@ pub struct TypeDeclQuery {
     /// Имя типа КАК НАПИСАНО в запросе (case-sensitive — как якорь
     /// [`SignatureQuery`]: идентификаторы C++ чувствительны к регистру).
     pub name_word: String,
+    /// v0.86.0 (ГРАБЛЯ 45, Boost.Spirit): запрос с template-префиксом —
+    /// `template struct phrase_parse` / `template class Parser`.
+    /// В реальном C++ между `template` и class-key всегда стоит
+    /// параметрический блок `<typename Iterator, …>` — строгая фраза
+    /// слепа к нему (между токенами ~60 байт параметров).
+    pub template: bool,
 }
 
 impl TypeDeclQuery {
     /// Разбирает запрос формы `class Name` / `struct Name` с необязательным
     /// пунктуационным хвостом из `:` `{` `;` (базовый класс / тело /
-    /// декларация).
+    /// декларация) и — v0.86.0 — трёхсловную форму
+    /// `template struct Name` / `template class Name` (ГРАБЛЯ 45).
     ///
     /// Отказ (None):
     /// * прикреплённая скобка — это сигнатурный слой ([`SignatureQuery`]);
     /// * кириллица;
-    /// * слов ≠ 2: `enum class Color`, `class LLVM_ABI Function`
-    ///   (юзер сам вписал макрос — точный путь), `class Foo usage`;
-    /// * первое слово не `class`/`struct`;
+    /// * слов ≠ 2 (и ≠ 3 для template-формы): `enum class Color`,
+    ///   `class LLVM_ABI Function` (юзер сам вписал макрос — точный путь),
+    ///   `class Foo usage`;
+    /// * первое слово не `class`/`struct` (для template-формы — второе);
     /// * имя короче 2 символов или начинается с цифры (шум).
     pub fn parse(query: &str) -> Option<Self> {
         if query.chars().any(is_cyrillic) {
@@ -438,6 +446,25 @@ impl TypeDeclQuery {
             }
             words.push(core);
         }
+        // v0.86.0: template-форма — 3 слова, class-key на второй позиции.
+        // Параметрический блок `<…>` юзер НЕ вписывает (токенизация запроса
+        // его бы разорвала) — движок восстанавливает его в файле сам.
+        if words.len() == 3 && words[0].eq_ignore_ascii_case("template") {
+            let keyword = words[1].to_lowercase();
+            if keyword != "class" && keyword != "struct" {
+                return None;
+            }
+            let name_word = words[2].clone();
+            if name_word.len() < 2
+                || name_word
+                    .chars()
+                    .next()
+                    .map_or(true, |c| c.is_ascii_digit())
+            {
+                return None; // односимвольное/цифровое имя — шум
+            }
+            return Some(Self { keyword, name_word, template: true });
+        }
         if words.len() != 2 {
             return None;
         }
@@ -454,7 +481,7 @@ impl TypeDeclQuery {
         {
             return None; // односимвольное/цифровое имя — шум
         }
-        Some(Self { keyword, name_word })
+        Some(Self { keyword, name_word, template: false })
     }
 }
 
@@ -775,5 +802,35 @@ mod tests {
         assert!(TypeDeclQuery::parse("class F").is_none());
         // пусто
         assert!(TypeDeclQuery::parse("").is_none());
+    }
+
+    // ---------- v0.86.0: template-форма TypeDeclQuery (ГРАБЛЯ 45) ----------
+
+    #[test]
+    fn type_decl_parse_template_forms() {
+        // Boost.Spirit-кейс: `template struct phrase_parse`
+        let td = TypeDeclQuery::parse("template struct phrase_parse").unwrap();
+        assert_eq!(td.keyword, "struct");
+        assert_eq!(td.name_word, "phrase_parse");
+        assert!(td.template);
+        let td = TypeDeclQuery::parse("template class Parser").unwrap();
+        assert_eq!(td.keyword, "class");
+        assert_eq!(td.name_word, "Parser");
+        assert!(td.template);
+        // хвостовая пунктуация допустима и в template-форме
+        let td = TypeDeclQuery::parse("template struct phrase_parse {").unwrap();
+        assert!(td.template);
+        // регистр template-слова не важен (class-key строго lowercase-сравнивается)
+        assert!(TypeDeclQuery::parse("TEMPLATE struct Foo").is_some());
+        // отказы: 2 слова (template сам — не class-key), typename/fn на
+        // второй позиции, цифровое имя
+        assert!(TypeDeclQuery::parse("template struct").is_none());
+        assert!(TypeDeclQuery::parse("template typename phrase_parse").is_none());
+        assert!(TypeDeclQuery::parse("template fn parse").is_none());
+        assert!(TypeDeclQuery::parse("template struct 9parse").is_none());
+        assert!(TypeDeclQuery::parse("template struct p").is_none());
+        // обычная форма — template=false (обратная совместимость)
+        let td = TypeDeclQuery::parse("class Function :").unwrap();
+        assert!(!td.template);
     }
 }

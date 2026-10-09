@@ -68,8 +68,15 @@ pub struct CodeScope {
 }
 
 static SIGNATURE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // v0.86.0 (ГРАБЛЯ 45, Boost.Spirit): необязательный template-префикс
+    // `template <…>` перед class-key. Параметрический блок — всё до `>`
+    // в пределах СТРОКИ без `;`/`{`/`}` (незакрытый блок = префикс не
+    // матчится, а `struct Foo` на следующей строке ловится прежней
+    // продукцией — многострочные объявления не теряются).
+    // Прежде без префикса `template <typename T> struct Foo {` был
+    // НЕВИДИМ символьному слою: ключевое слово struct не в начале строки.
     Regex::new(
-        r#"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:pub\(crate\)\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?(?:const\s+)?(?:static\s+)?(fn|def|function|func|class|struct|impl|trait|enum|interface|mod|module|type)\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+        r#"^\s*(?:template\s*<[^;{}\n]*>\s*)?(?:pub(?:\([^)]*\))?\s+)?(?:pub\(crate\)\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?(?:const\s+)?(?:static\s+)?(fn|def|function|func|class|struct|impl|trait|enum|interface|mod|module|type)\s+([A-Za-z_][A-Za-z0-9_]*)"#,
     )
     .unwrap()
 });
@@ -478,14 +485,26 @@ fn lex_scan(
     stack: &mut Vec<usize>,
     stop_on_close: bool,
 ) -> usize {
+    lex_scan_state(source, start, LexMode::Normal, stop_at, stack, stop_on_close).0
+}
+
+/// v0.86.0 (ГРАБЛЯ 44): stateful-вариант [`lex_scan`] — возвращает режим
+/// лексера на позиции остановки (для инкрементального [`ScopeLocator`]).
+fn lex_scan_state(
+    source: &str,
+    start: usize,
+    mut mode: LexMode,
+    stop_at: Option<usize>,
+    stack: &mut Vec<usize>,
+    stop_on_close: bool,
+) -> (usize, LexMode) {
     let b = source.as_bytes();
     let mut i = start;
-    let mut mode = LexMode::Normal;
 
     while i < b.len() {
         if let Some(sa) = stop_at {
             if i >= sa {
-                return i;
+                return (i, mode);
             }
         }
         match mode {
@@ -522,7 +541,7 @@ fn lex_scan(
                 b'}' => {
                     stack.pop();
                     if stop_on_close && stack.is_empty() {
-                        return i + 1;
+                        return (i + 1, mode);
                     }
                     i += 1;
                 }
@@ -585,7 +604,87 @@ fn lex_scan(
             },
         }
     }
-    b.len()
+    (b.len(), mode)
+}
+
+/// v0.86.0 (ГРАБЛЯ 44, продолжение — вторая квадратичная точка):
+/// инкрементальный локатор скоупов для brace-языков.
+///
+/// `brace_bounds` сканирует файл от байта 0 на КАЖДЫЙ запрос (фаза 1
+/// собирает стек `{` до смещения) — на монолите 250k строк с ~100k
+/// вызовов это Σ(off) ≈ 10¹⁰ байт-шагов лексера: O(N²) по CPU.
+/// Локатор сохраняет состояние лексера (позиция + режим + стек `{`)
+/// между запросами: запросы по возрастанию смещений сканируют файл
+/// РОВНО ОДИН РАЗ — суммарно O(N). Обратный запрос (смещение меньше
+/// отсканированного) честно ресканирует с нуля — семантика идентична
+/// [`brace_bounds`], порядок вызовов из `captures_iter` всегда прямой.
+///
+/// Фаза 2 (поиск парной `}` от открывающей скобки) локальна — одна
+/// функция, не кэшируется.
+pub struct ScopeLocator<'a> {
+    source: &'a str,
+    /// Позиция, до которой лексер дошёл; `(scanned, mode, stack)` —
+    /// согласованное состояние на ЭТОЙ позиции.
+    scanned: usize,
+    mode: LexMode,
+    stack: Vec<usize>,
+}
+
+impl<'a> ScopeLocator<'a> {
+    pub fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            scanned: 0,
+            mode: LexMode::Normal,
+            stack: Vec::new(),
+        }
+    }
+
+    /// Локализация enclosing-скоупа (семантика [`brace_bounds`]).
+    pub fn locate(&mut self, off: usize) -> Option<(usize, usize)> {
+        let source = self.source;
+        let off = off.min(source.len());
+        // фаза 1: досканировать до off (прямой порядок — инкремент)
+        if off < self.scanned {
+            let mut stack = Vec::new();
+            let (p, m) =
+                lex_scan_state(source, 0, LexMode::Normal, Some(off), &mut stack, false);
+            self.scanned = p;
+            self.mode = m;
+            self.stack = stack;
+        } else {
+            let (p, m) = lex_scan_state(
+                source,
+                self.scanned,
+                self.mode,
+                Some(off),
+                &mut self.stack,
+                false,
+            );
+            self.scanned = p;
+            self.mode = m;
+        }
+
+        // совпадение в строке сигнатуры (до '{'): дословно brace_bounds
+        let open_pos = match self.stack.last() {
+            Some(&p) => p,
+            None => {
+                let line_end = source[off..]
+                    .find('\n')
+                    .map(|i| off + i)
+                    .unwrap_or(source.len());
+                let mut probe: Vec<usize> = Vec::new();
+                lex_scan(source, off, Some(line_end), &mut probe, false);
+                *probe.last()?
+            }
+        };
+
+        // фаза 2: парная закрывающая скобка от open_pos (локально)
+        let mut close_stack: Vec<usize> = Vec::new();
+        let close_end = lex_scan(source, open_pos, None, &mut close_stack, true);
+
+        Some((line_start(source, open_pos), close_end))
+    }
 }
 
 fn brace_bounds(source: &str, off: usize) -> Option<(usize, usize)> {
@@ -954,5 +1053,44 @@ mod tests {
             sc.text
         );
         assert!(!sc.text.contains("prev"));
+    }
+
+    #[test]
+    fn template_signature_visible() {
+        // v0.86.0 (ГРАБЛЯ 45, Boost.Spirit): template-префикс больше не
+        // прячет объявление от символьного слоя
+        assert_eq!(
+            signature_of("template <typename Iterator, typename Enable = void> struct phrase_parse_impl {"),
+            Some(("struct".to_string(), "phrase_parse_impl".to_string()))
+        );
+        assert_eq!(
+            signature_of("template <typename T> class Parser {"),
+            Some(("class".to_string(), "Parser".to_string()))
+        );
+        // пустой параметрический блок (явная специализация)
+        assert_eq!(
+            signature_of("template <> struct token_printer_debug {"),
+            Some(("struct".to_string(), "token_printer_debug".to_string()))
+        );
+        // префикс + fn
+        assert_eq!(
+            signature_of("template <class C> fn make() {"),
+            Some(("fn".to_string(), "make".to_string()))
+        );
+        // незакрытый блок (многострочные параметры): строка template
+        // НЕ матчится — имя ловится на своей строке отдельно
+        assert_eq!(signature_of("template <typename Iterator,"), None);
+        assert_eq!(
+            signature_of("struct phrase_parse_impl {"),
+            Some(("struct".to_string(), "phrase_parse_impl".to_string()))
+        );
+        // регрессия: сравнение без template не сломано
+        assert_eq!(signature_of("int x = a < b;"), None);
+        assert_eq!(
+            signature_of("int sqlite3_step(sqlite3_stmt *pStmt){"),
+            Some(("fn".to_string(), "sqlite3_step".to_string()))
+        );
+        // комментарий с template — не определение
+        assert_eq!(signature_of("// template <typename T> struct Foo {"), None);
     }
 }

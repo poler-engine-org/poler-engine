@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
+use crate::aidde::symbols::{CallSite, Definition, SymbolTable};
 use crate::compression::{GlobalStats, PostingsStore, StatsRef, VocabArena};
 use crate::graph::EntityGraph;
-use crate::output::{ContextAnchor, SearchResult};
+use crate::output::{ContextAnchor, NexusNode, NexusSite, SearchResult};
 use crate::parser::markdown_scenes::truncate_char_safe;
 use crate::parser::SceneContext;
 use crate::search::intent::{hit_tier, IntentMode, QueryIntent, SignatureQuery, TypeDeclQuery};
@@ -161,6 +162,7 @@ impl Engine {
                     total_hits: 0,
                     soft_fallback: false,
                     soft_fallback_kind: None,
+                    nexus: Vec::new(),
                     anchors: Vec::new(),
                 },
                 stats,
@@ -621,7 +623,7 @@ impl Engine {
         // v0.82.0: якорь несёт номер строки хита (1-based, 0 = неизвестно)
         // и относительный путь от корня сканирования (терминал не захламляется).
         // v0.83.0: + превью от строки хита (строка совпадения — первая).
-        let anchors: Vec<ContextAnchor> = records
+        let mut anchors: Vec<ContextAnchor> = records
             .iter()
             .map(|r| {
                 let (scene, line, preview) = materialize_scene(r, &config, &cleaner);
@@ -646,9 +648,38 @@ impl Engine {
                     resonance: round2(r.resonance),
                     scene,
                     k_hop_relations: k_hop.clone(),
+                    nexus_symbol: None,
                 }
             })
             .collect();
+
+        // ---------- v0.86.0 (ГРАБЛЯ 41, SQLite): Causal Nexus ----------
+        // Кросс-языковая группировка top-N код-хитов по символу:
+        // SymbolTable на hit-файлах + EntityGraph::from_symbol_table
+        // (CodeSymbol-идентичность, рёбра caller —calls→ callee, K-hop).
+        // Директива владельца: ИИ и человек видят ОДНОВРЕМЕННО C-ядро,
+        // JNI-прослойку, заголовок и вызовы — «граф, а не костыль»
+        // def-бонуса. Ранжирование не искажается: якорь получает только
+        // метку nexus_symbol, порядок остаётся (тир, −R).
+        let root_symbol: Option<String> = signature
+            .as_ref()
+            .map(|s| s.anchor_word.clone())
+            .or_else(|| type_decl.as_ref().map(|td| td.name_word.clone()))
+            .or_else(|| {
+                // одно-токенный запрос: токен может быть именем символа
+                // (`sqlite3_step`); resolve регистрозависим — несовпадение
+                // деградирует в группировку по enclosing-определениям
+                if query_tokens.len() == 1 {
+                    Some(query_tokens[0].clone())
+                } else {
+                    None
+                }
+            });
+        let (nexus, nexus_symbols) =
+            build_nexus(&records, &anchors, root_symbol.as_deref(), &config);
+        for (a, s) in anchors.iter_mut().zip(nexus_symbols.into_iter()) {
+            a.nexus_symbol = s;
+        }
 
         stats.elapsed_ms = started.elapsed().as_millis();
 
@@ -693,10 +724,17 @@ impl Engine {
                 soft_fallback_kind: if soft_prefix.is_some() {
                     Some("prefix".to_string())
                 } else if soft_type_gap {
-                    Some("type_decl_gap".to_string())
+                    // v0.86.0: template-гэп отличаем от макро-гэпа —
+                    // агенты различают Boost-кейс от LLVM-кейса
+                    if type_decl.as_ref().is_some_and(|td| td.template) {
+                        Some("template_decl_gap".to_string())
+                    } else {
+                        Some("type_decl_gap".to_string())
+                    }
                 } else {
                     None
                 },
+                nexus,
                 anchors,
             },
             stats,
@@ -790,4 +828,192 @@ fn hit_line_preview(from_line_start: &str) -> String {
         lines.truncate(PREVIEW_MAX_LINES);
     }
     lines.join("\n")
+}
+
+/// v0.86.0 (ГРАБЛЯ 41, SQLite): построение Causal Nexus — кросс-языковой
+/// группировки top-N код-хитов по символу.
+///
+/// Технологии ядра (директива «граф, а не костыль», session-19/20):
+/// * `SymbolTable` — O(1) resolve, лексический скоуп, call-graph;
+/// * `EntityGraph::from_symbol_table` — CodeSymbol-идентичность
+///   (case-sensitive, module::name), рёбра caller —calls→ callee;
+/// * `extract_k_hop` — BFS в обе стороны с cap(max_relations).
+///
+/// Группировка: хит внутри определения искомого символа → узел этого
+/// символа (C-ядро и JNI-прослойка дают ОДИН узел — идентичность по
+/// bare-имени); хит на строке вызова → узел с ролью call; хит в чужой
+/// функции без отношения к корню — собственный узел enclosing-символа;
+/// упоминание в заголовке/прототипе → роль ref. Возвращает узлы и метку
+/// символа для каждого якоря (None — без группы).
+///
+/// Стоимость: один линейный проход по hit-файлам top-N (≤ top_n файлов,
+/// line-адресация O(N) — фикс ГРАБЛИ 44) — на фоне трёх проходов
+/// конвейра незаметно; проза нексусом не группируется.
+fn build_nexus(
+    records: &[HitRecord],
+    anchors: &[ContextAnchor],
+    root_symbol: Option<&str>,
+    config: &EngineConfig,
+) -> (Vec<NexusNode>, Vec<Option<String>>) {
+    let mut symbols: Vec<Option<String>> = vec![None; records.len()];
+    // только код-хиты; проза нексусом не группируется
+    let code_idx: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_code)
+        .map(|(i, _)| i)
+        .collect();
+    if code_idx.is_empty() {
+        return (Vec::new(), symbols);
+    }
+
+    // hit-файлы (уникальные) — компактный набор top-N якорей
+    let hit_files: Vec<PathBuf> = {
+        let mut seen: HashSet<&Path> = HashSet::new();
+        code_idx
+            .iter()
+            .map(|&i| records[i].path.as_path())
+            .filter(|p| seen.insert(*p))
+            .map(Path::to_path_buf)
+            .collect()
+    };
+
+    // символьная таблица + граф сущностей на hit-файлах —
+    // ПЕРВОЕ подключение код-символ-графа к поисковому контуру
+    // (прежде — только --impact; поиск жил на нарратив-тройках сцен)
+    let table = SymbolTable::build(&hit_files, config.max_file_bytes);
+    let graph = EntityGraph::from_symbol_table(&table);
+    let root = match root_symbol {
+        Some(r) if !table.resolve(r).is_empty() => Some(r),
+        _ => None,
+    };
+
+    // определения по файлам (внутри файла — в порядке байтов)
+    let mut defs_by_file: HashMap<&str, Vec<&Definition>> = HashMap::new();
+    for d in &table.defs {
+        defs_by_file.entry(d.file.as_str()).or_default().push(d);
+    }
+    // вызовы по файлам — для распознавания call-сайтов на строке хита
+    let mut calls_by_file: HashMap<&str, Vec<&CallSite>> = HashMap::new();
+    for c in &table.calls {
+        calls_by_file.entry(c.file.as_str()).or_default().push(c);
+    }
+
+    // группировка: порядок узлов = порядок первого вхождения (старший
+    // якорь первым — согласовано с ранжированием (тир, −R))
+    let mut node_order: Vec<String> = Vec::new();
+    let mut node_sites: HashMap<String, Vec<NexusSite>> = HashMap::new();
+    for &i in &code_idx {
+        let r = &records[i];
+        let a = &anchors[i];
+        let file_s = r.path.to_string_lossy().to_string();
+        let defs = defs_by_file
+            .get(file_s.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        // enclosing-определение: последний def с байтом <= хита
+        // (partition_point: defs отсортированы по byte внутри файла)
+        let enclosing = defs
+            .partition_point(|d| d.byte <= r.byte_pos)
+            .checked_sub(1)
+            .and_then(|k| defs.get(k).copied());
+
+        let (sym, role, kind) = match (root, enclosing) {
+            (Some(root_name), Some(d)) if d.symbol == root_name => {
+                // хит внутри определения искомого символа — C-ядро
+                // ИЛИ JNI-прослойка: кросс-языковая идентичность по имени
+                (Some(d.symbol.clone()), "def", d.kind.clone())
+            }
+            (Some(root_name), _) => {
+                // хит на строке вызова искомого символа? (role: call)
+                let call_here = calls_by_file
+                    .get(file_s.as_str())
+                    .map_or(false, |v| {
+                        v.iter().any(|c| {
+                            c.line == a.line
+                                && table
+                                    .resolve(&c.callee)
+                                    .iter()
+                                    .any(|d| d.symbol == root_name)
+                        })
+                    });
+                if call_here {
+                    (
+                        Some(root_name.to_string()),
+                        "call",
+                        enclosing.map_or_else(String::new, |d| d.kind.clone()),
+                    )
+                } else if let Some(d) = enclosing {
+                    // хит в чужой функции без отношения к корню —
+                    // собственный узел enclosing-символа
+                    (Some(d.symbol.clone()), "def", d.kind.clone())
+                } else if a
+                    .preview
+                    .as_deref()
+                    .and_then(|p| p.lines().next())
+                    .is_some_and(|l| l.contains(root_name))
+                {
+                    // упоминание без enclosing (заголовок/прототип)
+                    (Some(root_name.to_string()), "ref", "decl".to_string())
+                } else {
+                    (None, "", String::new())
+                }
+            }
+            (None, Some(d)) => (Some(d.symbol.clone()), "def", d.kind.clone()),
+            (None, None) => (None, "", String::new()),
+        };
+
+        if let Some(s) = sym {
+            symbols[i] = Some(s.clone());
+            node_sites.entry(s.clone()).or_default().push(NexusSite {
+                file: a
+                    .rel_file
+                    .clone()
+                    .unwrap_or_else(|| a.file.clone()),
+                line: a.line,
+                role: role.to_string(),
+                kind,
+            });
+            if !node_order.contains(&s) {
+                node_order.push(s);
+            }
+        }
+    }
+
+    // K-hop рёбра каждого узла: CodeSymbol-идентичность квалифицирована
+    // (module::name) — bare-символ живёт в нескольких модулях/языках;
+    // нексус объединяет соседства всех его узлов в графе
+    let mut nexus: Vec<NexusNode> = Vec::with_capacity(node_order.len());
+    for sym in node_order {
+        let suffix = format!("::{sym}");
+        let mut keys: Vec<String> = graph
+            .node_keys()
+            .into_iter()
+            .filter(|k| *k == sym || k.ends_with(&suffix))
+            .map(str::to_string)
+            .collect();
+        keys.sort(); // детерминизм обхода
+        let mut relations: Vec<(String, String, String)> = Vec::new();
+        let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
+        for key in &keys {
+            for triple in graph.extract_k_hop(
+                key,
+                config.k_hop_depth,
+                config.temporal_filter.as_deref(),
+                config.max_relations,
+            ) {
+                if seen_rel.insert(triple.clone()) {
+                    relations.push(triple);
+                }
+            }
+        }
+        relations.truncate(config.max_relations);
+        nexus.push(NexusNode {
+            symbol: sym.clone(),
+            sites: node_sites.remove(&sym).unwrap_or_default(),
+            relations,
+        });
+    }
+
+    (nexus, symbols)
 }

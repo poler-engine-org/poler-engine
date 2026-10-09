@@ -3213,12 +3213,19 @@ fn run(cli: Cli) -> ExitCode {
         // JSON/simple/md не загрязняется); JSON несёт soft_fallback:true.
         // v0.85.0: две разновидности — префикс идентификатора (скобка,
         // v0.83.0) и гэп макро-атрибутов объявления типа (ГРАБЛЯ 43).
+        // v0.86.0: третья — template-гэп (параметрический блок <...>
+        // между template и class-key, ГРАБЛЯ 45, Boost.Spirit).
         if result.soft_fallback {
             match result.soft_fallback_kind.as_deref() {
                 Some("type_decl_gap") => eprintln!(
                     "poler-engine: определение типа не найдено строгой фразой \
                      (макро-атрибут между class/struct и именем) — мягкий \
                      fallback с пропуском макро-атрибута"
+                ),
+                Some("template_decl_gap") => eprintln!(
+                    "poler-engine: объявление шаблона не найдено строгой фразой \
+                     (параметрический блок <...> между template и class-key) — \
+                     мягкий fallback с пропуском блока"
                 ),
                 _ => eprintln!(
                     "poler-engine: точная сигнатура не найдена — мягкий fallback \

@@ -132,6 +132,16 @@ impl EntityGraph {
         self.graph.node_count()
     }
 
+    /// v0.86.0: ключи всех узлов графа (по политике идентичности).
+    ///
+    /// Для `CodeSymbol` ключи квалифицированы (`module::name`) — один и
+    /// тот же bare-символ живёт в нескольких модулях/языках
+    /// (`vdbeapi::sqlite3_step` и `CApi::sqlite3_step`): кросс-языковой
+    /// нексус собирает соседство каждого из них.
+    pub fn node_keys(&self) -> Vec<&str> {
+        self.lookup.keys().map(|s| s.as_str()).collect()
+    }
+
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
     }

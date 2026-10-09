@@ -217,6 +217,63 @@ impl<'a> FileTokens<'a> {
         out
     }
 
+    /// v0.86.0 (ГРАБЛЯ 45, Boost.Spirit): позиции токенов `template`, за
+    /// которыми стоит параметрический блок `<…>` (баланс угловых скобок)
+    /// и class-key + имя типа из запроса.
+    ///
+    /// `template <typename Iterator, typename Enable = void>
+    ///  struct phrase_parse_impl {` при запросе `template struct
+    /// phrase_parse`: строгая фраза слепа (между `template` и `struct`
+    /// ~60 байт параметров), гэп-паттерн находит объявление.
+    ///
+    /// Блок `<…>` сканируется по сырому тексту с подсчётом глубины
+    /// (вложенные `vector<T>` законны, многострочность законна —
+    /// Boost переносит параметры на отдельные строки); `->` не сбивает
+    /// глубину; незакрытый за лимитом блок — не шаблон (сырой `<` в
+    /// выражениях). Хит — токен `template` (начало строки объявления):
+    /// превью начинается со строки хита → юзер видит объявление целиком.
+    pub fn find_template_decl_gaps(&self, text: &str, td: &TypeDeclQuery) -> Vec<u32> {
+        let bytes = text.as_bytes();
+        let n = self.raw.len();
+        let mut out = Vec::new();
+        for i in 0..n {
+            if self.tok(i) != "template" {
+                continue;
+            }
+            if !at_line_start(bytes, self.pos[i] as usize) {
+                continue; // template в выражении / упоминание в комментарии-токенах
+            }
+            let kw_end = self.pos[i] as usize + self.raw[i].len();
+            let Some(gt_end) = skip_template_param_block(bytes, kw_end) else {
+                continue; // незакрытый блок — не объявление
+            };
+            // class-key — первый токен за закрывающей `>`
+            let mut j = i + 1;
+            while j < n && (self.pos[j] as usize) < gt_end {
+                j += 1;
+            }
+            if j >= n || self.tok(j) != td.keyword {
+                continue; // за блоком не struct/class — не объявление типа
+            }
+            // имя типа — в пределах нескольких токенов за class-key
+            // (макро-гэп LLVM_ABI между class-key и именем — законен и тут;
+            // ПУСТОЙ гэп — норма: template-запрос никогда не матчится
+            // точной фразой, «чужая семантика» v0.85 сюда не переносится)
+            let ck_end = self.pos[j] as usize + self.raw[j].len();
+            for k in (j + 1)..(j + 5).min(n) {
+                if self.raw[k] != td.name_word {
+                    continue; // кандидат-макрос в гэпе
+                }
+                let gap = &text[ck_end..self.pos[k] as usize];
+                if is_decl_gap_region(gap) {
+                    out.push(i as u32);
+                }
+                break; // первое вхождение имени в окне — единственный кандидат
+            }
+        }
+        out
+    }
+
     /// v0.85.0: есть ли среди ТОЧНЫХ фразовых хитов (позиции keyword)
     /// определение типа — keyword в начале строки + def-сигнал
     /// ([`TypeDeclKind::Definition`]) после имени. Гасит гэп-fallback:
@@ -482,6 +539,17 @@ fn is_macro_gap_region(gap: &str) -> bool {
     parts.iter().all(|p| is_macro_gap_part(p))
 }
 
+/// v0.86.0: гэп между class-key и именем в template-объявлении —
+/// пустой (whitespace) допустим: template-запрос не матчится точной
+/// фразой (параметрический блок между токенами), «чужая семантика
+/// пустого гэпа» из v0.85 сюда не переносится.
+fn is_decl_gap_region(gap: &str) -> bool {
+    if gap.trim().is_empty() {
+        return true;
+    }
+    is_macro_gap_region(gap)
+}
+
 /// Одна часть гэпа: макрос или атрибутная форма.
 ///
 /// * целое слово из заглавных/цифр/подчёркиваний — LLVM_ABI,
@@ -510,6 +578,46 @@ fn is_macro_gap_part(part: &str) -> bool {
         || part.starts_with("__declspec")
         || part.starts_with('(')
         || part.ends_with(')')
+}
+
+/// v0.86.0 (ГРАБЛЯ 45): конец параметрического блока шаблона `<…>` —
+/// байт ЗА закрывающей `>`, начиная от `from` (пропуск whitespace).
+///
+/// Баланс угловых скобок с учётом вложенности (`template <typename T,
+/// std::vector<int> V>` законно); многострочность законна (Boost
+/// переносит длинные списки параметров); `->` не закрывает уровень
+/// (тип-выражения с стрелкой в параметрах не сбивают глубину).
+/// `None` — блок не начался (нет `<`) или не закрылся в пределах
+/// лимита (сырой `<` в выражениях — не шаблон).
+fn skip_template_param_block(bytes: &[u8], from: usize) -> Option<usize> {
+    /// Потолок длины блока: реалистичные списки параметров (даже
+    /// многострочные с дефолтными аргументами) короче; сырая `<` в
+    /// коде без закрытия дальше не живёт.
+    const TEMPLATE_GAP_MAX_BYTES: usize = 4096;
+    let mut p = from;
+    while p < bytes.len() && matches!(bytes[p], b' ' | b'\t' | b'\n' | b'\r') {
+        p += 1;
+    }
+    if p >= bytes.len() || bytes[p] != b'<' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = p;
+    while i < bytes.len() && i - p < TEMPLATE_GAP_MAX_BYTES {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {} // `->` — не закрывает
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -640,12 +748,19 @@ pub fn pass1_file(
         // v0.85.0 (ГРАБЛЯ 43): протокол объявлений типов — зеркально
         // prefix_hits. Точные хиты: def-сигнал (гасит гэп-fallback
         // глобально — Blender-кейс `struct BMVert {`). Нет точных:
-        // лениво ищем гэп `class МАКРО Name` (LLVM-кейс). Только
+        // лениво ищем гэп `class МАКРО Name` (LLVM-кейс) — v0.86.0:
+        // template-запросы идут своим паттерном (параметрический блок
+        // `<…>` между template и class-key, Boost-кейс). Только
         // код-файлы: определения типов в документации не живут.
         let (type_def_exact, type_gap_hits) = match type_decl {
             Some(td) if is_code_file(path) => {
                 if hits.is_empty() {
-                    (false, ft.find_type_decl_gaps(raw, td))
+                    let gaps = if td.template {
+                        ft.find_template_decl_gaps(raw, td)
+                    } else {
+                        ft.find_type_decl_gaps(raw, td)
+                    };
+                    (false, gaps)
                 } else {
                     (ft.has_type_def_exact(raw, &hits), Vec::new())
                 }
@@ -870,11 +985,17 @@ pub fn pass2_giant_parallel(
                 let sub_ft = FileTokens::build(sub_text);
                 // v0.83.0: мягкий fallback — префикс-семантика якоря;
                 // v0.85.0: гэп-семантика объявления типа (ГРАБЛЯ 43);
+                // v0.86.0: template-гэп — параметрический блок `<…>`
+                // (ГРАБЛЯ 45, Boost.Spirit);
                 // в норме — прежняя фразовая (strict для код-интента).
                 let sub_hits = if let Some(pa) = soft_prefix {
                     sub_ft.find_token_prefix(pa)
                 } else if let Some(td) = type_gap {
-                    sub_ft.find_type_decl_gaps(sub_text, td)
+                    if td.template {
+                        sub_ft.find_template_decl_gaps(sub_text, td)
+                    } else {
+                        sub_ft.find_type_decl_gaps(sub_text, td)
+                    }
                 } else if strict_phrase {
                     sub_ft.find_phrase_strict(query_tokens)
                 } else {
@@ -1985,5 +2106,69 @@ mod tests {
         let ft3 = FileTokens::build(friend);
         let hits3 = ft3.find_phrase_strict(&["class".into(), "function".into()]);
         assert!(!ft3.has_type_def_exact(friend, &hits3));
+    }
+
+    // ---------- v0.86.0: template-гэп объявления типа (ГРАБЛЯ 45) ----------
+
+    #[test]
+    fn find_template_decl_gaps_boost_morphology() {
+        // Boost.Spirit-морфология: параметрический блок <...> между
+        // template и struct; строгая фраза `template struct phrase_parse`
+        // к этому тексту слепа
+        let text = "template <typename Iterator, typename Enable = void>\n\
+                    struct phrase_parse_impl {\n\
+                        void run() {}\n\
+                    };\n\
+                    template <typename T> struct token_printer_debug {\n\
+                        T t;\n\
+                    };\n";
+        let ft = FileTokens::build(text);
+        let td = TypeDeclQuery::parse("template struct phrase_parse_impl").unwrap();
+        assert!(td.template);
+        let hits = ft.find_template_decl_gaps(text, &td);
+        assert_eq!(hits.len(), 1, "hits={hits:?}");
+        // хит — токен `template` в начале строки объявления
+        assert_eq!(ft.tok(hits[0] as usize), "template");
+        // второе объявление — тоже находится
+        let td2 = TypeDeclQuery::parse("template struct token_printer_debug").unwrap();
+        let hits2 = ft.find_template_decl_gaps(text, &td2);
+        assert_eq!(hits2.len(), 1, "hits={hits2:?}");
+        // однострочная форма (Boost также пишет в одну строку)
+        let single = "template <typename Iterator, typename Attribute> struct phrase_parse_impl { void run(); };\n";
+        let fts = FileTokens::build(single);
+        let hits3 = fts.find_template_decl_gaps(single, &td);
+        assert_eq!(hits3.len(), 1, "hits3={hits3:?}");
+    }
+
+    #[test]
+    fn find_template_decl_gaps_nested_params_and_rejects() {
+        // вложенные угловые скобки в параметрах (контейнеры) + отказы:
+        // имя из блока, class-key не тот, template без блока
+        let text = "template <typename T, std::vector<int> V> struct Holder {\n\
+                    int cmp(int a, int b) { return a < b; }\n\
+                    template <typename T> struct Plain {\n\
+                        T t;\n\
+                    };\n";
+        let ft = FileTokens::build(text);
+        let td = TypeDeclQuery::parse("template struct Holder").unwrap();
+        let hits = ft.find_template_decl_gaps(text, &td);
+        assert_eq!(hits.len(), 1, "вложенные <> потеряны: {hits:?}");
+        // имя из параметрического блока НЕ принимается за имя типа
+        // (окно имени — только ЗА class-key)
+        let td2 = TypeDeclQuery::parse("template struct vector").unwrap();
+        assert!(ft.find_template_decl_gaps(text, &td2).is_empty());
+        // class-key не тот: в файле struct, запросили class — мимо
+        let td3 = TypeDeclQuery::parse("template class Plain").unwrap();
+        assert!(ft.find_template_decl_gaps(text, &td3).is_empty());
+        // тот же class-key — находка
+        let td3b = TypeDeclQuery::parse("template struct Plain").unwrap();
+        assert_eq!(ft.find_template_decl_gaps(text, &td3b).len(), 1);
+        // template без параметров вообще (сырой < отсутствует) — мимо:
+        let text2 = "template struct phrase_parse { };\n";
+        let ft2 = FileTokens::build(text2);
+        let td4 = TypeDeclQuery::parse("template struct phrase_parse").unwrap();
+        // нет блока <...> — гэп-паттерн не срабатывает (точная фраза
+        // сама найдёт: [template, struct, phrase_parse] подряд)
+        assert!(ft2.find_template_decl_gaps(text2, &td4).is_empty());
     }
 }

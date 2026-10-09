@@ -1687,3 +1687,199 @@ fn type_decl_gap_respects_qt_morphology() {
         "превью обязано показать Qt-определение: {preview:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v0.86.0: три контура — O(N²)-фикс, template-гэп, Causal Nexus
+// ---------------------------------------------------------------------------
+
+/// Boost.Spirit-морфология (ГРАБЛЯ 45): параметрический блок <...> между
+/// template и struct — строгая фраза слепа, template-гэп находит.
+const BOOST_PARSE_HPP: &str = r#"#pragma once
+namespace boost { namespace spirit { namespace qi {
+template <typename Iterator, typename Skipper, typename Attr>
+inline bool phrase_parse_impl(Iterator& first, Iterator last, Attr& attr){
+    return true;
+}
+template <typename Iterator, typename Enable = void>
+struct phrase_parse_impl {
+    typedef Iterator type;
+    void run() { }
+};
+template <typename T>
+struct token_printer_debug {
+    T t;
+};
+}}}
+"#;
+
+#[test]
+fn template_decl_gap_finds_boost_declaration() {
+    // ГРАБЛЯ 45: `template struct phrase_parse_impl` на v0.85.0 — exit 1
+    // (строгая фраза слепа к параметрическому блоку). v0.86.0: гэп-паттерн
+    // пропускает блок <...> и находит объявление.
+    let dir = TempDir::new().unwrap();
+    let inc = dir.path().join("include/boost/spirit/home/qi");
+    fs::create_dir_all(&inc).unwrap();
+    fs::write(inc.join("parse.hpp"), BOOST_PARSE_HPP).unwrap();
+
+    let res = scan_path(
+        dir.path(),
+        "template struct phrase_parse_impl",
+        &EngineConfig::default(),
+    );
+    assert!(
+        res.total_hits > 0,
+        "template-гэп обязан находить объявление за блоком <...>"
+    );
+    assert!(res.soft_fallback, "флаг soft_fallback не поднят");
+    assert_eq!(
+        res.soft_fallback_kind.as_deref(),
+        Some("template_decl_gap"),
+        "разновидность fallback обязана быть template_decl_gap"
+    );
+    // хит — строка `template <...>`: превью показывает объявление целиком
+    let top = &res.anchors[0];
+    assert!(
+        top.file.ends_with("parse.hpp"),
+        "топ-1 обязан быть объявлением: {}",
+        top.file
+    );
+    let preview = top.preview.as_deref().expect("превью материализовано");
+    let first = preview.lines().next().unwrap_or("");
+    assert!(
+        first.contains("template <typename Iterator, typename Enable = void>"),
+        "превью обязано начинаться со строки template: {first:?}"
+    );
+    // однострочная форма тоже находится
+    let res2 = scan_path(
+        dir.path(),
+        "template struct token_printer_debug",
+        &EngineConfig::default(),
+    );
+    assert!(
+        res2.total_hits > 0,
+        "однострочная template-форма тоже обязана находиться"
+    );
+    // шаблонная ФУНКЦИЯ (inline bool) не путается со структурой:
+    // её токен phrase_parse_impl внутри тела — не объявление в начале
+    // строки с struct — не расширяет хиты без причины
+}
+
+#[test]
+fn template_decl_query_rejects_nonmatching() {
+    // class-key не тот / имя из блока — честный 0 без fallback-обмана
+    let dir = TempDir::new().unwrap();
+    let inc = dir.path().join("include/boost/spirit/home/qi");
+    fs::create_dir_all(&inc).unwrap();
+    fs::write(inc.join("parse.hpp"), BOOST_PARSE_HPP).unwrap();
+
+    // в файле struct, запросили class — не нашлось
+    let res = scan_path(
+        dir.path(),
+        "template class phrase_parse_impl",
+        &EngineConfig::default(),
+    );
+    assert_eq!(res.total_hits, 0, "class-key mismatch обязан дать 0");
+}
+
+/// SQLite-морфология (ГРАБЛЯ 41): C-ядро + JNI-прослойка + заголовок —
+/// все три сайта в ОДНОМ узле Causal Nexus.
+const SQLITE_VDBEAPI_C: &str = r#"#include "sqlite3.h"
+int sqlite3_step(sqlite3_stmt *pStmt){
+    int rc = 0;
+    Vdbe *v = (Vdbe*)pStmt;
+    if (v->magic != 0x21bdc316) return 25;
+    rc = sqlite3Step(v, 1);
+    return rc & (0xff | 0x100);
+}
+"#;
+
+const SQLITE_CAPI_JAVA: &str = r#"package org.sqlite.jni.capi;
+public class CApi {
+  public static int sqlite3_step(@NotNull sqlite3_stmt stmt){
+    return null==stmt ? 1 : sqlite3_step(stmt.getNativePointer());
+  }
+}
+"#;
+
+const SQLITE_H: &str = r#"typedef struct sqlite3_stmt sqlite3_stmt;
+int sqlite3_step(sqlite3_stmt*);
+"#;
+
+#[test]
+fn causal_nexus_groups_cross_language_sites() {
+    // Директива владельца: ИИ и человек видят ОДНОВРЕМЕННО C-ядро и
+    // JNI-прослойку (граф, а не def-бонус). Ранжирование не искажается —
+    // нексус чистая надстройка.
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    let jni = dir
+        .path()
+        .join("ext/jni/src/org/sqlite/jni/capi");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&jni).unwrap();
+    fs::write(src.join("vdbeapi.c"), SQLITE_VDBEAPI_C).unwrap();
+    fs::write(jni.join("CApi.java"), SQLITE_CAPI_JAVA).unwrap();
+    fs::write(dir.path().join("sqlite3.h"), SQLITE_H).unwrap();
+
+    let res = scan_path(dir.path(), "int sqlite3_step(", &EngineConfig::default());
+    assert!(res.total_hits >= 2, "хиты обязаны найтись: {}", res.total_hits);
+
+    // нексус: узел sqlite3_step с def-сайтами в ДВУХ языках
+    let node = res
+        .nexus
+        .iter()
+        .find(|n| n.symbol == "sqlite3_step")
+        .expect("узел нексуса sqlite3_step обязан существовать");
+    let files: Vec<&str> = node.sites.iter().map(|s| s.file.as_str()).collect();
+    assert!(
+        files.iter().any(|f| f.ends_with("vdbeapi.c")),
+        "нет C-ядра в нексусе: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("CApi.java")),
+        "нет JNI-прослойки в нексусе: {files:?}"
+    );
+    // оба def-сайта
+    let defs: Vec<_> = node
+        .sites
+        .iter()
+        .filter(|s| s.role == "def")
+        .collect();
+    assert!(
+        defs.len() >= 2,
+        "C-ядро и JNI обязаны быть def-сайтами: {:?}",
+        node.sites
+    );
+    // якорь несёт метку узла
+    let a0 = &res.anchors[0];
+    assert_eq!(
+        a0.nexus_symbol.as_deref(),
+        Some("sqlite3_step"),
+        "якорь обязан быть помечен nexus_symbol"
+    );
+    // K-hop рёбра графа символов присутствуют (call-graph hit-файлов)
+    assert!(
+        !node.relations.is_empty(),
+        "нексус обязан нести рёбра графа символов"
+    );
+    // JSON-контракт: nexus сериализуется
+    let v = serde_json::to_value(&res).unwrap();
+    assert!(v["nexus"].is_array(), "nexus обязан сериализоваться");
+    // simple-рендер несёт блок нексуса
+    let s = poler_engine::render_simple(&res);
+    assert!(
+        s.contains("◇ Нексус «sqlite3_step»"),
+        "simple не содержит нексус: {s}"
+    );
+}
+
+#[test]
+fn nexus_absent_for_prose_queries() {
+    // проза не группируется в нексус: поле скрыто, узлов нет
+    let dir = write_fixture("chapter_36.md", CH36);
+    let res = scan_path(dir.path(), "нокс", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+    assert!(res.nexus.is_empty(), "проза не даёт нексуса");
+    assert!(res.anchors[0].nexus_symbol.is_none());
+}

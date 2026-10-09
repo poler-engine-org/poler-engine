@@ -11,7 +11,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-
 use crate::parser::ast_code;
 use crate::parser::triples::CALL_KEYWORDS;
 use crate::parser::{detect_lang, CodeLang};
@@ -57,8 +56,28 @@ static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-fn line_of_byte(text: &str, byte: usize) -> usize {
-    text[..byte.min(text.len())].matches('\n').count() + 1
+/// v0.86.0 (ГРАБЛЯ 44, sqlite3.c-монолит): индекс переводов строки —
+/// O(N) построение одним SIMD-memchr-проходом, O(log N) запрос
+/// (partition_point). Прежняя `line_of_byte` сканировала файл от байта 0
+/// на КАЖДЫЙ def и call-site — на монолите 250k строк это Σ(off) ≈
+/// 4×10¹⁰ байт-операций (квадрат по CPU при линейном IO).
+struct LineIndex {
+    /// Байтовые позиции всех '\n' (отсортированы по построению).
+    nl: Vec<usize>,
+}
+
+impl LineIndex {
+    fn build(text: &str) -> Self {
+        Self {
+            nl: memchr::memchr_iter(b'\n', text.as_bytes()).collect(),
+        }
+    }
+
+    /// Номер строки (1-based) байтового смещения — семантика прежней
+    /// `line_of_byte`: число '\n' строго до `byte`, +1.
+    fn line_of(&self, byte: usize) -> usize {
+        self.nl.partition_point(|&p| p < byte) + 1
+    }
 }
 
 fn import_of(line: &str) -> Option<String> {
@@ -172,14 +191,21 @@ pub(crate) fn scan_one_file(
 let file_s = path.to_string_lossy().to_string();
 
     // --- определения + импорты (построчно) ---
+    // v0.86.0 (ГРАБЛЯ 44): номер строки — инкрементальный счётчик цикла
+    // (бесплатно), байтовое смещение продвигается с учётом \r\n
+    // (`lines()` срезает \r — прежний `off += len + 1` дрейфовал на
+    // CRLF-файлах). Прежний вызов line_of_byte пересканировал текст
+    // от байта 0 на каждый def — O(N²) на монолитах.
+    let text_bytes = text.as_bytes();
     let mut off = 0usize;
+    let mut line_no = 1usize;
     for line in text.lines() {
         if let Some((kind, name)) = ast_code::signature_of(line) {
             defs.push(Definition {
                 symbol: name,
                 kind,
                 file: file_s.clone(),
-                line: line_of_byte(&text, off),
+                line: line_no,
                 byte: off,
             });
         }
@@ -189,7 +215,15 @@ let file_s = path.to_string_lossy().to_string();
                 module,
             });
         }
-        off += line.len() + 1;
+        let mut next = off + line.len();
+        if text_bytes.get(next) == Some(&b'\r') {
+            next += 1;
+        }
+        if text_bytes.get(next) == Some(&b'\n') {
+            next += 1;
+        }
+        off = next;
+        line_no += 1;
     }
 
     // --- вызовы (call graph) ---
@@ -219,6 +253,18 @@ let file_s = path.to_string_lossy().to_string();
         }
     };
 
+    // v0.86.0 (ГРАБЛЯ 44): один O(N) SIMD-индекс '\n' на файл,
+    // O(log N) запрос на вызов — вместо O(byte) рескана от начала файла
+    // на каждый call-site (монолит sqlite3.c: ~100k вызовов × ~4 МБ
+    // среднего смещения ≈ 4×10¹⁰ байт-сканов → один проход 8.5 МБ).
+    let line_index = LineIndex::build(&text);
+
+    // v0.86.0 (ГРАБЛЯ 44, вторая точка): инкрементальный локатор скоупов —
+    // brace_bounds прежде сканировал файл от байта 0 на КАЖДЫЙ вызов
+    // (O(N²) по CPU на монолитах). captures_iter даёт вызовы по возрастанию
+    // смещений → лексер проходит файл ровно один раз (O(N) суммарно).
+    let mut locator = ast_code::ScopeLocator::new(&text);
+
     for caps in CALL_RE.captures_iter(&text) {
         let callee = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
         if callee.is_empty() || CALL_KEYWORDS.contains(&callee.as_str()) {
@@ -231,7 +277,10 @@ let file_s = path.to_string_lossy().to_string();
             continue;
         }
 
-        let scope = ast_code::locate_scope(&text, call_off, lang);
+        let scope = match lang {
+            CodeLang::Brace => locator.locate(call_off),
+            _ => ast_code::locate_scope(&text, call_off, lang),
+        };
 
         // Определение вне любого блока (например, `fn inner() {}`
         // на верхнем уровне): сигнатура строки совпадает с callee.
@@ -276,7 +325,7 @@ let file_s = path.to_string_lossy().to_string();
             caller,
             callee,
             file: file_s.clone(),
-            line: line_of_byte(&text, call_off),
+            line: line_index.line_of(call_off),
         });
     }
 
@@ -387,5 +436,33 @@ mod tests {
         let t = SymbolTable::build(&[dir.path().join("s.rs")], 1024 * 1024);
         assert!(t.calls.iter().any(|c| c.callee == "real"));
         assert!(!t.calls.iter().any(|c| c.callee == "not_a_call"));
+    }
+
+    #[test]
+    fn line_numbers_incremental_and_crlf() {
+        // v0.86.0 (ГРАБЛЯ 44): номера строк defs/calls — инкрементальный
+        // счётчик и newline-индекс; CRLF больше не дрейфует
+        let dir = tempfile::TempDir::new().unwrap();
+        // LF-файл: def на строке 3, вызов на строке 5
+        let lf = "fn a() {\n    let x = 1;\n}\nfn b() {\n    a();\n}\n";
+        write(dir.path(), "lf.rs", lf);
+        let t = SymbolTable::build(&[dir.path().join("lf.rs")], 1024 * 1024);
+        let def_a = t.defs.iter().find(|d| d.symbol == "a").unwrap();
+        let def_b = t.defs.iter().find(|d| d.symbol == "b").unwrap();
+        assert_eq!(def_a.line, 1);
+        assert_eq!(def_b.line, 4);
+        let call = t.calls.iter().find(|c| c.callee == "a").unwrap();
+        assert_eq!(call.line, 5);
+        // байтовые смещения точны
+        assert_eq!(def_b.byte, lf.find("fn b()").unwrap());
+        // CRLF-файл: та же морфология — строки и байты не дрейфуют
+        let crlf = "fn a() {\r\n    let x = 1;\r\n}\r\nfn b() {\r\n    a();\r\n}\r\n";
+        write(dir.path(), "crlf.rs", crlf);
+        let t2 = SymbolTable::build(&[dir.path().join("crlf.rs")], 1024 * 1024);
+        let def_b2 = t2.defs.iter().find(|d| d.symbol == "b").unwrap();
+        assert_eq!(def_b2.line, 4, "CRLF: строка def дрейфует");
+        assert_eq!(def_b2.byte, crlf.find("fn b()").unwrap(), "CRLF: байт def дрейфует");
+        let call2 = t2.calls.iter().find(|c| c.callee == "a").unwrap();
+        assert_eq!(call2.line, 5, "CRLF: строка call дрейфует");
     }
 }

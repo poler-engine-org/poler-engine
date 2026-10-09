@@ -29,6 +29,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::markdown_scenes::SceneContext;
 
+/// v0.86.0 (ГРАБЛЯ 41, SQLite): сайт сущности в нексусе — точка, где
+/// символ живёт (определение в конкретном файле/языке или место вызова).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NexusSite {
+    /// Путь файла сайта (абсолютный — стабильный машинный контракт).
+    pub file: String,
+    /// Строка сайта, 1-based.
+    pub line: usize,
+    /// Роль сайта: `def` — определение/обёртка (хит в заголовке или теле
+    /// определения символа), `call` — место вызова/использования,
+    /// `ref` — упоминание без enclosing-определения (заголовок/макро).
+    pub role: String,
+    /// Вид символа из символьной таблицы (`fn`/`struct`/`class`/…).
+    pub kind: String,
+}
+
+/// v0.86.0: причинно-следственный узел (Causal Nexus) — кросс-языковая
+/// группировка top-N хитов по символу.
+///
+/// Директива владельца (SQLite-кейс): ИИ и человек обязаны видеть
+/// ОДНОВРЕМЕННО и C-ядро (`vdbeapi.c:980`), и JNI-прослойку
+/// (`CApi.java:2141`), и заголовок, и места вызовов — а не устраивать
+/// драку языков за первое место. Ранжирование НЕ искажается: якоря
+/// остаются в порядке (тир, −R) — нексус — надстройка-представление,
+/// «граф, а не костыль» def-бонуса.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NexusNode {
+    /// Имя сущности как в коде (case-sensitive, кросс-языковая
+    /// идентичность по имени — `sqlite3_step` в C и в Java).
+    pub symbol: String,
+    /// Все сайты сущности среди top-N хитов: определения во всех
+    /// языках + места вызовов.
+    pub sites: Vec<NexusSite>,
+    /// Рёбра графа символов в радиусе K-hop от сущности
+    /// (`caller`, `"calls"`, `callee`), EntityGraph на символьной
+    /// таблице hit-файлов.
+    pub relations: Vec<(String, String, String)>,
+}
+
 /// Один Context Anchor: самодостаточный контекст совпадения.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextAnchor {
@@ -54,6 +93,12 @@ pub struct ContextAnchor {
     pub resonance: f64,
     pub scene: SceneContext,
     pub k_hop_relations: Vec<(String, String, String)>,
+    /// v0.86.0 (ГРАБЛЯ 41): символ нексуса, к которому отнесён этот хит
+    /// (группировка по enclosing-определению из символьной таблицы
+    /// hit-файлов). `None` — проза/хит без символа; сгруппированные
+    /// якоря разворачиваются в `SearchResult::nexus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nexus_symbol: Option<String>,
 }
 
 /// Итог поиска.
@@ -75,6 +120,13 @@ pub struct SearchResult {
     /// срабатывал; агенты различают причину без парсинга stderr.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soft_fallback_kind: Option<String>,
+    /// v0.86.0 (ГРАБЛЯ 41, SQLite): кросс-языковые узлы сущностей —
+    /// группировка top-N код-хитов по символу через символьную таблицу
+    /// и [`crate::graph::EntityGraph`] (`from_symbol_table`, K-hop).
+    /// ИИ видит всю цепь вызова (C-ядро + JNI-прослойка + вызовы) одним
+    /// взглядом. Пусто для прозы и хитов без символов — поле скрыто.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nexus: Vec<NexusNode>,
     pub anchors: Vec<ContextAnchor>,
 }
 
@@ -125,6 +177,37 @@ pub fn render_markdown(res: &SearchResult) -> String {
             }
         }
         out.push_str(&format!("\n```text\n{}\n```\n---\n\n", a.scene.enclosing_scope));
+    }
+    out.push_str(&render_nexus_markdown(res));
+    out
+}
+
+/// v0.86.0: рендер Causal Nexus в Markdown — кросс-языковое дерево
+/// сущности (определения во всех языках + места вызовов + K-hop рёбра).
+fn render_nexus_markdown(res: &SearchResult) -> String {
+    let mut out = String::new();
+    for node in &res.nexus {
+        out.push_str(&format!(
+            "## Causal Nexus: `{}` (сайтов: {}, связей: {})\n\n",
+            node.symbol,
+            node.sites.len(),
+            node.relations.len()
+        ));
+        for s in &node.sites {
+            let role = match s.role.as_str() {
+                "def" => "определение",
+                "call" => "вызов",
+                _ => "упоминание",
+            };
+            out.push_str(&format!("- **{role}** `{}:{}` ({})\n", s.file, s.line, s.kind));
+        }
+        if !node.relations.is_empty() {
+            out.push_str("\n**Граф символов (K-hop):**\n\n");
+            for (subj, pred, obj) in &node.relations {
+                out.push_str(&format!("- `{subj}` —{pred}→ `{obj}`\n"));
+            }
+        }
+        out.push('\n');
     }
     out
 }
@@ -202,6 +285,9 @@ fn simple_snippet(a: &ContextAnchor) -> String {
 /// v0.83.0: путь резолвится из CWD (файл под CWD → относительно CWD,
 /// иначе абсолютный); сниппет начинается СО СТРОКИ ХИТА — сигнатура
 /// целиком, хвост — компактно.
+///
+/// v0.86.0: после списка якорей — компактный блок Causal Nexus
+/// (кросс-языковые узлы сущностей).
 pub fn render_simple(res: &SearchResult) -> String {
     let mut out = String::new();
     let total = res.anchors.len();
@@ -221,6 +307,33 @@ pub fn render_simple(res: &SearchResult) -> String {
             where_ref,
             simple_snippet(a)
         ));
+    }
+    out.push_str(&render_nexus_simple(res));
+    out
+}
+
+/// v0.86.0: компактный рендер нексуса для `--format simple`.
+fn render_nexus_simple(res: &SearchResult) -> String {
+    let mut out = String::new();
+    for node in &res.nexus {
+        out.push_str(&format!(
+            "◇ Нексус «{}»: {} сайтов, {} связей\n",
+            node.symbol,
+            node.sites.len(),
+            node.relations.len()
+        ));
+        for s in &node.sites {
+            out.push_str(&format!(
+                "    {:<4} {}:{} ({})\n",
+                s.role,
+                s.file,
+                s.line,
+                s.kind
+            ));
+        }
+        for (subj, pred, obj) in node.relations.iter().take(8) {
+            out.push_str(&format!("    ⤷ {subj} —{pred}→ {obj}\n"));
+        }
     }
     out
 }
@@ -246,6 +359,7 @@ mod tests {
             total_hits: 3,
             soft_fallback: false,
             soft_fallback_kind: None,
+            nexus: Vec::new(),
             anchors: vec![ContextAnchor {
                 file: "/book/chapter_36.md".into(),
                 rel_file: Some("chapter_36.md".into()),
@@ -260,6 +374,7 @@ mod tests {
                     "вонзила_когти".into(),
                     "Солнечное сплетение".into(),
                 )],
+                nexus_symbol: None,
             }],
         }
     }
@@ -289,6 +404,8 @@ mod tests {
         assert!(v.get("soft_fallback").is_none());
         // v0.85.0: разновидность тоже скрыта без fallback
         assert!(v.get("soft_fallback_kind").is_none());
+        // v0.86.0: пустой нексус скрыт
+        assert!(v.get("nexus").is_none());
         // k_hop_relations — массивы из трёх строк
         let rel = &a["k_hop_relations"][0];
         assert_eq!(rel.as_array().unwrap().len(), 3);
@@ -414,5 +531,54 @@ mod tests {
         a.rel_file = None;
         let s = render_simple(&res);
         assert!(s.contains("/book/chapter_36.md |"), "фолбэк на абсолютный путь: {s}");
+    }
+
+    #[test]
+    fn nexus_render_and_json_contract() {
+        // v0.86.0 (ГРАБЛЯ 41): кросс-языковой нексус — рендер + JSON-контракт
+        let mut res = sample();
+        res.query = "int sqlite3_step(".into();
+        res.anchors[0].nexus_symbol = Some("sqlite3_step".into());
+        res.nexus = vec![NexusNode {
+            symbol: "sqlite3_step".into(),
+            sites: vec![
+                NexusSite {
+                    file: "src/vdbeapi.c".into(),
+                    line: 980,
+                    role: "def".into(),
+                    kind: "fn".into(),
+                },
+                NexusSite {
+                    file: "ext/jni/CApi.java".into(),
+                    line: 2141,
+                    role: "def".into(),
+                    kind: "fn".into(),
+                },
+                NexusSite {
+                    file: "shell.c".into(),
+                    line: 8123,
+                    role: "call".into(),
+                    kind: "fn".into(),
+                },
+            ],
+            relations: vec![("main".into(), "calls".into(), "sqlite3_step".into())],
+        }];
+        // JSON-контракт: nexus сериализуется, якорь несёт nexus_symbol
+        let v = serde_json::to_value(&res).unwrap();
+        let nx = &v["nexus"][0];
+        assert_eq!(nx["symbol"], "sqlite3_step");
+        assert_eq!(nx["sites"].as_array().unwrap().len(), 3);
+        assert_eq!(nx["sites"][1]["file"], "ext/jni/CApi.java");
+        assert_eq!(nx["sites"][2]["role"], "call");
+        assert_eq!(v["anchors"][0]["nexus_symbol"], "sqlite3_step");
+        // simple-рендер: компактный блок нексуса
+        let s = render_simple(&res);
+        assert!(s.contains("◇ Нексус «sqlite3_step»"), "нет заголовка нексуса: {s}");
+        assert!(s.contains("src/vdbeapi.c:980"), "нет C-ядра: {s}");
+        assert!(s.contains("ext/jni/CApi.java:2141"), "нет JNI-моста: {s}");
+        // md-рендер: секция Causal Nexus
+        let md = render_markdown(&res);
+        assert!(md.contains("## Causal Nexus: `sqlite3_step`"), "нет секции md: {md}");
+        assert!(md.contains("**вызов** `shell.c:8123`"), "нет call-сайта md: {md}");
     }
 }
