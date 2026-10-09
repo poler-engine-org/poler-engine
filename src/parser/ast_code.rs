@@ -197,6 +197,29 @@ const C_CONTROL_KEYWORDS: &[&str] = &[
     "if", "for", "while", "switch", "return", "sizeof", "else", "do", "case",
 ];
 
+/// Открывашка C-сигнатуры: `тип имя(` — строка НАЧИНАЕТ многстрочную
+/// ANSI-сигнатуру (параметры на той же строке, хвост — ниже). Без
+/// требования закрытия `)` и `{`: носитель имени может кончаться запятой
+/// (`int git_foo(git_repository **out, const char *path,`).
+static C_SIG_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[\s]*((?:static|inline|extern|asmlinkage|__visible|__init|__exit|__always_inline|noinline|__weak|__noreturn|const|volatile|unsigned|signed|struct|enum|union|typedef)\s+)*[A-Za-z_][A-Za-z0-9_\s\*]*?[\s\*]([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    )
+    .unwrap()
+});
+
+/// Строка-носитель имени многострочной C-сигнатуры.
+fn is_c_signature_opener(line: &str) -> bool {
+    if let Some(name) = C_SIG_OPEN_RE
+        .captures(line)
+        .and_then(|c| c.get(c.len() - 1))
+        .map(|m| m.as_str())
+    {
+        return !name.is_empty() && !C_CONTROL_KEYWORDS.contains(&name);
+    }
+    false
+}
+
 /// Сигнатура C-функции одной строки: имя. Возвращает None для прототипов,
 /// вызовов (с ';' на конце) и управляющих конструкций.
 pub(crate) fn c_signature_name(line: &str) -> Option<String> {
@@ -242,19 +265,23 @@ pub fn extract_enclosing_scope(source: &str, byte_offset: usize, lang: CodeLang)
     }
 }
 
-/// Диапазон сигнатуры над открывающей скобкой (C-стиль, `{` на
-/// собственной строке): (старт байт, конец байт — до строки со скобкой).
-/// Сигнатура — часть «функции целиком»: без неё скоуп — тело без
-/// контракта. Поднимается от строки со скобкой вверх ≤10 строк, пока
-/// строки «похожи на сигнатуру»; носитель имени — самая верхняя строка,
-/// распознанная как полная сигнатура либо открывашка многострочной
-/// (кончается на `(`). Управляющие конструкции (if/while/switch…)
-/// отфильтрованы контрольными словами в `c_signature_name`.
+/// Диапазон сигнатуры над открывающей скобкой (C-стиль): (старт байт,
+/// конец байт — до строки со скобкой). Сигнатура — часть «функции
+/// целиком»: без неё скоуп — тело без контракта. Поднимается от строки
+/// со скобкой вверх ≤10 строк, пока строки «похожи на сигнатуру»; носитель
+/// имени — самая верхняя строка, распознанная как полная сигнатура либо
+/// открывашка многострочной (кончается на `(`). Покрывает оба стиля
+/// расстановки скобки: K&R (`{` на собственной строке) и ANSI
+/// (`const char *path) {` — скобка в конце последней строки параметров);
+/// однострочная сигнатура не поднимается — она уже на строке со скобкой.
+/// Управляющие конструкции (if/while/switch…) отфильтрованы контрольными
+/// словами в `c_signature_name`.
 fn signature_span(source: &str, open_line_start: usize) -> Option<(usize, usize)> {
-    let open_line = source[open_line_start..].lines().next()?;
-    if !open_line.trim_start().starts_with('{') {
-        return None; // сигнатура на строке со скобкой (Rust-стиль) — уже в скоупе
-    }
+    // Оба стиля поднимают многострочную сигнатуру: K&R (`{` на собственной
+    // строке) и ANSI (`const char *path) {`). Однострочная сигнатура
+    // (`int f(void) {`, `fn foo() {`) не поднимается: строка над ней — не
+    // часть сигнатуры, parts остаются пустыми и скоуп начинается прямо
+    // со строки со скобкой, где сигнатура уже есть.
     let mut parts: Vec<usize> = Vec::new(); // старты строк-частей сигнатуры
     let mut pos = open_line_start;
     for _ in 0..10 {
@@ -270,10 +297,14 @@ fn signature_span(source: &str, open_line_start: usize) -> Option<(usize, usize)
         parts.push(prev_start);
         pos = prev_start;
     }
-    // верхняя строка-носитель имени: полная сигнатура или `(`-открывашка
+    // верхняя строка-носитель имени: полная сигнатура, `(`-открывашка
+    // или ANSI-открывашка (параметры на строке имени, хвост ниже)
     for &start in parts.iter().rev() {
         let line = source[start..].lines().next().unwrap_or("");
-        if c_signature_name(line).is_some() || line.trim_end().ends_with('(') {
+        if c_signature_name(line).is_some()
+            || line.trim_end().ends_with('(')
+            || is_c_signature_opener(line)
+        {
             return Some((start, open_line_start));
         }
     }
@@ -623,14 +654,28 @@ fn find_signature(source: &str, open_pos: usize) -> (&'static str, Option<String
         }
     }
     // C-стиль: тип имя(аргументы) без ключевого слова fn/def — строки
-    // сигнатуры над `{` склеиваются (многострочные сигнатуры).
-    if let Some((sig_start, sig_end)) = signature_span(source, open_line_start) {
-        let joined: String = source[sig_start..sig_end]
+    // сигнатуры над `{` склеиваются (многострочные сигнатуры). В клей
+    // входит и сама строка со скобкой: ANSI-хвост (`*opts) {`) замыкает
+    // список параметров — без него клей кончается запятой.
+    if let Some((sig_start, _)) = signature_span(source, open_line_start) {
+        let open_line_end = source[open_line_start..]
+            .lines()
+            .next()
+            .map(|l| open_line_start + l.len())
+            .unwrap_or(open_line_start);
+        let joined: String = source[sig_start..open_line_end]
             .lines()
             .map(str::trim)
             .collect::<Vec<_>>()
             .join(" ");
         if let Some(name) = c_signature_name(&joined) {
+            return ("function", Some(name));
+        }
+    }
+    // Однострочная C-сигнатура на самой строке со скобкой
+    // (`int git_open(void) {`): раньше молча давала block/None.
+    if let Some(l) = source[open_line_start..].lines().next() {
+        if let Some(name) = c_signature_name(l) {
             return ("function", Some(name));
         }
     }
@@ -862,5 +907,42 @@ mod tests {
         let src = "fn alpha() {\n    let z = 9;\n}\n";
         let sc = scope_at(src, "z =");
         assert_eq!(sc.text.matches("fn alpha").count(), 1);
+    }
+
+    #[test]
+    fn ansi_multiline_signature_lifted() {
+        // ANSI-стиль: скобка в конце последней строки параметров —
+        // многострочная сигнатура тоже поднимается в «функцию целиком"
+        // (провал смоук-фикстуры v0.81.0: скоуп начинался со строки
+        // параметров, имя функции оставалось вне скоупа).
+        let src = "/* doc */\nint git_repository_init_ext(git_repository **repo_out, const char *path,\n        unsigned flags, const git_repository_init_options *opts) {\n    return init_it(out, path);\n}\n";
+        let sc = scope_at(src, "init_it");
+        assert_eq!(sc.name.as_deref(), Some("git_repository_init_ext"));
+        assert_eq!(sc.scope_type, "function");
+        assert!(
+            sc.text.starts_with("int git_repository_init_ext("),
+            "ANSI-сигнатура открывает скоуп: {}",
+            sc.text
+        );
+        assert!(sc.text.contains("*opts) {"));
+        assert_eq!(sc.start_line, 2, "start_line на носителе имени: {}", sc.start_line);
+        // док-коммент не втягивается
+        assert!(!sc.text.contains("doc"));
+    }
+
+    #[test]
+    fn ansi_single_line_signature_unchanged() {
+        // Однострочная ANSI-сигнатура (`int f(void) {`) не поднимается:
+        // она уже на строке со скобкой; строка выше (конец прошлого тела)
+        // не притягивается.
+        let src = "int prev(void) { return 0; }\nint git_open(void) {\n    return do_open();\n}\n";
+        let sc = scope_at(src, "do_open");
+        assert_eq!(sc.name.as_deref(), Some("git_open"));
+        assert!(
+            sc.text.starts_with("int git_open(void) {"),
+            "однострочная сигнатура без дублирования: {}",
+            sc.text
+        );
+        assert!(!sc.text.contains("prev"));
     }
 }

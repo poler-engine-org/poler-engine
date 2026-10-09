@@ -31,7 +31,11 @@
 //!
 //! Мега-скоуп, не влезающий в бюджет, НЕ подаётся целиком и НЕ режется
 //! по живому: пакет получает сигнатуру + фокальные окна вокруг хитов,
-//! разрывы помечены честными маркерами «N строк укрыто».
+//! разрывы помечены честными маркерами «N строк укрыто». Сцена хранит
+//! первые `max_scope_bytes` (16 КБ) скоупа — движок обязан держать память
+//! O(1), — но если хит запроса лежит ЗА границей обрезки, скоуп
+//! перечитывается из файла целиком: фокальные окна обязаны строиться
+//! вокруг реальных хитов (JSON-элемент помечается `rehydrated: true`).
 //!
 //! Синтаксис (poler-shell / `--exec`):
 //! ```text
@@ -97,6 +101,12 @@ const COMPRESS_NOTE_TOKENS: usize = 16;
 const IMPACT_BASE_TOKENS: usize = 34;
 /// Резерв на один элемент пакета при обрезке impact-списков (мин. сжатый вид).
 const MIN_ITEM_RESERVE: usize = 160;
+/// Потолок файла для перечитывания мега-скоупа (манифест O(1): гиганты
+/// остаются на честном 16-КБ виде сцены с хвостовым «…»).
+const REHYDRATE_FILE_MAX: usize = 16 * 1024 * 1024;
+/// Потолок перечитанного скоупа (функция больше 2 МБ — патология,
+/// сжатие и тогда справится видом сцены).
+const REHYDRATE_SCOPE_MAX: usize = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Оценка токенов (письменность-осознанная, без словарей)
@@ -322,6 +332,50 @@ fn compress_scope(scope: &str, terms: &[String], max_tokens: usize) -> ScopeComp
     unreachable!("кандидат (радиус 1, одно окно) всегда терминирует цикл")
 }
 
+/// Мега-скоуп перечитан из файла целиком (срез за 16 КБ обрезки сцены).
+///
+/// Сцена держит первые `max_scope_bytes` (16 КБ) скоупа — обрезка честна
+/// и помечена хвостовым «…». Но хит запроса может лежать за границей
+/// обрезки (мега-функция 40 КБ, хит на строке 600) — фокальные окна,
+/// построенные по префиксу, промахиваются мимо цели правки. Обрезанный
+/// текст — префикс скоупа: находим его в файле (со второй строки — первая
+/// обрезана `.trim()` скоупа) и извлекаем скоуп целиком brace-matching'ом
+/// от точки внутри префикса. `feed` — контекст-шлюз под действие: один
+/// дополнительный read_file оправдан точностью пакета; проза не
+/// перечитывается (её сцены — не функции), гигантские файлы — тоже.
+fn rehydrate_scope(anchor: &crate::ContextAnchor) -> Option<String> {
+    if !anchor.scene.enclosing_scope.ends_with('…') {
+        return None; // не обрезан — сцена уже держит скоуп целиком
+    }
+    let file = std::path::Path::new(&anchor.file);
+    let lang = crate::detect_lang(file);
+    if !file.is_file() || lang == crate::CodeLang::Plain {
+        return None;
+    }
+    let text = std::fs::read_to_string(file).ok()?;
+    if text.len() > REHYDRATE_FILE_MAX {
+        return None;
+    }
+    let prefix = anchor.scene.enclosing_scope.strip_suffix('…')?;
+    // Первая строка префикса обрезана `.trim()` скоупа — ищем со второй.
+    let second_line = prefix.find('\n')? + 1;
+    let needle = &prefix[second_line..];
+    if needle.len() < 256 {
+        return None; // слишком короткая зацепка — поиск небезопасен
+    }
+    let probe = text.find(needle)? + needle.len() / 2;
+    let scope = crate::extract_enclosing_scope(&text, probe, lang);
+    // Файловый уровень / не вырос против обрезанного вида / патологический
+    // размер — честно остаёмся на виде сцены.
+    if scope.scope_type == "file"
+        || scope.text.len() <= anchor.scene.enclosing_scope.len()
+        || scope.text.len() > REHYDRATE_SCOPE_MAX
+    {
+        return None;
+    }
+    Some(scope.text)
+}
+
 // ---------------------------------------------------------------------------
 // Статистика энергии пула
 // ---------------------------------------------------------------------------
@@ -372,14 +426,18 @@ struct FeedItem<'a> {
     verdict: Option<&'static str>,
     /// Сжатие мега-скоупа (сигнатура + фокальные окна), если применялось.
     compression: Option<ScopeCompression>,
+    /// Полный текст скоупа, если сцена была обрезана по `max_scope_bytes`
+    /// и файл перечитан: без сжатия подаётся именно он.
+    full_scope: Option<String>,
 }
 
 impl FeedItem<'_> {
-    /// Текст скоупа элемента пакета: сжатый, если сжатие применялось.
+    /// Текст скоупа элемента пакета: сжатый → перечитанный → вид сцены.
     fn scope_text(&self) -> &str {
-        match &self.compression {
-            Some(c) => c.text.as_str(),
-            None => self.anchor.scene.enclosing_scope.as_str(),
+        match (&self.compression, &self.full_scope) {
+            (Some(c), _) => c.text.as_str(),
+            (None, Some(full)) => full.as_str(),
+            (None, None) => self.anchor.scene.enclosing_scope.as_str(),
         }
     }
 }
@@ -610,7 +668,14 @@ pub fn run_feed(
     let mut selected: Vec<FeedItem> = Vec::new();
     for (pos, &i) in items_order.iter().enumerate() {
         let a = &pool[i];
-        let full_cost = estimate_tokens(&a.scene.enclosing_scope) + ITEM_META_TOKENS;
+        // Мега-скоуп: сцена держит первые 16 КБ (max_scope_bytes, O(1)-память) —
+        // перечитываем файл и извлекаем функцию целиком: фокальные окна
+        // обязаны строиться вокруг реальных хитов, даже за границей обрезки.
+        let full_scope = rehydrate_scope(a);
+        let scope_text: &str = full_scope
+            .as_deref()
+            .unwrap_or(a.scene.enclosing_scope.as_str());
+        let full_cost = estimate_tokens(scope_text) + ITEM_META_TOKENS;
         // Мега-скоуп первого якоря: сигнатура + локальный фокус, а не весь
         // мега-файл целиком (стресс-тест libgit2: 5269/3000 ток). Цель
         // правки остаётся в пакете — внутри фокальных окон вокруг хитов.
@@ -621,7 +686,7 @@ pub fn run_feed(
             if !terms.iter().any(|t| t.eq_ignore_ascii_case(&a.token)) {
                 terms.push(a.token.clone());
             }
-            let c = compress_scope(&a.scene.enclosing_scope, &terms, max_item);
+            let c = compress_scope(scope_text, &terms, max_item);
             let cost = estimate_tokens(&c.text) + ITEM_META_TOKENS + COMPRESS_NOTE_TOKENS;
             (cost, Some(c))
         } else {
@@ -636,6 +701,7 @@ pub fn run_feed(
             tokens: cost,
             verdict: verdicts.as_ref().map(|v| v[pos]),
             compression,
+            full_scope,
         });
     }
 
@@ -681,6 +747,9 @@ pub fn run_feed(
                         "fallback": c.fallback,
                         "note": "мега-скоуп подан сжато: сигнатура + фокальные окна вокруг хитов",
                     });
+                }
+                if it.full_scope.is_some() {
+                    v["rehydrated"] = json!(true);
                 }
                 v
             })
@@ -1458,6 +1527,59 @@ mod tests {
         // Карта: пометка о сжатии вместо паники «превышает бюджет».
         let card = run_feed(&d, FeedMode::Edit, "validate_and_open", 500, 40, false);
         assert!(card.contains("фокальных окон"), "пометка в карте: {card}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn feed_mega_scope_rehydrated_beyond_16k_cut() {
+        // Смоук-кейс v0.81.0: мега-функция > 16 КБ, хит — ЗА границей
+        // обрезки сцены. Без перечитывания фокальные окна строились по
+        // префиксу и промахивались мимо цели правки (fallback, 0 окон).
+        let d = temp_dir("rehydrate");
+        let mut src = String::new();
+        // ANSI-сигнатура: скобка в конце последней строки параметров
+        src.push_str(
+            "int git_repository_init_ext(git_repository **repo_out, const char *path,\n        unsigned flags, const git_repository_init_options *opts) {\n",
+        );
+        // ~700 строк × ~55 байт ≈ 38 КБ > max_scope_bytes (16 КБ)
+        for i in 0..700 {
+            src.push_str(&format!(
+                "    int stage_buffer_{i} = transform_stage_{i}(path, flags);\n"
+            ));
+        }
+        // хит — в самом хвосте, ЗА границей 16-КБ обрезки
+        src.push_str("    git_object *handle = git_object_acquire(repo_out, opts);\n");
+        src.push_str("    return finish_init(handle, flags);\n");
+        src.push_str("}\n");
+        std::fs::write(d.join("repository_ext.c"), src).unwrap();
+        let js = run_feed(&d, FeedMode::Edit, "git_object_acquire", 500, 40, true);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("JSON");
+        assert_eq!(v["over_budget"], false, "сжатый вид влез: {js}");
+        assert!(
+            v["spent_tokens"].as_u64().unwrap() <= 500,
+            "бюджет уважен: {js}"
+        );
+        let it = &v["items"][0];
+        assert_eq!(it["rehydrated"], true, "скоуп перечитан из файла: {js}");
+        assert_eq!(it["compressed"]["applied"], true, "сжатие применено: {js}");
+        assert_eq!(
+            it["compressed"]["fallback"], false,
+            "хиты найдены в полном тексте: {js}"
+        );
+        assert!(
+            it["compressed"]["windows"].as_u64().unwrap() >= 1,
+            "фокальное окно построено: {js}"
+        );
+        let scope = it["scope"].as_str().unwrap();
+        assert!(
+            scope.contains("int git_repository_init_ext("),
+            "ANSI-сигнатура поднята: {scope}"
+        );
+        assert!(
+            scope.contains("git_object_acquire"),
+            "хит за границей обрезки — в окне: {scope}"
+        );
+        assert!(scope.contains("укрыто"), "маркеры пропуска: {scope}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
