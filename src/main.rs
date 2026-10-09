@@ -91,6 +91,19 @@ enum ResonanceArg {
     Poler,
 }
 
+/// v0.82.0: режим intent-ранжирования — код ↔ проза (симметрично).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum IntentArg {
+    /// Автодетект: `func Default`/`express()` → код; кириллица/вопросы → проза.
+    Auto,
+    /// Принудительно: приоритет исходникам, документация — вниз.
+    Code,
+    /// Принудительно: приоритет документации, код — вниз.
+    Prose,
+    /// Без intent-тиров (ранжирование чисто по резонансу, как в v0.81).
+    Off,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum KnowledgeEmbedderArg {
     /// Без векторного слоя (только BM25/WebRank) — быстрый инжест.
@@ -1778,6 +1791,10 @@ struct Cli {
     #[arg(long = "resonance-mode", value_enum, default_value_t = ResonanceArg::Hits)]
     resonance: ResonanceArg,
 
+    /// Intent-ранжирование код ↔ проза (v0.82.0).
+    #[arg(long, value_enum, default_value_t = IntentArg::Auto)]
+    intent: IntentArg,
+
     /// POLER[Ψ]: η — скорость обучения внимания [default: 0.05].
     #[arg(long = "psi-eta", default_value_t = 0.05)]
     psi_eta: f64,
@@ -3064,6 +3081,12 @@ fn run(cli: Cli) -> ExitCode {
             mix: cli.poler_mix,
             dissipator: cli.poler_dissipator,
             ..poler_engine::poler::PolerParams::default()
+        },
+        intent_mode: match cli.intent {
+            IntentArg::Auto => poler_engine::search::intent::IntentMode::Auto,
+            IntentArg::Code => poler_engine::search::intent::IntentMode::Code,
+            IntentArg::Prose => poler_engine::search::intent::IntentMode::Prose,
+            IntentArg::Off => poler_engine::search::intent::IntentMode::Off,
         },
     };
 

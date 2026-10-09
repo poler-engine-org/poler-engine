@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use crate::parser::markdown_scenes::{light_meta, LightSceneMeta, SceneBounds};
 use crate::parser::{detect_lang, extract_code_triples, extract_triples, CodeLang, SceneContext, Triple};
 use crate::resonance::{apply_iir_resonance, calculate_epsilon, semantic_bonus};
+use crate::search::intent::SignatureQuery;
 use crate::{with_text, EngineConfig, PiiCleaner, ResonanceMode};
 
 /// Порог «гигантского» файла: обрабатывается строго последовательно.
@@ -139,6 +140,22 @@ impl<'a> FileTokens<'a> {
     ///   без точной фразы давал 0 хитов, даже если все токены жили в
     ///   одной функции — главный агентский кейс («isatty confirm_mutating»).
     pub fn find_phrase(&self, query: &[String]) -> Vec<u32> {
+        self.find_phrase_inner(query, false)
+    }
+
+    /// Строгий режим (v0.82.0, код-интент): ТОЛЬКО точная фраза,
+    /// proximity-AND выключен.
+    ///
+    /// Код-грамматические запросы (`func Default`, `impl Display`,
+    /// `class Engine`) — синтаксически упорядочены: struct-теги
+    /// (`form:",default=1"`) и случайные вхождения в окне ±128 токенов —
+    /// шум, а не сигнал. Проза/нейтральные запросы сохраняют proximity
+    /// (кейс «isatty confirm_mutating» — идентификаторы без грамматики).
+    pub fn find_phrase_strict(&self, query: &[String]) -> Vec<u32> {
+        self.find_phrase_inner(query, true)
+    }
+
+    fn find_phrase_inner(&self, query: &[String], strict: bool) -> Vec<u32> {
         if query.is_empty() {
             return Vec::new();
         }
@@ -165,6 +182,10 @@ impl<'a> FileTokens<'a> {
             }
         }
         if !out.is_empty() {
+            return out;
+        }
+        // Код-интент: proximity выключен — запрошена грамматика кода.
+        if strict {
             return out;
         }
         // Дисциплина отрицания (Negation Blindness): частица «не»/«ни»
@@ -355,6 +376,7 @@ pub struct Pass1File {
 pub fn pass1_file(
     path: &Path,
     query_tokens: &[String],
+    strict_phrase: bool,
     config: &EngineConfig,
     _cleaner: &PiiCleaner,
     pre: &Option<Teddy>,
@@ -376,7 +398,13 @@ pub fn pass1_file(
             };
         }
         let ft = FileTokens::build(raw);
-        let hits = ft.find_phrase(query_tokens);
+        // v0.82.0: код-интент — строгая фраза (proximity-AND — шум
+        // для грамматических запросов `func Default`).
+        let hits = if strict_phrase {
+            ft.find_phrase_strict(query_tokens)
+        } else {
+            ft.find_phrase(query_tokens)
+        };
         let total = ft.toks_len() as u64;
         // v2.0: словарь файла перемещается целиком (ноль клонов строк);
         // интернирование в FSST-арену происходит в sink под мьютексом.
@@ -403,6 +431,9 @@ pub struct HitRecord {
     pub scene_key: (usize, usize),
     pub is_code: bool,
     pub metric_tag: Option<String>,
+    /// Хит совпал с сигнатурным паттерном запроса (v0.82.0).
+    /// false при неактивном сигнатурном слое — тир определяется intent'ом.
+    pub signature_matched: bool,
 }
 
 /// Результат прохода 2 по одному файлу.
@@ -519,11 +550,13 @@ pub fn chunk_boundaries(text: &str) -> Vec<(usize, usize)> {
 pub fn pass2_giant_parallel(
     path: &Path,
     query_tokens: &[String],
+    strict_phrase: bool,
     config: &EngineConfig,
     _cleaner: &PiiCleaner,
     global_counts: &StatsRef,
     n_total: usize,
     hits: &[u32],
+    signature: Option<&SignatureQuery>,
 ) -> Option<Pass2Result> {
     use rayon::prelude::*;
 
@@ -534,7 +567,16 @@ pub fn pass2_giant_parallel(
         let chunks = chunk_boundaries(text);
         if chunks.len() <= 1 {
             // один чанк — обычный последовательный путь
-            return pass2_file(path, query_tokens, config, _cleaner, global_counts, n_total, hits);
+            return pass2_file(
+                path,
+                query_tokens,
+                config,
+                _cleaner,
+                global_counts,
+                n_total,
+                hits,
+                signature,
+            );
         }
 
         // Распределение хитов по чанкам: байтовые позиции растут вместе
@@ -573,7 +615,11 @@ pub fn pass2_giant_parallel(
                 }
                 let sub_text = &text[*start..*end];
                 let sub_ft = FileTokens::build(sub_text);
-                let sub_hits = sub_ft.find_phrase(query_tokens);
+                let sub_hits = if strict_phrase {
+                    sub_ft.find_phrase_strict(query_tokens)
+                } else {
+                    sub_ft.find_phrase(query_tokens)
+                };
                 if sub_hits.is_empty() {
                     return None;
                 }
@@ -724,6 +770,8 @@ pub fn pass2_giant_parallel(
                 };
 
                 // ── Стриминговый Top-K в чанке (bug PYCCLE) ──
+                // v0.82.0: ключ кучи — (тир сигнатуры, R): сигнатурные хиты
+                // выживают в per-chunk top-N ДО финальной сортировки движка.
                 use std::cmp::Reverse;
                 let chunk_locator =
                     crate::parser::markdown_scenes::SceneLocator::new(sub_text, path);
@@ -735,10 +783,10 @@ pub fn pass2_giant_parallel(
                         !b
                     }
                 };
-                let mut heap: std::collections::BinaryHeap<Reverse<(u64, usize)>> =
+                let mut heap: std::collections::BinaryHeap<Reverse<(u8, u64, usize)>> =
                     std::collections::BinaryHeap::new();
-                // (hit_idx, byte_pos, key, is_code) — лёгкие данные чанка
-                let mut light: Vec<(usize, usize, (usize, usize), bool)> =
+                // (hit_idx, byte_pos, key, is_code, sig_matched) — лёгкие данные чанка
+                let mut light: Vec<(usize, usize, (usize, usize), bool, bool)> =
                     Vec::with_capacity(sub_hits.len().min(1 << 20));
 
                 for (i, &h) in sub_hits.iter().enumerate() {
@@ -760,16 +808,26 @@ pub fn pass2_giant_parallel(
                         ((*start + b.start, *start + b.end), false)
                     };
 
-                    light.push((i, byte_pos, key, is_code));
-                    heap.push(Reverse((bit_key(sub_eps_res[i].1), light.len() - 1)));
+                    let sig_matched =
+                        signature.map_or(false, |sig| sig.matches_at(text, byte_pos));
+                    light.push((i, byte_pos, key, is_code, sig_matched));
+                    let tier: u8 = if signature.is_some() {
+                        u8::from(!sig_matched)
+                    } else {
+                        0
+                    };
+                    heap.push(Reverse((tier, bit_key(sub_eps_res[i].1), light.len() - 1)));
                     if heap.len() > config.top_n {
                         heap.pop();
                     }
                 }
-                let chunk_hit_keys: Vec<usize> = light.iter().map(|(_, b, _, _)| *b).collect();
+                let chunk_hit_keys: Vec<usize> =
+                    light.iter().map(|(_, b, _, _, _)| *b).collect();
                 let survivors: Vec<usize> = {
-                    let mut v: Vec<usize> =
-                        heap.into_iter().map(|Reverse((_, li))| li).collect();
+                    let mut v: Vec<usize> = heap
+                        .into_iter()
+                        .map(|Reverse((_, _, li))| li)
+                        .collect();
                     v.sort_unstable();
                     v
                 };
@@ -778,7 +836,7 @@ pub fn pass2_giant_parallel(
                 let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
                 let mut records: Vec<HitRecord> = Vec::with_capacity(survivors.len());
                 for li in survivors {
-                    let (i, byte_pos, key, is_code) = light[li];
+                    let (i, byte_pos, key, is_code, sig_matched) = light[li];
                     let info = scenes.entry(key).or_insert_with(|| {
                         if is_code {
                             let scope_text = &text[key.0..key.1.min(text.len())];
@@ -814,6 +872,7 @@ pub fn pass2_giant_parallel(
                         scene_key: key,
                         is_code,
                         metric_tag: info.metric_tag.clone(),
+                        signature_matched: sig_matched,
                     });
                 }
                 Some((records, scenes, chunk_hit_keys))
@@ -821,7 +880,7 @@ pub fn pass2_giant_parallel(
             .collect();
 
         // Слияние чанков: объединение per-chunk top-N ⊇ глобального top-N
-        // (IIR в чанках независим) -> финальная обрезка по резонансу.
+        // (IIR в чанках независим) -> финальная обрезка по (тир, резонанс).
         let mut all_light: Vec<HitRecord> = Vec::new();
         let mut all_scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
         let mut all_hit_keys: Vec<usize> = Vec::new();
@@ -832,10 +891,15 @@ pub fn pass2_giant_parallel(
                 all_scenes.entry(k).or_insert(v);
             }
         }
+        let sig_active = signature.is_some();
         all_light.sort_by(|a, b| {
-            b.resonance
-                .partial_cmp(&a.resonance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let ta = u8::from(sig_active && !a.signature_matched);
+            let tb = u8::from(sig_active && !b.signature_matched);
+            ta.cmp(&tb).then_with(|| {
+                b.resonance
+                    .partial_cmp(&a.resonance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         all_light.truncate(config.top_n);
         // осиротевшие сцены после финальной обрезки
@@ -949,6 +1013,10 @@ fn build_scene_info(
 }
 
 /// Проход 2 по hit-файлу: возвращает лёгкие записи и тройки сцен.
+///
+/// v0.82.0: `signature` — литеральный сигнатурный паттерн запроса
+/// (активен, когда в запросе есть прикреплённая скобка `Default(`).
+/// Сигнатурные хиты выживают в per-file top-N первыми (тир в ключе кучи).
 #[allow(clippy::too_many_arguments)]
 pub fn pass2_file(
     path: &Path,
@@ -958,6 +1026,7 @@ pub fn pass2_file(
     global_counts: &StatsRef,
     n_total: usize,
     hits: &[u32],
+    signature: Option<&SignatureQuery>,
 ) -> Option<Pass2Result> {
     with_text(path, config.max_file_bytes, |raw| {
         let text: &str = raw;
@@ -1085,6 +1154,7 @@ pub fn pass2_file(
 
         // Куча top-N: ключ — монотонное отображение f64 в u64
         // (каноничный total-order transform): не-/отрицательные ветки.
+        // v0.82.0: префикс тира — сигнатурные хиты выживают первыми.
         let bit_key = |r: f64| -> u64 {
             let b = r.to_bits();
             if b >> 63 == 0 {
@@ -1093,10 +1163,10 @@ pub fn pass2_file(
                 !b
             }
         };
-        let mut heap: std::collections::BinaryHeap<Reverse<(u64, usize)>> =
+        let mut heap: std::collections::BinaryHeap<Reverse<(u8, u64, usize)>> =
             std::collections::BinaryHeap::new();
-        // Лёгкие данные хита: (hit_idx, byte_pos, key, is_code)
-        let mut light: Vec<(usize, usize, (usize, usize), bool)> =
+        // Лёгкие данные хита: (hit_idx, byte_pos, key, is_code, sig_matched)
+        let mut light: Vec<(usize, usize, (usize, usize), bool, bool)> =
             Vec::with_capacity(hits.len().min(1 << 20));
         let mut bounds_cache: HashMap<(usize, usize), SceneBounds> = HashMap::new();
 
@@ -1119,19 +1189,28 @@ pub fn pass2_file(
                 (key, false)
             };
 
-            light.push((i, byte_pos, key, is_code));
-            heap.push(Reverse((bit_key(eps_res[i].1), light.len() - 1)));
+            let sig_matched = signature.map_or(false, |sig| sig.matches_at(text, byte_pos));
+            light.push((i, byte_pos, key, is_code, sig_matched));
+            let tier: u8 = if signature.is_some() {
+                u8::from(!sig_matched)
+            } else {
+                0
+            };
+            heap.push(Reverse((tier, bit_key(eps_res[i].1), light.len() - 1)));
             if heap.len() > config.top_n {
                 heap.pop();
             }
         }
 
         // Полный набор байтовых позиций (компактно) — до отсева
-        let hit_keys: Vec<usize> = light.iter().map(|(_, b, _, _)| *b).collect();
+        let hit_keys: Vec<usize> = light.iter().map(|(_, b, _, _, _)| *b).collect();
 
-        // Выжившие индексы (top-N по резонансу) — сцены строим только для них
+        // Выжившие индексы (top-N по (тир, резонанс)) — сцены строим только для них
         let survivors: Vec<usize> = {
-            let mut v: Vec<usize> = heap.into_iter().map(|Reverse((_, li))| li).collect();
+            let mut v: Vec<usize> = heap
+                .into_iter()
+                .map(|Reverse((_, _, li))| li)
+                .collect();
             v.sort_unstable();
             v
         };
@@ -1139,7 +1218,7 @@ pub fn pass2_file(
         let mut scenes: HashMap<(usize, usize), SceneInfo> = HashMap::new();
         let mut records: Vec<HitRecord> = Vec::with_capacity(survivors.len());
         for li in survivors {
-            let (i, byte_pos, key, is_code) = light[li];
+            let (i, byte_pos, key, is_code, sig_matched) = light[li];
             let bounds = if is_code {
                 None
             } else {
@@ -1170,6 +1249,7 @@ pub fn pass2_file(
                 scene_key: key,
                 is_code,
                 metric_tag: info.metric_tag.clone(),
+                signature_matched: sig_matched,
             });
         }
 
@@ -1315,6 +1395,38 @@ mod tests {
                 "якорь должен быть токеном запроса, got {t}"
             );
         }
+    }
+
+    #[test]
+    fn find_phrase_strict_drops_proximity_noise() {
+        // v0.82.0 (код-интент): struct-тег `form:",default=1"` + `func`
+        // в окне ±128 токенов — proximity-шум. Строгий режим — только
+        // точная фраза: теги выпадают, определение остаётся.
+        // Файл БЕЗ фразы `func default` (теги + func далеко):
+        let noise = "var s struct { Age int `form:\",default=1\"` } \
+                   func TestMapping ( t * TestingT ) { s = load ( ) }";
+        let ft = FileTokens::build(noise);
+        let loose = ft.find_phrase(&q(&["func", "default"]));
+        assert!(!loose.is_empty(), "proximity должен ловить шум тегов");
+        let strict = ft.find_phrase_strict(&q(&["func", "default"]));
+        assert!(strict.is_empty(), "строгий режим обязан отбросить теги");
+        // Файл С фразой `func Default (` — оба режима находят только её
+        let def = "func Default ( ) * Engine { return New ( ) }";
+        let ft2 = FileTokens::build(def);
+        assert_eq!(
+            ft2.find_phrase_strict(&q(&["func", "default"])),
+            ft2.find_phrase(&q(&["func", "default"]))
+        );
+    }
+
+    #[test]
+    fn find_phrase_strict_single_token_unchanged() {
+        // одиночный токен — семантика идентична в обоих режимах
+        let ft = FileTokens::build("alpha beta alpha gamma");
+        assert_eq!(
+            ft.find_phrase_strict(&q(&["alpha"])),
+            ft.find_phrase(&q(&["alpha"]))
+        );
     }
 
     #[test]

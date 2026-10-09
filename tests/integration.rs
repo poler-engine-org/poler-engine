@@ -1041,3 +1041,225 @@ fn web_docstore_compression_roundtrip() {
     assert_eq!(hits3.len(), 1);
     assert!(db_bytes > 0);
 }
+
+// ---------------------------------------------------------------------------
+// v0.82.0: intent-ранжирование код ↔ проза + сигнатурный слой
+// (стресс-кейс владельца на gin-gonic: docs/doc.md R=55000 вытеснял
+//  gin.go R=4240 из топ-10 запроса `func Default`)
+// ---------------------------------------------------------------------------
+
+use poler_engine::{render_simple, IntentMode};
+
+/// Ключевой Go-файл: настоящая точка определения.
+const GIN_GO: &str = r#"package gin
+
+import (
+	"net/http"
+)
+
+// Default returns an Engine instance with the Logger
+// and Recovery middleware already attached.
+func Default() *Engine {
+	engine := New()
+	engine.Use(Logger(), Recovery())
+	return engine
+}
+
+func New() *Engine {
+	debugPrintWARNINGNew()
+	engine := &Engine{
+		RouterGroup: RouterGroup{
+			Handlers: nil,
+			basePath: "/",
+			root:     true,
+		},
+	}
+	return engine
+}
+"#;
+
+/// Шумовой файл: struct-теги с `default=1` + func поблизости
+/// (proximity-AND ловит их на запрос `func Default()`).
+const BINDING_GO: &str = r#"package binding
+
+type formMapping struct {
+	formatter formatter
+}
+
+type exampleStruct struct {
+	Name    string `form:"name" binding:"required"`
+	Age     int    `form:",default=1"`
+	Enabled bool   `form:"enabled,default=true"`
+	Slot    int    `form:"slot,default=0"`
+}
+
+func mapForm(ptr any, tag string) error {
+	return decode(ptr, tag)
+}
+"#;
+
+/// Документация-обидчик: «default» сотни раз, IIR-резонанс раздувается.
+fn gin_doc_md() -> String {
+    let mut out = String::from("# gin documentation\n\n");
+    for i in 0..40 {
+        out.push_str(&format!(
+            "## Section {i}\n\nThe default router uses the default middleware \
+with default configuration. By default the default engine applies default \
+logging and default recovery. Default values fall back to the default \
+handler when the default flag is unset. The func default convention is \
+documented here.\n\n"
+        ));
+    }
+    out
+}
+
+fn gin_corpus() -> TempDir {
+    let dir = TempDir::new().expect("tempdir");
+    let docs = dir.path().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(dir.path().join("gin.go"), GIN_GO).unwrap();
+    fs::write(dir.path().join("form_mapping.go"), BINDING_GO).unwrap();
+    fs::write(docs.join("doc.md"), gin_doc_md()).unwrap();
+    dir
+}
+
+fn def_line() -> usize {
+    GIN_GO.lines().position(|l| l.contains("func Default()")).unwrap() + 1
+}
+
+#[test]
+fn intent_code_query_demotes_docs() {
+    // Кейс владельца: `func Default` без ручного --extensions go.
+    // Документация (тир 1) обязана опуститься НИЖЕ кода (тир 0)
+    // независимо от магнитуды IIR-резонанса.
+    let dir = gin_corpus();
+    let res = scan_path(dir.path(), "func Default", &EngineConfig::default());
+    assert!(res.total_hits > 0, "хиты должны быть");
+
+    let pos_go = res.anchors.iter().position(|a| a.file.ends_with("gin.go"));
+    let pos_md = res
+        .anchors
+        .iter()
+        .position(|a| a.file.ends_with("doc.md"));
+    assert!(pos_go.is_some(), "gin.go должен быть в топ-N");
+    assert!(pos_md.is_some(), "doc.md должен быть в топ-N (тир 1, но видим)");
+    assert!(
+        pos_go.unwrap() < pos_md.unwrap(),
+        "код обязан стоять выше документации: go={:?} md={:?}",
+        pos_go, pos_md
+    );
+}
+
+#[test]
+fn intent_off_restores_pure_resonance_order() {
+    // --intent off: тиры выключены, порядок — чисто по R (контракт v0.81).
+    let dir = gin_corpus();
+    let mut cfg = EngineConfig::default();
+    cfg.intent_mode = IntentMode::Off;
+    let res = scan_path(dir.path(), "func Default", &cfg);
+    // порядок монотонен по резонансу
+    for w in res.anchors.windows(2) {
+        assert!(
+            w[0].resonance >= w[1].resonance,
+            "R должен убывать: {} -> {}",
+            w[0].resonance,
+            w[1].resonance
+        );
+    }
+}
+
+#[test]
+fn intent_prose_query_demotes_code() {
+    // Симметрия: прозаический запрос → документация выше кода.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::write(
+        dir.path().join("docs").join("readme_ru.md"),
+        "# Резонанс\n\nКак работает резонанс: поле накапливает энергию. \
+Как работает резонанс в движке — рассказано ниже.\n\nКак работает \
+резонанс памяти: IIR-фильтр затухает.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("engine_ru.go"),
+        "package engine\n\n// резонанс: как это работает в цикле\nfunc loop() {\n\treturn\n}\n",
+    )
+    .unwrap();
+
+    let res = scan_path(dir.path(), "как работает резонанс", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+    let first = &res.anchors[0];
+    assert!(
+        first.file.ends_with(".md"),
+        "проза-запрос: топ-1 обязан быть документацией, а не кодом: {}",
+        first.file
+    );
+}
+
+#[test]
+fn signature_query_puts_exact_definition_first() {
+    // `func Default()` — прикреплённая скобка включает сигнатурный слой:
+    // точка определения (тир 0) выше proximity-шума struct-тегов (тир 2).
+    let dir = gin_corpus();
+    let res = scan_path(dir.path(), "func Default()", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+
+    let top = &res.anchors[0];
+    assert!(
+        top.file.ends_with("gin.go"),
+        "топ-1 обязан быть точкой определения, а не тегом/доком: {}",
+        top.file
+    );
+    // v0.82.0: номер строки хита + относительный путь
+    assert_eq!(top.line, def_line(), "строка определения");
+    assert_eq!(top.rel_file.as_deref(), Some("gin.go"));
+    assert!(top.scene.enclosing_scope.contains("func Default() *Engine"));
+}
+
+#[test]
+fn signature_keeps_token_hits_when_case_mismatches() {
+    // `func default()` (нижний регистр): сигнатуры в gin.go НЕТ (Go
+    // экспортирует с заглавной) — но токены по-прежнему находятся,
+    // сигнатурный слой не теряет хиты (тир 2 у всех, порядок по R).
+    let dir = gin_corpus();
+    let res = scan_path(dir.path(), "func default()", &EngineConfig::default());
+    assert!(res.total_hits > 0, "токенные хиты не должны теряться");
+    // рендер не падает на новых полях
+    let s = render_simple(&res);
+    assert!(s.contains("gin.go:") || s.contains("doc.md:") || s.contains("form_mapping.go:"));
+}
+
+#[test]
+fn anchor_line_and_rel_path_in_subdirs() {
+    // Глубокая вложенность: rel_file от корня сканирования, line 1-based.
+    let dir = gin_corpus();
+    let res = scan_path(dir.path(), "func Default()", &EngineConfig::default());
+    for a in &res.anchors {
+        // rel_file всегда без абсолютного префикса директории
+        if let Some(rel) = &a.rel_file {
+            assert!(!rel.starts_with('/'), "rel_file абсолютен: {rel}");
+        }
+    }
+    let doc_anchor = res
+        .anchors
+        .iter()
+        .find(|a| a.file.ends_with("doc.md"))
+        .expect("doc.md в результатах");
+    assert_eq!(
+        doc_anchor.rel_file.as_deref(),
+        Some("docs/doc.md"),
+        "относительный путь от корня"
+    );
+    assert!(doc_anchor.line >= 1);
+}
+
+#[test]
+fn single_file_target_uses_file_name() {
+    // Цель — отдельный файл: rel_file = имя файла, не полный путь.
+    let dir = write_fixture("gin.go", GIN_GO);
+    let target = dir.path().join("gin.go");
+    let res = scan_path(&target, "func Default()", &EngineConfig::default());
+    let top = &res.anchors[0];
+    assert_eq!(top.rel_file.as_deref(), Some("gin.go"));
+    assert_eq!(top.line, def_line());
+}

@@ -26,6 +26,7 @@ use crate::graph::EntityGraph;
 use crate::output::{ContextAnchor, SearchResult};
 use crate::parser::markdown_scenes::truncate_char_safe;
 use crate::parser::SceneContext;
+use crate::search::intent::{hit_tier, IntentMode, QueryIntent, SignatureQuery};
 use crate::streaming::{self, HitRecord, Pass2Result, SceneInfo};
 
 use crate::{collect_files, with_text, EngineConfig, PiiCleaner, PiiMode, ScanStats};
@@ -167,6 +168,15 @@ impl Engine {
         let files = collect_files(target, &config);
         stats.files_scanned = files.len();
         let pre = streaming::literal_prefilter(&query_tokens);
+        // v0.82.0: намерение запроса (код ↔ проза) и сигнатурный паттерн
+        // (прикреплённая скобка). Ранжирование — двухуровневым ключом
+        // (тир, −R): метрики ε/R остаются честными, порядок — политикой.
+        // Код-интент дополнительно включает строгий phrase-режим (без
+        // proximity-AND): грамматика кода упорядочена, struct-теги
+        // (`form:",default=1"`) в окне ±128 токенов — шум, не сигнал.
+        let intent: QueryIntent = config.intent_mode.resolve(query);
+        let strict_phrase = intent == QueryIntent::Code;
+        let signature = SignatureQuery::parse(query);
 
         // ---------- классификация файлов (incremental) ----------
         // v2.0: словарь корпуса (FSST-арена) живёт в состоянии и переходит
@@ -297,14 +307,18 @@ impl Engine {
         let (giants, normals) = streaming::split_giants(&to_process);
         let sink_mu = Mutex::new(sink);
         normals.par_iter().for_each(|p| {
-            if let Some(r) = streaming::pass1_file(p, &query_tokens, &config, &cleaner, &pre) {
+            if let Some(r) =
+                streaming::pass1_file(p, &query_tokens, strict_phrase, &config, &cleaner, &pre)
+            {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         });
         // Гигантские файлы — строго последовательно: пик памяти ограничен
         // одним большим временным индексом.
         for p in &giants {
-            if let Some(r) = streaming::pass1_file(p, &query_tokens, &config, &cleaner, &pre) {
+            if let Some(r) =
+                streaming::pass1_file(p, &query_tokens, strict_phrase, &config, &cleaner, &pre)
+            {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         }
@@ -332,7 +346,16 @@ impl Engine {
 
         let pass2 = |p: &Path| -> Option<Pass2Result> {
             let hits = sink.hit_files.get(p)?;
-            streaming::pass2_file(p, &query_tokens, &config, &cleaner, &gstats, n_total, hits)
+            streaming::pass2_file(
+                p,
+                &query_tokens,
+                &config,
+                &cleaner,
+                &gstats,
+                n_total,
+                hits,
+                signature.as_ref(),
+            )
         };
 
         let results_mu: Mutex<Vec<(PathBuf, Pass2Result)>> = Mutex::new(Vec::new());
@@ -353,11 +376,13 @@ impl Engine {
             if let Some((records, scenes, hit_keys)) = streaming::pass2_giant_parallel(
                 p,
                 &query_tokens,
+                strict_phrase,
                 &config,
                 &cleaner,
                 &gstats,
                 n_total,
                 hits,
+                signature.as_ref(),
             ) {
                 results_mu
                     .lock()
@@ -459,10 +484,20 @@ impl Engine {
             records.retain(|r| !prev.contains(&(r.path.clone(), r.byte_pos)));
         }
 
+        // v0.82.0: финальное ранжирование — двухуровневый ключ (тир, −R).
+        // Тир — детерминированная политика: сигнатура доминирует (матч → 0,
+        // промах → 2), иначе intent (класс файла конфликтует с намерением → 1).
+        // ε и R не искажаются: документация с R=55000 не вытеснит код с R=4240
+        // не потому что её метрика урезана, а потому что тир выше.
+        let sig_active = signature.is_some();
         records.sort_by(|a, b| {
-            b.resonance
-                .partial_cmp(&a.resonance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            hit_tier(intent, sig_active, a.signature_matched, &a.path)
+                .cmp(&hit_tier(intent, sig_active, b.signature_matched, &b.path))
+                .then_with(|| {
+                    b.resonance
+                        .partial_cmp(&a.resonance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| a.byte_pos.cmp(&b.byte_pos))
         });
@@ -478,12 +513,27 @@ impl Engine {
         );
 
         // ---------- Проход 3: материализация только top-N ----------
+        // v0.82.0: якорь несёт номер строки хита (1-based, 0 = неизвестно)
+        // и относительный путь от корня сканирования (терминал не захламляется).
         let anchors: Vec<ContextAnchor> = records
             .iter()
             .map(|r| {
-                let scene = materialize_scene(r, &config, &cleaner);
+                let (scene, line) = materialize_scene(r, &config, &cleaner);
+                let rel_file = if target.is_file() {
+                    r.path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                } else {
+                    r.path
+                        .strip_prefix(target)
+                        .ok()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.to_string_lossy().to_string())
+                };
                 ContextAnchor {
                     file: r.path.to_string_lossy().to_string(),
+                    rel_file,
+                    line,
                     token: query.to_string(),
                     epsilon: round2(r.epsilon),
                     resonance: round2(r.resonance),
@@ -541,14 +591,27 @@ impl Engine {
 
 /// Полная материализация сцены одного якоря (проход 3): перечитывает
 /// файл через mmap и строит SceneContext только для top-N записей.
+/// Возвращает (сцена, номер строки хита, 1-based).
 ///
 /// PII-маскирование (v0.4) применяется ТОЛЬКО здесь — на тексте,
 /// получаемом AI-потребителем: enclosing_scope и метаданных сцены.
 /// Байтовые позиции внутри конвейера остаются raw-точными; маскирование
 /// не смещает индексы, потому что выполняется над готовой строкой.
-fn materialize_scene(r: &HitRecord, config: &EngineConfig, cleaner: &PiiCleaner) -> SceneContext {
+fn materialize_scene(
+    r: &HitRecord,
+    config: &EngineConfig,
+    cleaner: &PiiCleaner,
+) -> (SceneContext, usize) {
     let res = with_text(&r.path, config.max_file_bytes, |raw| {
         let text: &str = raw;
+        // v0.82.0: номер строки хита — по raw-байтам ДО маскирования.
+        // Граница символа: byte_pos — старт токена (всегда граница), но
+        // при выходе за конец текста откатываемся к ближайшей валидной.
+        let mut cut = r.byte_pos.min(text.len());
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let line = 1 + text[..cut].bytes().filter(|&b| b == b'\n').count();
         let mut sc = if r.is_code {
             let scope =
                 crate::parser::ast_code::materialize_scope(text, r.scene_key.0, r.scene_key.1);
@@ -564,16 +627,21 @@ fn materialize_scene(r: &HitRecord, config: &EngineConfig, cleaner: &PiiCleaner)
             }
         }
         sc.enclosing_scope = truncate_char_safe(&sc.enclosing_scope, config.max_scope_bytes);
-        sc
+        (sc, line)
     });
-    res.unwrap_or_else(|| SceneContext {
-        chapter: r.path.to_string_lossy().to_string(),
-        temporal_metric: None,
-        location: None,
-        subjects: Vec::new(),
-        enclosing_scope: String::new(),
-        metric_tag: None,
-        subject_names: Vec::new(),
-        subject_pairs: Vec::new(),
+    res.unwrap_or_else(|| {
+        (
+            SceneContext {
+                chapter: r.path.to_string_lossy().to_string(),
+                temporal_metric: None,
+                location: None,
+                subjects: Vec::new(),
+                enclosing_scope: String::new(),
+                metric_tag: None,
+                subject_names: Vec::new(),
+                subject_pairs: Vec::new(),
+            },
+            0,
+        )
     })
 }

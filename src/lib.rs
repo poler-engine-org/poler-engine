@@ -205,6 +205,7 @@ pub use resonance::{
     apply_iir_resonance, calculate_epsilon, semantic_bonus, IirFilter, SlidingEpsilon,
 };
 pub use compression::{GlobalStats, PostingsStore, TermFreqs, VocabArena};
+pub use search::intent::{detect_query_intent, hit_tier, FileClass, IntentMode, QueryIntent, SignatureQuery};
 pub use streaming::{FileTokens, GIANT_FILE_BYTES};
 pub use tokenizer::{InvertedIndex, PiiCleaner, PiiMode};
 
@@ -271,6 +272,8 @@ pub struct EngineConfig {
     pub psi_params: crate::psi::PsiParams,
     /// Гиперпараметры канонического POLER-цикла (P3_Engine) — режим Poler.
     pub poler_params: crate::poler::PolerParams,
+    /// Режим intent-детекта запроса: код ↔ проза (v0.82.0).
+    pub intent_mode: IntentMode,
 }
 
 impl Default for EngineConfig {
@@ -297,6 +300,7 @@ impl Default for EngineConfig {
             max_graph_triples: 200_000,
             psi_params: crate::psi::PsiParams::default(),
             poler_params: crate::poler::PolerParams::default(),
+            intent_mode: IntentMode::Auto,
         }
     }
 }
