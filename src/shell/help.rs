@@ -474,7 +474,7 @@ fn format_entry_detail(e: &HelpEntry) -> String {
             s.push_str("  poler-engine --exec 'feed . --for understand -q \"архитектура\" --json'\n\n");
             s.push_str("РЕЖИМИ:\n");
             s.push_str("  understand — СКЕЛЕТ: высокоэнергетичные узлы + K-hop (для понимания)\n");
-            s.push_str("  edit — цели по ε возрастанию (периферия первой) + AIDDE impact\n\n");
+            s.push_str("  edit — цели по ε возрастанию (разреженные зоны первыми) + AIDDE impact\n\n");
             s.push_str("ОЦІНКА ТОКЕНІВ:\n");
             s.push_str("  Письменность-осознанная (Script из universal_letters): CJK ≈ 1\n");
             s.push_str("  токен/символ, кириллица ≈ 3 символа/токен, латиница ≈ 4 символа/токен.\n");

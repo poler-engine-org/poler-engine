@@ -10,13 +10,19 @@
 //! под конкретное действие** и укладывает его в токен-бюджет:
 //!
 //! * `--for understand` — СКЕЛЕТ: якоря, ранжированные по ε (высокая
-//!   энергия = несущие узлы темы), + K-hop связи. Карта «что это и на
+//!   ε = плотное ядро темы), + K-hop связи. Карта «что это и на
 //!   чём держится».
 //! * `--for edit` — ПРАВОЧНЫЙ ПАКЕТ: якоря цели, ранжированные по ε
-//!   ВОЗРАСТАНИЕМ (периферия — безопасные зоны правок — первой),
-//!   с вердиктом «несущая стена / середина / периферия» по перцентилю
-//!   энергии, + AIDDE impact-паспорт (доказанный call graph: кто
-//!   сломается, если править) + связи сущности.
+//!   ВОЗРАСТАНИЕМ (разреженные зоны — хирургические цели — первыми),
+//!   с вердиктом «плотная зона / середина / разреженная зона» по
+//!   перцентилю ε, + точка определения символа + AIDDE impact-паспорт
+//!   (доказанный call graph: кто сломается, если править) + связи.
+//!
+//! Философия вердиктов (честность метрик): ε меряет ПЛОТНОСТЬ токенов
+//! вокруг совпадения — не «важность» и не нагрузку на проект. Нагрузку
+//! доказывает только символьный граф: центральная функция может быть
+//! определена один раз (разреженная точка) и при этом держать
+//! пол-проекта.
 //!
 //! Оценка токенов — письменность-осознанная (через
 //! [`crate::universal_letters::Script`]): CJK/Хангыль/Кана ≈ 1 токен на
@@ -125,12 +131,20 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
 }
 
-/// Вердикт энергий якоря по его перцентилю в пуле.
+/// Вердикт ПЛОТНОСТИ якоря по его перцентилю ε в пуле.
+///
+/// Важно (философия движка): ε измеряет плотность токенов вокруг
+/// совпадения — НЕ «важность» и НЕ нагрузку на проект. Единственное
+/// упоминание центрального символа — разреженная точка (игла в стоге
+/// сена), а его нагрузка определяется ТОЛЬКО графом вызовов (AIDDE
+/// impact), не энергией. Поэтому вердикты здесь — про плотность
+/// контекста: плотная зона = сложное окружение (много редких токенов
+/// рядом), разреженная = хирургическая цель для точечной правки.
 fn energy_verdict(p: f64) -> &'static str {
     if p >= 0.75 {
-        "несущая стена"
+        "плотная зона"
     } else if p <= 0.25 {
-        "периферия"
+        "разреженная зона"
     } else {
         "середина"
     }
@@ -164,7 +178,9 @@ fn scan_pool(target: &PathBuf, query: &str) -> Option<crate::SearchResult> {
 }
 
 /// AIDDE impact-паспорт символа по кодовым файлам пути (если они есть).
-fn impact_for(path: &PathBuf, symbol: &str) -> Option<crate::aidde::ImpactReport> {
+/// Второй элемент — сколько точек определения нашёл символьный граф
+/// (0 = extern/макро: определения нет, паспорт собран по вызовам).
+fn impact_for(path: &PathBuf, symbol: &str) -> Option<(crate::aidde::ImpactReport, usize)> {
     let config = EngineConfig::default();
     let files: Vec<PathBuf> = crate::collect_files(path, &config)
         .into_iter()
@@ -174,7 +190,19 @@ fn impact_for(path: &PathBuf, symbol: &str) -> Option<crate::aidde::ImpactReport
         return None;
     }
     let table = crate::aidde::SymbolTable::build(&files, config.max_file_bytes);
-    crate::aidde::impact_analysis(&table, symbol, 3, 200)
+    let def_count = table.resolve(symbol).len();
+    crate::aidde::impact_analysis(&table, symbol, 3, 200).map(|r| (r, def_count))
+}
+
+/// Честная формулировка точки определения: сколько мест объявляет символ.
+/// Точное число — в числовом поле `definition_sites`; текст грамматически
+/// устойчив для любого количества.
+fn definition_note(def_count: usize) -> String {
+    match def_count {
+        0 => "внешний/макро-символ: точки определения нет — паспорт по вызовам".into(),
+        1 => "единственная точка определения (символьный граф)".into(),
+        _ => "несколько точек определения — показана первая (символьный граф)".into(),
+    }
 }
 
 /// Связи K-hop: движок кладёт их в каждый якорь (одни и те же для корня
@@ -254,7 +282,7 @@ pub fn run_feed(
     let eps_q3 = percentile(&eps_sorted, 0.75);
     let eps_max = eps_sorted[n - 1];
 
-    // -------- edit-режим: периферия первой (ε по возрастанию) --------
+    // -------- edit-режим: разреженные зоны первыми (ε по возрастанию) --------
     let (items_order, verdicts): (Vec<usize>, Option<Vec<&'static str>>) = match mode {
         FeedMode::Understand => ((0..n).collect(), None),
         FeedMode::Edit => {
@@ -290,15 +318,17 @@ pub fn run_feed(
     let rels = relations_of(&res, relations_limit);
     let rel_cost = relations_tokens(&rels);
 
-    let impact = if mode == FeedMode::Edit {
+    let impact_pack = if mode == FeedMode::Edit {
         impact_for(path, query.trim())
     } else {
         None
     };
+    let impact = impact_pack.as_ref().map(|(r, _)| r);
+    let def_count = impact_pack.as_ref().map(|(_, c)| *c).unwrap_or(0);
     let impact_cost = impact
-        .as_ref()
         .map(|r| {
-            let mut t = 24usize;
+            // 34 = конверт impact-паспорта + точка определения
+            let mut t = 34usize;
             for d in r.structural_relations.upstream_dependents.iter() {
                 t += estimate_tokens(&format!("{} {}", d.caller, d.file)) + 4;
             }
@@ -355,7 +385,7 @@ pub fn run_feed(
                     v["temporal_metric"] = json!(m);
                 }
                 if let Some(verdict) = it.verdict {
-                    v["energy_verdict"] = json!(verdict);
+                    v["density_verdict"] = json!(verdict);
                 }
                 v
             })
@@ -383,7 +413,17 @@ pub fn run_feed(
             "items": items_json,
             "relations": rels_json,
         });
-        if let Some(r) = &impact {
+        if let Some(r) = impact {
+            // Точка определения — «игла в стоге сена»: символьный граф доказал,
+            // ГДЕ и СКОЛЬКО раз символ объявлен. Это точка истины правки —
+            // она НЕ выводится из ε (ε меряет плотность, не нагрузку).
+            packet["definition"] = json!({
+                "symbol": r.target_function,
+                "file": r.file,
+                "lines": r.lines,
+                "definition_sites": def_count,
+                "note": definition_note(def_count),
+            });
             packet["impact"] = json!({
                 "target": r.target_function,
                 "file": r.file,
@@ -407,7 +447,8 @@ pub fn run_feed(
             mode,
             query,
             &selected,
-            impact.as_ref(),
+            impact,
+            def_count,
             n,
             eps_median
         ));
@@ -428,7 +469,8 @@ pub fn run_feed(
             eps_max,
             &selected,
             &rels,
-            impact.as_ref(),
+            impact,
+            def_count,
         )
     }
 }
@@ -439,6 +481,7 @@ fn advice_text(
     query: &str,
     selected: &[FeedItem],
     impact: Option<&crate::aidde::ImpactReport>,
+    def_count: usize,
     pool: usize,
     eps_median: f64,
 ) -> String {
@@ -450,8 +493,9 @@ fn advice_text(
                 .unwrap_or(0.0);
             format!(
                 "Подай модели этот пакет как ядро темы «{query}»: {} якорей из пула {} \
-                 (медиана энергии пула ε={:.1}, топ ε={:.1}). Высокая энергия = несущие узлы: \
-                 держи их в рабочей памяти, периферию догружай точечными запросами.",
+                 (медиана плотности пула ε={:.1}, топ ε={:.1}). Плотные узлы — \
+                 тематическое ядро: держи их в рабочей памяти, остальное догружай \
+                 точечными запросами.",
                 selected.len(),
                 pool,
                 eps_median,
@@ -464,43 +508,63 @@ fn advice_text(
                 .iter()
                 .filter_map(|it| it.verdict)
                 .collect();
-            let walls = verdicts.iter().filter(|v| **v == "несущая стена").count();
-            let periphery = verdicts.iter().filter(|v| **v == "периферия").count();
+            let sparse = verdicts
+                .iter()
+                .filter(|v| **v == "разреженная зона")
+                .count();
+            let dense = verdicts.iter().filter(|v| **v == "плотная зона").count();
+            // Точка истины — честно о числе определений: символьный граф ЗНАЕТ,
+            // где символ объявлен; ε этого не знает (плотность ≠ нагрузка).
+            match (impact, def_count) {
+                (Some(r), 1) => s.push_str(&format!(
+                    "Точка истины: «{query}» определён ровно один раз: {} строки {} \
+                     (найдено символьным графом, не угадано). ",
+                    r.file, r.lines
+                )),
+                (Some(r), n) if n > 1 => s.push_str(&format!(
+                    "«{query}» объявлен в {n} местах (первая: {} строки {}): \
+                     проверь, та ли точка попала в пакет. ",
+                    r.file, r.lines
+                )),
+                (Some(_), _) => s.push_str(
+                    "Точка определения не найдена (внешний/макро-символ): \
+                     паспорт собран по вызовам. ",
+                ),
+                (None, _) => s.push_str(&format!(
+                    "Символ «{query}» не найден в кодовом call graph (или корпус текстовый): \
+                     опирайся на связи сущности и плотность зон. ",
+                )),
+            }
             if let Some(r) = impact {
                 s.push_str(&format!(
-                    "Правка «{query}» заденет доказанный call graph: {} upstream-потребителей, \
+                    "Правка заденет доказанный call graph: {} upstream-потребителей, \
                      {} downstream-зависимостей, danger: {}. ",
                     r.structural_relations.upstream_dependents.len(),
                     r.structural_relations.downstream_dependencies.len(),
                     r.danger_level_if_modified
                 ));
-            } else {
+            }
+            // Нагрузка на проект — только от графа; плотность — только от ε.
+            // Эти вещи НЕ синонимы: центральная функция может быть определена
+            // один раз (разреженная точка) и одновременно держать пол-проекта.
+            let graph_load = impact
+                .map(|r| r.structural_relations.upstream_dependents.len())
+                .unwrap_or(0);
+            if graph_load >= 10 {
                 s.push_str(&format!(
-                    "Символ «{query}» не найден в кодовом call graph (или корпус текстовый): \
-                     опирайся на связи сущности и энергию зон. "
+                    "Нагрузка на граф ВЫСОКАЯ ({} потребителей): меняй контракт \
+                     только осознанно. ",
+                    graph_load
                 ));
             }
-            if periphery > 0 && walls == 0 {
-                s.push_str(&format!(
-                    "Все цели — периферия ({} из {}): правки локальны и безопасны, \
-                     несущие конструкции не затрагиваются.",
-                    periphery,
-                    verdicts.len()
-                ));
-            } else if walls > 0 {
-                s.push_str(&format!(
-                    "Осторожно: {} цель(ей) — несущая стена (высокая энергия, много связей). \
-                     Правь минимально, проверь upstream после изменения; периферийных зон: {}.",
-                    walls,
-                    periphery
-                ));
-            } else {
-                s.push_str(&format!(
-                    "Цели в середине энергий ({} якорей): правки умеренного риска, \
-                     держи рядом K-hop связи сущности.",
-                    verdicts.len()
-                ));
-            }
+            s.push_str(&format!(
+                "Сами правки делай в разреженных зонах (низкая ε — локальные, \
+                 изолированные контексты): их {} из {}; плотных зон (сложное \
+                 окружение) — {}. Низкая ε — не шум, а точечная цель.",
+                sparse,
+                verdicts.len(),
+                dense
+            ));
             s
         }
     }
@@ -524,6 +588,7 @@ fn render_card(
     selected: &[FeedItem],
     rels: &[(String, String, String)],
     impact: Option<&crate::aidde::ImpactReport>,
+    def_count: usize,
 ) -> String {
     let mut out = String::new();
     let icon = if mode == FeedMode::Understand {
@@ -586,7 +651,7 @@ fn render_card(
             }
         }
         FeedMode::Edit => {
-            out.push_str("── ЦЕЛЬ ПРАВКИ (низкоэнергетичные зоны первыми) ──\n");
+            out.push_str("── ЦЕЛЬ ПРАВКИ (разреженные зоны первыми) ──\n");
             for (i, it) in selected.iter().enumerate() {
                 let a = it.anchor;
                 let verdict = it.verdict.unwrap_or("середина");
@@ -613,6 +678,14 @@ fn render_card(
         out.push_str(&format!(
             "target: {} | {} | строки {} | danger: {}\n",
             r.target_function, r.file, r.lines, r.danger_level_if_modified
+        ));
+        out.push_str(&format!(
+            "точка определения: {}\n",
+            match def_count {
+                0 => "нет — внешний/макро-символ (паспорт по вызовам)".to_string(),
+                1 => "единственная (символьный граф)".to_string(),
+                n => format!("в {n} местах — показана первая (символьный граф)"),
+            }
         ));
         out.push_str(&format!(
             "⬆ upstream ({}):\n",
@@ -648,6 +721,7 @@ fn render_card(
         query,
         selected,
         impact,
+        def_count,
         pool,
         eps_median,
     ));
@@ -665,11 +739,12 @@ pub fn feed_usage() -> String {
      Контекст-шлюз под действие (манифест п.11): пакет контекста по энергии,\n\
      уложенный в токен-бюджет — то, что подавать модели вместо всего текста.\n\n\
      Режимы:\n\
-       --for understand  СКЕЛЕТ: высокоэнергетичные узлы темы + K-hop связи\n\
+       --for understand  СКЕЛЕТ: плотное ядро темы по ε + K-hop связи\n\
                          (для понимания: «что это и на чём держится»)\n\
-       --for edit        ПРАВОЧНЫЙ ПАКЕТ: цели по ε ВОЗРАСТАНИЮ (периферия\n\
-                         первой), вердикты «несущая стена/середина/периферия\",\n\
-                         AIDDE impact (кто сломается) + связи сущности\n\n\
+       --for edit        ПРАВОЧНЫЙ ПАКЕТ: цели по ε ВОЗРАСТАНИЮ (разреженные\n\
+                         зоны первыми), вердикты «плотная/середина/разреженная\n\
+                         зона», точка определения + AIDDE impact (кто\n\
+                         сломается) + связи сущности\n\n\
      Опции:\n\
        --query, -q \"...\"   запрос: сущность/фраза/символ (обязателен)\n\
        --budget, -b N       токен-бюджет пакета (дефолт 8000)\n\
@@ -848,7 +923,7 @@ mod tests {
         assert!(v["spent_tokens"].as_u64().unwrap() > 0);
         assert!(v["items"].as_array().unwrap().len() >= 1);
         assert!(v["energy"]["median"].is_f64());
-        assert!(v["advice"].as_str().unwrap().contains("несущие узлы"));
+        assert!(v["advice"].as_str().unwrap().contains("тематическое ядро"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -867,8 +942,10 @@ mod tests {
         assert!(out.contains("FEED · edit"), "карта edit: {out}");
         assert!(out.contains("ЦЕЛЬ ПРАВКИ"), "секция цели: {out}");
         assert!(
-            out.contains("периферия") || out.contains("несущая стена") || out.contains("середина"),
-            "вердикты энергии: {out}"
+            out.contains("разреженная зона")
+                || out.contains("плотная зона")
+                || out.contains("середина"),
+            "вердикты плотности: {out}"
         );
         assert!(out.contains("СОВЕТ"), "совет: {out}");
         let _ = std::fs::remove_dir_all(&d);
@@ -885,6 +962,10 @@ mod tests {
         let out = run_feed(&src, FeedMode::Edit, "cmd_search", 60_000, 40, false);
         assert!(out.contains("FEED · edit"), "режим: {out}");
         assert!(out.contains("ВЛИЯНИЕ"), "AIDDE-блок: {out}");
+        assert!(
+            out.contains("точка определения"),
+            "точка определения в карте: {out}"
+        );
         assert!(
             out.contains("upstream") || out.contains("downstream"),
             "call graph в карте: {out}"
@@ -981,8 +1062,23 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.5), 2.5);
         assert_eq!(percentile(&sorted, 0.0), 1.0);
         assert_eq!(percentile(&sorted, 1.0), 4.0);
-        assert_eq!(energy_verdict(0.75), "несущая стена");
-        assert_eq!(energy_verdict(0.25), "периферия");
+        assert_eq!(energy_verdict(0.75), "плотная зона");
+        assert_eq!(energy_verdict(0.25), "разреженная зона");
         assert_eq!(energy_verdict(0.5), "середина");
+    }
+
+    #[test]
+    fn definition_note_is_honest_about_count() {
+        assert!(definition_note(0).contains("нет"), "extern: честный ноль");
+        assert!(
+            definition_note(1).contains("единственная"),
+            "одна точка: {:?}",
+            definition_note(1)
+        );
+        assert!(
+            definition_note(5).contains("несколько"),
+            "много точек: {:?}",
+            definition_note(5)
+        );
     }
 }
