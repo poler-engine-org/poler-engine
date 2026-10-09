@@ -218,8 +218,13 @@ pub const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".svn", ".hg"
 /// и скрипты больше не отсекаются на обходе дерева. Матчинг расширений
 /// НЕЗАВИСИМ ОТ РЕГИСТРА (v0.83.0): `.s` GNU as и `.S` после cpp —
 /// оба покрываются записью `s` (конфиг приводится к нижнему регистру).
+///
+/// v0.84.0: +`hh`,`hxx`,`cxx`,`inc`,`inl` — современный C++ (Blender,
+/// LLVM, Google) держит заголовки и inline-определения в `.hh`/`.hxx`/
+/// `.inc`/`.inl`; без них `struct BMVert` в `bmesh_class.hh` требовал
+/// ручного `--extensions hh` (грабля 42, стресс-тест Blender).
 pub const DEFAULT_EXTENSIONS: &str =
-    "md,markdown,txt,rst,rs,py,c,h,cpp,hpp,cc,js,jsx,ts,tsx,java,go,kt,swift,cs,scala,dart,zig,s,asm,lua,json,toml,yaml,yml,sql,sh";
+    "md,markdown,txt,rst,rs,py,c,h,cpp,hpp,cc,hh,hxx,cxx,inc,inl,js,jsx,ts,tsx,java,go,kt,swift,cs,scala,dart,zig,s,asm,lua,json,toml,yaml,yml,sql,sh";
 
 /// Режим накопления резонанса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +441,14 @@ mod tests {
         assert!(c.k_hop_depth >= 2);
         assert!(c.extensions.contains(&"md".to_string()));
         assert!(c.max_graph_triples > 0);
+        // v0.84.0: современный C++ в дефолте (Blender-грабля 42 —
+        // `struct BMVert` в bmesh_class.hh не находился без --extensions hh)
+        for ext in ["hh", "hxx", "cxx", "inc", "inl"] {
+            assert!(
+                c.extensions.contains(&ext.to_string()),
+                "нет .{ext} в дефолтных расширениях"
+            );
+        }
     }
 
     #[test]

@@ -125,11 +125,14 @@ const DOC_EXTS: &[&str] = &["md", "markdown", "txt", "rst", "adoc", "org"];
 /// Расширения исходного кода.
 ///
 /// v0.83.0: +`s`,`asm` (`.S` приводится к нижнему регистру здесь же).
+/// v0.84.0: +`hh`,`hxx`,`inc`,`inl` — современный C++ (Blender/LLVM):
+/// заголовки `.hh`/`.hxx` и inline-фрагменты `.inc`/`.inl` классифицируются
+/// как код (тир проза-интента честно понижается).
 const CODE_EXTS: &[&str] = &[
-    "rs", "py", "c", "h", "cpp", "hpp", "cc", "cxx", "js", "jsx", "ts", "tsx", "java",
-    "go", "kt", "kts", "swift", "cs", "scala", "dart", "rb", "php", "pl", "lua",
-    "sh", "bash", "zsh", "fish", "m", "mm", "zig", "v", "sv", "vh", "sql", "r", "jl",
-    "s", "asm",
+    "rs", "py", "c", "h", "cpp", "hpp", "cc", "hh", "hxx", "cxx", "inc", "inl", "js",
+    "jsx", "ts", "tsx", "java", "go", "kt", "kts", "swift", "cs", "scala", "dart",
+    "rb", "php", "pl", "lua", "sh", "bash", "zsh", "fish", "m", "mm", "zig", "v",
+    "sv", "vh", "sql", "r", "jl", "s", "asm",
 ];
 
 /// Определяет намерение запроса по структуре (детерминированно, без ML).
@@ -480,6 +483,12 @@ mod tests {
         assert_eq!(classify_path(Path::new("/a/b/lib.rs")), FileClass::Code);
         assert_eq!(classify_path(Path::new("/a/b/cfg.json")), FileClass::Data);
         assert_eq!(classify_path(Path::new("/a/b/Makefile")), FileClass::Data);
+        // v0.84.0: современный C++ (Blender/LLVM) — .hh/.hxx/.cxx/.inc/.inl это код
+        assert_eq!(classify_path(Path::new("/a/b/bmesh_class.hh")), FileClass::Code);
+        assert_eq!(classify_path(Path::new("/a/b/dna_gen.hxx")), FileClass::Code);
+        assert_eq!(classify_path(Path::new("/a/b/bmesh_ops.cxx")), FileClass::Code);
+        assert_eq!(classify_path(Path::new("/a/b/inline_ops.inc")), FileClass::Code);
+        assert_eq!(classify_path(Path::new("/a/b/vec_inl.inl")), FileClass::Code);
     }
 
     // ---------- hit_tier ----------

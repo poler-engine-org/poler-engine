@@ -42,7 +42,10 @@ pub fn detect_lang(path: &Path) -> CodeLang {
         .to_lowercase();
     match ext.as_str() {
         "py" | "pyw" | "pyi" => CodeLang::Python,
-        "rs" | "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "js" | "jsx" | "ts" | "tsx"
+        // v0.84.0: +`hxx`,`cxx`,`inc`,`inl` — современный C++ (Blender/LLVM);
+        // `.hh` был и раньше, остальные inline-морфологии добираем
+        "rs" | "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "hxx" | "cxx" | "inc" | "inl"
+        | "js" | "jsx" | "ts" | "tsx"
         | "java" | "go" | "kt" | "kts" | "swift" | "cs" | "scala" | "dart" | "m" | "mm"
         | "json" | "css" | "scss" | "groovy" => CodeLang::Brace,
         _ => CodeLang::Plain,
@@ -866,6 +869,13 @@ mod tests {
         assert_eq!(detect_lang(Path::new("/a/b/main.rs")), CodeLang::Brace);
         assert_eq!(detect_lang(Path::new("/a/b/app.py")), CodeLang::Python);
         assert_eq!(detect_lang(Path::new("/a/b/chapter.md")), CodeLang::Plain);
+        // v0.84.0: современный C++ (Blender/LLVM) — inline-морфологии
+        // фигурно-скобочные, enclosing_scope работает как для .cpp
+        assert_eq!(detect_lang(Path::new("/a/b/bmesh_class.hh")), CodeLang::Brace);
+        assert_eq!(detect_lang(Path::new("/a/b/dna_gen.hxx")), CodeLang::Brace);
+        assert_eq!(detect_lang(Path::new("/a/b/bmesh_ops.cxx")), CodeLang::Brace);
+        assert_eq!(detect_lang(Path::new("/a/b/inline_ops.inc")), CodeLang::Brace);
+        assert_eq!(detect_lang(Path::new("/a/b/vec_inl.inl")), CodeLang::Brace);
     }
 
     #[test]

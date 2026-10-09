@@ -20,10 +20,10 @@ description: |
   «кто сломается, если править X», «подай контекст под токен-бюджет»,
   «разбей на сцены/чанки», «граф связей сущностей».
 language: ru
-version: 0.83.0
+version: 0.84.0
 ---
 
-# poler-engine — поисково-аналитический движок для агента (v0.83.0)
+# poler-engine — поисково-аналитический движок для агента (v0.84.0)
 
 ## Зачем этот скил существует
 
@@ -47,11 +47,11 @@ version: 0.83.0
 
 ## Установка (уже выполнена в этом окружении)
 
-- **Бинарник (release v0.83.0):** `~/.local/bin/poler-engine`
+- **Бинарник (release v0.84.0):** `~/.local/bin/poler-engine`
   (копия-эталон: `/home/z/my-project/scripts/poler-install/poler-engine`)
 - **Исходники:** `/home/z/my-project/skills/poler-engine/` (synced @ main)
   и dev-клон `/home/z/poler-engine-fresh`
-- Проверка: `poler-engine --version` → `poler-engine 0.83.0`
+- Проверка: `poler-engine --version` → `poler-engine 0.84.0`
 
 Пересборка (только если реально нужно):
 ```bash
@@ -217,6 +217,11 @@ fallback скобочного запроса. Режимы резонанса:
 - **Дефолтные расширения (v0.83.0)**: `zig`, `s`/`S`, `asm`, `lua` —
   низкоуровневые ядра и скрипты сканируются без ручного `--extensions`;
   матчинг расширений регистронезависим.
+- **Дефолтные расширения (v0.84.0)**: `hh`, `hxx`, `cxx`, `inc`, `inl` —
+  современный C++ (Blender/LLVM/Google) из коробки: `struct BMVert` в
+  `bmesh_class.hh` находится без ручного `--extensions hh`; `.cxx`/`.hxx`/
+  `.inc`/`.inl` классифицируются как код и парсятся как фигурно-скобочные
+  (enclosing_scope — функция целиком).
 - Управление: `--intent auto|code|prose|off` (по умолчанию auto;
   off — ранжирование чисто по R, как в v0.81).
 - **Честность метрик сохранена**: ε и R не искажаются — порядок задаёт
@@ -249,6 +254,21 @@ upstream-потребители (кто сломается), downstream-зави
   `--extensions` — сигнатура `pub fn schedule(...) callconv(.c) u64`
   целиком в simple-выдаче; enclosing_scope в ai-json — функция с
   архитектурными комментариями.
+- **Boost.Spirit** (v0.83.0, hell-benchmark владельца — чистый TMP):
+  `phrase_parse(` — ядро парсера `qi/parse.hpp:188` и перегрузки со всеми
+  skip_flag/Iterator-параметрами; `template <typename Iterator` —
+  структуры специализации токенизатора с корректными скоупами.
+  Честный предел: `template struct phrase_parse` (шаблонные аргументы
+  МЕЖДУ словами) точных хитов не даёт — искать по имени структуры либо
+  по префиксу `template <typename`.
+- **FFmpeg** (v0.83.0, hell-benchmark владельца — макро-ад `##`):
+  `int ff_h264_decode_mb_cabac(` — объявление `h264_cabac.c:1920` на [1/2]
+  за ~3 с на 10 000+ файлах; `ff_h264_decoder` — `const FFCodec
+  ff_h264_decoder` в `h264dec.c:1194`.
+- **Blender (BMesh + DNA/RNA)** (v0.84.0, hell-benchmark владельца):
+  определение `struct BMVert` в `bmesh_class.hh` — из коробки, без
+  ручного `--extensions hh` (в v0.83.0 требовался — грабля 42);
+  код-интент держит .hh-определение выше .md-упоминаний.
 - **libgit2** (полный репо, 8000+ файлов, ~114 МБ): `feed --for edit` —
   ~5 с, RSS ≤ 24 МБ; 215 хитов по запросу; 200 upstream-потребителей;
   изолированный тест-блок с ε=2901.6 найден и подан в бюджет 3000 ток.
