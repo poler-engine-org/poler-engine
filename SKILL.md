@@ -1,554 +1,231 @@
 ---
 name: poler-engine
-description: AI-Native суверенный поисково-аналитический движок POLER v0.36.0 (Rust + Zig 0.14.0). Резонансный поиск с ε-плотностью и K-hop графом, grep с гарантией полноты, скан архивов БЕЗ распаковки (zip/tar/tar.gz/tar.zst/gz/zst, пароли ZipCrypto/AES прямо в CLI), RAG-чанки с byte-якорями, крипто-память Vault .pvt (PND v8.2, CBC + KDF 100k + MAC), Суверенный Гиппокамп знаний с MVR-провенансом, нативный инференс .pqw (энкодеры XLM-R/BGE-M3, GLiNER, GLM-декодер int8/int4 — без Python/ONNX/GPU), ИДЕАЛЬНЫЙ ИСПОЛНИТЕЛЬ КОМАНД poler_exec E2 (ядро Zig raw-syscalls: таймауты TERM→grace→KILL группе, захват голова+маркер+хвост O(1), pidfd — зомби невозможны, PTY 200x50 для isatty-программ, cwd/env, PATH разрешает ребёнок, отмена cancel_flag за ≤25 мс, ФОНОВЫЕ задачи poler_exec_async/kill), CLI --exec и MCP-семейство из 5 инструментов с ПАРАЛЛЕЛЬНЫМ исполнением (пул воркеров), ЖИВАЯ МУХА C2 — коннектом FLYCSR1 (мозг мухи FlyWire v783: 138 639 нейронов, 54,5 млн синапсов) как резидентная матрица A в RAM: 10 MCP-инструментов poler_fly_* (паспорт нейрона, ребро/ротор J = A − Aᵀ, K-hop, кратчайший путь с цепочкой синапсов, общие партнёры, центральность/PageRank, глобальный топ циркуляции, мотивы u⇄v/feedforward/feedback, симуляция распространения сигнала x(t+1) = leak·x + γ·A·x) + 7 новых CLI-режимов; артефакт грузится один раз и живёт между вызовами, тяжёлые запросы параллелятся, РЕЗИДЕНТНЫЙ MCP-сервер для LLM-агентов (тёплые хэндлы в RAM: grep p50≈650 мкс, knowledge p99≈250 мкс; стриминг логов в зашифрованный Vault на лету). Математическая база — пятифазный когнитивный цикл ℘-O-L-ε-R[n]-Ψ и каноническое уравнение dp/dt = -η·Π_Λ[D·p + γJ·p + ∇F]. Использовать для: поиска по данным и архивам, RAG-подготовки, защиты памяти, базы знаний, семантического поиска, NER, НАДЁЖНОГО запуска команд с таймаутами/PTY/фоновым режимом и лимитом вывода, работы с сотнями документов (пересказ, противоречия, кластеризация, валидация), ГРАФОВЫХ ЗАПРОСОВ И СИМУЛЯЦИЙ НА БИОЛОГИЧЕСКОМ ЭТАЛОНЕ СВЯЗНОСТИ (нейроны, пути, хабы, динамика сигнала), ЛИТЕРАТУРНОГО ДВИГАТЕЛЯ POLER[Ψ] L1 (физика смысла: замысел → фазовая траектория → сверхпроводимость H^Ψ = 0 или предельный цикл, калиброванный ротором J = A − Aᵀ живого мозга; архетипы, причинный проектор, темпоральное эхо, призма No-Excuses, Trit5 No-Mul). СИНАПТИЧЕСКОГО ВИХРЯ SSN S1/v0.35.0 (живой мозг как субстрат управления: 226 уравнений и 109 алгоритмов извлечены из архивов, 67/67 проверок доказаны ДО реализации; полный стек — виртуальная топология (ноль RAM на граф, 100M синапсов < 1 ГБ), фазовые синапсы, латеральное торможение, STDP+DA, гомеостаз-интегратор, ретикулярный тон (анти-windup), E/I-контроллер, нейромодуляторы DA/5HT/NE, ритмы θ/γ; CSE-сенсорика с золотой фазой (разделимость 1.35); резидентные сессии мозга в MCP poler_ssn_*; 10 seed × 10k шагов устойчивости, ~4200 шагов/с). ТРИЕДИНАЯ АРХИТЕКТУРА S2/v0.36.0 (муха + синусоидный вихрь + троичный кристалл → ЖИВАЯ РЕЧЬ: пульс мухи — ротор касты 12×12 разводит лексику по архетипам, γ=0 зацикливает речь; вихрь дышит между токенами, медиаторы DA/5HT/NE задают температуру сэмплирования; кристалл знаний .t5c — Trit5 5 тритов/байт, No-Mul SIMD, зашит в бинарник, sha256; NMDA-гейт пропускает совпадающие смыслы; полный провенанс каждого токена sem/gate/syn/fly/tau; моторный слой S2 — только предложения poler_exec, деструктив отклоняется; ПОТОКОВОЕ КВАНТОВАНИЕ .t5q — 70B веса без сырого диска: пик RAM 64 КБ, 19× сжатие, 1.67 бита/вес, чанк-инвариантность доказана; ~96 токенов речи/с).
+description: |
+  AI-Native Topographical, Resonant and Graph Search Engine на Rust —
+  локальный поисково-аналитический движок для LLM-агентов, ЗАМЕНЯЮЩИЙ
+  grep/ripgrep/Grep/Glob и слепой векторный RAG при исследовании любых
+  корпусов: код, проза, документация, архивы. Возвращает полный логический
+  скоуп (функция С сигнатурой / сцена целиком), информационную плотность ε,
+  резонанс R(t), K-hop подграф связей и AIDDE impact-анализ вместо
+  изолированных строк. Флагман — команда feed: контекст-шлюз под действие
+  (манифест «Работа с текстом» п.11) — «для понимания — высокоэнергетичные
+  узлы и связи, для правки — низкоэнергетичные участки и влияние на них» —
+  укладывает пакет контекста в токен-бюджет LLM (мега-скоупы сжимаются до
+  «сигнатура + фокальные окна», impact-паспорт обрезается под бюджет).
+  Память O(1) ≤ 48 МБ, терабайты не страшны, ноль словарей, полностью
+  офлайн без Google-аккаунта/API-ключей. Использовать всегда, когда нужно:
+  найти/понять/исследовать в кодовой базе или текстах, «где используется X»,
+  «кто сломается, если править X», «подай контекст под токен-бюджет»,
+  «разбей на сцены/чанки», «граф связей сущностей».
+language: ru
+version: 0.81.0
 ---
 
-# POLER-Engine — суверенный гиппокамп, крипто-субстрат и нативный инференс для LLM-агентов
+# poler-engine — поисково-аналитический движок для агента (v0.81.0)
 
-Поисково-аналитический, крипто-структурный и инференс-движок, спроектированный как
-**инструмент для ИИ**: индексирует, находит, отдаёт, защищает память (.pvt Vault),
-читает архивы без распаковки, режет RAG-чанки, эмбеддит и извлекает сущности нативно
-на CPU. Не понимает контент, не генерирует текст, не принимает решений — понимает ИИ,
-творит автор.
+## Зачем этот скил существует
 
-Репозиторий: https://github.com/poler-engine-org/poler-engine
-Архитектура: `docs/UNIFIED_ARCHITECTURE.md` | Vault: `docs/formats/VAULT_FORMAT.md` |
-.pqw: `docs/formats/PQW_FORMAT.md` | CLI: `docs/CLI.md` | **Математика: `MATH.md`** (рядом с этим файлом)
+Обычные инструменты агента слепы: `grep`/`Grep`/`Glob` возвращают изолированные
+строки без контекста; агент вынужден долистывать файлы вручную, теряя и время,
+и середину контекста («Lost in the Middle»). poler-engine делает по-другому:
 
-## Принципы (не нарушать)
+1. **Полный логический скоуп** — не строка, а функция целиком (включая
+   сигнатуру-контракт) либо сцена/абзац целиком.
+2. **ε (эпсилон) — плотность токенов** вокруг совпадения: что релевантнее,
+   решает математика, а не порядок файлов.
+3. **K-hop граф сущностей** — связи доказаны, а не угаданы.
+4. **AIDDE impact** — символьный call graph: кто сломается от правки.
+5. **feed — контекст-шлюз**: готовый пакет под токен-бюджет модели.
 
-1. **Инструмент, не ИИ** — индексировать/находить/отдавать/шифровать/связывать; не
-   понимать, не генерировать, не решать.
-2. **Суверенный стек** — никаких облачных API, нуль внешних ключей. Локальные CPU,
-   mmap-структуры, чистый Rust + Zig C-ABI.
-3. **Крипто-слой данных (CDL)** — PND v8.2 (256-бит, 32 раунда Feistel, GF(2⁸)),
-   KDF 100k итераций, постраничный CBC (4096 Б), цепочечный MAC, внешний SHA-256.
-4. **Архивы не распаковываются** — записи читаются напрямую в bounded-память
-   виртуальными путями `архив::запись`; ни один байт не пишется на диск
-   (zip-slip/бомбы/inode-кража исключены by design).
-5. **Нативный инференс** — вес­а `.pqw` v2 (mmap zero-copy, SHA-256 при открытии),
-   кернелы pqc (int8/int4/f32, LayerNorm/RoPE/SwiGLU/MoE). Не ONNX, не Python, не GPU.
-6. **MVR (Mathematical Verification Record)** — каждое утверждение проверяемо:
-   golden-векторы bit-for-bit, дифференциальные тесты против fp32-эталонов, Z3/SMT.
-7. **Банальность — сила** — быстрый детерминированный доступ к данным, как grep/SQL/git.
+**Принципиально:** всё офлайн, никаких Google-аккаунтов, OAuth, API-ключей и
+облаков. Память O(1) ≤ 48 МБ — движку плевать на объём (100 ГБ, терабайт —
+перемалывает потоком). Индекс не раздувается. Ноль словарей: оценка токенов
+письменность-осознанная (CJK ≈ 1 токен/символ, кириллица ≈ 3 символа/токен,
+латиница ≈ 4).
 
-## Сборка и тесты
+## Установка (уже выполнена в этом окружении)
 
-> **ИИ-агентам в песочнице с ограниченным диском:** НЕ собирайте из исходников
-> сразу — установите конструктором по [docs/INSTALL-AGENT.md](docs/INSTALL-AGENT.md)
-> (готовый бинарник из Releases = 18 МБ за 30 секунд; скил — `--depth 1`;
-> чтение кода из архива без распаковки). Стандартная сборка ниже — для
-> полной установки на своей машине.
+- **Бинарник (release v0.81.0):** `~/.local/bin/poler-engine`
+  (копия-эталон: `/home/z/my-project/scripts/poler-install/poler-engine`)
+- **Исходники:** `/home/z/my-project/skills/poler-engine/` (synced @ main)
+  и dev-клон `/home/z/poler-engine-fresh`
+- Проверка: `poler-engine --version` → `poler-engine 0.81.0`
+
+Пересборка (только если реально нужно):
+```bash
+. "$HOME/.cargo/env"
+cd /home/z/my-project/skills/poler-engine
+CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo build --release -j1        # ~9 минут; тесты: cargo test --release --lib -j1
+cp target/release/poler-engine ~/.local/bin/
+```
+⚠ В песочнице с 4 ГБ RAM перед `cargo test --release` освободи память
+(тестовая сборка ест ~3 ГБ; сборка бинарника — меньше).
+
+## Маршрутизация: когда звать poler-engine вместо grep/Grep/Glob
+
+| Задача агента | Инструмент |
+|---|---|
+| «Найди где X используется / определяется» | `feed <путь> --for edit -q X` |
+| «Пойми тему X в этом репо/корпусе» | `feed <путь> --for understand -q X` |
+| «Кто сломается, если изменить X» | `feed --for edit` (impact-паспорт) или `impact <путь> X` |
+| «Подай контекст модели в N токенов» | `feed … --budget N --json` |
+| «Обычный поиск со сценами и ε» | `poler-engine <путь> -q "X" --format ai-json` |
+| «Точный подсчёт вхождений» | `poler-engine <путь> --grep "X"` |
+| «Чанки для RAG с byte-якорями» | `--chunk --chunk-size 500` |
+| Сгенерировать документ/PPT | ❌ docx/pdf/pptx скилы |
+| Поиск в живом интернете | ❌ web-search скил |
+| Анализ изображений | ❌ VLM скил |
+
+**Правило по умолчанию:** исследуешь кодовую базу или корпус текстов —
+сначала `feed`, а не Grep/Glob. Одна команда заменяет десятки слепых
+перелистываний.
+
+## Команда 1: feed — контекст-шлюз под действие (главная)
+
+Собирает пакет контекста под конкретное действие агента и укладывает его
+в токен-бюджет. Синтаксис:
 
 ```bash
-cd poler-engine
-# Крипто-мост: готовая Zig-библиотека (или zig в PATH / POLER_ZIG)
-POLER_CORE_LIB=$PWD/os/core/zig-out/lib cargo build --release --features pnd-ffi
-./target/release/poler-engine --version
-
-# Тесты: 1238/1238 (pnd-ffi), default 1176/1176, zig 21/21 + 33/33, golden 54 626 bit-for-bit
-cargo test --features pnd-ffi
-(cd os/core && zig test poler_core.zig)
+poler-engine --exec 'feed <PATH> --for <understand|edit> -q "<запрос>" [--budget N] [--relations N] [--json]'
 ```
 
-## Справочник режимов CLI
+### understand — СКЕЛЕТ темы (для понимания)
 
-### 1. Точный grep (слой 0) — ВСЕ совпадения, гарантия полноты, exit-коды grep
+Якоря по ε УБЫВАНИЮ (высокоэнергетичные узлы темы первыми) + K-hop связи +
+статистика энергии пула (медиана/Q3/max). Это карта «что это и на чём держится».
 
 ```bash
-poler-engine ~/corpus --grep "fn main" [--grep-regex] [--grep-i] [-A/-B N] [--grep-count]
-poler-engine ~/corpus --grep "TODO" --grep-json      # byte offsets для агента
+poler-engine --exec 'feed ./src --for understand -q "authentication" --budget 6000 --json'
 ```
 
-### 2. Идеальный исполнитель команд E2/v0.32.0 (фича pnd-ffi) — замена падающим Bash-инструментам
+### edit — ПРАВОЧНЫЙ ПАКЕТ (для правки)
 
-Рождён диагностикой исходников GNU bash 5.2 самим движком
-(docs/EXEC_AUDIT.md: 424 unsafe-вызова в 75 .c-файлах, free() в trap-механике,
-REINSTALL_SIGCHLD-гонка, неограниченный $(...), ноль таймаутов). Ядро —
-Zig с raw-syscall слоем: классы bash-ошибок исключены конструктивно.
+Цели по ε ВОЗРАСТАНИЮ — разреженные зоны (низкая ε = локальные, изолированные
+контексты) первыми, с вердиктами «плотная зона / середина / разреженная зона»
+по перцентилю; + точка определения символа + AIDDE impact (кто сломается) +
+связи. Совет в конце пакета говорит, как править.
 
 ```bash
-# флаги — ДО --exec; после --exec — команда целиком (включая её -флаги)
-poler-engine --exec-timeout-ms 5000 --exec make -j4
-poler-engine --exec-max-out 65536 --exec dd if=/dev/zero bs=1M count=64
-poler-engine --exec-stdin "вопрос" --exec cat
-# E2: рабочий каталог, окружение, терминал, голова+хвост
-poler-engine --exec-cwd /var/log --exec ls -la
-poler-engine --exec-env LC_ALL=C --exec-env DEBUG=1 --exec sort file.txt
-poler-engine --exec-pty --exec sudo -n apt-get update      # isatty-программы
-poler-engine --exec-capture head_tail --exec-max-out 4096 --exec make -j8  # и голова, и хвост лога
-# коды: ребёнка | 124 таймаут | 127 не найдено | 126 без права | 125 плохой cwd
+poler-engine --exec 'feed ./src --for edit -q cmd_search --budget 4000 --json'
 ```
 
-Гарантии: таймаут timerfd(MONOTONIC) + SIGTERM → grace → SIGKILL группе;
-захват — O(1) памяти (tail: хвост max_out; head_tail: первые B/2 + маркер
-«dropped N» + последние B/2 — стек-трейс в начале гигантского лога
-не теряется); зомби невозможны (pidfd + wait4 в ppoll-цикле); шелл-инъекции
-невозможны (argv массивом, без парсинга); fds-гигиена CLOEXEC; PTY —
-настоящий терминал 200x50 (stdout/stderr слиты); PATH разрешает сам ребёнок
-(ноль stat в родителе); отмена — атомарный флаг, TERM→KILL за ≤25 мс.
+### Честность метрик (не подменяй понятия!)
 
-### 3. Архивы без распаковки (v0.28.1) — виртуальные файлы «архив::запись»
+- **ε меряет ПЛОТНОСТЬ токенов** вокруг совпадения — не «важность» и не
+  нагрузку. Центральная функция может быть определена один раз (разреженная
+  точка) и держать пол-проекта.
+- **Нагрузку доказывает только символьный граф**: upstream/downstream от AIDDE.
+- Вердикты в пакете — про плотность зоны; impact-паспорт — про нагрузку.
+
+### JSON-контракт пакета
+
+```jsonc
+{
+  "feed": "edit", "query": "cmd_search",
+  "budget_tokens": 4000, "spent_tokens": 2828, "over_budget": false,  // честно
+  "pool_anchors": 9, "total_hits": 9, "selected": 4, "coverage_pct": 44.4,
+  "energy": {"median": 5900.0, "q3": 6100.0, "max": 8300.0},
+  "items": [{
+    "file": "src/shell/commands.rs", "chapter": "commands [fn] :: cmd_search (L120–L180)",
+    "epsilon": 3355.9, "resonance": 0.42, "tokens": 218,
+    "scope": "…полный текст функции с сигнатурой…",
+    "density_verdict": "разреженная зона",
+    "compressed": {           // только если мега-скоуп не влез целиком
+      "applied": true, "windows": 1, "skipped_lines": 38,
+      "full_tokens": 194, "fallback": false,
+      "note": "мега-скоуп подан сжато: сигнатура + фокальные окна вокруг хитов"
+    }
+  }],
+  "relations": [["Darcy", "взаимодействует_с", "Elizabeth"], ...],
+  "definition": {"symbol": "…", "file": "…", "lines": "…",
+                 "definition_sites": 1, "note": "единственная точка (граф)"},
+  "impact": {
+    "target": "…", "danger_level_if_modified": "HIGH …",
+    "upstream_total": 200, "upstream_shown": 55,   // счётчики полные всегда
+    "upstream_dependents": [{"caller": "…", "file": "…"}],
+    "downstream_total": 38, "downstream_shown": 35,
+    "truncated": true, "note": "списки обрезаны под токен-бюджет; …"
+  },
+  "advice": "…текстовый совет агенту…"
+}
+```
+
+### Мега-скоупы: сигнатура + локальный фокус
+
+Скоуп, не влезающий в бюджет, НЕ подаётся целиком и НЕ режется по живому:
+пакет получает **сигнатуру** (для кода — строки до `{` включительно),
+**фокальные окна** вокруг каждого хита запроса (радиус до 6 строк, при
+тесном бюджете сужается до 1) и закрывающую строку; разрывы помечены
+честными маркерами:
+
+```c
+static int local_connect(…, const char *path, …)
+{
+    /* … 24 строк укрыто … */
+    error = git_repository_open(&repo, path);
+    /* … 14 строк укрыто … */
+}
+```
+
+`over_budget: true` означает «даже сжатый вид не влез» — подними `--budget`
+или уточни запрос. impact-паспорт с сотнями потребителей обрезается сам
+(upstream 70% / downstream 30% списочного резерва, счётчики полные).
+
+## Команда 2: топографический поиск
 
 ```bash
-poler-engine ~/corpus --grep "Subquantum" --archives # zip/tar/tar.gz/tar.zst/gz/zst in-place
-poler-engine --archive-list export.zip               # листинг БЕЗ пароля и без распаковки
-poler-engine --archive-list export.zip --archive-json # JSON: имена/размеры/шифрование
-poler-engine "export.zip::docs/paper.md" --chunk     # RAG-чанки записи архива
-poler-engine ~/corpus --grep "secret" --archives --archive-password "PASS"  # пароль в CLI
-env POLER_ARCHIVE_KEY="PASS" poler-engine ~/corpus --grep "secret" --archives
-poler-engine ~/corpus --grep "x" --archives --archive-max-entry-mb 128     # лимит бомб
+poler-engine ~/my-repo -q "нокс" --format simple    # человекочитаемо
+poler-engine ~/my-repo -q "memory leak" --format ai-json   # для агента
+poler-engine ~/my-repo -q "архитектура" --format md   # в ответ модели
 ```
 
-### 4. RAG-чанки (слой B) — секция→абзац→предложение, byte-якоря + breadcrumb
+Ключевые поля `ai-json`: `anchors[].epsilon` (плотность), `resonance`,
+`anchors[].scene.enclosing_scope` (полный скоуп), `k_hop_relations`.
+Режимы резонанса: `--resonance-mode hits|field|psi|poler` (psi — скрытые
+сюжетные/смысловые связи).
+
+## Команда 3: impact — паспорт символа
 
 ```bash
-poler-engine document.md --chunk [--chunk-size 384] [--chunk-overlap N] [--chunk-json]
-poler-engine "dump.zip::17-Active_inference.md" --chunk --chunk-json  # запись архива
+poler-engine --exec 'impact ./src cmd_search --json'
 ```
 
-### 5. Резонансный POLER-поиск — ε-плотность, IIR-резонанс R(t), сцены, K-hop граф
-
-```bash
-poler-engine ~/corpus -q "Алексей" --format ai-json    # машинный JSON с ε и R(t)
-poler-engine ~/corpus -q "Алексей" --resonance-mode psi|poler|field|hits
-poler-engine ~/corpus -q "тема" -k 4                   # K-hop подграф связей
-# Гиперпараметры канона — прямо в CLI (см. MATH.md):
-#   --psi-eta 0.05 --psi-gamma 0.5 --psi-rho 0.9 --psi-depth 8
-#   --poler-eta 0.01 --poler-gamma 0.1 --poler-mix 0.1 --poler-dissipator 0.02
-```
-
-### 6. Нативный суверенный ML (.pqw, без Python/ONNX/GPU)
-
-```bash
-poler-engine --pqw-selftest                        # автономный цикл 6/6 (энкодер→GLiNER→GLM)
-poler-engine doc.md -q "POLER" --semantic dense --model models/encoder.pqw
-poler-engine doc.md -q "запрос" --semantic dense --model models/bge-m3.pqw \
-    --semantic-corpus ~/corpus --semantic-limit 10 # живой поиск: чанки→эмбеддинги→косинус
-poler-engine doc.md -q "..." --ner gliner --model models/gliner.pqw \
-    --ner-labels "ORGANIZATION,PERSON,CONCEPT"      # zero-shot NER
-poler-engine doc.md -q "..." --llm local --model models/glm.pqw  # GLM-декодер
-
-# Конвертеры реальных весов (стримингово, RAM не растёт с моделью):
-python3 scripts/convert_hf_to_pqw.py     # torch-zip → .pqw int8/int4 (XLM-R/BGE-M3)
-python3 scripts/convert_gliner_to_pqw.py # GLiNER (mdeberta-спина) → .pqw
-python3 scripts/convert_chatglm_to_pqw.py# ChatGLM3-6B → .pqw int4
-python3 scripts/gen_demo_pqw.py          # демо-модели для смоук-тестов
-```
-
-### 7. Защищённая память Vault (.pvt CDL) — «насмерть», git-переносимая
-
-```bash
-export POLER_VAULT_KEY="парольная_фраза"            # или ввод с stdin/TTY
-poler-engine --memory-seal <ФАЙЛ> [--memory-out OUT.pvt] [--memory-content-id ID]
-poler-engine --memory-open <ФАЙЛ.pvt> [--memory-out OUT.bin]
-poler-engine --memory-verify <ФАЙЛ.pvt>             # внешний SHA-256 БЕЗ ключа
-poler-engine --memory-info <ФАЙЛ.pvt>               # страницы, соль, KDF-итерации
-# Ключ через env: --memory-key-env ИМЯ_ПЕРЕМЕННОЙ; KDF: --memory-kdf-iters N
-```
-
-### 8. Суверенный Гиппокамп — база знаний с эпистемической градацией
-
-```bash
-poler-engine --knowledge-ingest ~/library/          # 6 слоёв, FNV-дедуп, MVR-разметка
-poler-engine --knowledge-search "запрос" [--min-provenance mvr|source|narrative]
-poler-engine --knowledge-stats                      # источники/чанки/токены/провенанс
-# Эмбеддер: --knowledge-embedder none|hash|pqw (pqw: env POLER_KNOWLEDGE_MODEL=path.pqw)
-# БД по умолчанию knowledge.db (+ .graph/.vectors спутники); --knowledge-db PATH
-```
-
-### 9. AIDDE impact-анализ — call graph + паспорт символа
-
-```bash
-poler-engine ./src --impact "run_gateway" [--impact-depth 3] [--impact-cache db]
-```
-
-### 10. Коннектом FLYCSR1 (C2/v0.33.0 «Живая муха») — мозг мухи как матрица A
-
-```bash
-poler-engine --connectome docs/flywire-connectome/flywire_v783_core.csr.zst
-poler-engine --connectome ...core.csr.zst --connectome-nodes ...nodes.bin \
-  --connectome-node 0                # паспорт нейрона (индекс или root_id)
-poler-engine --connectome ... --connectome-edge 0:6135       # вес/медиатор/знак + J = A − Aᵀ
-poler-engine --connectome ... --connectome-khop 0 -k 2      # BFS потока сигнала: [13, 443], 457
-poler-engine --connectome ... --connectome-impact 0         # CSC «кто управляет нейроном»
-# C2/v0.33.0 — глубокое взаимодействие:
-poler-engine --connectome ... --connectome-neighbors 79529 --connectome-dir in   # партнёры по весу
-poler-engine --connectome ... --connectome-path 0:116214   # кратчайший путь с цепочкой синапсов
-poler-engine --connectome ... --connectome-common 0,6135 --connectome-dir down # общие мишени/источники
-poler-engine --connectome ... --connectome-centrality --connectome-top 5        # хабы + PageRank
-poler-engine --connectome ... --connectome-rotor-top 5 --connectome-min-abs 50 # топ циркуляции J
-poler-engine --connectome ... --connectome-motifs 79529     # реципрокные/ff/fb мотивы
-poler-engine --connectome ... --connectome-propagate 0 --connectome-steps 3    # симуляция сигнала
-poler-engine --connectome ... --connectome-json            # JSON для агентов
-```
-
-- Знак связи: **+1** ach/glut, **−1** gaba, **0** модуляторы (oct/ser/da);
-  фильтр потока: `--connectome-sign all|exc|inh`. Exit-коды grep: 0 найдено / 1 нет / 2 ошибка.
-- Артефакты в git (~43 МБ): full 35 МБ / core 7 МБ / nodes 1.1 МБ; загрузка
-  core ≈ 70 мс (≈ 25 МБ RAM), full ≈ 400 мс; сырьё 852 МБ feather не нужно.
-- **MCP — основной путь для агентов**: резидентная муха живёт в RAM между
-  вызовами (`poler_fly` грузит артефакт один раз, дальше все запросы без
-  диска; CSC строится лениво один раз). Клиент каждый CLI-вызов платил
-  60–400 мс загрузки + 43 мс CSC — MCP-сервер платит это ровно один раз.
-- Золотые числа ядра: топ циркуляции J[74067][133436] = **+2395**; хаб
-  79529 (6399 исх. / 5080 вх., 3684 реципрокных пары); PageRank-топ 66912;
-  симуляция от 0: активные [14, 455, 15 457] за 3 шага, торможение доминирует.
-
-### 11. Веб (локальный индекс, не облако)
-
-```bash
-poler-engine https://example.com --crawl --crawl-depth 2 --crawl-max 25
-poler-engine --web-search "запрос"                  # Semantic Bridge ru↔en офлайн
-poler-engine --semantic-expand "запрос"             # диагностика моста
-```
-
-### 12. Интерфейсы и сервисы
-
-```bash
-poler-engine --mcp                                   # MCP-сервер (stdio JSON-RPC)
-poler-engine --mcp-http 127.0.0.1:8765 --mcp-token X # MCP через HTTP (Bearer)
-poler-engine --shell | --tui | --gateway | --license
-poler-engine --benchmark [--benchmark-json r.json]   # Exact/Lexical/Passage/latency/RAM
-```
-
-## Когнитивный цикл работы с документами (глаза для модели)
-
-Как читать сотни документов «как человек», а не автоматом: движок даёт якоря и
-извлечение, агент — понимание. Фазы ℘-O-L-ε-R[n]-Ψ (полная математика — `MATH.md`):
-
-| Фаза | Смысл | Команда движка |
-|------|-------|----------------|
-| ℘ Перцепция | осмотр без искажения | `--archive-list --archive-json` (что внутри, до пароля) |
-| O Образ | сущности и структура | `--chunk --chunk-json` (byte-якоря, breadcrumb); `--ner gliner` |
-| L Логика | противоречия | `--grep --archives` по утверждению → кросс-док сравнение цитат |
-| ε Энергия | плотность смысла | `-q --format ai-json` (ε-ранжирование сцен) |
-| R[n] Резонанс | темпоральное эхо | итеративный `-q` + `-k` K-hop подграф (накопление контекста) |
-| Ψ Аттрактор | верифицированный итог | `--knowledge-search --min-provenance mvr` → MVR-паспорт |
-
-Четыре операции над корпусом (протестированы на 300-документном архиве 32 МБ):
-
-1. **Точный пересказ** — `--chunk` режет с координатами (путь, строки, byte_start/byte_end);
-   каждый тезис привязан к строке исходника, галлюцинации исключены конструктивно.
-2. **Поиск противоречий** — `--grep --archives "формула/утверждение"` собирает ВСЕ контексты;
-   агент сопоставляет и фиксирует расхождения с двумя точными цитатами.
-3. **Классификация по темам** — `--ner gliner` извлекает [ТЕОРИЯ]/[АВТОР]/[МЕТОД]/[ИНВАРИАНТ],
-   пересечение сущностей + K-hop граф дают кластеры документов.
-4. **Паспорт валидации** — градус провенанса каждого тезиса: **MVR** (доказано кодом/Z3) >
-   **Source** (рецензируемый источник) > **Narrative** (гипотеза/заметка).
-
-## Архивы: правила для агента
-
-- **Форматы:** zip (stored/deflate/zstd; ZipCrypto и AES-256), tar, tar.gz, tar.zst,
-  gz (мульти-член), zst; контейнеры jar/war/epub/odt. bzip2/xz нет (суверенный минимум).
-- **Пароль** — цепочка: `--archive-password` → env `POLER_ARCHIVE_KEY` → TTY-промпт.
-  Неверный пароль = ошибка в stderr на запись, остальной корпус сканируется.
-- **Сначала осмотр** (`--archive-list` без пароля), потом вскрытие.
-- **Бомба-гард:** распакованная запись > 64 МиБ (`--archive-max-entry-mb`) пропускается.
-- **Селектор `архив::запись`** работает с `--chunk`. Нужен «файл» из архива — используй `::`,
-  никогда не unzip. Вложенные архивы (zip в tar) v1 не раскрываются.
-- **На диск не пишется ничего** — верифицировано тестами.
-
-## Vault: правила для агента
-
-- Ключ: env `POLER_VAULT_KEY` → stdin (пустой = отказ). Вывод существует → отказ с подсказкой.
-- `.pvt` можно хранить в git/переносить: `--memory-verify` проверяет целостность БЕЗ ключа
-  (внешний SHA-256), tamper 1 бит ловится. Полный доступ — только с ключом.
-- Формат: страницы 4096 Б CBC (IV из соли+номера), цепочечный MAC листьев, KDF 100k.
-- Логи/диалоги агента запечатываются в `.pvt` и гоняются через любой git.
-
-### 11. Литературный Двигатель POLER[Ψ] (L1/v0.34.0) — физика смысла, калиброванная мухой
-
-Полная матричная форма канонического уравнения: замысел → инвариантный вектор
-Ω(o) (FNV-хэш термов, ноль RNG, ‖Ω‖ = 1) → фазовая динамика
-
-```
-p_{t+1} = p_t − η·Π_Λ(∇F + D·p + γJ·p) + η_r·Π_Λ(κ·(echo − p))
-```
-
-где Π_Λ — проектор причинности (галлюцинации аннигилируются математически),
-echo = Σ 0.9ᵏ·p_{t−k} — темпоральное эхо (бесконечный контекст через
-интеграл состояний), **J = A − Aᵀ — ротор живого мозга мухи** (циркуляция
-смыслов: каста нейронов от семян, якорь = FNV(root_id) mod 12 архетипов),
-**D = L·Lᵀ — метрика Ляпунова на графе касты** (диссипация пертурбаций).
-H^Ψ → 0 = Observer-Kill = «информационная сверхпроводимость».
-
-```bash
-# Анализ поля: термы-инварианты + 12 архетипов (Кэмпбелл + канон POLER)
-poler-engine --literary-field "герой идёт в поход против тьмы и бездны"
-
-# Генерация: чистая физика текста — СХОДИМОСТЬ (F → 1e-5, сверхпроводимость)
-poler-engine --literary-generate "текст замысла" [--literary-steps 128]
-
-# Генерация с мушиной калибровкой — ПРЕДЕЛЬНЫЙ ЦИКЛ (живой мозг не даёт
-# нарративу замереть) + драматургические пары = роторные пары нейронов
-poler-engine --literary-generate "текст" --literary-csr .../flywire_v783_core.csr.zst \
-  --literary-seeds 0,116214 --literary-max-cast 32 [--literary-no-mul] [--literary-json]
-```
-
-Отчёт: три акта с архетипическими доминантами, конфликты (кто доминирует
-над кем, с силой J), инженерная телеметрия F / ε / Σ(t) / H^Ψ / причинность.
-Принцип «No Excuses»: при семантическом тупике (F растёт 3 шага) энергия
-смысла ПРЕЛОМЛЯЕТСЯ призмой в ближайший архетип с точным сохранением нормы —
-отказа от генерации не существует. Trit5 No-Mul: p_t квантуется в {−1,0,+1},
-резонансные скалярные произведения — AVX2 без f32-умножений.
-Руководство агента: `docs/LITERARY.md`.
-
-### 12. Синаптический Вихрь SSN (S1/v0.35.0) — живой мозг, доказанный до реализации
-
-Субстрат управления: текст → CSE-сенсорика → живая нейродинамика → readout.
-Извлечено из архивов пользователя (226 уравнений, 109 алгоритмов),
-доказано численно (67/67 проверок, 13 найденных и исправленных режимов
-отказа F1–F13), затем портировано в Rust. **Ни одна строка ядра не
-написана до доказательства.**
-
-Полный стек шага: виртуальная топология `tgt = (i·39293 + f·29101 +
-seed·73471) mod N` (связь = арифметика, ноль RAM на граф), фазовые
-синапсы `cos(phase + 0.3·θ_mod)`, латеральное торможение («сосед
-кричит — ты молчишь»), STDP сквозь дофаминовые ворота, гомеостаз по
-медленному следу f_sys (интегральный контроллер, знак F2 + след F8),
-ретикулярный тон b_tone (анти-windup F13 — второй интегральный канал),
-E/I-контроллер с мёртвой зоной [2,6], нейромодуляторы DA/5HT/NE,
-ритмы θ (5 рад/с) / γ (40 рад/с). Здоровье: активность ~5% с лавинными
-флуктуациями (критичность, край хаоса), S < 0.8, E/I ≈ 4.
-
-```bash
-# живой мозг: 10k шагов, телеметрия (акт/f_sys/тон/S/C/E/I/медиаторы)
-poler-engine --ssn-demo [--ssn-n 10000] [--ssn-seed 42] [--ssn-json]
-
-# CSE-сенсорика: разделимость текстов (золотая фаза, зазор 1.35)
-poler-engine --ssn-encode "герой идёт в поход" --ssn-encode-b "кофеварка сломалась"
-
-# сенсорная инъекция: текст → мозг → динамика → readout
-poler-engine --ssn-inject "открыть терминал и собрать проект" --ssn-steps 5000
-```
-
-MCP-семейство `poler_ssn_*` — резидентные живые мозги (LRU 8):
-`poler_ssn_step` (создать/шагнуть: seed/n/fields/dims/steps),
-`poler_ssn_inject` (text → CSE → активации), `poler_ssn_status`
-(снимок: телеметрия + readout топ-K), `poler_ssn_eject`.
-Производительность: ~4200 шагов/с (600 нейронов × 16 полей, release).
-Доказательства: `proofs/ssn_verify3.py` (67/67), `proofs/ssn_f13_proof.py`
-(10 seed × 10k). Руководство агента: `docs/SSN.md`.
-
-### 13. Триединая Архитектура (S2/v0.36.0) — муха + вихрь + кристалл → речь
-
-Три доказанные опоры сходятся в одном цикле порождения слова.
-**Муха** (FlyPulse): ротор касты FLYCSR1 агрегируется в антисимметричную
-матрицу 12×12 по якорям архетипов (Jᵀ = −J, метрика Ляпунова D гасит);
-фаза p ← p + dt(γJ·p − D·p), дрейф tanh((γJ·p)[архетип токена]) разводит
-лексику — при γ = 0 речь вырождается в циклы (доказано усреднением по
-8 seed). Без артефакта коннектома — честная виртуальная муха из seed
-(происхождение всегда сообщается агенту). **Вихрь** (SSN): между токенами
-мозг дышит steps_per_token шагов; медиаторы задают температуру речи
-τ = base·(1 + 0.6·DA − 0.5·5HT − 0.3·NE), зажата [0.6, 1.8]. **Кристалл**
-(.t5c): словарь + биграммная топология (знаковая квантизация PMI:
-трит = +1 при r ≥ 1.7, −1 при r ≤ 0.5), семантика выводится из золотой
-фазы CSE и квантуется в триты — сенсорика и память делят один код.
-Счёт кандидата: w_sem·sem·NMDA-гейт + w_syn·биграммный трит +
-w_fly·дрейф − штраф повтора → WTA(8) → softmax(τ) → слово; эхо речи
-возвращается в мозг (замкнутый контур, громкость 0.25).
-
-```bash
-# живая речь от промпта (виртуальная муха; ~96 токенов/с)
-poler-engine --triune-speak "живой мозг говорит" --triune-tokens 32
-
-# НАСТОЯЩИЙ мозг мухи как пульс речи
-poler-engine --triune-speak "система слушает" --triune-connectome flycsr1.csr.zst --triune-seeds 1000,5000,9000
-
-# витрина: 3 фразы + телеметрия + моторные интенты
-poler-engine --triune-demo --triune-json
-
-# собрать свой кристалл из корпуса (детерминизм: тот же корпус → те же байты)
-poler-engine --crystal-build corpus.txt --crystal-out my.t5c
-
-# ПОТОКОВОЕ КВАНТОВАНИЕ: 140 ГБ FP16-весов → .t5q без сырого диска,
-# пик RAM 64 КБ, чанки чтения не влияют на результат
-poler-engine --stream-quant weights.f32.bin --stream-quant-out w.t5q
-curl -sL <url> | poler-engine --stream-quant - --stream-quant-f16 --stream-quant-keep 0.1
-```
-
-Моторный слой S2: скан речи на повелительные конструкции → интенты
-`poler_exec open/run/show/read/build -- объект` — ТОЛЬКО предложения,
-исполнение остаётся за агентом; деструктивная лексика (удалить/стереть/…)
-отклоняется белым списком. MCP-семейство `poler_triune_speak`
-(родить/продолжить разговор: text/seed/gamma/tokens → речь + трейс
-провенанса + интенты) и `poler_triune_state` (снимок: последняя фраза,
-токены, телеметрия мозга). Честная математика 70B: плотный Trit5 =
-14.6 ГБ (гарантированный этаж), keep=0.1 рождает 90% вакуума —
-подготовлено к sparse-загрузчику следующего поколения (~2 ГБ).
-Форматы: .t5c (кристалл, sha256, детерминированная сборка) и .t5q
-(поток, заголовок 72 Б + блоки [f32 scale][103 Б тритов] + трейлер,
-sha256, без перемотки — дружит с pipe).
-
-## MCP-инструменты (для LLM-агентов)
-
-`poler_web_search`, `poler_crawl`, `poler_fetch`, `poler_search`,
-`poler_grep` (аргументы `archives: true`, `archive_password: "…"`),
-`poler_chunk`, `poler_box_exec`, `poler_box_status`,
-`poler_exec` (E2: идеальный запуск команд — command/args/timeout_ms/
-grace_ms/max_out_bytes/stdin/cwd/env/pty/capture → JSON exit_code/signal/
-stdout/stderr/timed_out/cancelled/truncated/duration_us/pid; ядро Zig
-raw-syscalls; умолчание capture=head_tail),
-`poler_exec_async` (фоновый запуск → task_id мгновенно),
-`poler_exec_task` (опрос/ожидание: task_id + wait_ms),
-`poler_exec_kill` (отмена: TERM→KILL за ≤25 мс),
-`poler_exec_list` (обзор фоновых задач),
-`poler_knowledge` (query, top, min_provenance).
-
-**v0.48.0 Калькулятор Всего — 2 инструмента:** `poler_calc` (expression:
-арифметика, единицы to, solve, матрицы expm/eigen/pinv, триты, астрономия,
-геодезия; состояние резидентное — переменные/ans между вызовами) и
-`poler_hw` (скрытые параметры ПК: кеши, ISA-флаги, NUMA, GPU).
-
-**v0.52.0 (циклы P+Q) Квантовый мост — `poler_quantum`:** действия
-`run` (bell/ghz/qft/iqft/grover/bv/dj/period/teleport: распределение
-Борна, энтропия, ландауэровская стоимость), `qcasm` (произвольная
-QCASM-lite схема из source/path; noise — пресет железа поверх идеала),
-`qaoa` (MaxCut-ансатц с классической оптимизацией углов: edges парами или
-строкой, p — глубина; отчёт с E[cut], лучшим битстрингом и
-аппроксимационным отношением), `teleport` (телепортация
-q0→q2 — когерентный канал 6 Клиффорд-вентилей, фиделити 1; exact —
-структурное равенство в ℤ[1/√2, i]), `bloch` (сфера Блоха; амплитуды —
-выражения poler_calc: 1/sqrt(2), i/2…), `verify` (формальная верификация:
-unitary U†U = I, equivalence двух схем вплоть до глобальной фазы,
-teleport-канал на базисе; вердикты proved_exact / verified_numeric /
-verified_sampling / refuted — градуированная честность; noise —
-TVD/фиделити/χ² поверх вердикта), `list`.
-Тот же мост в шелле: `quantum run|qcasm|qaoa|teleport|bloch|verify|calc`
-(алиас `qm`), физика уровней — `quantum calc schrodinger(…)`.
-
-**v0.53.0 (цикл R) P³-Мост — шелл-команда `p3`:** `p3 info` (библиотека
-libp3ffi.so: путь, тег ядра Zig 0.14.0, ABI-рукопожатие), `p3 conformance
-[--pairs N --json]` (живой конформанс Rust ↔ Zig через C-ABI: d_FS
-Фубини–Штуди, гомогенность, U†U = I, (A·B)v = A(Bv), det(PGL4),
-идемпотенты P² = P — расхождения на уровне 1 ulp), `p3 frame [opts]`
-(«кадр из гамильтониана»: цепочка Изинга → эволюция expm → P³-рендер
-тройного буфера RGB+depth+seg → 3 PNG; opts: --n 2..8 --steps --size
-WxH --jz --hx --cloud --out). Библиотека коммитится в ffi/ (пересборка
-ffi/build.sh), поиск через P3_FFI_LIB. Отчёт: docs/P3_CONFORMANCE_REPORT_v0.53.0.md.
-
-**v0.54.0 (цикл S) Ядро Игры — шелл-команда `game`:** фундамент игрового
-движка по итогам разбора UE/Unity/Godot (см.
-docs/GAME_ENGINE_ROADMAP_UE_ANALYSIS.md). `game info` (статус ядра:
-демо-сцена, физика, state-hash), `game demo [opts]` (демо-сцена
-«Этерия» из лора: 11 тел, иерархия глубины 3, кеплеровские орбиты
-ω=√(G·M)/r^1.5 → P³-рендер → 3 PNG; opts: --ticks --size --out
---no-orbits --no-box --json), `game scene <json>` (своя сцена: тела
-id/class/mass/radius, иерархия parent, orbit_radius/inclination,
-камера dist/yaw/pitch, именованные цвета), `game write-demo <json>`
-(выгрузить демо-сцену как редактируемый JSON). Архитектура:
-Entity(index, generation) без GC, плотные компонентные хранилища,
-fixed-timestep аккумулятор (dt=1/60, cap на спираль смерти), фазы
-Orbit→Transform→Hash, state-hash FNV-1a по битам позиций — детерминизм
-бит-в-бит (replay/lockstep без дублирования логики). 2.7 млн тиков/с
-(0.37 мкс/тик = 2% бюджета 60 Гц кадра), бенчмарк
-docs/benchmarks/GAME_CORE_v0.54.0.md.
-
-**v0.55.0 (цикл T) Кристаллы — звук и текстуры:** `game sound [opts]`
-(T1 акустический кристалл: сонофикация мира физикой — ω→высота,
-радиус→гейн, X→power-pan; ADSR + 4 волны по классу тела, tanh-лимитер,
-свой WAV PCM16, свой радикс-2 FFT, STFT→топ-пики→crystal_hash; opts:
---ticks --out F.wav --fs 8000..96000 --gain 0..1 --json) и
-`game texture [opts]` (T2 спектральный синтез: аналитический тайл
-value-noise/fBm/domain-warp → бесконечный зум без пикселизации;
-стили noise|marble|wood, палитры gray|copper|ice|jade, --contrast;
-SVD rank-k кодек Якоби–Хестенеса: rank 4/16 = 55–57 dB, --svd-rank
-K, --rank-curve; texture_hash бит-в-бит). Полер-бокс: UE-референсы в
-docs/research-archive/ue_reference.poler (ArchiveKind::Poler —
---archive-list/grep --archives/--poler-cat прозрачно; POLER_NOTES.md
-внутри архива). Бенчмарк docs/benchmarks/GAME_CYCLE_T_v0.55.0.md;
-VLM: marble 8.5/10, noise 7.5/10, wood 7/10 — все SHIP.
-
-**v0.56.0 (цикл U) Окно — события/ввод/камера/окно:** `game normalmap
-[opts]` (U0: тангентные нормали из той же height-функции — честная
-производная dh/du центральной разностью, амплитуда рельефа в долях
-тайла --amplitude 0..1.5, разрешение/зум-инвариантно, normal_hash
-бит-в-бит), `game input-demo [opts]` (U1–U4: JSON-скрипт событий
---script {frame,type:key_down|mouse_move|wheel|…} или встроенный
-сценарий → EventQueue с коалесцингом → Input (рёбра just_pressed ровно
-кадр) → орбит-камера с экспоненциальным демпфированием → P³-кадры;
-frames_hash/camera_hash/state_hash — детерминизм всей цепочки
-бит-в-бит; 2.5 мс/кадр 640×360 ≈ 400 fps офлайн) и `game window`
-(U3: НАСТОЯЩЕЕ X11-окно через dlopen libX11.so.6 без зависимостей —
-ЛКМ-драг орбита, колесо зум, WASD/QE; в headless — внятный отказ).
-Архитектура: WindowBackend-трейт, OffscreenWindow = replay-эталон,
-единый game_window_loop для офлайн и realtime. Бенчмарк
-docs/benchmarks/GAME_CYCLE_U_v0.56.0.md; VLM: normal maps 8/8/7.5,
-кадры орбиты 9/10 — все SHIP.
-
-**C2/v0.33.0 «Живая муха» — 10 инструментов:** `poler_fly` (загрузка/сводка/
-eject коннектома в RAM), `poler_fly_node` (паспорт), `poler_fly_edge`
-(ребро + ротор J), `poler_fly_khop` (BFS фронтов), `poler_fly_path`
-(кратчайший путь с цепочкой синапсов), `poler_fly_common` (общие мишени/
-источники набора), `poler_fly_centrality` (хабы + PageRank), `poler_fly_rotor`
-(глобальный топ циркуляции |J|), `poler_fly_motifs` (реципрокные пары,
-feedforward, feedback), `poler_fly_propagate` (симуляция сигнала
-x(t+1) = leak·x + γ·A·x на знаковых весах). Нейроны задаются индексом или
-root_id; первый вызов грузит артефакт (csr + опционально nodes), дальше —
-без диска. Семейство исполняется в пуле воркеров: пачка запросов к мухе
-параллелится (11-запросный конвейер release-смоука — 0.49 с суммарно).
-
-**L1/v0.34.0 POLER[Ψ] — 4 инструмента:** `poler_literary_field` (анализ
-поля интенции: термы + архетипы + опциональная каста мухи), `poler_literary_step`
-(резидентный полигон: text создаёт сессию, session шагает p_t → p_{t+1},
-observation эволюционирует замысел; LRU 8 сессий в RAM), `poler_literary_generate`
-(полный прогон: акты + драматургические пары + телеметрия + текст-разметка),
-`poler_literary_eject` (выгрузка сессий). Мушиная калибровка переиспользует
-тёплый коннектом WarmFly (csr один раз, каста от seeds).
-
-**S2/v0.36.0 Триединство — 2 инструмента:** `poler_triune_speak` (без session
-— рождает говорящее Триединство из seed/gamma; с session — продолжает
-разговор: text/tokens → речь + трейс провенанса sem/gate/syn/fly/tau +
-моторные интенты; мозг, муха и контекст живут между вызовами, LRU 4) и
-`poler_triune_state` (снимок без шага: последняя фраза, токены,
-телеметрия живого мозга). Кристалл — зашитый в бинарник .t5c;
-моторные интенты — ТОЛЬКО предложения poler_exec, исполнение за агентом.
-
-**E2: параллельное исполнение.** stdio-сервер исполняет exec-инструменты
-в пуле воркеров (2–8 потоков): агент может отправлять N запросов подряд —
-они выполняются ПАРАЛЛЕЛЬНО, ответы приходят по готовности (JSON-RPC
-сопоставляет по id). Пример: два `sleep 1` параллельно = 1.0 с стеновых,
-а не 2 с. C2 расширяет пул на всё семейство poler_fly_*.
-
-### M6: резидентное состояние (real-time, без холодного старта)
-
-Сервер держит в RAM между запросами: тёплый Гиппокамп (SQLite/RaBitQ/HNSW/
-эмбеддер — открыты один раз), LRU-кэш файлов для grep (инвалидация mtime+len)
-и WebIndex. Каждый dispatch замеряется и (опционально) стримится в
-зашифрованный журнал.
-
-```bash
-poler-engine --mcp --vault-log session.pvt          # + стриминг логов вызовов в Vault .pvt
-POLER_VAULT_PASS="фраза" poler-engine --mcp --vault-log session.pvt  # пароль через env
-poler-engine --mcp --mcp-ram-budget 64               # бюджет RAM-кэша, МиБ (по умолч. 48)
-poler-engine --mcp-bench 500                          # бенчмарк резидентности: cold vs warm p50/p95/p99
-```
-
-- Формат журнала в `.pvt`: JSON-строки `{"ts","method","tool","us","ok"}` —
-  файл **валиден на каждом коммите**, читается штатным `--memory-open/verify`.
-- `--mcp-bench` — приёмка M6: тёплые p99 < 5 мс (exit 0/1); на release-сборке
-  grep p50≈650 мкс / p99≤2 мс, knowledge p99≈250 мкс.
-
-## Верификационные числа (золотой стандарт)
-
-- Rust: **1302/1302** тестов (pnd-ffi; S2: +34 triune-семейство), default **1240/1240** (lib 1185 + интеграция/gateway/модели 55); Zig: **21/21** exec + 33/33 крипто/ABI; golden-векторы PND: **54 626 bit-for-bit**.
-- SSN S1 (доказательство до реализации): Python-пруф **67/67** проверок; F13-пруф **10/10** seed × 10k шагов (активность 4.5–5.2%, w@клип ≤ 1.9%); Rust full-fidelity **10/10** seed × 10k; CSE-паритет с Python побитовый (cos = 0.9987 / −0.3547); Кэли-дрейф 3.7e-14 за 2000 шагов.
-- Триединство S2 (доказано до реализации): детерминизм речи (seed → те же слова); вихрь жив во время речи (активность 6–10%, S < 0.8); **муха ломает циклы** (γ=0.8 vs γ=0, усреднение 8 seed × 40 токенов, анти-луп отключён для изоляции вклада); температура зажата [0.6, 1.8] при любых медиаторах; NMDA-гейт пропускает совпадающие смыслы; мотор отклоняет деструктив; .t5c раунд-трип побитовый + sha256 ловит порчу; **чанк-инвариантность потокового квантования** (чанки 1 Б … 64 КБ → идентичные байты); пик RAM ≤ 64 КБ при 200 КБ входа; сжатие 19.1× (1.673 бита/вес); keep=0.1 → 89.8% вакуума; f16-конверсия против эталонных битовых паттернов.
-- Муха C2 (ядро v783, артефакты из git): ротор-топ J[74067][133436] = +2395,
-  J[112021][86059] = +2343, J[129880][136978] = +2330; хаб 79529 — 6399 исх. /
-  5080 вх.; PageRank-топ 66912 (ранг 0.001836547); мотивы 79529 — 3684
-  реципрокных / 11 999 ff / 8082 fb; симуляция от 0 — [14, 455, 15 457]
-  активных, |торможение| > возбуждение на шаге 3; путь 0→116214 — w17 ach.
-- pqw/pqc: дифференциалы против fp32-эталонов — int8 cos > 0.999, int4 > 0.98, fp32 > 0.9999.
-- Токенизатор XLM-R: 40/40 текстов побитово = HF `tokenizers` v0.23.2.
-- BGE-M3 int8 (573 МБ): cos ≥ 0.9999 на всех 24 слоях. GLiNER (urchade/gliner_multi):
-  7/7 сущностей, скоры в допуске 0.03.
-- GLM-декодер: greedy ~1450 ток/с, MoE int4 ~840 ток/с (2 ядра CPU).
-- Vault: 33 МБ за 5.4 с (KDF 100k = 0.62 с фиксированно); tamper-детект побитовый.
-
-## Связанные навыки
-
-- `poler-causal-operator` — операционный манифест ℘-O-L-ε-R[n]-Ψ (как ДУМАТЬ в парадигме).
-- `document-translator` — перевод техдоков с защитой формул LaTeX и Mermaid.
-- Тестовый корпус: роман «Eteryya» https://github.com/Kotokvit/Eteryya
+AIDDE-паспорт: точка определения (definition_sites — сколько раз объявлен),
+upstream-потребители (кто сломается), downstream-зависимости, danger level.
+
+## Проверенные пределы (стресс-тест на живых корпусах)
+
+- **libgit2** (полный репо, 8000+ файлов, ~114 МБ): `feed --for edit` —
+  ~5 с, RSS ≤ 24 МБ; 215 хитов по запросу; 200 upstream-потребителей;
+  изолированный тест-блок с ε=2901.6 найден и подан в бюджет 3000 ток.
+- **Pride and Prejudice** (Project Gutenberg, 700 КБ): `feed --for
+  understand -q Darcy` — 0.2 с; 430 хитов; плотнейшая глава ε=8338;
+  ноль предлогов-сущностей в графе.
+- Код на чистом C: сигнатуры функций (в т.ч. многострочные) входят в скоуп
+  целиком; ключевые слова языка и слова из комментариев не попадают в граф
+  сущностей.
+
+## Философия (не нарушать)
+
+1. **Движок — инструмент, не ИИ**: индексировать/находить/отдавать/связывать;
+   понимает агент, творит автор.
+2. **Суверенный стек**: ноль облачных API, ноль внешних ключей, CPU + mmap.
+3. **Ноль словарей**: закрытые классы языка (предлоги/союзы/артикли ~170 слов)
+  — это грамматика, а не морфологические словари; всё остальное — аналитика.
+4. **Честность метрик**: ε = плотность; нагрузка = только граф; маркеры
+   пропуска и флаги `over_budget`/`truncated` говорят правду о пакете.
+5. **O(1) память**: ≤ 48 МБ RSS на любом объёме; терабайты перемалываются
+   потоком, миллисекунды на отклик.
+
+## Не путать
+
+- `--google-*` / `--nlm-*` / `--gcp-*` флаги в CLI существуют, но в этом
+  скиле НЕ используются и НЕ требуются.
+- Для генерации документов/презентаций/таблиц — соответствующие скилы
+  (docx/pdf/pptx/xlsx); poler-engine только находит и готовит контекст.
+- Для произвольного веб-поиска — web-search; poler-engine работает по
+  локальным путям (и офлайн-краулингу через `--crawl`).
+
+Полная вселенная (Vault .pvt, нативный инференс .pqw, MCP-семейство,
+муха C2, SSN, литературный двигатель): `README.md` и `docs/` репозитория.
