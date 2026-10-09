@@ -370,6 +370,94 @@ impl SignatureQuery {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Запрос-объявление типа (v0.85.0, ГРАБЛЯ 43)
+// ---------------------------------------------------------------------------
+
+/// Запрос-объявление типа: `class Name` / `struct Name` (+ хвост `:` `{` `;`).
+///
+/// ГРАБЛЯ 43 (LLVM, стресс-тест владельца): в определениях мировых C++
+/// проектов между ключевым словом и именем типа стоит макрос экспорта
+/// видимости — `class LLVM_ABI Function : public GlobalObject`,
+/// `class Q_CORE_EXPORT QObject`, `struct PLATFORM_EXPORT BMVert`.
+/// Токенайзер не рвёт `LLVM_ABI` (подчёркивание — словесный символ),
+/// строгая фраза (код-интент) требует соседства токенов — определение
+/// невидимо, выдачу забивают forward-декларации `class Function;`.
+/// Запрос формы «класс/структура + имя» включает мягкий fallback:
+/// между keyword и именем допускается гэп из макро-атрибутов
+/// (валидация — в [`crate::streaming::FileTokens::find_type_decl_gaps`]).
+///
+/// В легальном C++ между `class`/`struct` и именем типа не может стоять
+/// ничего, кроме атрибутов и макросов (грамматика: class-key
+/// attribute-specifier-seq[opt] class-head-name) — поэтому гэп-токен
+/// из заглавных/цифр/подчёркиваний почти наверняка макрос, ложных
+/// срабатываний на переменные/elaborated-описатели нет (гэп там пуст).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeDeclQuery {
+    /// Ключевое слово (lowercase): `class` | `struct`.
+    pub keyword: String,
+    /// Имя типа КАК НАПИСАНО в запросе (case-sensitive — как якорь
+    /// [`SignatureQuery`]: идентификаторы C++ чувствительны к регистру).
+    pub name_word: String,
+}
+
+impl TypeDeclQuery {
+    /// Разбирает запрос формы `class Name` / `struct Name` с необязательным
+    /// пунктуационным хвостом из `:` `{` `;` (базовый класс / тело /
+    /// декларация).
+    ///
+    /// Отказ (None):
+    /// * прикреплённая скобка — это сигнатурный слой ([`SignatureQuery`]);
+    /// * кириллица;
+    /// * слов ≠ 2: `enum class Color`, `class LLVM_ABI Function`
+    ///   (юзер сам вписал макрос — точный путь), `class Foo usage`;
+    /// * первое слово не `class`/`struct`;
+    /// * имя короче 2 символов или начинается с цифры (шум).
+    pub fn parse(query: &str) -> Option<Self> {
+        if query.chars().any(is_cyrillic) {
+            return None;
+        }
+        if SignatureQuery::parse(query).is_some() {
+            return None; // прикреплённая скобка — сигнатурный слой
+        }
+        let mut words: Vec<String> = Vec::new();
+        for tok in query.split_whitespace() {
+            let core: String = tok
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if core.is_empty() {
+                // пунктуационный хвост: допустимы только : { ;
+                if !tok.chars().all(|c| matches!(c, ':' | '{' | ';')) {
+                    return None;
+                }
+                continue;
+            }
+            if core.len() > 64 {
+                return None; // мусорный «токен» — не объявление типа
+            }
+            words.push(core);
+        }
+        if words.len() != 2 {
+            return None;
+        }
+        let keyword = words[0].to_lowercase();
+        if keyword != "class" && keyword != "struct" {
+            return None;
+        }
+        let name_word = words[1].clone();
+        if name_word.len() < 2
+            || name_word
+                .chars()
+                .next()
+                .map_or(true, |c| c.is_ascii_digit())
+        {
+            return None; // односимвольное/цифровое имя — шум
+        }
+        Some(Self { keyword, name_word })
+    }
+}
+
 #[inline]
 fn is_word_b(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
@@ -645,5 +733,47 @@ mod tests {
         let text = "let x = vec[0];";
         let pos = text.find("vec").unwrap();
         assert!(s.matches_at(text, pos));
+    }
+
+    // ---------- TypeDeclQuery::parse (v0.85.0, ГРАБЛЯ 43) ----------
+
+    #[test]
+    fn type_decl_parse_variants() {
+        // канонические формы запроса-объявления (+ хвост : { ;)
+        let td = TypeDeclQuery::parse("class Function :").unwrap();
+        assert_eq!(td.keyword, "class");
+        assert_eq!(td.name_word, "Function");
+        assert!(TypeDeclQuery::parse("struct BMVert {").is_some());
+        assert!(TypeDeclQuery::parse("class Function").is_some());
+        assert!(TypeDeclQuery::parse("class Function;").is_some());
+        assert!(TypeDeclQuery::parse("struct Function{").is_some());
+        // РЕГРЕССИЯ Blender v0.84.0: определение без макроса обязано
+        // идти точным путём — а значит, парс запроса должен работать
+    }
+
+    #[test]
+    fn type_decl_parse_rejects() {
+        // юзер сам вписал макрос — 3 слова, точный путь (LLVM-кейс
+        // владельца: `class LLVM_ABI Function` уже нашёл [1/1])
+        assert!(TypeDeclQuery::parse("class LLVM_ABI Function").is_none());
+        // enum class — 3 слова, не наш домен
+        assert!(TypeDeclQuery::parse("enum class Color :").is_none());
+        // прикреплённая скобка — сигнатурный слой
+        assert!(TypeDeclQuery::parse("class Function(").is_none());
+        assert!(TypeDeclQuery::parse("struct Function[").is_none());
+        // кириллица
+        assert!(TypeDeclQuery::parse("class Функція :").is_none());
+        // не class/struct
+        assert!(TypeDeclQuery::parse("impl Engine for").is_none());
+        assert!(TypeDeclQuery::parse("fn parse").is_none());
+        // 3+ слова / прозаический хвост
+        assert!(TypeDeclQuery::parse("class Function usage").is_none());
+        assert!(TypeDeclQuery::parse("class Function (deprecated)").is_none());
+        // мусорный хвост
+        assert!(TypeDeclQuery::parse("class Function ???").is_none());
+        // однобуквенное имя — шум
+        assert!(TypeDeclQuery::parse("class F").is_none());
+        // пусто
+        assert!(TypeDeclQuery::parse("").is_none());
     }
 }

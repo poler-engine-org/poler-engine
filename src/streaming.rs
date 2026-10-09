@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use crate::parser::markdown_scenes::{light_meta, LightSceneMeta, SceneBounds};
 use crate::parser::{detect_lang, extract_code_triples, extract_triples, CodeLang, SceneContext, Triple};
 use crate::resonance::{apply_iir_resonance, calculate_epsilon, semantic_bonus};
-use crate::search::intent::SignatureQuery;
+use crate::search::intent::{SignatureQuery, TypeDeclQuery};
 use crate::{with_text, EngineConfig, PiiCleaner, ResonanceMode};
 
 /// Порог «гигантского» файла: обрабатывается строго последовательно.
@@ -171,6 +171,74 @@ impl<'a> FileTokens<'a> {
             .filter(|i| self.tok(*i).starts_with(prefix))
             .map(|i| i as u32)
             .collect()
+    }
+
+    /// v0.85.0 (ГРАБЛЯ 43, LLVM): позиции токенов-ключевых слов
+    /// `class`/`struct`, за которыми через 1–4 макро-атрибута стоит имя
+    /// типа из запроса.
+    ///
+    /// `class LLVM_ABI Function : public GlobalObject {` при запросе
+    /// `class Function :` — строгая фраза не матчится (макрос между
+    /// токенами), гэп-паттерн находит определение. Валидация гэпа — по
+    /// сырому тексту между keyword и именем ([`is_macro_gap_region`]):
+    /// только целые слова из заглавных/цифр/подчёркиваний (LLVM_ABI,
+    /// Q_CORE_EXPORT, PLATFORM_EXPORT, __attribute__) и/или атрибутные
+    /// скобочные формы ([[nodiscard]], alignas(16), __declspec(...),
+    /// скобочные фрагменты). Ключевое слово обязано стоять в НАЧАЛЕ
+    /// строки: определения/декларации типов не пишут внутрь выражений,
+    /// а `friend class X;` и `enum class X` отсекаются этим же якорем.
+    ///
+    /// Хит — токен keyword (начало строки объявления): превью (v0.83.0)
+    /// начинается со строки хита → пользователь видит объявление целиком.
+    pub fn find_type_decl_gaps(&self, text: &str, td: &TypeDeclQuery) -> Vec<u32> {
+        let bytes = text.as_bytes();
+        let n = self.raw.len();
+        let mut out = Vec::new();
+        for i in 0..n {
+            if self.tok(i) != td.keyword {
+                continue;
+            }
+            if !at_line_start(bytes, self.pos[i] as usize) {
+                continue; // friend/enum-префикс/упоминание в выражении
+            }
+            // имя типа — в пределах нескольких токенов за keyword
+            let kw_end = self.pos[i] as usize + self.raw[i].len();
+            for j in (i + 1)..(i + 5).min(n) {
+                if self.raw[j] != td.name_word {
+                    continue; // кандидат-макрос в гэпе
+                }
+                let gap = &text[kw_end..self.pos[j] as usize];
+                if is_macro_gap_region(gap) {
+                    out.push(i as u32);
+                }
+                break; // первое вхождение имени в окне — единственный кандидат
+            }
+        }
+        out
+    }
+
+    /// v0.85.0: есть ли среди ТОЧНЫХ фразовых хитов (позиции keyword)
+    /// определение типа — keyword в начале строки + def-сигнал
+    /// ([`TypeDeclKind::Definition`]) после имени. Гасит гэп-fallback:
+    /// определение без макроса найдено точным путём (Blender-кейс
+    /// `struct BMVert {`).
+    pub fn has_type_def_exact(&self, text: &str, hits: &[u32]) -> bool {
+        let bytes = text.as_bytes();
+        hits.iter().any(|&h| {
+            let h = h as usize;
+            if h + 1 >= self.raw.len() {
+                return false;
+            }
+            // строгая фраза [keyword, name] нашлась в h — имя стоит в h+1
+            if !at_line_start(bytes, self.pos[h] as usize) {
+                return false; // friend-декларация/упоминание в выражении
+            }
+            let name_end = self.pos[h + 1] as usize + self.raw[h + 1].len();
+            matches!(
+                type_decl_kind_after(text, name_end),
+                TypeDeclKind::Definition
+            )
+        })
     }
 
     fn find_phrase_inner(&self, query: &[String], strict: bool) -> Vec<u32> {
@@ -328,6 +396,123 @@ pub fn streaming_counts(text: &str) -> (HashMap<Box<str>, u32>, u64) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.85.0: гэп макро-атрибутов объявления типа (ГРАБЛЯ 43, LLVM/Qt)
+// ---------------------------------------------------------------------------
+
+/// Форма объявления типа после имени (v0.85.0).
+///
+/// `Definition` — за именем стоит `{` (тело) или `:` (базовый класс /
+/// Python-класс); `Declaration` — `;` (forward-декларация) или иной
+/// токен (elaborated-описатель переменной, упоминание в комментарии).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeDeclKind {
+    Definition,
+    Declaration,
+}
+
+/// Токен стоит в начале строки: от него назад — только пробелы/табы
+/// до перевода строки (или начала файла).
+fn at_line_start(bytes: &[u8], pos: usize) -> bool {
+    let mut i = pos;
+    while i > 0 {
+        match bytes[i - 1] {
+            b'\n' => return true,
+            b' ' | b'\t' | b'\r' => i -= 1,
+            _ => return false,
+        }
+    }
+    true // начало файла
+}
+
+/// Def-сигнал после имени типа (v0.85.0).
+///
+/// 1) та же строка: ws → необязательное `final` → ws → `{`/`:` = Definition,
+///    `;` = Declaration;
+/// 2) стиль «class Foo\n{» — ограниченный проход по whitespace дальше
+///    (≤2 переводов строки, ≤24 байт): `{` или `:` = Definition.
+///
+/// Python-классы (`class Foo:`) честно считаются определениями:
+/// `:` сразу после имени — база (для C++) либо заголовок класса (Python).
+pub(crate) fn type_decl_kind_after(text: &str, name_end: usize) -> TypeDeclKind {
+    let bytes = text.as_bytes();
+    let mut i = name_end;
+    // 1) та же строка: пропускаем ws, необязательное `final`, снова ws.
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r') {
+        i += 1;
+    }
+    if text[i..].starts_with("final") {
+        i += "final".len();
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r') {
+            i += 1;
+        }
+    }
+    match bytes.get(i) {
+        Some(b'{') | Some(b':') => return TypeDeclKind::Definition,
+        Some(b';') => return TypeDeclKind::Declaration,
+        _ => {}
+    }
+    // 2) `{`/базовый класс на следующей строке.
+    let mut newlines = 0usize;
+    while i < bytes.len() && newlines <= 2 && i - name_end <= 24 {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'\n' => {
+                newlines += 1;
+                i += 1;
+            }
+            b'{' | b':' => return TypeDeclKind::Definition,
+            _ => return TypeDeclKind::Declaration,
+        }
+    }
+    TypeDeclKind::Declaration
+}
+
+/// Гэп между keyword и именем типа — только макро-атрибуты (v0.85.0).
+///
+/// Пустой гэп — НЕ гэп (точная фраза, чужая семантика), перевод строки —
+/// не гэп (объявление обязано жить в одной строке до имени), частей ≤ 4.
+fn is_macro_gap_region(gap: &str) -> bool {
+    if gap.is_empty() || gap.contains('\n') {
+        return false;
+    }
+    let parts: Vec<&str> = gap.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    parts.iter().all(|p| is_macro_gap_part(p))
+}
+
+/// Одна часть гэпа: макрос или атрибутная форма.
+///
+/// * целое слово из заглавных/цифр/подчёркиваний — LLVM_ABI,
+///   Q_CORE_EXPORT, PLATFORM_EXPORT, V8_EXPORT, EXPORT;
+/// * `[[...]]` — [[nodiscard]], [[deprecated("x")]];
+/// * `alignas`/`alignas(16)`;
+/// * GNU/MS-формы (строчные ключевые слова!): `__attribute__`,
+///   `__declspec` — отдельно или со скобочной группой;
+/// * скобочные фрагменты — `((visibility("default")))`, `(dllexport)`:
+///   начинается с `(` либо заканчивается `)` (в легальном C++ между
+///   class/struct и именем ничего иного стоять не может — грамматика
+///   допускает только attribute-specifier-seq и макросы).
+fn is_macro_gap_part(part: &str) -> bool {
+    if part.is_empty() {
+        return false;
+    }
+    let first = part.as_bytes()[0];
+    let all_caps_word = (first.is_ascii_uppercase() || first == b'_')
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    all_caps_word
+        || part.starts_with("[[")
+        || part.starts_with("alignas")
+        || part.starts_with("__attribute__")
+        || part.starts_with("__declspec")
+        || part.starts_with('(')
+        || part.ends_with(')')
+}
+
+// ---------------------------------------------------------------------------
 // Литеральный предфильтр (Teddy SIMD — v2.0 задача 2.5)
 // ---------------------------------------------------------------------------
 
@@ -390,11 +575,21 @@ pub fn literal_present(raw: &str, query_tokens: &[String], pre: &Option<Teddy>) 
 /// позиции токенов, начинающихся с якоря идентификатора. Считается ТОЛЬКО
 /// когда точных хитов в файле нет — движок решает глобально, точные хиты
 /// где-либо есть → fallback не включается и эти позиции отбрасываются.
+///
+/// `type_def_exact`/`type_gap_hits` (v0.85.0) — зеркальный протокол для
+/// объявлений типов с макро-атрибутами (ГРАБЛЯ 43): def-сигнал точных
+/// хитов (гасит fallback глобально) и ленивые гэп-хиты
+/// `class МАКРО_АТРИБУТ Name` — только в файлах без точных хитов.
 pub struct Pass1File {
     pub counts: HashMap<Box<str>, u32>,
     pub total: u64,
     pub hits: Vec<u32>,
     pub prefix_hits: Vec<u32>,
+    /// v0.85.0: среди точных хитов есть определение типа (def-сигнал
+    /// `{`/`:` после имени, keyword в начале строки). Только код-файлы.
+    pub type_def_exact: bool,
+    /// v0.85.0: хиты гэп-паттерна `class/struct МАКРО_АТРИБУТ Name`.
+    pub type_gap_hits: Vec<u32>,
 }
 
 pub fn pass1_file(
@@ -405,6 +600,7 @@ pub fn pass1_file(
     _cleaner: &PiiCleaner,
     pre: &Option<Teddy>,
     prefix_anchor: Option<&str>,
+    type_decl: Option<&TypeDeclQuery>,
 ) -> Option<Pass1File> {
     with_text(path, config.max_file_bytes, |raw| {
         // Предфильтр по сырому тексту: файлы без литерала не токенизируются,
@@ -421,6 +617,8 @@ pub fn pass1_file(
                 total,
                 hits: Vec::new(),
                 prefix_hits: Vec::new(),
+                type_def_exact: false,
+                type_gap_hits: Vec::new(),
             };
         }
         let ft = FileTokens::build(raw);
@@ -439,6 +637,21 @@ pub fn pass1_file(
         } else {
             Vec::new()
         };
+        // v0.85.0 (ГРАБЛЯ 43): протокол объявлений типов — зеркально
+        // prefix_hits. Точные хиты: def-сигнал (гасит гэп-fallback
+        // глобально — Blender-кейс `struct BMVert {`). Нет точных:
+        // лениво ищем гэп `class МАКРО Name` (LLVM-кейс). Только
+        // код-файлы: определения типов в документации не живут.
+        let (type_def_exact, type_gap_hits) = match type_decl {
+            Some(td) if is_code_file(path) => {
+                if hits.is_empty() {
+                    (false, ft.find_type_decl_gaps(raw, td))
+                } else {
+                    (ft.has_type_def_exact(raw, &hits), Vec::new())
+                }
+            }
+            _ => (false, Vec::new()),
+        };
         let total = ft.toks_len() as u64;
         // v2.0: словарь файла перемещается целиком (ноль клонов строк);
         // интернирование в FSST-арену происходит в sink под мьютексом.
@@ -447,6 +660,8 @@ pub fn pass1_file(
             total,
             hits,
             prefix_hits,
+            type_def_exact,
+            type_gap_hits,
         }
     })
 }
@@ -593,6 +808,7 @@ pub fn pass2_giant_parallel(
     hits: &[u32],
     signature: Option<&SignatureQuery>,
     soft_prefix: Option<&str>,
+    type_gap: Option<&TypeDeclQuery>,
 ) -> Option<Pass2Result> {
     use rayon::prelude::*;
 
@@ -652,10 +868,13 @@ pub fn pass2_giant_parallel(
                 }
                 let sub_text = &text[*start..*end];
                 let sub_ft = FileTokens::build(sub_text);
-                // v0.83.0: мягкий fallback — префикс-семантика якоря; в
-                // норме — прежняя фразовая (strict для код-интента).
+                // v0.83.0: мягкий fallback — префикс-семантика якоря;
+                // v0.85.0: гэп-семантика объявления типа (ГРАБЛЯ 43);
+                // в норме — прежняя фразовая (strict для код-интента).
                 let sub_hits = if let Some(pa) = soft_prefix {
                     sub_ft.find_token_prefix(pa)
+                } else if let Some(td) = type_gap {
+                    sub_ft.find_type_decl_gaps(sub_text, td)
                 } else if strict_phrase {
                     sub_ft.find_phrase_strict(query_tokens)
                 } else {
@@ -1663,5 +1882,108 @@ mod tests {
         let hits = ft.find_token_prefix("wslua_proto");
         assert_eq!(hits.len(), 1, "hits={hits:?}");
         assert_eq!(ft.tok(hits[0] as usize), "wslua_proto_register");
+    }
+
+    // ---------- v0.85.0: гэп макро-атрибутов объявления типа ----------
+
+    #[test]
+    fn find_type_decl_gaps_macro_families() {
+        // LLVM / Qt / Chromium-морфология: макрос экспорта между
+        // class/struct и именем типа
+        let text = "class LLVM_ABI Function : public GlobalObject {\n\
+                    class Q_CORE_EXPORT QObject {\n\
+                    struct PLATFORM_EXPORT BMVert {\n\
+                    class __attribute__ ((visibility(\"default\"))) Module {\n\
+                    struct alignas(16) BMEdge {\n\
+                    class [[deprecated]] LegacyAPI {\n";
+        let ft = FileTokens::build(text);
+        let td = TypeDeclQuery::parse("class Function :").unwrap();
+        let hits = ft.find_type_decl_gaps(text, &td);
+        assert_eq!(hits.len(), 1, "hits={hits:?}");
+        // хит — токен keyword в начале строки объявления
+        assert_eq!(ft.tok(hits[0] as usize), "class");
+
+        for (query, name) in [
+            ("class QObject", "Q_CORE_EXPORT"),
+            ("struct BMVert {", "PLATFORM_EXPORT"),
+            ("class Module", "__attribute__"),
+            ("struct BMEdge {", "alignas"),
+            ("class LegacyAPI", "[[deprecated]]"),
+        ] {
+            let td = TypeDeclQuery::parse(query).unwrap();
+            let hits = ft.find_type_decl_gaps(text, &td);
+            assert_eq!(hits.len(), 1, "{query}: hits={hits:?}");
+            let _ = name;
+        }
+    }
+
+    #[test]
+    fn find_type_decl_gaps_rejects_non_macros() {
+        // без гэпа (точная фраза), enum-префикс, комментарий,
+        // не-в-начале-строки, квалифицированное имя, lowercase-гэп
+        let text = "class Function {\n\
+                    enum class Color : int {\n\
+                    // class LLVM_ABI Function : public X {\n\
+                    void f() { class Local Foo; }\n\
+                    class llvm::Function;\n\
+                    class my_macro Function;\n\
+                    friend class Function;\n";
+        let ft = FileTokens::build(text);
+        let td = TypeDeclQuery::parse("class Function :").unwrap();
+        let hits = ft.find_type_decl_gaps(text, &td);
+        assert!(hits.is_empty(), "ложные гэп-хиты: {hits:?}");
+    }
+
+    #[test]
+    fn find_type_decl_gaps_case_sensitive_name() {
+        // имя чувствительно к регистру (как якорь сигнатуры)
+        let text = "class LLVM_ABI function : public X {\n";
+        let ft = FileTokens::build(text);
+        let td = TypeDeclQuery::parse("class Function :").unwrap();
+        assert!(ft.find_type_decl_gaps(text, &td).is_empty());
+    }
+
+    #[test]
+    fn type_decl_kind_after_forms() {
+        use super::TypeDeclKind::{Declaration, Definition};
+        let cases: &[(&str, TypeDeclKind)] = &[
+            ("class Foo {", Definition),          // тело на той же строке
+            ("class Foo : public Bar {", Definition), // базовый класс
+            ("class Foo final : public Bar {", Definition), // final между
+            ("struct Foo\n{", Definition),         // тело на следующей строке
+            ("struct Foo\n    : public Bar {", Definition), // база ниже
+            ("class Foo;", Declaration),           // forward-декларация
+            ("struct Foo x;", Declaration),        // elaborated-описатель
+            ("class Foo is used", Declaration),    // проза
+            ("class Foo:", Definition),            // Python-класс
+        ];
+        for (line, want) in cases {
+            let name_end = line.find("Foo").unwrap() + "Foo".len();
+            let got = super::type_decl_kind_after(line, name_end);
+            assert_eq!(got, *want, "{line}: got={got:?}");
+        }
+    }
+
+    #[test]
+    fn has_type_def_exact_signal() {
+        // точная фраза нашлась: def-сигнал различает определение
+        // и forward-декларацию (гасит/не гасит гэп-fallback)
+        let def = "class Function {\n  int x;\n};\n";
+        let ft = FileTokens::build(def);
+        let td_hits = ft.find_phrase_strict(&["class".into(), "function".into()]);
+        assert!(!td_hits.is_empty());
+        assert!(ft.has_type_def_exact(def, &td_hits));
+
+        let fwd = "class Function;\nvoid use(Function *f);\n";
+        let ft2 = FileTokens::build(fwd);
+        let hits2 = ft2.find_phrase_strict(&["class".into(), "function".into()]);
+        assert!(!hits2.is_empty());
+        assert!(!ft2.has_type_def_exact(fwd, &hits2));
+
+        // friend-декларация — не определение (не в начале строки)
+        let friend = "friend class Function;\n";
+        let ft3 = FileTokens::build(friend);
+        let hits3 = ft3.find_phrase_strict(&["class".into(), "function".into()]);
+        assert!(!ft3.has_type_def_exact(friend, &hits3));
     }
 }

@@ -69,6 +69,12 @@ pub struct SearchResult {
     /// не срабатывал.
     #[serde(default, skip_serializing_if = "is_false")]
     pub soft_fallback: bool,
+    /// v0.85.0: разновидность мягкого fallback — "prefix" (v0.83.0,
+    /// скобка) или "type_decl_gap" (макро-атрибут между class/struct и
+    /// именем типа, ГРАБЛЯ 43). Скрыт в JSON, когда fallback не
+    /// срабатывал; агенты различают причину без парсинга stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_fallback_kind: Option<String>,
     pub anchors: Vec<ContextAnchor>,
 }
 
@@ -239,6 +245,7 @@ mod tests {
             query: "нокс".into(),
             total_hits: 3,
             soft_fallback: false,
+            soft_fallback_kind: None,
             anchors: vec![ContextAnchor {
                 file: "/book/chapter_36.md".into(),
                 rel_file: Some("chapter_36.md".into()),
@@ -280,6 +287,8 @@ mod tests {
         assert!(a["scene"].get("subject_names").is_none());
         // soft_fallback=false скрыт (v0.83.0: флаг появляется только в fallback)
         assert!(v.get("soft_fallback").is_none());
+        // v0.85.0: разновидность тоже скрыта без fallback
+        assert!(v.get("soft_fallback_kind").is_none());
         // k_hop_relations — массивы из трёх строк
         let rel = &a["k_hop_relations"][0];
         assert_eq!(rel.as_array().unwrap().len(), 3);

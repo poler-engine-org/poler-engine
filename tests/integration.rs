@@ -1517,3 +1517,173 @@ fn soft_fallback_flag_serialized_only_when_true() {
         "флаг не должен сериализоваться при обычном поиске"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v0.85.0: макро-атрибуты между class/struct и именем типа (ГРАБЛЯ 43,
+// стресс-тест владельца на LLVM: `class LLVM_ABI Function :` невидим для
+// запроса `class Function :`, выдачу забивают forward-декларации)
+// ---------------------------------------------------------------------------
+
+/// LLVM-морфология: определение за макросом экспорта видимости.
+const LLVM_FN_H: &str = r#"#pragma once
+namespace llvm {
+class LLVM_ABI Function : public GlobalObject {
+public:
+  Function(Type *Ty, LinkageTypes Linkage);
+  const BasicBlock &getEntryBlock() const;
+};
+} // end namespace llvm
+"#;
+
+/// Forward-декларации — они и забивали выдачу в v0.84.0.
+const LLVM_FWD_H: &str = r#"#pragma once
+namespace llvm {
+class Function;
+class Module;
+class BasicBlock;
+class GlobalObject;
+friend class Function;
+void printFunctionName(const Function *F);
+} // end namespace llvm
+"#;
+
+#[test]
+fn type_decl_gap_fallback_finds_macro_definition() {
+    // Кейс владельца (LLVM): `class Function :` выдал 10 forward-деклараций,
+    // определение спрятано за LLVM_ABI. v0.85.0: гэп-fallback поднимает
+    // определение на [1], forward-декларации больше не вытесняют его.
+    let dir = TempDir::new().unwrap();
+    let inc = dir.path().join("include/llvm/IR");
+    fs::create_dir_all(&inc).unwrap();
+    fs::write(inc.join("Function.h"), LLVM_FN_H).unwrap();
+    fs::write(inc.join("FunctionFwd.h"), LLVM_FWD_H).unwrap();
+
+    let res = scan_path(dir.path(), "class Function :", &EngineConfig::default());
+    assert!(
+        res.total_hits > 0,
+        "гэп-fallback обязан находить определение за макросом"
+    );
+    assert!(res.soft_fallback, "флаг soft_fallback не поднят");
+    assert_eq!(
+        res.soft_fallback_kind.as_deref(),
+        Some("type_decl_gap"),
+        "разновидность fallback обязана быть type_decl_gap"
+    );
+    // топ-1 — определение (Function.h), не forward-декларации
+    let top = &res.anchors[0];
+    assert!(
+        top.file.ends_with("Function.h"),
+        "топ-1 обязан быть определением, не forward: {}",
+        top.file
+    );
+    assert_eq!(top.line, 3, "строка определения class LLVM_ABI Function");
+    let preview = top.preview.as_deref().expect("превью материализовано");
+    let first = preview.lines().next().unwrap_or("");
+    assert!(
+        first.contains("class LLVM_ABI Function"),
+        "превью обязано начинаться со строки определения: {first:?}"
+    );
+    // simple-рендер несёт определение
+    let s = render_simple(&res);
+    assert!(
+        s.contains("class LLVM_ABI Function"),
+        "simple не содержит определение: {s}"
+    );
+    // JSON-контракт: разновидность сериализуется только в fallback
+    let v = serde_json::to_value(&res).unwrap();
+    assert_eq!(v["soft_fallback_kind"], serde_json::json!("type_decl_gap"));
+}
+
+#[test]
+fn type_decl_exact_definition_disables_gap_fallback() {
+    // РЕГРЕССИЯ Blender (v0.84.0): `struct BMVert {` — определение без
+    // макроса, def-сигнал точного хита гасит гэп-fallback: точный путь.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("bmesh_class.hh"),
+        "#pragma once\nstruct BMVert {\n  struct BMHeader head;\n  int index;\n};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("fwd.hh"),
+        "#pragma once\nstruct BMVert;\nstruct BMEdge;\n",
+    )
+    .unwrap();
+
+    let res = scan_path(dir.path(), "struct BMVert {", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+    assert!(
+        !res.soft_fallback,
+        "точное определение гасит гэп-fallback"
+    );
+    assert!(res.soft_fallback_kind.is_none());
+    assert!(
+        res.anchors[0].file.ends_with("bmesh_class.hh"),
+        "топ-1 — точное определение: {}",
+        res.anchors[0].file
+    );
+}
+
+#[test]
+fn type_decl_explicit_macro_query_stays_exact() {
+    // Юзер сам вписал макрос — 3 слова, TypeDeclQuery не парсится,
+    // точная строгая фраза без всякого fallback (поведение v0.84.0).
+    let dir = TempDir::new().unwrap();
+    let inc = dir.path().join("include/llvm/IR");
+    fs::create_dir_all(&inc).unwrap();
+    fs::write(inc.join("Function.h"), LLVM_FN_H).unwrap();
+    fs::write(inc.join("FunctionFwd.h"), LLVM_FWD_H).unwrap();
+
+    let res = scan_path(dir.path(), "class LLVM_ABI Function", &EngineConfig::default());
+    assert!(res.total_hits > 0, "точная фраза обязана находить определение");
+    assert!(!res.soft_fallback, "точный путь — без fallback");
+    assert!(res.soft_fallback_kind.is_none());
+    assert!(res.anchors[0].file.ends_with("Function.h"));
+}
+
+#[test]
+fn type_decl_gap_only_decls_honest_fallback() {
+    // Гэп-хиты есть, но все — декларации (`class MY_EXPORT Widget;`):
+    // fallback честно возвращает их (детерминированно), не выдумывая
+    // определение, и помечает разновидность.
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("widget.h"),
+        "#pragma once\nclass MY_EXPORT Widget;\nvoid make(Widget *w);\n",
+    )
+    .unwrap();
+
+    let res = scan_path(dir.path(), "class Widget", &EngineConfig::default());
+    assert!(res.total_hits > 0, "гэп-fallback находит макро-декларацию");
+    assert!(res.soft_fallback);
+    assert_eq!(res.soft_fallback_kind.as_deref(), Some("type_decl_gap"));
+    let top = &res.anchors[0];
+    let preview = top.preview.as_deref().unwrap_or("");
+    assert!(
+        preview.contains("class MY_EXPORT Widget"),
+        "превью обязано показать макро-декларацию: {preview:?}"
+    );
+}
+
+#[test]
+fn type_decl_gap_respects_qt_morphology() {
+    // Qt: `class Q_CORE_EXPORT QObject` при запросе `class QObject :`
+    // (вторая мировая конвенция экспорта после LLVM).
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("qobject.h"),
+        "#pragma once\nclass Q_CORE_EXPORT QObject : public QObjectBase {\n\
+         public:\n  QObject(QObject *parent = nullptr);\n};\n",
+    )
+    .unwrap();
+
+    let res = scan_path(dir.path(), "class QObject :", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+    assert!(res.soft_fallback);
+    assert_eq!(res.soft_fallback_kind.as_deref(), Some("type_decl_gap"));
+    let preview = res.anchors[0].preview.as_deref().unwrap_or("");
+    assert!(
+        preview.contains("class Q_CORE_EXPORT QObject"),
+        "превью обязано показать Qt-определение: {preview:?}"
+    );
+}

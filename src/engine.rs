@@ -26,7 +26,7 @@ use crate::graph::EntityGraph;
 use crate::output::{ContextAnchor, SearchResult};
 use crate::parser::markdown_scenes::truncate_char_safe;
 use crate::parser::SceneContext;
-use crate::search::intent::{hit_tier, IntentMode, QueryIntent, SignatureQuery};
+use crate::search::intent::{hit_tier, IntentMode, QueryIntent, SignatureQuery, TypeDeclQuery};
 use crate::streaming::{self, HitRecord, Pass2Result, SceneInfo};
 
 use crate::{collect_files, with_text, EngineConfig, PiiCleaner, PiiMode, ScanStats};
@@ -72,6 +72,9 @@ struct FileEntry {
     hit_keys: PostingsStore,
     /// Число хитов, прошедших temporal-фильтр (честный total_hits).
     hits_temporal: usize,
+    /// v0.85.0: точный хит-определение типа (def-сигнал) — гасит
+    /// гэп-fallback в инкрементальном прогоне.
+    has_type_def: bool,
     /// Только top_n лучших якорей файла (по резонансу).
     records: Vec<HitRecord>,
     scenes: HashMap<(usize, usize), SceneInfo>,
@@ -157,6 +160,7 @@ impl Engine {
                     query: query.to_string(),
                     total_hits: 0,
                     soft_fallback: false,
+                    soft_fallback_kind: None,
                     anchors: Vec::new(),
                 },
                 stats,
@@ -183,6 +187,17 @@ impl Engine {
         // префиксные хиты ТОЛЬКО в файлах без точных хитов.
         let sig_prefix: Option<String> =
             signature.as_ref().map(|s| s.anchor_word.to_lowercase());
+        // v0.85.0 (ГРАБЛЯ 43, LLVM): запрос-объявление типа
+        // `class Name` / `struct Name` (+ хвост `:`/`{`/`;`) — мягкий
+        // fallback на макро-атрибуты между keyword и именем
+        // (`class LLVM_ABI Function` при запросе `class Function :`).
+        // Только строгая фраза (код-интент) и без сигнатурной скобки —
+        // слоя взаимно исключны по форме запроса.
+        let type_decl: Option<TypeDeclQuery> = if strict_phrase && signature.is_none() {
+            TypeDeclQuery::parse(query)
+        } else {
+            None
+        };
 
         // ---------- классификация файлов (incremental) ----------
         // v2.0: словарь корпуса (FSST-арена) живёт в состоянии и переходит
@@ -240,6 +255,11 @@ impl Engine {
             /// v0.83.0: кандидаты мягкого fallback — файлы без точных,
             /// но с префиксными хитами (отдельно, чтобы не смешивать семантики).
             prefix_hit_files: HashMap<PathBuf, Vec<u32>>,
+            /// v0.85.0: файлы с гэп-хитами `class МАКРО Name` (без точных) —
+            /// кандидаты fallback'а объявлений типов (ГРАБЛЯ 43).
+            type_gap_hit_files: HashMap<PathBuf, Vec<u32>>,
+            /// v0.85.0: файлы, где точный хит — определение типа (def-сигнал).
+            type_def_files: HashSet<PathBuf>,
             entries: HashMap<PathBuf, FileEntry>,
         }
 
@@ -280,14 +300,23 @@ impl Engine {
                         hits: hits_store,
                         hit_keys: PostingsStore::default(),
                         hits_temporal: 0,
+                        has_type_def: r.type_def_exact,
                         records: Vec::new(),
                         scenes: HashMap::new(),
                     },
                 );
                 if !r.hits.is_empty() {
                     self.hit_files.insert(path.to_path_buf(), r.hits);
+                    if r.type_def_exact {
+                        self.type_def_files.insert(path.to_path_buf());
+                    }
                 } else if !r.prefix_hits.is_empty() {
                     self.prefix_hit_files.insert(path.to_path_buf(), r.prefix_hits);
+                } else if !r.type_gap_hits.is_empty() {
+                    // v0.85.0: ленивые гэп-кандидаты — только файлы без
+                    // точных и без префиксных (слои исключны по форме запроса).
+                    self.type_gap_hit_files
+                        .insert(path.to_path_buf(), r.type_gap_hits);
                 }
             }
 
@@ -310,6 +339,8 @@ impl Engine {
             n_total: 0,
             hit_files: HashMap::new(),
             prefix_hit_files: HashMap::new(),
+            type_gap_hit_files: HashMap::new(),
+            type_def_files: HashSet::new(),
             entries: HashMap::new(),
         };
         for e in kept.values() {
@@ -327,6 +358,7 @@ impl Engine {
                 &cleaner,
                 &pre,
                 sig_prefix.as_deref(),
+                type_decl.as_ref(),
             ) {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
@@ -342,6 +374,7 @@ impl Engine {
                 &cleaner,
                 &pre,
                 sig_prefix.as_deref(),
+                type_decl.as_ref(),
             ) {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
@@ -363,6 +396,27 @@ impl Engine {
             if !exact_any && !sink.prefix_hit_files.is_empty() {
                 soft_prefix = sig_prefix.clone();
                 sink.hit_files = std::mem::take(&mut sink.prefix_hit_files);
+            }
+        }
+        // ---------- v0.85.0: мягкий fallback макро-атрибутов ----------
+        // объявления типа (ГРАБЛЯ 43, LLVM/Qt/Chromium)
+        //
+        // Кейс владельца: `class Function :` выдал 10 forward-деклараций —
+        // определение спрятано за `class LLVM_ABI Function : public …`.
+        // Триггер: НИ ОДИН точный хит не является определением
+        // (def-сигнал `{`/`:` после имени отсутствует глобально) — либо
+        // точных нет вовсе — и есть гэп-хиты. Гэп-хиты подменяют
+        // hit_files (зеркально протоколу v0.83.0): определение
+        // поднимается на [1], forward-декларации не вытесняют его.
+        // Точное определение без макроса гасит fallback (Blender-кейс
+        // `struct BMVert {` идёт точным путём v0.84.0).
+        let mut soft_type_gap = false;
+        if type_decl.is_some() {
+            let has_exact_def = !sink.type_def_files.is_empty()
+                || kept.values().any(|e| e.has_type_def);
+            if !has_exact_def && !sink.type_gap_hit_files.is_empty() {
+                soft_type_gap = true;
+                sink.hit_files = std::mem::take(&mut sink.type_gap_hit_files);
             }
         }
         // Эффективный сигнатурный слой для pass 2 и финальной сортировки:
@@ -433,6 +487,7 @@ impl Engine {
                 hits,
                 signature_pass2,
                 soft_prefix.as_deref(),
+                if soft_type_gap { type_decl.as_ref() } else { None },
             ) {
                 results_mu
                     .lock()
@@ -634,7 +689,14 @@ impl Engine {
             SearchResult {
                 query: query.to_string(),
                 total_hits: full_hits,
-                soft_fallback: soft_prefix.is_some(),
+                soft_fallback: soft_prefix.is_some() || soft_type_gap,
+                soft_fallback_kind: if soft_prefix.is_some() {
+                    Some("prefix".to_string())
+                } else if soft_type_gap {
+                    Some("type_decl_gap".to_string())
+                } else {
+                    None
+                },
                 anchors,
             },
             stats,

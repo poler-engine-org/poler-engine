@@ -20,10 +20,10 @@ description: |
   «кто сломается, если править X», «подай контекст под токен-бюджет»,
   «разбей на сцены/чанки», «граф связей сущностей».
 language: ru
-version: 0.84.0
+version: 0.85.0
 ---
 
-# poler-engine — поисково-аналитический движок для агента (v0.84.0)
+# poler-engine — поисково-аналитический движок для агента (v0.85.0)
 
 ## Зачем этот скил существует
 
@@ -47,11 +47,11 @@ version: 0.84.0
 
 ## Установка (уже выполнена в этом окружении)
 
-- **Бинарник (release v0.84.0):** `~/.local/bin/poler-engine`
+- **Бинарник (release v0.85.0):** `~/.local/bin/poler-engine`
   (копия-эталон: `/home/z/my-project/scripts/poler-install/poler-engine`)
 - **Исходники:** `/home/z/my-project/skills/poler-engine/` (synced @ main)
   и dev-клон `/home/z/poler-engine-fresh`
-- Проверка: `poler-engine --version` → `poler-engine 0.84.0`
+- Проверка: `poler-engine --version` → `poler-engine 0.85.0`
 
 Пересборка (только если реально нужно):
 ```bash
@@ -222,6 +222,17 @@ fallback скобочного запроса. Режимы резонанса:
   `bmesh_class.hh` находится без ручного `--extensions hh`; `.cxx`/`.hxx`/
   `.inc`/`.inl` классифицируются как код и парсятся как фигурно-скобочные
   (enclosing_scope — функция целиком).
+- **Макро-прозрачность объявлений типов (v0.85.0, ГРАБЛЯ 43)**: запрос
+  `class Name :` / `struct Name` (+ хвост `:`/`{`/`;`) — если строгая фраза
+  не нашла НИ ОДНОГО определения (выдача из forward-деклараций `class X;`
+  или пуста), движок автоматически пропускает макросы экспорта между
+  keyword и именем: `class LLVM_ABI Function`, `class Q_CORE_EXPORT
+  QObject`, `struct PLATFORM_EXPORT BMVert`, а также атрибутные формы
+  `[[nodiscard]]`/`alignas(16)`/`__attribute__((...))`/`__declspec(...)`.
+  Определение поднимается на [1], JSON несёт `soft_fallback_kind:
+  "type_decl_gap"`, stderr — заметку. Точное определение без макроса
+  гасит fallback (Blender-путь v0.84.0); запрос с уже вписанным макросом
+  (`class LLVM_ABI Function`) идёт точным путём.
 - Управление: `--intent auto|code|prose|off` (по умолчанию auto;
   off — ранжирование чисто по R, как в v0.81).
 - **Честность метрик сохранена**: ε и R не искажаются — порядок задаёт
@@ -269,6 +280,17 @@ upstream-потребители (кто сломается), downstream-зави
   определение `struct BMVert` в `bmesh_class.hh` — из коробки, без
   ручного `--extensions hh` (в v0.83.0 требовался — грабля 42);
   код-интент держит .hh-определение выше .md-упоминаний.
+- **LLVM Project (LLVM_ABI и Q_CORE_EXPORT)** (v0.85.0, стресс-тест
+  владельца — C++ атрибуты видимости): `class Function :` в v0.84.0 выдал
+  10 forward-деклараций — определение `class LLVM_ABI Function : public
+  GlobalObject` было невидимо для строгой фразы. v0.85.0: гэп-fallback
+  поднимает определение на [1/1] (`include/llvm/IR/Function.h:65` в
+  живом LLVM, `Function.h:7` на фикстуре), Qt-морфология `class
+  Q_CORE_EXPORT QObject` — аналогично. Честный предел: макрос в гэпе
+  обязан выглядеть макросом (заглавные/цифры/подчёркивания, ≤4 части) —
+  квалифицированные имена `class llvm::Function` и lowercase-гэпы не
+  матчатся (сознательно: в легальном C++ между class/struct и именем
+  стоит только attribute-specifier-seq и макросы).
 - **libgit2** (полный репо, 8000+ файлов, ~114 МБ): `feed --for edit` —
   ~5 с, RSS ≤ 24 МБ; 215 хитов по запросу; 200 upstream-потребителей;
   изолированный тест-блок с ε=2901.6 найден и подан в бюджет 3000 ток.

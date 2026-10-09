@@ -205,7 +205,7 @@ pub use resonance::{
     apply_iir_resonance, calculate_epsilon, semantic_bonus, IirFilter, SlidingEpsilon,
 };
 pub use compression::{GlobalStats, PostingsStore, TermFreqs, VocabArena};
-pub use search::intent::{detect_query_intent, hit_tier, FileClass, IntentMode, QueryIntent, SignatureQuery};
+pub use search::intent::{detect_query_intent, hit_tier, FileClass, IntentMode, QueryIntent, SignatureQuery, TypeDeclQuery};
 pub use streaming::{FileTokens, GIANT_FILE_BYTES};
 pub use tokenizer::{InvertedIndex, PiiCleaner, PiiMode};
 

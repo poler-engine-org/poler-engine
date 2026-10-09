@@ -3211,11 +3211,20 @@ fn run(cli: Cli) -> ExitCode {
         }
         // v0.83.0: честный флаг мягкого fallback — на stderr (stdout-контракт
         // JSON/simple/md не загрязняется); JSON несёт soft_fallback:true.
+        // v0.85.0: две разновидности — префикс идентификатора (скобка,
+        // v0.83.0) и гэп макро-атрибутов объявления типа (ГРАБЛЯ 43).
         if result.soft_fallback {
-            eprintln!(
-                "poler-engine: точная сигнатура не найдена — мягкий fallback \
-                 на префикс идентификатора без скобки"
-            );
+            match result.soft_fallback_kind.as_deref() {
+                Some("type_decl_gap") => eprintln!(
+                    "poler-engine: определение типа не найдено строгой фразой \
+                     (макро-атрибут между class/struct и именем) — мягкий \
+                     fallback с пропуском макро-атрибута"
+                ),
+                _ => eprintln!(
+                    "poler-engine: точная сигнатура не найдена — мягкий fallback \
+                     на префикс идентификатора без скобки"
+                ),
+            }
         }
         print_result(&result, cli.format);
         if result.total_hits == 0 {
