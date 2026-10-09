@@ -213,8 +213,13 @@ pub use tokenizer::{InvertedIndex, PiiCleaner, PiiMode};
 pub const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".svn", ".hg", "__pycache__"];
 
 /// Расширения, сканируемые по умолчанию.
+///
+/// v0.83.0: +`zig`,`s`,`asm`,`lua` — низкоуровневые ядра (poler-os)
+/// и скрипты больше не отсекаются на обходе дерева. Матчинг расширений
+/// НЕЗАВИСИМ ОТ РЕГИСТРА (v0.83.0): `.s` GNU as и `.S` после cpp —
+/// оба покрываются записью `s` (конфиг приводится к нижнему регистру).
 pub const DEFAULT_EXTENSIONS: &str =
-    "md,markdown,txt,rst,rs,py,c,h,cpp,hpp,cc,js,jsx,ts,tsx,java,go,kt,swift,cs,scala,dart,json,toml,yaml,yml,sql,sh";
+    "md,markdown,txt,rst,rs,py,c,h,cpp,hpp,cc,js,jsx,ts,tsx,java,go,kt,swift,cs,scala,dart,zig,s,asm,lua,json,toml,yaml,yml,sql,sh";
 
 /// Режим накопления резонанса.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,7 +383,9 @@ pub fn collect_files(target: &Path, config: &EngineConfig) -> Vec<PathBuf> {
             e.path()
                 .extension()
                 .and_then(|s| s.to_str())
-                .map(|s| exts.iter().any(|x| x == s))
+                // v0.83.0: регистронезависимо — `.S` (после cpp) матчится
+                // на конфиг-запись `s`; конфиг и так фолдится в нижний регистр
+                .map(|s| exts.iter().any(|x| x.eq_ignore_ascii_case(s)))
                 .unwrap_or(false)
         })
         .map(|e| e.into_path())

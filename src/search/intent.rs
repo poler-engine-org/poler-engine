@@ -123,10 +123,13 @@ const DOC_HINT_WORDS: &[&str] = &[
 const DOC_EXTS: &[&str] = &["md", "markdown", "txt", "rst", "adoc", "org"];
 
 /// Расширения исходного кода.
+///
+/// v0.83.0: +`s`,`asm` (`.S` приводится к нижнему регистру здесь же).
 const CODE_EXTS: &[&str] = &[
     "rs", "py", "c", "h", "cpp", "hpp", "cc", "cxx", "js", "jsx", "ts", "tsx", "java",
     "go", "kt", "kts", "swift", "cs", "scala", "dart", "rb", "php", "pl", "lua",
     "sh", "bash", "zsh", "fish", "m", "mm", "zig", "v", "sv", "vh", "sql", "r", "jl",
+    "s", "asm",
 ];
 
 /// Определяет намерение запроса по структуре (детерминированно, без ML).

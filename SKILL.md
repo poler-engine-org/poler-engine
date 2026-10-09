@@ -20,10 +20,10 @@ description: |
   «кто сломается, если править X», «подай контекст под токен-бюджет»,
   «разбей на сцены/чанки», «граф связей сущностей».
 language: ru
-version: 0.82.0
+version: 0.83.0
 ---
 
-# poler-engine — поисково-аналитический движок для агента (v0.82.0)
+# poler-engine — поисково-аналитический движок для агента (v0.83.0)
 
 ## Зачем этот скил существует
 
@@ -47,11 +47,11 @@ version: 0.82.0
 
 ## Установка (уже выполнена в этом окружении)
 
-- **Бинарник (release v0.82.0):** `~/.local/bin/poler-engine`
+- **Бинарник (release v0.83.0):** `~/.local/bin/poler-engine`
   (копия-эталон: `/home/z/my-project/scripts/poler-install/poler-engine`)
 - **Исходники:** `/home/z/my-project/skills/poler-engine/` (synced @ main)
   и dev-клон `/home/z/poler-engine-fresh`
-- Проверка: `poler-engine --version` → `poler-engine 0.82.0`
+- Проверка: `poler-engine --version` → `poler-engine 0.83.0`
 
 Пересборка (только если реально нужно):
 ```bash
@@ -184,10 +184,13 @@ poler-engine ~/my-repo -q "архитектура" --format md   # в ответ
 ```
 
 Ключевые поля `ai-json`: `anchors[].epsilon` (плотность), `resonance`,
-`anchors[].scene.enclosing_scope` (полный скоуп), `k_hop_relations`,
-`anchors[].line` (номер строки хита, 1-based) и `anchors[].rel_file`
-(путь от корня сканирования — `gin.go:250` в simple-формате вместо
-абсолютного пути, съедающего терминал). Режимы резонанса:
+`anchors[].scene.enclosing_scope` (полный скоуп), `anchors[].preview`
+(v0.83.0: сниппет от СТРОКИ ХИТА — строка совпадения первая, сигнатура
+с модификаторами целиком), `k_hop_relations`, `anchors[].line` (номер
+строки хита, 1-based) и `anchors[].rel_file` (путь от корня сканирования).
+В simple/md путь резолвится из CWD агента (файл под CWD → относительно
+CWD, иначе абсолютный), `soft_fallback: true` маркирует прогон мягкого
+fallback скобочного запроса. Режимы резонанса:
 `--resonance-mode hits|field|psi|poler` (psi — скрытые сюжетные/смысловые
 связи).
 
@@ -206,6 +209,14 @@ poler-engine ~/my-repo -q "архитектура" --format md   # в ответ
   поднимает ЛИТЕРАЛЬНОЕ совпадение `func Default(` в топ (якорь
   case-sensitive, префиксные слова через `::`/`->`/`.`); call-site
   `Default(...)` без `func` перед ним не поднимается.
+- **Мягкий fallback (v0.83.0)**: точный хит со скобкой дал 0 результатов
+  (`proto_register_field(` при наличии только `proto_register_field_array`)
+  — автоматический переход на префикс идентификатора без скобки: семейство
+  продолжений находится, код остаётся выше документации (intent-тиры),
+  exit code 0 вместо 1; JSON несёт `soft_fallback: true`, stderr — заметку.
+- **Дефолтные расширения (v0.83.0)**: `zig`, `s`/`S`, `asm`, `lua` —
+  низкоуровневые ядра и скрипты сканируются без ручного `--extensions`;
+  матчинг расширений регистронезависим.
 - Управление: `--intent auto|code|prose|off` (по умолчанию auto;
   off — ранжирование чисто по R, как в v0.81).
 - **Честность метрик сохранена**: ε и R не искажаются — порядок задаёт
@@ -229,6 +240,15 @@ upstream-потребители (кто сломается), downstream-зави
   реальные `func Default(...)` (gin.go:250 в выдаче, line+rel_file в
   якоре). `-q "express()"` на expressjs/express — 54 мс, топ — литеральные
   call-sites `express()`.
+- **wireshark ~1.2 ГБ** (v0.83.0, стресс-тест владельца):
+  `-q "proto_register"` — точные C-сигнатуры за ~5–6 с без индексирования;
+  `proto_register_field(` (точного токена нет) — мягкий fallback находит
+  семейство `proto_register_field_array`, код выше доков, exit 0.
+- **poler-os (Zig/C/ASM/Python/MD)** (v0.83.0, стресс-тест владельца):
+  `fn schedule` в `zig-kernel/src64/scheduler.zig:791` без ручного
+  `--extensions` — сигнатура `pub fn schedule(...) callconv(.c) u64`
+  целиком в simple-выдаче; enclosing_scope в ai-json — функция с
+  архитектурными комментариями.
 - **libgit2** (полный репо, 8000+ файлов, ~114 МБ): `feed --for edit` —
   ~5 с, RSS ≤ 24 МБ; 215 хитов по запросу; 200 upstream-потребителей;
   изолированный тест-блок с ε=2901.6 найден и подан в бюджет 3000 ток.

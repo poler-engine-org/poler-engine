@@ -3209,6 +3209,14 @@ fn run(cli: Cli) -> ExitCode {
                 stats.elapsed_ms
             );
         }
+        // v0.83.0: честный флаг мягкого fallback — на stderr (stdout-контракт
+        // JSON/simple/md не загрязняется); JSON несёт soft_fallback:true.
+        if result.soft_fallback {
+            eprintln!(
+                "poler-engine: точная сигнатура не найдена — мягкий fallback \
+                 на префикс идентификатора без скобки"
+            );
+        }
         print_result(&result, cli.format);
         if result.total_hits == 0 {
             ExitCode::from(1)

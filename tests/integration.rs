@@ -1054,27 +1054,27 @@ use poler_engine::{render_simple, IntentMode};
 const GIN_GO: &str = r#"package gin
 
 import (
-	"net/http"
+        "net/http"
 )
 
 // Default returns an Engine instance with the Logger
 // and Recovery middleware already attached.
 func Default() *Engine {
-	engine := New()
-	engine.Use(Logger(), Recovery())
-	return engine
+        engine := New()
+        engine.Use(Logger(), Recovery())
+        return engine
 }
 
 func New() *Engine {
-	debugPrintWARNINGNew()
-	engine := &Engine{
-		RouterGroup: RouterGroup{
-			Handlers: nil,
-			basePath: "/",
-			root:     true,
-		},
-	}
-	return engine
+        debugPrintWARNINGNew()
+        engine := &Engine{
+                RouterGroup: RouterGroup{
+                        Handlers: nil,
+                        basePath: "/",
+                        root:     true,
+                },
+        }
+        return engine
 }
 "#;
 
@@ -1083,18 +1083,18 @@ func New() *Engine {
 const BINDING_GO: &str = r#"package binding
 
 type formMapping struct {
-	formatter formatter
+        formatter formatter
 }
 
 type exampleStruct struct {
-	Name    string `form:"name" binding:"required"`
-	Age     int    `form:",default=1"`
-	Enabled bool   `form:"enabled,default=true"`
-	Slot    int    `form:"slot,default=0"`
+        Name    string `form:"name" binding:"required"`
+        Age     int    `form:",default=1"`
+        Enabled bool   `form:"enabled,default=true"`
+        Slot    int    `form:"slot,default=0"`
 }
 
 func mapForm(ptr any, tag string) error {
-	return decode(ptr, tag)
+        return decode(ptr, tag)
 }
 "#;
 
@@ -1262,4 +1262,176 @@ fn single_file_target_uses_file_name() {
     let top = &res.anchors[0];
     assert_eq!(top.rel_file.as_deref(), Some("gin.go"));
     assert_eq!(top.line, def_line());
+}
+
+// ---------------------------------------------------------------------------
+// v0.83.0: мягкий fallback скобочного запроса + превью по строке хита +
+// дефолтные расширения низкоуровневых языков (стресс-тест владельца на
+// wireshark 1.2 ГБ и ядре poler-os на Zig)
+// ---------------------------------------------------------------------------
+
+/// Wireshark-морфология: точного токена `proto_register_field` нет нигде,
+/// есть только семейство продолжений (`proto_register_field_array` — один
+/// токен, разрыв только по не-alnum).
+const WS_PROTO_C: &str = r#"#include "packet.h"
+
+WS_DLL_PUBLIC int proto_register_field_array(void) {
+    proto_register_field_array();
+    return 1;
+}
+"#;
+
+/// Документация с тем же префикс-семейством в прозе: fallback находит и её,
+/// но intent (код-запрос) обязан держать исходник выше.
+const WS_DOC_MD: &str = "# Wireshark internals\n\nThe proto_register_field_array helper\nregisters many fields at once. See also\nproto_register_field_init notes below.\n";
+
+#[test]
+fn signature_soft_fallback_finds_prefix_family() {
+    // Кейс владельца: `proto_register_field(` → exit code 1 (0 результатов),
+    // хотя `proto_register_field_array(...)` в коде точно есть. v0.83.0:
+    // автоматический мягкий fallback на префикс идентификатора.
+    let dir = TempDir::new().unwrap();
+    let docs = dir.path().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(dir.path().join("wslua_proto.c"), WS_PROTO_C).unwrap();
+    fs::write(docs.join("internals.md"), WS_DOC_MD).unwrap();
+
+    let res = scan_path(dir.path(), "proto_register_field(", &EngineConfig::default());
+    assert!(
+        res.total_hits > 0,
+        "мягкий fallback обязан находить семейство идентификаторов"
+    );
+    assert!(res.soft_fallback, "флаг soft_fallback не поднят");
+    // intent-тиры в fallback: код (тир 0) выше документации (тир 1)
+    let top = &res.anchors[0];
+    assert!(
+        top.file.ends_with("wslua_proto.c"),
+        "топ-1 обязан быть исходником, а не докой: {}",
+        top.file
+    );
+    // превью топ-якоря начинается СО СТРОКИ ХИТА (определение или
+    // call-site семейства — оба валидны, порядок решает IIR-резонанс)
+    let top_preview = top.preview.as_deref().expect("превью материализовано");
+    let first_line = top_preview.lines().next().unwrap_or("");
+    assert!(
+        first_line.contains("proto_register_field_array"),
+        "строка хита не первая в превью: {top_preview:?}"
+    );
+    // определение семейства в топ-N: сигнатура целиком со строки хита
+    let def_line = WS_PROTO_C
+        .lines()
+        .position(|l| l.contains("proto_register_field_array"))
+        .unwrap()
+        + 1;
+    let def = res
+        .anchors
+        .iter()
+        .find(|a| a.line == def_line)
+        .expect("определение семейства в топ-N");
+    let def_preview = def.preview.as_deref().unwrap();
+    assert!(
+        def_preview.starts_with("WS_DLL_PUBLIC int proto_register_field_array(void)"),
+        "превью определения не со строки хита: {def_preview:?}"
+    );
+    // рендер не теряет сигнатуру
+    let s = render_simple(&res);
+    assert!(
+        s.contains("proto_register_field_array(void)"),
+        "simple не содержит сигнатуру семейства: {s}"
+    );
+}
+
+#[test]
+fn signature_exact_hits_disable_fallback() {
+    // Точные токенные хиты есть (`func Default()` в gin-корпусе) —
+    // fallback не должен включаться и подменять семантику.
+    let dir = gin_corpus();
+    let res = scan_path(dir.path(), "func Default()", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+    assert!(!res.soft_fallback, "fallback не должен срабатывать");
+    assert!(res.anchors[0].file.ends_with("gin.go"));
+}
+
+#[test]
+fn preview_aligned_to_hit_line_not_scope_head() {
+    // Wireshark-кейс: хит на forward-объявлении ВНЕ функции — скоуп
+    // вырождается в целый файл (`#ifdef…extern "C" {…`), а превью
+    // обязано начинаться СО СТРОКИ ХИТА, а не с головы скоупа.
+    let packet_h = "#ifdef __cplusplus\nextern \"C\" {\n#endif /* __cplusplus */\n\nstruct wtap_block;\n\nWS_DLL_PUBLIC void proto_register_field_array(void) {\n    struct wtap_block *blk = 0;\n    (void)blk;\n}\n";
+    let dir = write_fixture("packet.h", packet_h);
+    let res = scan_path(dir.path(), "wtap_block", &EngineConfig::default());
+    assert!(res.total_hits > 0);
+
+    // якорь на строке forward-объявления (вне функции)
+    let decl = res
+        .anchors
+        .iter()
+        .find(|a| a.line == 5)
+        .expect("хит на forward-объявлении (строка 5)");
+    let preview = decl.preview.as_deref().expect("превью есть");
+    assert!(
+        preview.starts_with("struct wtap_block;"),
+        "превью обязано начинаться со строки хита, а не с головы скоупа: {preview:?}"
+    );
+    assert!(
+        !preview.starts_with("#ifdef") && !preview.starts_with("extern"),
+        "превью захватил закрывающий контекст перед объявлением: {preview:?}"
+    );
+    // каждый якорь: первая строка превью содержит токен хита
+    for a in &res.anchors {
+        let first = a.preview.as_deref().unwrap_or("").lines().next().unwrap_or("");
+        assert!(
+            first.contains("wtap_block"),
+            "строка хита не первая в превью {}: {first:?}",
+            a.rel_file.as_deref().unwrap_or(&a.file)
+        );
+    }
+}
+
+#[test]
+fn default_extensions_cover_zig_asm_lua() {
+    // Кейс poler-os: ядро на Zig + ASM-рассечение — без ручного
+    // `--extensions zig,rs,c,h,py,md` файлы отсекались на обходе дерева.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("kernel.zig"), "pub fn probe_9f3a() void {}\n").unwrap();
+    fs::write(dir.path().join("boot.s"), "# probe_9f3a cold boot\n").unwrap();
+    fs::write(dir.path().join("init.S"), "// probe_9f3a upper\n").unwrap();
+    fs::write(dir.path().join("loader.asm"), "; probe_9f3a real mode\n").unwrap();
+    fs::write(dir.path().join("tick.lua"), "-- probe_9f3a callback\n").unwrap();
+
+    let res = scan_path(dir.path(), "probe_9f3a", &EngineConfig::default());
+    let files: Vec<String> = res
+        .anchors
+        .iter()
+        .filter_map(|a| a.rel_file.clone())
+        .collect();
+    assert_eq!(
+        res.total_hits,
+        5,
+        "все 5 расширений должны находиться по умолчанию: {files:?}"
+    );
+    for ext in ["zig", "s", "S", "asm", "lua"] {
+        assert!(
+            files.iter().any(|f| f.ends_with(&format!(".{ext}"))),
+            "нет .{ext} в выдаче: {files:?}"
+        );
+    }
+}
+
+#[test]
+fn soft_fallback_flag_serialized_only_when_true() {
+    // JSON-контракт: soft_fallback появляется только в fallback-прогоне
+    // (обратная совместимость с потребителями v0.82.0).
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("wslua_proto.c"), WS_PROTO_C).unwrap();
+    let res = scan_path(dir.path(), "proto_register_field(", &EngineConfig::default());
+    let v = serde_json::to_value(&res).unwrap();
+    assert_eq!(v["soft_fallback"], serde_json::json!(true));
+
+    let res2 = scan_path(dir.path(), "proto_register_field_array", &EngineConfig::default());
+    let v2 = serde_json::to_value(&res2).unwrap();
+    assert!(
+        v2.get("soft_fallback").is_none(),
+        "флаг не должен сериализоваться при обычном поиске"
+    );
 }

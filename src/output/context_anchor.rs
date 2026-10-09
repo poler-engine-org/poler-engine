@@ -42,6 +42,13 @@ pub struct ContextAnchor {
     /// v0.82.0: переход к коду без лишнего действия (`gin.go:250`).
     #[serde(default)]
     pub line: usize,
+    /// Превью, выровненное по строке хита (v0.83.0): строка совпадения —
+    /// ПЕРВАЯ строка сниппета, а не «уехала вниз» за пределы превью.
+    /// Прежний байт-сдвиг окна назад мог захватить закрывающий
+    /// `extern "C"` вместо заголовка целевой функции (wireshark-кейс).
+    /// `None` — файл нечитаем; рендер откатывается на enclosing_scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     pub token: String,
     pub epsilon: f64,
     pub resonance: f64,
@@ -55,7 +62,19 @@ pub struct SearchResult {
     pub query: String,
     /// Общее число совпадений (до усечения по top_n).
     pub total_hits: usize,
+    /// v0.83.0: точный сигнатурный паттерн (прикреплённая скобка) не
+    /// найден нигде — выданы хиты мягкого fallback по префиксу
+    /// идентификатора без скобки (`proto_register_field(` → семейство
+    /// `proto_register_field_array`). Скрыт в JSON, когда fallback
+    /// не срабатывал.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub soft_fallback: bool,
     pub anchors: Vec<ContextAnchor>,
+}
+
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Markdown-рендер результата (формат `--format md`).
@@ -66,8 +85,9 @@ pub fn render_markdown(res: &SearchResult) -> String {
         res.query, res.total_hits
     ));
     for (i, a) in res.anchors.iter().enumerate() {
-        // v0.82.0: человекочитаемый путь + строка хита
-        let shown = a.rel_file.as_deref().unwrap_or(&a.file);
+        // v0.83.0: путь, резолвящийся из CWD (файл под CWD → относительно
+        // CWD, иначе абсолютный) + строка хита
+        let shown = display_path(a);
         let where_ref = if a.line > 0 {
             format!("{shown}:{}", a.line)
         } else {
@@ -103,21 +123,88 @@ pub fn render_markdown(res: &SearchResult) -> String {
     out
 }
 
+/// Путь для терминала/агента (v0.83.0).
+///
+/// Кейс владельца: агент стоит в `/home/vitalij`, скан запущен по
+/// `/home/vitalij/Стільниця/ripgrep-src` — путь `crates/globset/lib.rs`
+/// (от корня скана) НЕ резолвится инструментами агента. Правило:
+/// файл под CWD → путь относительно CWD (короткий И резолвящийся),
+/// иначе — абсолютный (резолвится всегда). Корень скана == CWD —
+/// совпадает с прежним поведением v0.82.0.
+fn display_path(a: &ContextAnchor) -> String {
+    std::env::current_dir().map_or_else(
+        |_| a.file.clone(),
+        |cwd| display_path_with(a, &cwd),
+    )
+}
+
+/// Чистая форма [`display_path`] с явным CWD — для тестов без chdir.
+fn display_path_with(a: &ContextAnchor, cwd: &std::path::Path) -> String {
+    let file = std::path::Path::new(&a.file);
+    if let Ok(rel) = file.strip_prefix(cwd) {
+        if !rel.as_os_str().is_empty() {
+            return rel.to_string_lossy().to_string();
+        }
+    }
+    a.file.clone()
+}
+
+/// Обрезка по СИМВОЛАМ с многоточием (границы UTF-8 не рвутся).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Компактный сниппет якоря (v0.83.0).
+///
+/// Строка хита (первая строка превью) — ЦЕЛИКОМ: сигнатура с
+/// модификаторами (`pub fn schedule(...) callconv(.c) u64`) больше не
+/// теряет хвост за многоточием. Последующие строки — компактно.
+fn simple_snippet(a: &ContextAnchor) -> String {
+    /// Первая строка (строка хита/сигнатура) — без обрезки до этого лимита.
+    const HEAD_CHARS: usize = 200;
+    /// Хвостовые строки — компактно для терминала.
+    const TAIL_CHARS: usize = 64;
+    /// Сколько хвостовых строк показывать.
+    const TAIL_LINES: usize = 2;
+    let text = a.preview.as_deref().unwrap_or(&a.scene.enclosing_scope);
+    let mut lines = text.split('\n');
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let mut out = truncate_chars(first.trim(), HEAD_CHARS);
+    for line in lines.take(TAIL_LINES) {
+        let l = line.trim_end();
+        if l.trim().is_empty() {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(&truncate_chars(l, TAIL_CHARS));
+    }
+    out
+}
+
 /// Компактный рендер (формат `--format simple`).
 ///
-/// v0.82.0: `путь:строка` — относительный путь от корня сканирования
-/// плюс номер строки хита: `gin.go:250` вместо абсолютного пути,
-/// съедающего половину терминала.
+/// v0.82.0: `путь:строка` вместо абсолютного пути, съедающего половину
+/// терминала.
+///
+/// v0.83.0: путь резолвится из CWD (файл под CWD → относительно CWD,
+/// иначе абсолютный); сниппет начинается СО СТРОКИ ХИТА — сигнатура
+/// целиком, хвост — компактно.
 pub fn render_simple(res: &SearchResult) -> String {
     let mut out = String::new();
     let total = res.anchors.len();
     for (i, a) in res.anchors.iter().enumerate() {
-        let head: String = a.scene.enclosing_scope.chars().take(120).collect();
-        let shown = a.rel_file.as_deref().unwrap_or(&a.file);
+        let shown = display_path(a);
         let where_ref = if a.line > 0 {
             format!("{shown}:{}", a.line)
         } else {
-            shown.to_string()
+            shown
         };
         out.push_str(&format!(
             "[{}/{}] R={:.1} ε={:.1} | {} | {}\n",
@@ -126,7 +213,7 @@ pub fn render_simple(res: &SearchResult) -> String {
             a.resonance,
             a.epsilon,
             where_ref,
-            head
+            simple_snippet(a)
         ));
     }
     out
@@ -151,10 +238,12 @@ mod tests {
         SearchResult {
             query: "нокс".into(),
             total_hits: 3,
+            soft_fallback: false,
             anchors: vec![ContextAnchor {
                 file: "/book/chapter_36.md".into(),
                 rel_file: Some("chapter_36.md".into()),
                 line: 250,
+                preview: Some("Нокс вонзила когти...".into()),
                 token: "нокс".into(),
                 epsilon: 7983.94,
                 resonance: 28714.73,
@@ -178,6 +267,7 @@ mod tests {
         assert_eq!(a["rel_file"], "chapter_36.md");
         assert_eq!(a["line"], 250);
         assert_eq!(a["token"], "нокс");
+        assert_eq!(a["preview"], "Нокс вонзила когти...");
         assert!(a["epsilon"].is_f64());
         assert!(a["resonance"].is_f64());
         assert_eq!(a["scene"]["chapter"], "Глава 36. Инертный");
@@ -188,6 +278,8 @@ mod tests {
         // скрытые поля не сериализуются
         assert!(a["scene"].get("metric_tag").is_none());
         assert!(a["scene"].get("subject_names").is_none());
+        // soft_fallback=false скрыт (v0.83.0: флаг появляется только в fallback)
+        assert!(v.get("soft_fallback").is_none());
         // k_hop_relations — массивы из трёх строк
         let rel = &a["k_hop_relations"][0];
         assert_eq!(rel.as_array().unwrap().len(), 3);
@@ -217,6 +309,7 @@ mod tests {
         let a: ContextAnchor = serde_json::from_value(old).unwrap();
         assert_eq!(a.line, 0);
         assert!(a.rel_file.is_none());
+        assert!(a.preview.is_none());
         assert_eq!(a.file, "/book/chapter_36.md");
     }
 
@@ -241,11 +334,67 @@ mod tests {
     #[test]
     fn simple_render_one_line_per_anchor() {
         let s = render_simple(&sample());
+        // превью однострочное → одна строка вывода на якорь
         assert_eq!(s.lines().count(), 1);
         assert!(s.contains("R="));
-        // v0.82.0: относительный путь + номер строки
+        // v0.83.0: путь:строка; файл вне CWD → абсолютный (всегда резолвится)
         assert!(s.contains("chapter_36.md:250"), "нет пути со строкой: {s}");
-        assert!(!s.contains("/book/chapter_36.md"), "абсолютный путь в simple: {s}");
+        // сниппет — из превью, выровненного по строке хита
+        assert!(s.contains("Нокс вонзила когти"), "нет сниппета: {s}");
+    }
+
+    #[test]
+    fn display_path_prefers_cwd_relative() {
+        // v0.83.0: путь в терминале обязан резолвиться из CWD агента
+        // (кейс: агент в /home/vitalij, скан по .../Стільниця/ripgrep-src).
+        let mut res = sample();
+        let a = &mut res.anchors[0];
+        a.file = "/home/u/repo/src/lib.rs".into();
+        // файл под CWD → относительно CWD
+        assert_eq!(
+            display_path_with(a, std::path::Path::new("/home/u/repo")),
+            "src/lib.rs"
+        );
+        // директория файла == CWD → имя файла
+        assert_eq!(
+            display_path_with(a, std::path::Path::new("/home/u/repo/src")),
+            "lib.rs"
+        );
+        // файл вне CWD → абсолютный
+        assert_eq!(
+            display_path_with(a, std::path::Path::new("/tmp")),
+            "/home/u/repo/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn simple_render_signature_line_not_truncated() {
+        // v0.83.0 (кейс poler-os/Zig): сигнатура с модификаторами длиннее
+        // хвостового лимита — обязана присутствовать ЦЕЛИКОМ, обрезка —
+        // только для хвостовых строк тела.
+        let mut res = sample();
+        let a = &mut res.anchors[0];
+        a.preview = Some(
+            "pub fn schedule(current_rsp: u64) callconv(.c) u64 { // v0.13.0 arch\n\
+             if (task_count <= 1) return current_rsp; // Only idle/kernel task exists\n\
+             const saved_rsp = current_rsp;\n\
+             const unreachable_tail_line = 0;\n"
+                .into(),
+        );
+        let s = render_simple(&res);
+        assert!(
+            s.contains("pub fn schedule(current_rsp: u64) callconv(.c) u64 { // v0.13.0 arch"),
+            "сигнатура обрезана: {s}"
+        );
+        // хвостовые строки — компактно: хвост за 64 символами срезан
+        assert!(s.contains('…'), "нет маркера обрезки хвоста: {s}");
+        assert!(!s.contains("task exists"), "хвостовая строка не обрезана: {s}");
+        assert!(
+            !s.contains("unreachable_tail_line"),
+            "третья хвостовая строка не должна показываться: {s}"
+        );
+        // заголовок с сигнатурой (одна строка) + 2 хвостовых = 3 строки
+        assert_eq!(s.lines().count(), 3, "строки вывода: {s}");
     }
 
     #[test]

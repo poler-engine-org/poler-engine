@@ -156,6 +156,7 @@ impl Engine {
                 SearchResult {
                     query: query.to_string(),
                     total_hits: 0,
+                    soft_fallback: false,
                     anchors: Vec::new(),
                 },
                 stats,
@@ -177,6 +178,11 @@ impl Engine {
         let intent: QueryIntent = config.intent_mode.resolve(query);
         let strict_phrase = intent == QueryIntent::Code;
         let signature = SignatureQuery::parse(query);
+        // v0.83.0: якорь идентификатора (нижний регистр — токены хранятся
+        // фолдом) для ленивого мягкого fallback: pass 1 собирает
+        // префиксные хиты ТОЛЬКО в файлах без точных хитов.
+        let sig_prefix: Option<String> =
+            signature.as_ref().map(|s| s.anchor_word.to_lowercase());
 
         // ---------- классификация файлов (incremental) ----------
         // v2.0: словарь корпуса (FSST-арена) живёт в состоянии и переходит
@@ -231,6 +237,9 @@ impl Engine {
             counts: Vec<u32>,
             n_total: u64,
             hit_files: HashMap<PathBuf, Vec<u32>>,
+            /// v0.83.0: кандидаты мягкого fallback — файлы без точных,
+            /// но с префиксными хитами (отдельно, чтобы не смешивать семантики).
+            prefix_hit_files: HashMap<PathBuf, Vec<u32>>,
             entries: HashMap<PathBuf, FileEntry>,
         }
 
@@ -277,6 +286,8 @@ impl Engine {
                 );
                 if !r.hits.is_empty() {
                     self.hit_files.insert(path.to_path_buf(), r.hits);
+                } else if !r.prefix_hits.is_empty() {
+                    self.prefix_hit_files.insert(path.to_path_buf(), r.prefix_hits);
                 }
             }
 
@@ -298,6 +309,7 @@ impl Engine {
             counts: Vec::new(),
             n_total: 0,
             hit_files: HashMap::new(),
+            prefix_hit_files: HashMap::new(),
             entries: HashMap::new(),
         };
         for e in kept.values() {
@@ -307,23 +319,59 @@ impl Engine {
         let (giants, normals) = streaming::split_giants(&to_process);
         let sink_mu = Mutex::new(sink);
         normals.par_iter().for_each(|p| {
-            if let Some(r) =
-                streaming::pass1_file(p, &query_tokens, strict_phrase, &config, &cleaner, &pre)
-            {
+            if let Some(r) = streaming::pass1_file(
+                p,
+                &query_tokens,
+                strict_phrase,
+                &config,
+                &cleaner,
+                &pre,
+                sig_prefix.as_deref(),
+            ) {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         });
         // Гигантские файлы — строго последовательно: пик памяти ограничен
         // одним большим временным индексом.
         for p in &giants {
-            if let Some(r) =
-                streaming::pass1_file(p, &query_tokens, strict_phrase, &config, &cleaner, &pre)
-            {
+            if let Some(r) = streaming::pass1_file(
+                p,
+                &query_tokens,
+                strict_phrase,
+                &config,
+                &cleaner,
+                &pre,
+                sig_prefix.as_deref(),
+            ) {
                 sink_mu.lock().unwrap().absorb(p, r, watching);
             }
         }
         let mut sink = sink_mu.into_inner().unwrap();
         stats.total_tokens = sink.n_total;
+
+        // ---------- v0.83.0: мягкий fallback сигнатурного запроса ----------
+        // Протокол владельца (wireshark): точный хит со скобкой дал 0
+        // результатов (`proto_register_field(` при наличии только
+        // `proto_register_field_array(`) — автоматический переход на поиск
+        // по префиксу идентификатора. Сигнатурный слой выключается (тиры
+        // возвращает intent: код выше документации), ε считается по
+        // фактическому префикс-семейству файла.
+        let mut soft_prefix: Option<String> = None;
+        if signature.is_some() {
+            let exact_any =
+                !sink.hit_files.is_empty() || kept.values().any(|e| !e.hits.is_empty());
+            if !exact_any && !sink.prefix_hit_files.is_empty() {
+                soft_prefix = sig_prefix.clone();
+                sink.hit_files = std::mem::take(&mut sink.prefix_hit_files);
+            }
+        }
+        // Эффективный сигнатурный слой для pass 2 и финальной сортировки:
+        // в fallback — None (тир по intent, не по промаху сигнатуры).
+        let signature_pass2: Option<&SignatureQuery> = if soft_prefix.is_some() {
+            None
+        } else {
+            signature.as_ref()
+        };
 
         // Между проходами: staging-фаза арены закрывается — таблица FSST
         // обучается, термы сжимаются. Проход 2 ищет частоты compress-probe
@@ -354,7 +402,8 @@ impl Engine {
                 &gstats,
                 n_total,
                 hits,
-                signature.as_ref(),
+                signature_pass2,
+                soft_prefix.as_deref(),
             )
         };
 
@@ -382,7 +431,8 @@ impl Engine {
                 &gstats,
                 n_total,
                 hits,
-                signature.as_ref(),
+                signature_pass2,
+                soft_prefix.as_deref(),
             ) {
                 results_mu
                     .lock()
@@ -489,7 +539,7 @@ impl Engine {
         // промах → 2), иначе intent (класс файла конфликтует с намерением → 1).
         // ε и R не искажаются: документация с R=55000 не вытеснит код с R=4240
         // не потому что её метрика урезана, а потому что тир выше.
-        let sig_active = signature.is_some();
+        let sig_active = signature_pass2.is_some();
         records.sort_by(|a, b| {
             hit_tier(intent, sig_active, a.signature_matched, &a.path)
                 .cmp(&hit_tier(intent, sig_active, b.signature_matched, &b.path))
@@ -515,10 +565,11 @@ impl Engine {
         // ---------- Проход 3: материализация только top-N ----------
         // v0.82.0: якорь несёт номер строки хита (1-based, 0 = неизвестно)
         // и относительный путь от корня сканирования (терминал не захламляется).
+        // v0.83.0: + превью от строки хита (строка совпадения — первая).
         let anchors: Vec<ContextAnchor> = records
             .iter()
             .map(|r| {
-                let (scene, line) = materialize_scene(r, &config, &cleaner);
+                let (scene, line, preview) = materialize_scene(r, &config, &cleaner);
                 let rel_file = if target.is_file() {
                     r.path
                         .file_name()
@@ -534,6 +585,7 @@ impl Engine {
                     file: r.path.to_string_lossy().to_string(),
                     rel_file,
                     line,
+                    preview,
                     token: query.to_string(),
                     epsilon: round2(r.epsilon),
                     resonance: round2(r.resonance),
@@ -582,6 +634,7 @@ impl Engine {
             SearchResult {
                 query: query.to_string(),
                 total_hits: full_hits,
+                soft_fallback: soft_prefix.is_some(),
                 anchors,
             },
             stats,
@@ -591,17 +644,18 @@ impl Engine {
 
 /// Полная материализация сцены одного якоря (проход 3): перечитывает
 /// файл через mmap и строит SceneContext только для top-N записей.
-/// Возвращает (сцена, номер строки хита, 1-based).
+/// Возвращает (сцена, номер строки хита 1-based, превью от строки хита).
 ///
 /// PII-маскирование (v0.4) применяется ТОЛЬКО здесь — на тексте,
-/// получаемом AI-потребителем: enclosing_scope и метаданных сцены.
-/// Байтовые позиции внутри конвейера остаются raw-точными; маскирование
-/// не смещает индексы, потому что выполняется над готовой строкой.
+/// получаемом AI-потребителем: enclosing_scope, превью и метаданных
+/// сцены. Байтовые позиции внутри конвейера остаются raw-точными;
+/// маскирование не смещает индексы, потому что выполняется над готовой
+/// строкой.
 fn materialize_scene(
     r: &HitRecord,
     config: &EngineConfig,
     cleaner: &PiiCleaner,
-) -> (SceneContext, usize) {
+) -> (SceneContext, usize, Option<String>) {
     let res = with_text(&r.path, config.max_file_bytes, |raw| {
         let text: &str = raw;
         // v0.82.0: номер строки хита — по raw-байтам ДО маскирования.
@@ -612,6 +666,11 @@ fn materialize_scene(
             cut -= 1;
         }
         let line = 1 + text[..cut].bytes().filter(|&b| b == b'\n').count();
+        // v0.83.0: превью, выровненное по строке хита — окно больше не
+        // «уезжает вниз» за байт-сдвигом назад (wireshark-кейс с
+        // закрывающим `extern "C"` вместо заголовка целевой функции).
+        let line_start = text[..cut].rfind('\n').map_or(0, |p| p + 1);
+        let mut preview = hit_line_preview(&text[line_start..]);
         let mut sc = if r.is_code {
             let scope =
                 crate::parser::ast_code::materialize_scope(text, r.scene_key.0, r.scene_key.1);
@@ -622,12 +681,13 @@ fn materialize_scene(
         };
         if config.pii_mode == PiiMode::Mask {
             sc.enclosing_scope = cleaner.clean(&sc.enclosing_scope).into_owned();
+            preview = cleaner.clean(&preview).into_owned();
             for s in sc.subjects.iter_mut() {
                 *s = cleaner.clean(s).into_owned();
             }
         }
         sc.enclosing_scope = truncate_char_safe(&sc.enclosing_scope, config.max_scope_bytes);
-        (sc, line)
+        (sc, line, Some(preview))
     });
     res.unwrap_or_else(|| {
         (
@@ -642,6 +702,30 @@ fn materialize_scene(
                 subject_pairs: Vec::new(),
             },
             0,
+            None,
         )
     })
+}
+
+/// Превью от начала строки хита (v0.83.0).
+///
+/// Протокол владельца: «строка хита должна быть первой или второй в
+/// сниппете, а не уезжать вниз за пределы превью». Строка совпадения —
+/// первая строка; до трёх строк тела следом; до [`PREVIEW_MAX_BYTES`]
+/// байт, обрезка char-safe с многоточием.
+fn hit_line_preview(from_line_start: &str) -> String {
+    /// Потолок байт превью (char-safe обрезка + «…»).
+    const PREVIEW_MAX_BYTES: usize = 512;
+    /// Строк в превью: строка хита + 3 строки тела.
+    const PREVIEW_MAX_LINES: usize = 4;
+    let cut = truncate_char_safe(from_line_start, PREVIEW_MAX_BYTES);
+    let mut lines: Vec<&str> = cut.split('\n').collect();
+    // пустой хвост (последняя строка обрезана посреди файла) не показываем
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.len() > PREVIEW_MAX_LINES {
+        lines.truncate(PREVIEW_MAX_LINES);
+    }
+    lines.join("\n")
 }

@@ -155,6 +155,24 @@ impl<'a> FileTokens<'a> {
         self.find_phrase_inner(query, true)
     }
 
+    /// Позиции токенов, НАЧИНАЮЩИХСЯ с префикса (v0.83.0, мягкий fallback
+    /// сигнатурного запроса).
+    ///
+    /// Кейс владельца (wireshark): `proto_register_field(` — точного токена
+    /// нет нигде, но есть `proto_register_field_array(`. Токенайзер рвёт по
+    /// не-alnum, `proto_register_field_array` — ОДИН токен; равенство его с
+    /// `proto_register_field` ложно, зато префикс-семантика находит всё
+    /// семейство идентификаторов.
+    pub fn find_token_prefix(&self, prefix: &str) -> Vec<u32> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        (0..self.raw.len())
+            .filter(|i| self.tok(*i).starts_with(prefix))
+            .map(|i| i as u32)
+            .collect()
+    }
+
     fn find_phrase_inner(&self, query: &[String], strict: bool) -> Vec<u32> {
         if query.is_empty() {
             return Vec::new();
@@ -367,10 +385,16 @@ pub fn literal_present(raw: &str, query_tokens: &[String], pre: &Option<Teddy>) 
 ///
 /// `counts` — словарь файла с `Box<str>`-ключами, перемещаемый из
 /// [`FileTokens`] без клонов строк (v2.0, Приоритет 3).
+///
+/// `prefix_hits` (v0.83.0) — ленивый мягкий fallback сигнатурного запроса:
+/// позиции токенов, начинающихся с якоря идентификатора. Считается ТОЛЬКО
+/// когда точных хитов в файле нет — движок решает глобально, точные хиты
+/// где-либо есть → fallback не включается и эти позиции отбрасываются.
 pub struct Pass1File {
     pub counts: HashMap<Box<str>, u32>,
     pub total: u64,
     pub hits: Vec<u32>,
+    pub prefix_hits: Vec<u32>,
 }
 
 pub fn pass1_file(
@@ -380,6 +404,7 @@ pub fn pass1_file(
     config: &EngineConfig,
     _cleaner: &PiiCleaner,
     pre: &Option<Teddy>,
+    prefix_anchor: Option<&str>,
 ) -> Option<Pass1File> {
     with_text(path, config.max_file_bytes, |raw| {
         // Предфильтр по сырому тексту: файлы без литерала не токенизируются,
@@ -395,6 +420,7 @@ pub fn pass1_file(
                 counts,
                 total,
                 hits: Vec::new(),
+                prefix_hits: Vec::new(),
             };
         }
         let ft = FileTokens::build(raw);
@@ -405,6 +431,14 @@ pub fn pass1_file(
         } else {
             ft.find_phrase(query_tokens)
         };
+        // v0.83.0: мягкий fallback — префикс якоря только при пустых
+        // точных хитах файла (литеральный префильтр Teddy уже пропустил
+        // файл: префикс — подстрока, решето её видит).
+        let prefix_hits = if hits.is_empty() {
+            prefix_anchor.map_or(Vec::new(), |pa| ft.find_token_prefix(pa))
+        } else {
+            Vec::new()
+        };
         let total = ft.toks_len() as u64;
         // v2.0: словарь файла перемещается целиком (ноль клонов строк);
         // интернирование в FSST-арену происходит в sink под мьютексом.
@@ -412,6 +446,7 @@ pub fn pass1_file(
             counts: ft.counts,
             total,
             hits,
+            prefix_hits,
         }
     })
 }
@@ -557,6 +592,7 @@ pub fn pass2_giant_parallel(
     n_total: usize,
     hits: &[u32],
     signature: Option<&SignatureQuery>,
+    soft_prefix: Option<&str>,
 ) -> Option<Pass2Result> {
     use rayon::prelude::*;
 
@@ -576,6 +612,7 @@ pub fn pass2_giant_parallel(
                 n_total,
                 hits,
                 signature,
+                soft_prefix,
             );
         }
 
@@ -615,7 +652,11 @@ pub fn pass2_giant_parallel(
                 }
                 let sub_text = &text[*start..*end];
                 let sub_ft = FileTokens::build(sub_text);
-                let sub_hits = if strict_phrase {
+                // v0.83.0: мягкий fallback — префикс-семантика якоря; в
+                // норме — прежняя фразовая (strict для код-интента).
+                let sub_hits = if let Some(pa) = soft_prefix {
+                    sub_ft.find_token_prefix(pa)
+                } else if strict_phrase {
                     sub_ft.find_phrase_strict(query_tokens)
                 } else {
                     sub_ft.find_phrase(query_tokens)
@@ -623,6 +664,23 @@ pub fn pass2_giant_parallel(
                 if sub_hits.is_empty() {
                     return None;
                 }
+                // v0.83.0: эффективные токены запроса для ε — в fallback
+                // это фактические токены префикс-семейства чанка (kw_count
+                // честно растёт), в норме — исходные токены запроса.
+                let eff_tokens: Vec<String> = soft_prefix.map_or_else(
+                    || query_tokens.to_vec(),
+                    |pa| {
+                        let mut fam: std::collections::BTreeSet<String> =
+                            std::collections::BTreeSet::new();
+                        for &h in &sub_hits {
+                            let t = sub_ft.tok(h as usize);
+                            if t.starts_with(pa) {
+                                fam.insert(t.to_string());
+                            }
+                        }
+                        fam.into_iter().collect()
+                    },
+                );
 
                 let sub_eps_res: Vec<(f64, f64)> = match config.resonance_mode {
                     ResonanceMode::Psi => {
@@ -639,7 +697,7 @@ pub fn pass2_giant_parallel(
                                 .collect();
                             epsilons.push(calculate_epsilon(
                                 &window,
-                                query_tokens,
+                                &eff_tokens,
                                 global_counts,
                                 n_total,
                                 config.kappa,
@@ -666,7 +724,7 @@ pub fn pass2_giant_parallel(
                                 .collect();
                             epsilons.push(calculate_epsilon(
                                 &window,
-                                query_tokens,
+                                &eff_tokens,
                                 global_counts,
                                 n_total,
                                 config.kappa,
@@ -695,7 +753,7 @@ pub fn pass2_giant_parallel(
                                 .collect();
                             epsilons.push(calculate_epsilon(
                                 &window,
-                                query_tokens,
+                                &eff_tokens,
                                 global_counts,
                                 n_total,
                                 config.kappa,
@@ -711,7 +769,7 @@ pub fn pass2_giant_parallel(
                         let mut out = vec![(0.0, 0.0); sub_hits.len()];
                         let log_n = (n_total.max(1) as f64).ln();
                         let qset: HashSet<&str> =
-                            query_tokens.iter().map(|s| s.as_str()).collect();
+                            eff_tokens.iter().map(|s| s.as_str()).collect();
                         let rarity2 = |tok: &str| -> f64 {
                             let freq = global_counts.freq(tok).unwrap_or(1) as f64;
                             let rr = (log_n - freq.ln()).max(0.0);
@@ -859,7 +917,7 @@ pub fn pass2_giant_parallel(
                             );
                             let scene = SceneContext::from_meta(&meta);
                             SceneInfo {
-                                triples: extract_triples(scope_text, &scene, query_tokens),
+                                triples: extract_triples(scope_text, &scene, &eff_tokens),
                                 metric_tag: meta.metric_tag,
                             }
                         }
@@ -1017,6 +1075,10 @@ fn build_scene_info(
 /// v0.82.0: `signature` — литеральный сигнатурный паттерн запроса
 /// (активен, когда в запросе есть прикреплённая скобка `Default(`).
 /// Сигнатурные хиты выживают в per-file top-N первыми (тир в ключе кучи).
+///
+/// v0.83.0: `soft_prefix` — активный мягкий fallback (движок уже выяснил:
+/// точных хитов нет нигде). `hits` тогда содержат префиксные позиции из
+/// прохода 1, а ε считается по фактическому префикс-семейству файла.
 #[allow(clippy::too_many_arguments)]
 pub fn pass2_file(
     path: &Path,
@@ -1027,6 +1089,7 @@ pub fn pass2_file(
     n_total: usize,
     hits: &[u32],
     signature: Option<&SignatureQuery>,
+    soft_prefix: Option<&str>,
 ) -> Option<Pass2Result> {
     with_text(path, config.max_file_bytes, |raw| {
         let text: &str = raw;
@@ -1050,6 +1113,25 @@ pub fn pass2_file(
             (global_counts, n_total)
         };
 
+        // v0.83.0: эффективные токены запроса для ε. В норме — токены
+        // запроса; в мягком fallback — фактическое префикс-семейство
+        // файла (BTreeSet: детерминированный порядок), чтобы kw_count
+        // честно отражал плотность совпадений, а не фиксировал ноль.
+        let eff_tokens: Vec<String> = soft_prefix.map_or_else(
+            || query_tokens.to_vec(),
+            |pa| {
+                let mut fam: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for &h in hits {
+                    let t = ft.tok(h as usize);
+                    if t.starts_with(pa) {
+                        fam.insert(t.to_string());
+                    }
+                }
+                fam.into_iter().collect()
+            },
+        );
+
         // ε и IIR-резонанс по последовательности совпадений либо полю.
         let eps_res: Vec<(f64, f64)> = match config.resonance_mode {
             // POLER[Ψ]: наблюдения = ε окон, эволюция внимания по
@@ -1070,7 +1152,7 @@ pub fn pass2_file(
                         .collect();
                     epsilons.push(calculate_epsilon(
                         &window,
-                        query_tokens,
+                        &eff_tokens,
                         gcounts,
                         gtotal,
                         config.kappa,
@@ -1096,7 +1178,7 @@ pub fn pass2_file(
                         .collect();
                     epsilons.push(calculate_epsilon(
                         &window,
-                        query_tokens,
+                        &eff_tokens,
                         gcounts,
                         gtotal,
                         config.kappa,
@@ -1122,7 +1204,7 @@ pub fn pass2_file(
                         .collect();
                     epsilons.push(calculate_epsilon(
                         &window,
-                        query_tokens,
+                        &eff_tokens,
                         gcounts,
                         gtotal,
                         config.kappa,
@@ -1135,7 +1217,7 @@ pub fn pass2_file(
             ResonanceMode::Field => field_eps_res(
                 &ft,
                 hits,
-                query_tokens,
+                &eff_tokens,
                 gcounts,
                 gtotal,
                 config.kappa,
@@ -1239,7 +1321,7 @@ pub fn pass2_file(
                         structured: false,
                     })
                 });
-                build_scene_info(text, &b, key, is_code, &stem, query_tokens, config)
+                build_scene_info(text, &b, key, is_code, &stem, &eff_tokens, config)
             });
             records.push(HitRecord {
                 path: path.to_path_buf(),
@@ -1542,5 +1624,44 @@ mod tests {
         let t = truncate_slice(&s, 25);
         assert!(t.len() <= 25);
         assert!(s.starts_with(t));
+    }
+
+    // ---------- v0.83.0: префикс-семантика мягкого fallback ----------
+
+    #[test]
+    fn find_token_prefix_family() {
+        // wireshark-кейс: точного токена нет, но есть семейство
+        // идентификаторов-продолжений (`proto_register_field_array` —
+        // ОДИН токен: разрыв только по не-alnum).
+        let text = "void proto_register_field_array(void) {\n\
+                    int proto_register_field_init = 0;\n\
+                    proto_register_field_array();\n";
+        let ft = FileTokens::build(text);
+        let hits = ft.find_token_prefix("proto_register_field");
+        // 3 вхождения семейства, ни одного ложного
+        assert_eq!(hits.len(), 3, "hits={hits:?}");
+        // все хиты стоят на токенах префикс-семейства
+        for &h in &hits {
+            assert!(
+                ft.tok(h as usize).starts_with("proto_register_field"),
+                "хит не из семейства: {}",
+                ft.tok(h as usize)
+            );
+        }
+        // точное равенство НЕ требуется, но короткий префикс ловит больше
+        assert_eq!(ft.find_token_prefix("proto_register").len(), 3);
+        // пустой префикс — ничего (защита от дегенерации)
+        assert!(ft.find_token_prefix("").is_empty());
+        // несуществующий префикс — пусто
+        assert!(ft.find_token_prefix("zzz_absent").is_empty());
+    }
+
+    #[test]
+    fn find_token_prefix_case_folded() {
+        // токены хранятся фолдом: Wslua_PROTO_register( находит префикс
+        let ft = FileTokens::build("int Wslua_PROTO_register(void);");
+        let hits = ft.find_token_prefix("wslua_proto");
+        assert_eq!(hits.len(), 1, "hits={hits:?}");
+        assert_eq!(ft.tok(hits[0] as usize), "wslua_proto_register");
     }
 }
