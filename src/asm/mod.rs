@@ -19,6 +19,12 @@
 //! | [`trit_asm`] | 𝕋={−1,0,+1}: Клини, vpsignb, LEA×3, magic-÷3, VPTERNLOGD | SSSE3/SSE4.1/AVX-512 |
 //! | [`qutrit_asm`] | ℤ₃ ω-ротор 120° + мост трит→S¹ | SSE2/AVX2+FMA |
 //!
+//! v0.89.0 ABS-ZERO: АЗУ — Абсолютный Ноль ([`zero_asm`]): проективная
+//! прямая ℝP¹ [N:D] (деление перекрёстным умножением — ДЕЛЕНИЯ НЕТ,
+//! полюс D=0 — точка, не сбой), изолированный/уникальный/симметричный
+//! машинный нуль (121 = все-⊙, ±(3⁴⁰−1)/2), безопасное деление без #DE,
+//! ноль-сумма кутрита (N, D, −(N+D)).
+//!
 //! Каждое ядро имеет скалярный эталон (fallback для хостов без AVX2 и
 //! референс для тестов). CLI: `--asm-info`, `--asm-bench`.
 
@@ -36,6 +42,8 @@ pub mod stdp_asm;
 pub mod synapse_asm;
 #[cfg(target_arch = "x86_64")]
 pub mod trit_asm;
+#[cfg(target_arch = "x86_64")]
+pub mod zero_asm;
 
 use std::sync::OnceLock;
 
@@ -94,7 +102,7 @@ pub fn info_report() -> String {
     let c = caps();
     let on = |b: bool| if b { "ON" } else { "—" };
     format!(
-        "VAULT-ASM x86_64 microkernels (v0.88.0 TRIT-ASM)\n\
+        "VAULT-ASM x86_64 microkernels (v0.89.0 ABS-ZERO)\n\
          \n\
          CPU basis:\n\
            AVX2      : {}\n\
@@ -119,6 +127,14 @@ pub fn info_report() -> String {
                        / VPTERNLOGD-мультиплексор (imm 0xE4, sel?a:b)   [SSSE3+SSE4.1, AVX-512]\n\
            qutrit_asm   ℤ₃ ω-ротор 120° (f32 FMA + Q14 pmulhw) /\n\
                        мост трит→S¹ (θ_t = t·2π/3)              [SSE2/AVX2]\n\
+         \n\
+         ABS-ZERO v0.89.0 (АЗУ — Абсолютный Ноль, ℝP¹):\n\
+           zero_asm     [N:D] класс (Finite/Zero/Pole/Gauge) / инверсия=ОБМЕН /\n\
+                       умножение и ДЕЛЕНИЕ перекрёстным умножением (полюс D=0 —\n\
+                       точка, не сбой; 0/0 → калибровка) / 128-битное сравнение\n\
+                       дробей БЕЗ деления / div-safe ±MAX насыщение (нет #DE) /\n\
+                       вакуум-скан pack5 (121=все⊙, pcmpeqb+popcnt) /\n\
+                       qutrit3 (N,D,−(N+D)) — сумма ≡ 0 по построению    [int+SSE2+POPCNT]\n\
          \n\
          Golden set: {} | TRIT golden: {}",
         on(c.avx2),
@@ -152,7 +168,7 @@ fn gbs(bytes: f64, secs: f64) -> f64 {
 pub fn run_bench(synapses: usize, cycles: usize) -> std::process::ExitCode {
     use std::time::Instant;
     let c = caps();
-    println!("VAULT-ASM microkernel benchmark (v0.88.0 TRIT-ASM)");
+    println!("VAULT-ASM microkernel benchmark (v0.89.0 ABS-ZERO)");
     println!(
         "caps: avx2={} fma={} f16c={} popcnt={} avx512={} ssse3={} sse41={}\n",
         c.avx2, c.fma, c.f16c, c.popcnt, c.avx512f, c.ssse3, c.sse41
@@ -569,6 +585,105 @@ pub fn run_bench(synapses: usize, cycles: usize) -> std::process::ExitCode {
         );
     }
 
+    // ---------------- AZU: Абсолютный Ноль v0.89 ----------------
+    {
+        let n = 16 * 1024 * 1024;
+        let mut s = 97531u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // троичные данные с четвертью вакуума: ~25% байтов все-⊙ (121)
+        let packed: Vec<u8> = (0..n)
+            .map(|_| {
+                if next() % 4 == 0 {
+                    zero_asm::TRIT5_ZERO_CODE
+                } else {
+                    let mut v = (next() % 243) as u8;
+                    if v == zero_asm::TRIT5_ZERO_CODE {
+                        v = v.wrapping_add(1);
+                    }
+                    v
+                }
+            })
+            .collect();
+        let t = Instant::now();
+        let zeros = zero_asm::trit_zero_count(&packed);
+        let dt = t.elapsed().as_secs_f64();
+        let zeros_ref = zero_asm::trit_zero_count_scalar(&packed);
+        let ok = zeros == zeros_ref && zeros > 0;
+        all_pass &= ok;
+        println!(
+            "AZU  вакуум-скан  {:>9} Б      : {:8.2} GB/s    плотность ⊙ {:.1}%  {}",
+            n,
+            gbs(n as f64, dt),
+            100.0 * zeros as f64 / n as f64,
+            pass(ok)
+        );
+        // проективные операции на потоке пар
+        let m = 10_000_000;
+        let a: Vec<Proj2> = (0..m)
+            .map(|_| Proj2 { n: (next() % 4096) as i64 - 2048, d: (next() % 2045) as i64 + 4 })
+            .collect();
+        let b: Vec<Proj2> = (0..m)
+            .map(|_| Proj2 { n: (next() % 4096) as i64 - 2048, d: (next() % 2045) as i64 + 4 })
+            .collect();
+        let t = Instant::now();
+        let mut acc = 0i64;
+        for i in 0..m {
+            let r = a[i].div(&b[i]);
+            acc ^= r.n;
+        }
+        let dt = t.elapsed().as_secs_f64();
+        let ok = acc != i64::MAX; // живой поток, не вырожден
+        all_pass &= ok;
+        println!(
+            "AZU  [N:D] div    {:>9} дробь  : {:8.1} M div/s   перекрёстное умножение, деления НЕТ",
+            m,
+            mps(m as f64, dt)
+        );
+        // точное сравнение там, где f64 округляет
+        let t = Instant::now();
+        let mut ord = 0i64;
+        for i in 0..m {
+            let r = zero_asm::cmp_canonical(&a[i].into(), &b[i].into());
+            ord += r as i64;
+        }
+        let dt = t.elapsed().as_secs_f64();
+        let ok = (-(m as i64)..=m as i64).contains(&ord);
+        all_pass &= ok;
+        println!(
+            "AZU  cmp 128-бит  {:>9} дробь  : {:8.1} M cmp/s   Σord={} (N1·D2 vs N2·D1)",
+            m,
+            mps(m as f64, dt),
+            ord
+        );
+        // безопасное деление i32: края + поток
+        let nums: Vec<i32> = (0..m).map(|i| ((i % 977) as i32 - 488) * 4_194_303).collect();
+        let dens: Vec<i32> = (0..m).map(|i| ((i % 883) as i32 - 441) * 4_194_303).collect();
+        let t = Instant::now();
+        let mut dacc = 0i32;
+        for i in 0..m {
+            let r = zero_asm::div_safe_i32(nums[i], if i % 500_000 == 0 { 0 } else { dens[i] });
+            dacc = dacc.wrapping_add(r);
+        }
+        let dt = t.elapsed().as_secs_f64();
+        let edge_ok = zero_asm::div_safe_i32(7, 0) == i32::MAX
+            && zero_asm::div_safe_i32(-7, 0) == -i32::MAX
+            && zero_asm::div_safe_i32(i32::MIN, -1) == i32::MAX
+            && zero_asm::div_safe_i32(0, 0) == 0;
+        all_pass &= edge_ok;
+        println!(
+            "AZU  div-safe i32 {:>9} дел    : {:8.1} M div/s   края 0, MIN/-1: насыщение, не #DE  {}",
+            m,
+            mps(m as f64, dt),
+            pass(edge_ok)
+        );
+        let _ = dacc;
+    }
+
     println!("\nИтог: {}", if all_pass { "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ" } else { "ЕСТЬ РАССОГЛАСОВАНИЯ" });
     if all_pass {
         std::process::ExitCode::SUCCESS
@@ -585,6 +700,26 @@ fn wta_expected(rates: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// Локальная пара для бенча АЗУ (не pub — только run_bench).
+#[derive(Clone, Copy)]
+struct Proj2 {
+    n: i64,
+    d: i64,
+}
+
+impl From<Proj2> for zero_asm::Proj {
+    fn from(p: Proj2) -> Self {
+        zero_asm::Proj { n: p.n, d: p.d }
+    }
+}
+
+impl Proj2 {
+    fn div(&self, o: &Proj2) -> Proj2 {
+        let r = zero_asm::Proj::from(*self).div(&zero_asm::Proj::from(*o));
+        Proj2 { n: r.n, d: r.d }
+    }
 }
 
 fn pass(ok: bool) -> &'static str {
