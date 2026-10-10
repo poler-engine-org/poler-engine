@@ -11,9 +11,13 @@
 //! Crash-safety: запись идёт в `<out>.poler.part`, атомарный rename
 //! в конце; брошенный без finish() писатель удаляет свои temporaries.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use super::dedup::{chunk_hash, cut_point, ChunkDedup, CdcParams};
 use crate::pqc::sha256::{hex, Sha256};
@@ -68,6 +72,18 @@ pub struct StreamWriteConfig {
     pub read_chunk: usize,
     /// Прогресс в stderr каждые N сырых байт (0 = молчать).
     pub progress_bytes: u64,
+    /// v0.91.0 CORPUS-TRIT: число потоков сжатия. 0/1 — прежний
+    /// последовательный путь; ≥2 — буфер нарезки растёт до батча
+    /// (макс × min(jobs·2, 16)) и мисс-чанки сжимаются на rayon.
+    /// Выходные байты идентичны любому jobs: границы CDC зависят только
+    /// от содержимого, zstd-кадры сжимаются побайтово одинаково, запись
+    /// идёт строго в порядке потока.
+    pub jobs: usize,
+    /// v0.91.0: уровень глубокого яруса (дефолт 15 — прежнее поведение;
+    /// корпусной профиль v0.91 ставит 19). Уровень НЕ кодируется в
+    /// формате: кадр zstd самодокументирован, читатель безразличен к
+    /// уровню — .poler v1 остаётся .poler v1.
+    pub deep_level: i32,
 }
 
 impl Default for StreamWriteConfig {
@@ -78,6 +94,8 @@ impl Default for StreamWriteConfig {
             tier: CompressTier::Auto,
             read_chunk: 64 * 1024,
             progress_bytes: 256 * 1024 * 1024,
+            jobs: 0,
+            deep_level: 15,
         }
     }
 }
@@ -404,6 +422,123 @@ impl TarObserver {
     }
 }
 
+// ────────────────────────── Сжатие чанков ──────────────────────────
+
+/// План чанка пачки (v0.91.0): результат фазы нарезки/дедупа ДО сжатия.
+struct ChunkPlan {
+    raw_off: u64,
+    raw_len: u32,
+    hash: [u8; 32],
+    outcome: ChunkOutcome,
+}
+
+/// Судьба чанка пачки.
+enum ChunkOutcome {
+    /// Дедуп-хит на чанке ИЗ ПРЕДЫДУЩИХ пачек (уже записан —
+    /// stored_off известен из реестра).
+    HitStored { stored_off: u64 },
+    /// Дедуп-хит на чанке ЭТОЙ ЖЕ пачки (грабля v0.91.0: фаза планов
+    /// выполняется до записи, реестр ещё не видел пачку — полный
+    /// BLAKE3-ключ точен, stored_off мисса-предшественника будет
+    /// известен к моменту записи: мисс всегда пишется раньше).
+    HitInBatch { ordinal: usize },
+    /// Мисс: порядковый номер в векторе сжатых результатов.
+    Miss { ordinal: usize },
+}
+
+/// Пара переиспользуемых zstd-контекстов писателя: создание контекста —
+/// самая дорогая часть разового сжатия чанка, поэтому контексты живут
+/// столько же, сколько писатель (последовательный путь) или rayon-поток
+/// (батч-путь v0.91.0).
+struct ChunkCompressors {
+    fast: Option<zstd::bulk::Compressor<'static>>,
+    deep: Option<zstd::bulk::Compressor<'static>>,
+    deep_level: i32,
+}
+
+impl ChunkCompressors {
+    fn new(deep_level: i32) -> io::Result<ChunkCompressors> {
+        Ok(ChunkCompressors { fast: None, deep: None, deep_level })
+    }
+
+    fn zfast(&mut self, raw: &[u8]) -> io::Result<Vec<u8>> {
+        if self.fast.is_none() {
+            self.fast = Some(zstd_compressor(3)?);
+        }
+        self.fast.as_mut().unwrap().compress(raw)
+    }
+
+    fn zdeep(&mut self, raw: &[u8]) -> io::Result<Vec<u8>> {
+        if self.deep.is_none() {
+            self.deep = Some(zstd_compressor(self.deep_level)?);
+        }
+        self.deep.as_mut().unwrap().compress(raw)
+    }
+
+    /// Многоярусное сжатие одного чанка (логика прежняя, до v0.91.0).
+    fn compress(&mut self, raw: &[u8], tier: CompressTier) -> io::Result<(u8, Vec<u8>)> {
+        if raw.len() < 512 {
+            return Ok((METHOD_STORE, raw.to_vec()));
+        }
+        match tier {
+            CompressTier::Fast => {
+                let c = self.zfast(raw)?;
+                if c.len() < raw.len() * 15 / 16 {
+                    Ok((METHOD_ZFAST, c))
+                } else {
+                    Ok((METHOD_STORE, raw.to_vec()))
+                }
+            }
+            CompressTier::Deep => {
+                let c = self.zdeep(raw)?;
+                if c.len() < raw.len() * 15 / 16 {
+                    Ok((METHOD_ZDEEP, c))
+                } else {
+                    Ok((METHOD_STORE, raw.to_vec()))
+                }
+            }
+            CompressTier::Auto => {
+                let c3 = self.zfast(raw)?;
+                if c3.len() >= raw.len() * 15 / 16 {
+                    return Ok((METHOD_STORE, raw.to_vec()));
+                }
+                if c3.len() <= raw.len() / 2 {
+                    // хорошо сжимается — глубокий ярус может дать кратно
+                    let cd = self.zdeep(raw)?;
+                    if cd.len() < c3.len() {
+                        return Ok((METHOD_ZDEEP, cd));
+                    }
+                }
+                Ok((METHOD_ZFAST, c3))
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// v0.91.0: контексты rayon-потоков батч-сжатия. По паре на поток,
+    /// создание amortized по всему корпусу; смена deep_level
+    /// (профили/тесты) пересобирает контекст на первом чанке потока.
+    static TLS_COMPRESSORS: RefCell<Option<ChunkCompressors>> =
+        const { RefCell::new(None) };
+}
+
+/// Сжатие чанка на rayon-потоке: TLS-контексты, байтово та же логика,
+/// что у последовательного пути ([`ChunkCompressors::compress`]).
+fn tls_compress(raw: &[u8], tier: CompressTier, deep_level: i32) -> io::Result<(u8, Vec<u8>)> {
+    TLS_COMPRESSORS.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let rebuild = match guard.as_ref() {
+            Some(c) => c.deep_level != deep_level,
+            None => true,
+        };
+        if rebuild {
+            *guard = Some(ChunkCompressors::new(deep_level)?);
+        }
+        guard.as_mut().unwrap().compress(raw, tier)
+    })
+}
+
 // ────────────────────────── StreamWriter ──────────────────────────────
 
 /// Потоковый писатель .poler-контейнера.
@@ -421,12 +556,13 @@ pub struct StreamWriter {
     /// Позиции.
     raw_pos: u64,
     stored_pos: u64,
-    /// Буфер нарезки (ёмкость ≤ max + slack).
+    /// Буфер нарезки (ёмкость ≤ max + slack, при jobs≥2 — батч).
     buf: Vec<u8>,
     observer: TarObserver,
     stream_hash: Sha256,
-    fast: Option<zstd::bulk::Compressor<'static>>,
-    deep: Option<zstd::bulk::Compressor<'static>>,
+    /// Пара zstd-контекстов (fast/deep) — v0.91.0 вынесена из полей
+    /// fast/deep для переиспользования логики батч-путём.
+    compressors: ChunkCompressors,
     /// Статистика.
     dedup_chunks: u64,
     dedup_bytes: u64,
@@ -455,6 +591,7 @@ impl StreamWriter {
         file.write_all(MAGIC_START)?;
         let files_spill = File::create(&files_spill_path)?;
         let cap = cfg.cdc.max + cfg.read_chunk;
+        let deep_level = cfg.deep_level;
         Ok(StreamWriter {
             cfg,
             file,
@@ -470,8 +607,7 @@ impl StreamWriter {
             buf: Vec::with_capacity(cap),
             observer: TarObserver::new(),
             stream_hash: Sha256::new(),
-            fast: None,
-            deep: None,
+            compressors: ChunkCompressors::new(deep_level)?,
             dedup_chunks: 0,
             dedup_bytes: 0,
             stored_chunks: 0,
@@ -489,7 +625,22 @@ impl StreamWriter {
         let mut rest = bytes;
         let mut done_files = Vec::new();
         while !rest.is_empty() {
-            let want = self.cfg.cdc.max;
+            // v0.91.0: при jobs≥2 буфер нарезки копится до батча
+            // (макс × min(jobs·2, 16)) — и только потом режется: cut_ready
+            // ДО этого вызывался на каждом 8-КиБ куске tar-стрима и батч
+            // деградировал до 1–2 чанков (rayon простаивал). Инвариант
+            // детерминизма сохранён: окно cut_point ограничено cdc.max,
+            // накопление буфера границ не меняет (у jobs=0 поведение
+            // байтово прежнее: режем как только есть ≥ max).
+            let want = if self.cfg.jobs > 1 {
+                self.cfg
+                    .cdc
+                    .max
+                    .saturating_mul(self.cfg.jobs.min(8) * 2)
+                    .max(self.cfg.cdc.max)
+            } else {
+                self.cfg.cdc.max
+            };
             while self.buf.len() < want && !rest.is_empty() {
                 let take = (want - self.buf.len()).min(rest.len());
                 let chunk = &rest[..take];
@@ -501,7 +652,10 @@ impl StreamWriter {
             for d in done_files.drain(..) {
                 self.append_tar_file(d);
             }
-            self.cut_ready(false)?;
+            // батч готов (или источник исчерпан — хвост ждёт finish)
+            if self.buf.len() >= want {
+                self.cut_ready(false)?;
+            }
         }
         Ok(())
     }
@@ -615,115 +769,144 @@ impl StreamWriter {
         })
     }
 
-    /// Вырезать все готовые чанки из буфера. `eof` — источник исчерпан:
-    /// тогда остаток режется как хвост (граница может быть < max).
+    /// Вырезать все готовые чанки из буфера и прогнать их пачкой через
+    /// дедуп+сжатие+запись. `eof` — источник исчерпан: тогда остаток
+    /// режется как хвост (граница может быть < max).
+    ///
+    /// v0.91.0: чанки собираются в пачку (raws) и обрабатываются
+    /// [`process_batch`]; байты на выходе идентичны прежнему
+    /// по-чанковому пути при том же cfg.
     fn cut_ready(&mut self, eof: bool) -> io::Result<()> {
-        // buf вынимается: process_chunk(&mut self) не может заимствовать
+        // buf вынимается: process_batch(&mut self) не может заимствовать
         // срез самого себя
         let mut buf = std::mem::take(&mut self.buf);
-        loop {
-            if buf.is_empty() {
-                break;
-            }
+        let mut raws: Vec<Vec<u8>> = Vec::new();
+        while !buf.is_empty() {
             if !eof && buf.len() < self.cfg.cdc.max {
                 break; // ждём данных для детерминированной границы
             }
             let cut = cut_point(&buf, &self.cfg.cdc);
-            self.process_chunk(&buf[..cut])?;
-            buf.drain(..cut);
-            self.maybe_progress();
+            // drain переносит байты чанка без копии, ёмкость остаётся
+            raws.push(buf.drain(..cut).collect());
         }
         self.buf = buf;
+        self.process_batch(raws)?;
         Ok(())
     }
 
-    fn process_chunk(&mut self, raw: &[u8]) -> io::Result<()> {
-        let hash = chunk_hash(raw);
-        let raw_off = self.raw_pos;
-        let raw_len = raw.len() as u32;
-        self.raw_pos += raw.len() as u64;
-
-        if self.cfg.dedup {
-            if let Some(stored_off) = self.dedup.lookup(&hash, &self.file) {
-                self.logical.push(LogicalEntry { raw_off, stored_off, raw_len });
-                self.dedup.record_hit();
-                self.dedup_chunks += 1;
-                self.dedup_bytes += raw.len() as u64;
-                return Ok(());
-            }
+    /// v0.91.0: обработка пачки чанков. Фаза 1 (главный поток): BLAKE3 +
+    /// дедуп-план (реестр прошлых пачек + локальная карта пачки — дубли
+    /// ВНУТРИ пачки тоже схлопываются); фаза 2: сжатие мисс-чанков
+    /// (rayon при jobs≥2, иначе последовательно — байты одинаковы);
+    /// фаза 3: запись строго по порядку потока. Инварианты прежнего
+    /// process_chunk: raw_pos растёт по потоку, физические чанки лежат
+    /// в порядке нарезки, дедуп-реестр засеивается в порядке записи,
+    /// логический индекс — по raw_off.
+    fn process_batch(&mut self, raws: Vec<Vec<u8>>) -> io::Result<()> {
+        if raws.is_empty() {
+            return Ok(());
         }
-
-        let (method, payload) = self.compress(raw)?;
-        let stored_off = self.stored_pos;
-        let mut hdr = [0u8; CHUNK_HEADER_SIZE];
-        hdr[0..32].copy_from_slice(&hash);
-        hdr[32..36].copy_from_slice(&raw_len.to_le_bytes());
-        hdr[36..40].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        hdr[40] = method;
-        self.file.write_all(&hdr)?;
-        self.file.write_all(&payload)?;
-        self.stored_pos += (CHUNK_HEADER_SIZE + payload.len()) as u64;
-        self.logical.push(LogicalEntry { raw_off, stored_off, raw_len });
-        self.dedup.insert(&hash, stored_off);
-        match method {
-            METHOD_STORE => self.stored_chunks += 1,
-            METHOD_ZFAST => self.fast_chunks += 1,
-            _ => self.deep_chunks += 1,
-        }
-        Ok(())
-    }
-
-    /// Многоярусное сжатие одного чанка.
-    fn compress(&mut self, raw: &[u8]) -> io::Result<(u8, Vec<u8>)> {
-        if raw.len() < 512 {
-            return Ok((METHOD_STORE, raw.to_vec()));
-        }
-        match self.cfg.tier {
-            CompressTier::Fast => {
-                let c = self.zfast(raw)?;
-                if c.len() < raw.len() * 15 / 16 {
-                    Ok((METHOD_ZFAST, c))
-                } else {
-                    Ok((METHOD_STORE, raw.to_vec()))
+        let mut off = self.raw_pos;
+        let mut plans: Vec<ChunkPlan> = Vec::with_capacity(raws.len());
+        let mut miss_raws: Vec<Vec<u8>> = Vec::new();
+        // hash → порядковый номер первого вхождения В ЭТОЙ пачке;
+        // полный BLAKE3-ключ — коллизий нет (реестр хранит префиксы
+        // и верифицирует pread'ом, локальная карта точна по построению)
+        let mut batch_seen: HashMap<[u8; 32], usize> = HashMap::with_capacity(raws.len());
+        for raw in raws {
+            let raw_len = raw.len() as u32;
+            let hash = chunk_hash(&raw);
+            let raw_off = off;
+            off += raw_len as u64;
+            if self.cfg.dedup {
+                if let Some(stored_off) = self.dedup.lookup(&hash, &self.file) {
+                    self.dedup.record_hit();
+                    self.dedup_chunks += 1;
+                    self.dedup_bytes += raw_len as u64;
+                    plans.push(ChunkPlan {
+                        raw_off,
+                        raw_len,
+                        hash,
+                        outcome: ChunkOutcome::HitStored { stored_off },
+                    });
+                    continue;
+                }
+                if let Some(&ordinal) = batch_seen.get(&hash) {
+                    self.dedup.record_hit();
+                    self.dedup_chunks += 1;
+                    self.dedup_bytes += raw_len as u64;
+                    plans.push(ChunkPlan {
+                        raw_off,
+                        raw_len,
+                        hash,
+                        outcome: ChunkOutcome::HitInBatch { ordinal },
+                    });
+                    continue;
                 }
             }
-            CompressTier::Deep => {
-                let c = self.zdeep(raw)?;
-                if c.len() < raw.len() * 15 / 16 {
-                    Ok((METHOD_ZDEEP, c))
-                } else {
-                    Ok((METHOD_STORE, raw.to_vec()))
-                }
+            let ordinal = miss_raws.len();
+            if self.cfg.dedup {
+                batch_seen.insert(hash, ordinal);
             }
-            CompressTier::Auto => {
-                let c3 = self.zfast(raw)?;
-                if c3.len() >= raw.len() * 15 / 16 {
-                    return Ok((METHOD_STORE, raw.to_vec()));
-                }
-                if c3.len() <= raw.len() / 2 {
-                    // хорошо сжимается — глубокий ярус может дать кратно
-                    let c15 = self.zdeep(raw)?;
-                    if c15.len() < c3.len() {
-                        return Ok((METHOD_ZDEEP, c15));
+            plans.push(ChunkPlan {
+                raw_off,
+                raw_len,
+                hash,
+                outcome: ChunkOutcome::Miss { ordinal },
+            });
+            miss_raws.push(raw);
+        }
+        self.raw_pos = off;
+
+        let tier = self.cfg.tier;
+        let compressed: Vec<(u8, Vec<u8>)> = if self.cfg.jobs > 1 && miss_raws.len() > 1 {
+            let deep_level = self.cfg.deep_level;
+            miss_raws
+                .par_iter()
+                .map(|raw| tls_compress(raw, tier, deep_level))
+                .collect::<io::Result<Vec<_>>>()?
+        } else {
+            let mut out = Vec::with_capacity(miss_raws.len());
+            for raw in &miss_raws {
+                out.push(self.compressors.compress(raw, tier)?);
+            }
+            out
+        };
+
+        let mut miss_stored: Vec<u64> = vec![0u64; miss_raws.len()];
+        for plan in plans {
+            let stored_off = match plan.outcome {
+                ChunkOutcome::HitStored { stored_off } => stored_off,
+                ChunkOutcome::HitInBatch { ordinal } => miss_stored[ordinal],
+                ChunkOutcome::Miss { ordinal } => {
+                    let (method, payload) = &compressed[ordinal];
+                    let stored_off = self.stored_pos;
+                    let mut hdr = [0u8; CHUNK_HEADER_SIZE];
+                    hdr[0..32].copy_from_slice(&plan.hash);
+                    hdr[32..36].copy_from_slice(&plan.raw_len.to_le_bytes());
+                    hdr[36..40].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+                    hdr[40] = *method;
+                    self.file.write_all(&hdr)?;
+                    self.file.write_all(payload)?;
+                    self.stored_pos += (CHUNK_HEADER_SIZE + payload.len()) as u64;
+                    self.dedup.insert(&plan.hash, stored_off);
+                    miss_stored[ordinal] = stored_off;
+                    match *method {
+                        METHOD_STORE => self.stored_chunks += 1,
+                        METHOD_ZFAST => self.fast_chunks += 1,
+                        _ => self.deep_chunks += 1,
                     }
+                    stored_off
                 }
-                Ok((METHOD_ZFAST, c3))
-            }
+            };
+            self.logical.push(LogicalEntry {
+                raw_off: plan.raw_off,
+                stored_off,
+                raw_len: plan.raw_len,
+            });
         }
-    }
-
-    fn zfast(&mut self, raw: &[u8]) -> io::Result<Vec<u8>> {
-        if self.fast.is_none() {
-            self.fast = Some(zstd_compressor(3)?);
-        }
-        self.fast.as_mut().unwrap().compress(raw)
-    }
-
-    fn zdeep(&mut self, raw: &[u8]) -> io::Result<Vec<u8>> {
-        if self.deep.is_none() {
-            self.deep = Some(zstd_compressor(15)?);
-        }
-        self.deep.as_mut().unwrap().compress(raw)
+        self.maybe_progress();
+        Ok(())
     }
 
     /// Завершённый tar-файл → sidecar-таблица.
@@ -1043,6 +1226,92 @@ mod tests {
     fn peak_rss_reports_something() {
         let v = peak_rss_kb();
         assert!(v == 0 || v > 1000, "VmHWM = {v} КБ выглядит неразумно");
+    }
+
+    /// v0.91.0 CORPUS-TRIT: батч-путь (jobs=4) обязан давать БАЙТ-В-БАЙТ
+    /// тот же .poler, что последовательный (jobs=0): границы CDC зависят
+    /// только от содержимого, zstd-кадры чанка не зависят от потока,
+    /// запись идёт в порядке потока. Плюс deep_level=19 не хуже 15.
+    #[test]
+    fn parallel_jobs_byte_identical() {
+        // текстоподобные ~4 МиБ (повторяющиеся фразы) + дословные
+        // дубли-блоки (дедуп-хиты) + несжимаемый хвост (STORE)
+        let mut data = Vec::with_capacity(5 * 1024 * 1024);
+        let phrases: [&str; 8] = [
+            "синапс трёх состояний обходит умножение целиком",
+            "content defined chunking resists boundary shifts",
+            "квантовая решётка тритов живёт без умножения",
+            "the corpus packs itself into a single sovereign file",
+            "энтропия фильтра отделяет смысл от шума страницы",
+            "mmap backed readers open archives in constant time",
+            "троичный кристалл помнит весь корпус без диска",
+            "zero disk ingestion streams gigabytes into one poler",
+        ];
+        let mut st = 0xABCD_1234u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        while data.len() < 4 * 1024 * 1024 {
+            let p = phrases[(next() as usize) % phrases.len()];
+            data.extend_from_slice(p.as_bytes());
+            data.push(b'\n');
+        }
+        let block: Vec<u8> = data[..256 * 1024].to_vec();
+        for _ in 0..6 {
+            data.extend_from_slice(&block); // дубли → дедуп-хиты
+        }
+        for _ in 0..(512 * 1024 / 8) {
+            data.extend_from_slice(&next().to_le_bytes()); // несжимаемо
+        }
+
+        let base = StreamWriteConfig {
+            cdc: CdcParams::new(4096, 16 * 1024, 64 * 1024),
+            tier: CompressTier::Deep,
+            deep_level: 15,
+            jobs: 0,
+            progress_bytes: 0,
+            ..Default::default()
+        };
+        let p1 = tmp("par_seq.poler");
+        let p2 = tmp("par_jobs.poler");
+        let p3 = tmp("par_deep19.poler");
+        let s1 = write_stream(&data[..], &p1, base.clone(), "par.bin").unwrap();
+        let s2 = write_stream(
+            &data[..],
+            &p2,
+            StreamWriteConfig { jobs: 4, ..base.clone() },
+            "par.bin",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            std::fs::read(&p2).unwrap(),
+            "jobs=4 обязан быть байтово идентичен jobs=0"
+        );
+        assert_eq!(s1.logical_chunks, s2.logical_chunks);
+        assert_eq!(s1.dedup_chunks, s2.dedup_chunks);
+        assert!(s2.dedup_chunks >= 3, "дубли схлопнуты: {}", s2.dedup_chunks);
+
+        // глубокий уровень 19 плотнее уровня 15 на том же потоке
+        let s3 = write_stream(
+            &data[..],
+            &p3,
+            StreamWriteConfig { jobs: 2, deep_level: 19, ..base },
+            "par.bin",
+        )
+        .unwrap();
+        assert!(
+            s3.total_stored <= s1.total_stored,
+            "zstd-19 ({}) не хуже zstd-15 ({})",
+            s3.total_stored,
+            s1.total_stored
+        );
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+        let _ = std::fs::remove_file(&p3);
     }
 }
 

@@ -75,7 +75,10 @@ pub mod patcher;
 pub mod reader;
 pub mod stream_writer;
 
-pub use ingest::{ingest_file, ingest_reader, pack_dir, IngestKind, IngestMode};
+pub use ingest::{
+    corpus_config, corpus_pack, ingest_file, ingest_reader, pack_dir, CorpusClass,
+    CorpusClassStats, IngestKind, IngestMode,
+};
 pub use reader::{ExtractReport, PolerFile, PolerInfo, PolerReader, VerifyReport};
 pub use stream_writer::{
     fmt_bytes, peak_rss_kb, write_stream, CompressTier, StreamWriteConfig, StreamWriteStats,

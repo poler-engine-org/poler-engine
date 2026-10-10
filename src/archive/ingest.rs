@@ -13,12 +13,22 @@
 //! * [`pack_dir`] — «постоянный архиватор сборки»: упаковка каталога
 //!   в .poler с пофайловой таблицей (права 0o755 сохраняются — poler-box
 //!   запускает бинарники прямо из архива).
+//!
+//! v0.91.0 CORPUS-TRIT:
+//! * [`corpus_config`] — корпусной профиль плотности: CDC 128К/512К/1М,
+//!   Deep zstd-19, батч-сжатие чанков на rayon (jobs). Формат НЕ меняется:
+//!   уровень zstd не кодируется в .poler (кадр самодокументирован).
+//! * [`corpus_pack`] — упаковка ТЕКСТОВОГО КОРПУСА (код + литература,
+//!   сотни гигабайт) в один .poler с классификацией текстов по
+//!   расширениям ([`CorpusClass`]): код/литература/данные/прочее.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use super::stream_writer::{StreamWriter, StreamWriteConfig, StreamWriteStats};
+use super::dedup::CdcParams;
+use super::stream_writer::{CompressTier, StreamWriter, StreamWriteConfig, StreamWriteStats};
 
 /// Режим инжеста входного потока.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +206,117 @@ pub fn ingest_reader<R: Read>(
     }
 }
 
+// ────────────────────────── v0.91.0 CORPUS-TRIT ──────────────────────────
+
+/// Класс текста корпуса (по расширению имени; статистика обхода —
+/// бинарность содержимого дополнительно решает NUL-снифф кристалла
+/// `--archive-to-crystal` и семантического слоя, здесь — только отчёт).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorpusClass {
+    /// Программный код.
+    Code,
+    /// Литература/проза (markdown, книги, субтитры, логи прозы).
+    Prose,
+    /// Структурированные данные/разметка (json, yaml, csv, html…).
+    Data,
+    /// Прочее (бинарное/неизвестное).
+    Other,
+}
+
+impl CorpusClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CorpusClass::Code => "code",
+            CorpusClass::Prose => "prose",
+            CorpusClass::Data => "data",
+            CorpusClass::Other => "other",
+        }
+    }
+
+    /// Классификация по расширению (без точки, lowercase; пустое — Other).
+    pub fn of_ext(ext: &str) -> CorpusClass {
+        match ext {
+            "rs" | "py" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "js" | "mjs" | "cjs"
+            | "jsx" | "ts" | "tsx" | "java" | "kt" | "kts" | "go" | "rb" | "php" | "cs"
+            | "swift" | "zig" | "scala" | "sc" | "sh" | "bash" | "zsh" | "fish" | "sql"
+            | "pl" | "pm" | "lua" | "r" | "jl" | "dart" | "ex" | "exs" | "erl" | "hs"
+            | "ml" | "mli" | "fs" | "f90" | "f95" | "asm" | "s" | "svelte" | "vue"
+            | "awk" | "ps1" | "bat" | "cmd" | "v" | "cr" | "groovy" | "gradle" => {
+                CorpusClass::Code
+            }
+            "md" | "markdown" | "mdown" | "txt" | "rst" | "tex" | "org" | "adoc"
+            | "asciidoc" | "rtf" | "epub" | "mobi" | "fb2" | "djvu" | "srt" | "vtt"
+            | "nfo" | "log" | "letter" | "doc" | "docx" | "pdf" => CorpusClass::Prose,
+            "json" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv" | "ini" | "cfg"
+            | "conf" | "html" | "htm" | "css" | "scss" | "less" | "svg" | "geojson"
+            | "ndjson" | "parquet" | "db" | "sqlite" | "properties" => {
+                CorpusClass::Data
+            }
+            _ => CorpusClass::Other,
+        }
+    }
+}
+
+/// Статистика классов корпуса (собирается на обходе БЕЗ чтения тел).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CorpusClassStats {
+    pub code_files: u64,
+    pub code_bytes: u64,
+    pub prose_files: u64,
+    pub prose_bytes: u64,
+    pub data_files: u64,
+    pub data_bytes: u64,
+    pub other_files: u64,
+    pub other_bytes: u64,
+    /// Топ расширений по байтам: [ext, files, bytes].
+    pub top_ext: Vec<(String, u64, u64)>,
+}
+
+impl CorpusClassStats {
+    /// Учесть файл класса (используется пакером и --poler-stats).
+    pub fn bump(&mut self, class: CorpusClass, bytes: u64) {
+        match class {
+            CorpusClass::Code => {
+                self.code_files += 1;
+                self.code_bytes += bytes;
+            }
+            CorpusClass::Prose => {
+                self.prose_files += 1;
+                self.prose_bytes += bytes;
+            }
+            CorpusClass::Data => {
+                self.data_files += 1;
+                self.data_bytes += bytes;
+            }
+            CorpusClass::Other => {
+                self.other_files += 1;
+                self.other_bytes += bytes;
+            }
+        }
+    }
+}
+
+/// Корпусной профиль плотности (v0.91.0 CORPUS-TRIT):
+/// * CDC 128 КиБ / 512 КиБ / 1 МиБ — крупнее стримингового дефолта
+///   (64К/256К/1М): длиннее окно zstd на чанк, выше плотность текста;
+///   дедуп остаётся точным — границы по содержимому, повторяющиеся
+///   тома/клоны кода схлопываются чанково;
+/// * Deep zstd-19 (формат не меняется: уровень не кодируется в .poler,
+///   кадр zstd самодокументирован — любой читатель v0.39+ читает);
+/// * jobs≥2 — батч-сжатие чанков на rayon: 150 ГБ корпуса упаковываются
+///   за часы, а не за ночь.
+pub fn corpus_config(jobs: usize) -> StreamWriteConfig {
+    StreamWriteConfig {
+        cdc: CdcParams::new(128 * 1024, 512 * 1024, 1024 * 1024),
+        dedup: true,
+        tier: CompressTier::Deep,
+        read_chunk: 1024 * 1024,
+        progress_bytes: 1024 * 1024 * 1024,
+        jobs,
+        deep_level: 19,
+    }
+}
+
 /// «Постоянный архиватор сборки» (v0.65.0): упаковка каталога в .poler
 /// с ПОФАЙЛОВОЙ таблицей. Обход как у grep-слоя (respect .gitignore,
 /// скрытые по умолчанию пропускаются); файлы льются через tar-обёртку —
@@ -210,6 +331,35 @@ pub fn pack_dir(
     include_hidden: bool,
     respect_ignore: bool,
 ) -> io::Result<StreamWriteStats> {
+    pack_dir_inner(root, out_path, cfg, include_hidden, respect_ignore, false).map(|(s, _)| s)
+}
+
+/// v0.91.0 CORPUS-TRIT: упаковка ТЕКСТОВОГО КОРПУСА (код + литература)
+/// в один .poler — те же механизмы, что [`pack_dir`] (пофайловая таблица,
+/// BLAKE3-дедуп между файлами, zstd), плюс статистика классов текстов
+/// для отчёта. Классификация — по расширениям на обходе, тела файлов
+/// для неё не читаются. Профиль плотности задаёт вызывающий
+/// ([`corpus_config`]).
+pub fn corpus_pack(
+    root: &Path,
+    out_path: &Path,
+    cfg: StreamWriteConfig,
+    include_hidden: bool,
+    respect_ignore: bool,
+) -> io::Result<(StreamWriteStats, CorpusClassStats)> {
+    pack_dir_inner(root, out_path, cfg, include_hidden, respect_ignore, true)
+}
+
+/// Общая реализация [`pack_dir`]/[`corpus_pack`]; `classify` включает
+/// сбор статистики классов и гистограммы расширений.
+fn pack_dir_inner(
+    root: &Path,
+    out_path: &Path,
+    cfg: StreamWriteConfig,
+    include_hidden: bool,
+    respect_ignore: bool,
+    classify: bool,
+) -> io::Result<(StreamWriteStats, CorpusClassStats)> {
     use ignore::WalkBuilder;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -258,6 +408,8 @@ pub fn pack_dir(
     };
 
     let mut writer = StreamWriter::open(out_path, cfg)?;
+    let mut classes = CorpusClassStats::default();
+    let mut ext_hist: HashMap<String, (u64, u64)> = HashMap::new();
     {
         let mut tar_builder = tar::Builder::new(TarWriterShim { writer: &mut writer });
         let walker = WalkBuilder::new(root)
@@ -281,6 +433,21 @@ pub fn pack_dir(
             let rel = path.strip_prefix(root).unwrap_or(path);
             let name = rel.to_string_lossy().replace('\\', "/");
             let meta = std::fs::metadata(path)?;
+            if classify {
+                // v0.91.0: класс текста по расширению — статистика
+                // корпуса без чтения тел (бинарность решает NUL-снифф
+                // кристалла/семантики, здесь — только отчёт).
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_default();
+                classes.bump(CorpusClass::of_ext(&ext), meta.len());
+                let key = if ext.is_empty() { "(none)".to_string() } else { ext };
+                let slot = ext_hist.entry(key).or_insert((0, 0));
+                slot.0 += 1;
+                slot.1 += meta.len();
+            }
             let mut f = File::open(path)?;
             let mut header = tar::Header::new_gnu();
             header.set_size(meta.len());
@@ -295,7 +462,15 @@ pub fn pack_dir(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    writer.finish(&hint)
+    let stats = writer.finish(&hint)?;
+    if classify {
+        let mut top: Vec<(String, u64, u64)> =
+            ext_hist.into_iter().map(|(k, (f, b))| (k, f, b)).collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.truncate(16);
+        classes.top_ext = top;
+    }
+    Ok((stats, classes))
 }
 
 struct TarWriterShim<'a> {
@@ -503,5 +678,88 @@ mod tests {
         let rep = r.verify().unwrap();
         assert!(rep.all_ok, "verify: {:?}", rep.files_bad);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v0.91.0 CORPUS-TRIT: корпус → .poler (батч-сжатие jobs=2),
+    /// классификация код/литература/данные, дедуп дубля файла,
+    /// lossless-verify, извлечение байт-в-байт.
+    ///
+    /// ГРАБЛЯ, пойманная этим тестом: дедуп ВНУТРИ батча терялся
+    /// (фаза планов делала все lookup'ы до вставки хешей в реестр —
+    /// дубли одной пачки не схлопывались). Вторая грабля: идеально
+    /// ПЕРИОДИЧЕСКИЙ контент без энтропии не даёт CDC-триггеров —
+    /// границы жёстко по лимиту, копии не ресинхронизируются; поэтому
+    /// тестовый «код» энтропичен (счётчики в строках), как реальный.
+    #[test]
+    fn corpus_pack_roundtrip_and_classes() {
+        let d = std::env::temp_dir().join(format!("poler-corpus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("docs")).unwrap();
+        // ~160 КиБ «кода»: строки различны (энтропия → CDC-триггеры)
+        let mut code: Vec<u8> = Vec::with_capacity(164 * 1024);
+        let mut i = 0u32;
+        while code.len() < 160 * 1024 {
+            let line = format!(
+                "pub fn intersects_{i}(p: &Point<C>, q: &Point<C>, out: &mut Vec<Coord>) -> bool {{ p.x * {} + q.y >= {} }}\n",
+                i.wrapping_mul(7) % 997,
+                i % 13
+            );
+            code.extend_from_slice(line.as_bytes());
+            i += 1;
+        }
+        std::fs::write(d.join("src/geometry.rs"), &code).unwrap();
+        // «литература»: проза с абзацами
+        let prose = "Троичный кристалл помнит весь корпус: трит −1, 0, +1 живёт в байте впятером.\n\nСуверенный архиватор льёт поток прямо в кристалл без сырой выгрузки.\n\n"
+            .repeat(600);
+        std::fs::write(d.join("docs/story.md"), prose.as_bytes()).unwrap();
+        // «данные»
+        std::fs::write(
+            d.join("meta.json"),
+            br#"{"trits": 3, "qutrits": 9, "corpus": "poler-engine"}"#,
+        )
+        .unwrap();
+        // ДУБЛЬ кода: CDC-дедуп обязан схлопнуть повторяющиеся чанки
+        std::fs::write(d.join("src/geometry_copy.rs"), &code).unwrap();
+
+        let p = tmp("corpus.poler");
+        let mut cfg = corpus_config(2);
+        cfg.cdc = CdcParams::new(4096, 16 * 1024, 64 * 1024); // скорость теста
+        let (stats, classes) = corpus_pack(&d, &p, cfg, false, false).unwrap();
+        assert!(stats.tar_mode, "пофайловая таблица: {stats:?}");
+        assert_eq!(stats.files, 4, "4 файла корпуса в таблице");
+        assert!(
+            stats.dedup_chunks >= 2,
+            "дубль кода не схлопнут: {} хитов",
+            stats.dedup_chunks
+        );
+        assert_eq!(classes.code_files, 2);
+        assert_eq!(classes.prose_files, 1);
+        assert_eq!(classes.data_files, 1);
+        assert!(classes.top_ext.iter().any(|(e, _, _)| e == "rs"));
+
+        let r = PolerReader::open(&p).unwrap();
+        let rep = r.verify().unwrap();
+        assert!(rep.all_ok, "verify: {:?}", rep.files_bad);
+        let f = r.find_file("src/geometry.rs").unwrap();
+        let mut out = Vec::new();
+        r.read_range(f.raw_off, f.raw_len as usize, &mut out).unwrap();
+        assert_eq!(out, code, "lossless байт-в-байт");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// v0.91.0: классификация расширений корпуса.
+    #[test]
+    fn corpus_class_of_ext() {
+        assert_eq!(CorpusClass::of_ext("rs"), CorpusClass::Code);
+        assert_eq!(CorpusClass::of_ext("py"), CorpusClass::Code);
+        assert_eq!(CorpusClass::of_ext("md"), CorpusClass::Prose);
+        assert_eq!(CorpusClass::of_ext("txt"), CorpusClass::Prose);
+        assert_eq!(CorpusClass::of_ext("json"), CorpusClass::Data);
+        assert_eq!(CorpusClass::of_ext("yaml"), CorpusClass::Data);
+        assert_eq!(CorpusClass::of_ext("so"), CorpusClass::Other);
+        assert_eq!(CorpusClass::of_ext(""), CorpusClass::Other);
+        assert_eq!(CorpusClass::of_ext("pdf"), CorpusClass::Prose);
     }
 }

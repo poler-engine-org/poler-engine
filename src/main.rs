@@ -1541,6 +1541,48 @@ struct Cli {
     #[arg(long = "pack-gitignore", default_value_t = false)]
     pack_gitignore: bool,
 
+    /// v0.91.0 CORPUS-TRIT: КОРПУСНОЙ ПАКЕР — 150 ГБ текстов (код +
+    /// литература) → один .poler. Профиль плотности: CDC 128К/512К/1М,
+    /// Deep zstd-19, BLAKE3-дедуп между файлами; сжатие чанков БАТАМИ
+    /// на rayon (--pack-jobs); классификация текстов (код/литература/
+    /// данные/прочее) в статистике. Формат .poler v1 не меняется.
+    /// WYSIWYG: пакуется ВСЁ содержимое; --pack-gitignore включает
+    /// фильтр .gitignore+hidden.
+    #[arg(
+        long = "corpus-pack",
+        value_name = "DIR",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "poler_stats", "pack", "grep", "chunk", "web", "crawl", "web_search",
+            "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact",
+            "browser_index", "web_lens", "web_lens_install", "crystal_build",
+            "crystal_ingest_dir", "learn_web", "learn_dir", "stream_quant",
+        ]
+    )]
+    corpus_pack: Option<PathBuf>,
+
+    /// Потоки сжатия для --pack/--corpus-pack [default: 0 = все ядра].
+    #[arg(long = "pack-jobs", value_name = "N", default_value_t = 0)]
+    pack_jobs: usize,
+
+    /// v0.91.0: манифест .poler-корпуса БЕЗ декомпрессии — таблица
+    /// файлов, классы текстов (код/литература/данные), гистограмма
+    /// расширений, дедуп, топ-файлы. Только метаданные контейнера.
+    #[arg(
+        long = "poler-stats",
+        value_name = "POLER",
+        conflicts_with_all = [
+            "stream_download", "stream_file", "stream_bench", "browser_crawl",
+            "archive_to_crystal", "poler_list", "poler_verify", "poler_extract",
+            "corpus_pack", "pack", "grep", "chunk", "web", "crawl", "web_search",
+            "web_stats", "mcp", "mcp_http", "shell", "exec", "tui", "impact",
+            "browser_index", "web_lens", "web_lens_install", "crystal_build",
+            "crystal_ingest_dir", "learn_web", "learn_dir", "stream_quant",
+        ]
+    )]
+    poler_stats: Option<PathBuf>,
+
     /// Выходной .poler-архив для --stream-download/--stream-file/
     /// --stream-bench/--pack/--browser-crawl.
     #[arg(long = "output-archive", value_name = "POLER")]
@@ -2354,10 +2396,12 @@ fn run(cli: Cli) -> ExitCode {
     }
     // ---------- v0.39.0: Zero-Disk Streaming Ingestion Pipeline ----------
     // v0.65.0: + --pack (постоянный архиватор сборки)
+    // v0.91.0: + --corpus-pack (корпусной пакер CORPUS-TRIT)
     if cli.stream_download.is_some()
         || cli.stream_file.is_some()
         || cli.stream_bench.is_some()
         || cli.pack.is_some()
+        || cli.corpus_pack.is_some()
     {
         return ExitCode::from(run_stream_ingest(&cli) as u8);
     }
@@ -2366,6 +2410,9 @@ fn run(cli: Cli) -> ExitCode {
     }
     if cli.archive_to_crystal.is_some() {
         return ExitCode::from(run_archive_to_crystal(&cli) as u8);
+    }
+    if cli.poler_stats.is_some() {
+        return ExitCode::from(run_poler_stats(&cli) as u8);
     }
     if cli.poler_list.is_some() || cli.poler_verify.is_some() || cli.poler_extract.is_some() {
         return ExitCode::from(run_poler_ops(&cli) as u8);
@@ -3416,62 +3463,84 @@ fn run_semantic_corpus_search(
     use poler_engine::vectors::Embedder as _;
 
     let t0 = std::time::Instant::now();
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    if !collect_text_files(corpus, &mut files, 4096) {
-        return 2;
-    }
-    if files.is_empty() {
-        eprintln!("poler-engine: корпус пуст (текстовых файлов не найдено)");
-        return 2;
-    }
-
-    // Чанки: абзацы склеиваются до ~400 символов, длинные режутся.
     let mut chunks: Vec<(String, String)> = Vec::new(); // (file, text)
-    for f in &files {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
-        for piece in text.split("\n\n") {
-            let p = piece.trim();
-            if p.chars().count() < 40 {
-                continue; // мусорные осколки пропускаем
+    if poler_engine::archive::kind_of(corpus) == Some(poler_engine::archive::ArchiveKind::Poler) {
+        // v0.91.0 CORPUS-TRIT: живой корпус — .poler-контейнер. Чанки
+        // читаются read_range (декомпрессия чанков по требованию), БЕЗ
+        // распаковки на диск; NUL-снифф отсеивает бинарные записи,
+        // выборка — резервуар Vitter R (равномерно, RAM O(max_chunks)).
+        match poler_archive_chunks(corpus, max_chunks, &mut chunks) {
+            Ok((text_files, binary_files)) => {
+                eprintln!(
+                    "корпус: .poler {} → {} текстовых записей ({} бинарных пропущено) → {} чанков (резервуар ≤{})",
+                    corpus.display(),
+                    text_files,
+                    binary_files,
+                    chunks.len(),
+                    max_chunks
+                );
             }
-            if p.chars().count() <= 380 {
-                chunks.push((f.display().to_string(), p.to_string()));
-            } else {
-                // жёсткая нарезка длинных абзацев (~150 токенов на чанк)
-                let mut start = 0usize;
-                let cs: Vec<char> = p.chars().collect();
-                while start < cs.len() {
-                    let end = (start + 340).min(cs.len());
-                    let s: String = cs[start..end].iter().collect();
-                    chunks.push((f.display().to_string(), s));
-                    start = end;
+            Err(e) => {
+                eprintln!("poler-engine: {e}");
+                return 2;
+            }
+        }
+    } else {
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        if !collect_text_files(corpus, &mut files, 4096) {
+            return 2;
+        }
+        if files.is_empty() {
+            eprintln!("poler-engine: корпус пуст (текстовых файлов не найдено)");
+            return 2;
+        }
+
+        // Чанки: абзацы склеиваются до ~400 символов, длинные режутся.
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            for piece in text.split("\n\n") {
+                let p = piece.trim();
+                if p.chars().count() < 40 {
+                    continue; // мусорные осколки пропускаем
+                }
+                if p.chars().count() <= 380 {
+                    chunks.push((f.display().to_string(), p.to_string()));
+                } else {
+                    // жёсткая нарезка длинных абзацев (~150 токенов на чанк)
+                    let mut start = 0usize;
+                    let cs: Vec<char> = p.chars().collect();
+                    while start < cs.len() {
+                        let end = (start + 340).min(cs.len());
+                        let s: String = cs[start..end].iter().collect();
+                        chunks.push((f.display().to_string(), s));
+                        start = end;
+                    }
                 }
             }
         }
+        // Равномерная выборка до max_chunks (корпус может быть огромным).
+        if chunks.len() > max_chunks {
+            let step = chunks.len() as f64 / max_chunks as f64;
+            let picked: Vec<(String, String)> = (0..max_chunks)
+                .map(|i| chunks[(i as f64 * step) as usize].clone())
+                .collect();
+            eprintln!(
+                "poler-engine: {} чанков → равномерная выборка {} (--semantic-max-chunks)",
+                chunks.len(),
+                max_chunks
+            );
+            chunks = picked;
+        }
+        eprintln!(
+            "корпус: {} файлов → {} чанков · эмбеддинг…",
+            files.len(),
+            chunks.len()
+        );
     }
     if chunks.is_empty() {
         eprintln!("poler-engine: в корпусе нет абзацев достаточной длины");
         return 2;
     }
-    // Равномерная выборка до max_chunks (корпус может быть огромным).
-    if chunks.len() > max_chunks {
-        let step = chunks.len() as f64 / max_chunks as f64;
-        let picked: Vec<(String, String)> = (0..max_chunks)
-            .map(|i| chunks[(i as f64 * step) as usize].clone())
-            .collect();
-        eprintln!(
-            "poler-engine: {} чанков → равномерная выборка {} (--semantic-max-chunks)",
-            chunks.len(),
-            max_chunks
-        );
-        chunks = picked;
-    }
-
-    eprintln!(
-        "корпус: {} файлов → {} чанков · эмбеддинг…",
-        files.len(),
-        chunks.len()
-    );
     // Параллельно по чанкам (rayon): токенизация + forward — оба &self,
     // mmap-веса разделяются всеми потоками.
     let emb: &poler_engine::vectors::pqw_bridge::PqwEmbedder = &*embedder;
@@ -3540,6 +3609,90 @@ fn run_semantic_corpus_search(
         println!("   {snippet}…");
     }
     0
+}
+
+/// v0.91.0 CORPUS-TRIT: чанки текста ПРЯМО из .poler-архива — без
+/// распаковки на диск. ГРАБЛЯ, пойманная тестом: raw_region режет
+/// ФИЗИЧЕСКИЙ mmap архива, а raw_off/raw_len записей — координаты
+/// ЛОГИЧЕСКОГО потока; правильный путь — read_range (декомпрессия
+/// чанков по требованию, MADV_DONTNEED после — RSS не копится).
+/// NUL-снифф первых 4 КиБ отсеивает бинарные записи; длинные записи
+/// читаются первыми 2 МиБ. Выборка — резервуар Vitter R: равномерная
+/// по всему корпусу, RAM O(max_chunks), один проход.
+/// Возвращает (текстовые записи, бинарные записи).
+fn poler_archive_chunks(
+    archive: &std::path::Path,
+    max_chunks: usize,
+    out: &mut Vec<(String, String)>,
+) -> Result<(usize, usize), String> {
+    use poler_engine::archive::reader::PolerReader;
+    let reader = PolerReader::open(archive)?;
+    const PER_FILE_CAP: u64 = 2 * 1024 * 1024;
+    let prefix = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "corpus.poler".to_string());
+    let mut text_files = 0usize;
+    let mut binary_files = 0usize;
+    let mut seen: u64 = 0;
+    // детерминированный xorshift64 — резервуар воспроизводим
+    let mut rng: u64 = 0x504F_4C45_5253_4543; // "POLERSEC"
+    let mut scratch: Vec<u8> = Vec::new();
+    for f in reader.files() {
+        if f.raw_len == 0 {
+            continue;
+        }
+        let take = f.raw_len.min(PER_FILE_CAP) as usize;
+        scratch.clear();
+        if reader.read_range(f.raw_off, take, &mut scratch).is_err() {
+            continue;
+        }
+        let bytes: &[u8] = &scratch[..];
+        let probe = &bytes[..bytes.len().min(4096)];
+        if probe.contains(&0) {
+            binary_files += 1;
+            continue;
+        }
+        text_files += 1;
+        let name = format!("{prefix}::{}", f.name);
+        let text = String::from_utf8_lossy(bytes);
+        for piece in text.split("\n\n") {
+            let p = piece.trim();
+            if p.chars().count() < 40 {
+                continue; // мусорные осколки пропускаем
+            }
+            let pieces: Vec<String> = if p.chars().count() <= 380 {
+                vec![p.to_string()]
+            } else {
+                // жёсткая нарезка длинных абзацев (~150 токенов на чанк)
+                let mut v = Vec::new();
+                let mut start = 0usize;
+                let cs: Vec<char> = p.chars().collect();
+                while start < cs.len() {
+                    let end = (start + 340).min(cs.len());
+                    v.push(cs[start..end].iter().collect());
+                    start = end;
+                }
+                v
+            };
+            for s in pieces {
+                seen += 1;
+                if (out.len() as u64) < max_chunks as u64 {
+                    out.push((name.clone(), s));
+                } else {
+                    // резервуар Vitter R: замена с вероятностью max/seen
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let idx = (rng % seen) as usize;
+                    if idx < max_chunks {
+                        out[idx] = (name.clone(), s);
+                    }
+                }
+            }
+        }
+    }
+    Ok((text_files, binary_files))
 }
 
 // ---------------------------------------------------------------------------
@@ -6895,6 +7048,11 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
             return 2;
         }
     };
+    // v0.91.0 CORPUS-TRIT: корпусной пакер — свой профиль плотности,
+    // батч-сжатие на rayon, классификация текстов и честный отчёт.
+    if let Some(dir) = &cli.corpus_pack {
+        return run_corpus_pack(cli, dir, &out);
+    }
     let stats = if let Some(url) = &cli.stream_download {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             eprintln!("stream-download: ожидается http(s) URL: {url}");
@@ -6995,6 +7153,143 @@ fn run_stream_ingest(cli: &Cli) -> i32 {
             stats.peak_rss_kb
         );
     }
+    0
+}
+
+/// v0.91.0 CORPUS-TRIT: --corpus-pack — сотни гигабайт текстов
+/// (код + литература) → один .poler. Профиль плотности CDC 128К/512К/1М
+/// + Deep zstd-19 + BLAKE3-дедуп + батч-сжатие на rayon.
+fn run_corpus_pack(cli: &Cli, dir: &std::path::Path, out: &std::path::Path) -> i32 {
+    use poler_engine::archive::fmt_bytes;
+    use poler_engine::archive::{corpus_config, corpus_pack};
+    let jobs = if cli.pack_jobs == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        cli.pack_jobs
+    };
+    let mut cfg = corpus_config(jobs);
+    if cli.no_dedup {
+        cfg.dedup = false;
+    }
+    let (hidden, ignore) = if cli.pack_gitignore {
+        (false, true)
+    } else {
+        (true, false)
+    };
+    eprintln!(
+        "corpus-pack: {} → {}\n  профиль: CDC 128К/512К/1М · Deep zstd-{} · дедуп {} · батч-сжатие ×{}",
+        dir.display(),
+        out.display(),
+        cfg.deep_level,
+        if cfg.dedup { "вкл" } else { "выкл" },
+        jobs
+    );
+    let t0 = std::time::Instant::now();
+    match corpus_pack(dir, out, cfg, hidden, ignore) {
+        Ok((stats, classes)) => {
+            println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+            println!("{}", serde_json::to_string_pretty(&classes).unwrap_or_default());
+            let total_files =
+                classes.code_files + classes.prose_files + classes.data_files + classes.other_files;
+            eprintln!(
+                "corpus-pack: {} файлов (код {} · литература {} · данные {} · прочее {})",
+                total_files, classes.code_files, classes.prose_files, classes.data_files,
+                classes.other_files
+            );
+            eprintln!(
+                "corpus-pack: {} → {} (сжатие ×{:.2}), дедуп сэкономил {}, {} мс, {} МиБ/с",
+                fmt_bytes(stats.total_raw),
+                fmt_bytes(stats.total_stored),
+                if stats.total_raw > 0 {
+                    stats.total_raw as f64 / stats.total_stored as f64
+                } else {
+                    0.0
+                },
+                fmt_bytes(stats.dedup_bytes),
+                t0.elapsed().as_millis(),
+                stats.throughput_mbs
+            );
+            if stats.peak_rss_kb > 512 * 1024 {
+                eprintln!(
+                    "corpus-pack: пик RSS {} КиБ (батч-сжатие ×{})",
+                    stats.peak_rss_kb, jobs
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("corpus-pack: {e}");
+            2
+        }
+    }
+}
+
+/// v0.91.0: --poler-stats — манифест .poler-корпуса БЕЗ декомпрессии:
+/// классы текстов по именам записей, гистограмма расширений, дедуп,
+/// топ-файлы. Только метаданные контейнера (mmap + таблица файлов).
+fn run_poler_stats(cli: &Cli) -> i32 {
+    use poler_engine::archive::fmt_bytes;
+    use poler_engine::archive::ingest::{CorpusClass, CorpusClassStats};
+    use poler_engine::archive::reader::PolerReader;
+    use std::collections::HashMap;
+    let path = cli.poler_stats.as_ref().unwrap();
+    let reader = match PolerReader::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("poler-stats: {e}");
+            return 2;
+        }
+    };
+    let info = reader.info().clone();
+    let mut classes = CorpusClassStats::default();
+    let mut ext_hist: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut top_files: Vec<(String, u64)> = Vec::new();
+    for f in reader.files() {
+        top_files.push((f.name.clone(), f.raw_len));
+        let ext = std::path::Path::new(&f.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        classes.bump(CorpusClass::of_ext(&ext), f.raw_len);
+        let key = if ext.is_empty() { "(none)".to_string() } else { ext };
+        let slot = ext_hist.entry(key).or_insert((0, 0));
+        slot.0 += 1;
+        slot.1 += f.raw_len;
+    }
+    let mut top_ext: Vec<(String, u64, u64)> =
+        ext_hist.into_iter().map(|(k, (f, b))| (k, f, b)).collect();
+    top_ext.sort_by(|a, b| b.1.cmp(&a.1));
+    top_ext.truncate(16);
+    classes.top_ext = top_ext;
+    top_files.sort_by(|a, b| b.1.cmp(&a.1));
+    top_files.truncate(16);
+
+    let dedup_saved = info.logical_chunks.saturating_sub(info.physical_chunks);
+    let manifest = serde_json::json!({
+        "archive": path.display().to_string(),
+        "info": info,
+        "classes": classes,
+        "top_files": top_files,
+        "dedup_chunks_saved": dedup_saved,
+    });
+    println!("{}", serde_json::to_string_pretty(&manifest).unwrap_or_default());
+    eprintln!(
+        "poler-stats: {} записей · {} логических / {} физических чанков (дедуп −{}) · {} → {} (×{:.2})",
+        reader.files().len(),
+        info.logical_chunks,
+        info.physical_chunks,
+        dedup_saved,
+        fmt_bytes(info.total_raw),
+        fmt_bytes(info.total_stored),
+        if info.total_raw > 0 {
+            info.total_raw as f64 / info.total_stored as f64
+        } else {
+            0.0
+        }
+    );
     0
 }
 
@@ -8258,5 +8553,78 @@ fn jit_command(mode: JitModeArg, rows: usize, cols: usize) -> ExitCode {
             println!("  машинный код: {} инструкций, {} Б", compiled.instruction_count, compiled.machine_bytes.len());
             ExitCode::SUCCESS
         }
+    }
+}
+
+// ────────────────────────── тесты v0.91.0 CORPUS-TRIT ──────────────────────────
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::poler_archive_chunks;
+    use poler_engine::archive::ingest::{corpus_config, corpus_pack};
+    use poler_engine::archive::reader::PolerReader;
+    use poler_engine::archive::stream_writer::StreamWriteConfig;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("poler-main-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    /// .poler-корпус → чанки без распаковки: текстовые записи читаются,
+    /// бинарные отсеяны NUL-сниффом, резервуар держит потолок max_chunks.
+    #[test]
+    fn poler_archive_chunks_reservoir_and_binary_sniff() {
+        let d = std::env::temp_dir().join(format!(
+            "poler-semcorpus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // проза с двумя абзацами (>= 40 символов каждый)
+        std::fs::write(
+            d.join("story.md"),
+            "Троичный кристалл помнит весь корпус без единой распаковки на диск.\n\nСуверенный архиватор льёт поток прямо в кристалл из mmap-региона.",
+        )
+        .unwrap();
+        // короткий текст — не даёт чанков (осколок < 40)
+        std::fs::write(d.join("tiny.txt"), "слишком коротко").unwrap();
+        // бинарная запись — NUL-снифф обязан отсеять
+        std::fs::write(d.join("blob.bin"), [0u8, 1, 2, 0, 255, 254].repeat(1024)).unwrap();
+
+        let p = tmp("semcorpus.poler");
+        let cfg = StreamWriteConfig {
+            cdc: poler_engine::archive::dedup::CdcParams::new(4096, 16 * 1024, 64 * 1024),
+            ..corpus_config(2)
+        };
+        let (stats, _) = corpus_pack(&d, &p, cfg, false, false).unwrap();
+        assert_eq!(stats.files, 3);
+
+        // резервуар потолком 1: сколько бы чанков ни было — ровно ≤ 1
+        let mut chunks = Vec::new();
+        let (text_files, binary_files) = poler_archive_chunks(&p, 1, &mut chunks).unwrap();
+        assert_eq!(text_files, 2, "story.md + tiny.txt (текстовые)");
+        assert_eq!(binary_files, 1, "blob.bin отсеян NUL-сниффом");
+        assert_eq!(chunks.len(), 1, "резервуар держит потолок");
+        assert!(chunks[0].0.starts_with("semcorpus.poler::"), "имя архив::запись: {}", chunks[0].0);
+        assert!(chunks[0].1.contains("кристалл"));
+
+        // без потолка (4096): оба абзаца story.md среди чанков
+        let mut all = Vec::new();
+        let _ = poler_archive_chunks(&p, 4096, &mut all).unwrap();
+        assert!(all.len() >= 2, "два абзаца: {}", all.len());
+        assert!(all.iter().any(|(_, t)| t.contains("распаковки")));
+        assert!(all.iter().any(|(_, t)| t.contains("mmap-региона")));
+
+        // lossless-verify попутно
+        let r = PolerReader::open(&p).unwrap();
+        let rep = r.verify().unwrap();
+        assert!(rep.all_ok, "verify: {:?}", rep.files_bad);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_file(&p);
     }
 }
