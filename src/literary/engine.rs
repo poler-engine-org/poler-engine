@@ -301,8 +301,10 @@ impl LiteraryEngine {
 
     /// H^Ψ — обобщённая дистанция до когнитивного покоя: нормированные
     /// F, остаток причинности и инерция складываются в [0, ~3].
+    /// v0.90 АЗУ: нормировка через div_safe_f32 — полюс x = −1 (знаменатель
+    /// ровно 0) насыщает ±MAX вместо NaN-отравления конвейера, 0/0 → 0.
     fn h_psi(f: f32, residual: f32, sigma: f32) -> f32 {
-        let norm = |x: f32| x / (1.0 + x);
+        let norm = |x: f32| crate::asm::zero_asm::div_safe_f32(x, 1.0 + x);
         norm(f) + norm(residual) + norm(sigma)
     }
 

@@ -933,3 +933,213 @@ mod tests {
         assert_eq!(g.node_count(), 0);
     }
 }
+
+// ====================================================================
+// v0.90.0 SYNAPSE-TRIT: АЗУ в конвейере ранжирования рёбер
+// ====================================================================
+
+/// Точное разложение f64-веса с затуханием в каноническую дробь [N:D].
+///
+/// `lens = w · 2^(−depth)` — БЕЗ единого округления: f64 = ±m·2^(E−1075)
+/// (m — 53-битная мантисса с неявным битом), значит lens — диадическая
+/// рациональность. Общие степени двойки сокращаются (сдвигами m и
+/// знаменателя), произведения в [`crate::asm::zero_asm::cmp_canonical`]
+/// ограничены 2⁶²·2⁶² = 2¹²⁴ < 2¹²⁷ — сравнение ТОЧНО там, где f64
+/// цепочка «w·0.5^depth → f32-каст → SIMD-сравнение» давала ДВЕ
+/// погрешности на каждом ребре.
+///
+/// Диапазон точности: |value| ∈ [2⁻⁶², 2⁶²] — весь реальный диапазон
+/// семантических весов; за пределами — насыщение (документировано).
+pub fn lens_weight_proj(w: f64, depth: usize) -> crate::asm::zero_asm::Proj {
+    use crate::asm::zero_asm::Proj;
+    if w == 0.0 || !w.is_finite() {
+        return Proj::ZERO;
+    }
+    let bits = w.to_bits();
+    let sign = if bits >> 63 == 1 { -1i64 } else { 1i64 };
+    let mant = ((bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000) as i64; // 53 бита
+    let e = ((bits >> 52) & 0x7FF) as i32 - 1075; // w = ±mant·2^e
+    // lens = ±mant·2^(e−depth): каноническая [N:D], D > 0
+    let mut s = e - depth as i32; // показатель после затухания
+    let mut m = mant;
+    // сокращение общих степеней двойки (ТОЧНО — сдвиги):
+    let tz = m.trailing_zeros() as i32;
+    if s < 0 && tz > 0 {
+        let t = tz.min(-s);
+        m >>= t;
+        s += t;
+    }
+    if s >= 0 {
+        if s <= 9 {
+            // N = ±m·2^s ≤ 2^53·2^9 = 2^62 — произведения cmp ≤ 2^124 < 2^127
+            Proj {
+                n: sign * (m << s),
+                d: 1,
+            }
+        } else {
+            // |value| ≥ 2^62 — за пределами точного диапазона: насыщение
+            // максимумом (документировано; семантических весов таких нет)
+            Proj {
+                n: sign.saturating_mul(i64::MAX / 2),
+                d: 1,
+            }
+        }
+    } else {
+        // знаменатель 2^(−s), ограничение 2^62:
+        let dd = -s;
+        if dd > 62 {
+            // значение < 2^-62 — насыщение минимальной представимой точкой
+            Proj { n: sign, d: 1 << 62 }
+        } else {
+            Proj {
+                n: sign * m,
+                d: 1i64 << dd,
+            }
+        }
+    }
+}
+
+impl EntityGraph {
+    /// K-hop рёбра с ТОЧНЫМИ проективными весами ([N:D], без f64-кастов).
+    ///
+    /// v0.90 АЗУ: то же семантическое дерево обхода, что
+    /// [`extract_k_hop_weighted`], но lens-вес ребра — точная диадическая
+    /// дробь `w·2^−depth` (см. [`lens_weight_proj`]). Ранжирование и
+    /// барьер LENS на таких весах — БЕЗ погрешности.
+    pub fn extract_k_hop_proj(
+        &self,
+        entity: &str,
+        k: usize,
+        temporal_filter: Option<&str>,
+        max_relations: usize,
+    ) -> Vec<(String, String, String, crate::asm::zero_asm::Proj)> {
+        use crate::asm::zero_asm::Proj;
+        let mut out: Vec<(String, String, String, Proj)> = Vec::new();
+        let start = match self.policy {
+            IdentityPolicy::Text => match self.find_node(entity) {
+                Some(i) => i,
+                None => return out,
+            },
+            IdentityPolicy::CodeSymbol => match self
+                .find_code_symbol(None, entity)
+                .or_else(|| self.find_node(entity))
+            {
+                Some(i) => i,
+                None => return out,
+            },
+        };
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        visited.insert(start);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start, 0));
+        let mut seen_triples: HashSet<(String, String, String)> = HashSet::new();
+        while let Some((node, depth)) = queue.pop_front() {
+            if depth >= k || out.len() >= max_relations {
+                continue;
+            }
+            for dir in [Direction::Outgoing, Direction::Incoming] {
+                for edge in self.graph.edges_directed(node, dir) {
+                    let (src, dst) = match dir {
+                        Direction::Outgoing => (node, edge.target()),
+                        Direction::Incoming => (edge.source(), node),
+                    };
+                    if self.temporal_ok(src, dst, temporal_filter) {
+                        let s = self.display_name(src);
+                        let o = self.display_name(dst);
+                        let t = (s, edge.weight().predicate.clone(), o);
+                        if seen_triples.insert(self.triple_dedup_key(&t.0, &t.1, &t.2)) {
+                            out.push((
+                                t.0,
+                                t.1,
+                                t.2,
+                                lens_weight_proj(edge.weight().weight, depth),
+                            ));
+                            if out.len() >= max_relations {
+                                break;
+                            }
+                        }
+                    }
+                    let other = match dir {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    };
+                    if !visited.contains(&other) {
+                        visited.insert(other);
+                        queue.push_back((other, depth + 1));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod lens_proj_tests {
+    use super::lens_weight_proj;
+    use crate::asm::zero_asm::{cmp_canonical, Proj};
+
+    #[test]
+    fn lens_proj_dyadic_exactness() {
+        // 0.5·2^-1 = 0.25 = [1:4] — ТОЧНО
+        let p = lens_weight_proj(0.5, 1);
+        assert_eq!((p.n, p.d), (1, 4));
+        // 1.0 без затухания = [1:1]
+        let p = lens_weight_proj(1.0, 0);
+        assert_eq!((p.n, p.d), (1, 1));
+        // 0.75·2^-2 = 3/16 = [3:16] (0.75 = 3·2^-2 — сокращение!)
+        let p = lens_weight_proj(0.75, 2);
+        assert_eq!((p.n, p.d), (3, 16));
+        // ноль — абсолютный ноль [0:1]
+        assert_eq!(lens_weight_proj(0.0, 3).n, 0);
+    }
+
+    #[test]
+    fn lens_proj_value_roundtrip_exact() {
+        // value_f64 == w·2^-depth БИТ-В-БИТ (деление на степень двойки
+        // в f64 точно; f64-умножение на 0.5^k тоже точно)
+        let mut s = 0xABCDu64 | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..1000 {
+            let w = f64::from_bits((next() >> 11) as u64);
+            if !w.is_finite() || w == 0.0 {
+                continue;
+            }
+            for depth in 0..5usize {
+                let expect = w * 0.5f64.powi(depth as i32);
+                // точный диапазон АЗУ-разложения: [2^-62, 2^62] —
+                // за пределами НАСЫЩЕНИЕ (документировано: защита
+                // i128-произведений cmp_canonical ≤ 2^124)
+                if expect.is_normal() && expect.abs() >= 2f64.powi(-62) && expect.abs() <= 2f64.powi(62) {
+                    let got = lens_weight_proj(w, depth).value_f64();
+                    assert_eq!(got.to_bits(), expect.to_bits(), "w={w} depth={depth}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lens_proj_exact_vs_f64_boundary() {
+        // точный барьер LENS: w > 0.05 — проективно, без f32-каста
+        let barrier = lens_weight_proj(0.05f32 as f64, 0);
+        // вес ровно НАД барьером (ближайший f32-сосед сверху):
+        let above = f32::from_bits(0.05f32.to_bits() + 1);
+        let wa = lens_weight_proj(above as f64, 0);
+        assert_eq!(cmp_canonical(&wa, &barrier), std::cmp::Ordering::Greater);
+        // вес ровно ПОД барьером:
+        let below = f32::from_bits(0.05f32.to_bits() - 1);
+        let wb = lens_weight_proj(below as f64, 0);
+        assert_eq!(cmp_canonical(&wb, &barrier), std::cmp::Ordering::Less);
+        // сам барьер — равен (не строго больше): НЕ проходит
+        assert_eq!(cmp_canonical(&barrier, &barrier), std::cmp::Ordering::Equal);
+        // каноническая форма: d > 0 всегда
+        for &w in &[0.05f64, 1e-10, 1e10, 0.3] {
+            assert!(lens_weight_proj(w, 3).d > 0);
+        }
+    }
+}

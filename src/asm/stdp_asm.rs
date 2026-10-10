@@ -296,3 +296,55 @@ mod tests {
         assert_eq!(wta_argmax(&[-1.0, -0.5, -2.0]), 1);
     }
 }
+
+/// Softmax-награда LanguageCoreV2 с АЗУ-гарантом (v0.90.0):
+/// `r_i = e^{x_i} / Σ e^{x_j}` — классически делит на сумму; здесь
+/// знаменатель идёт через [`crate::asm::zero_asm::div_safe_f32`]:
+/// * Σ > 0 — обычная нормировка (сумма = 1);
+/// * Σ = 0 (все x → −∞ вырождены) — РАВНОМЕРНЫЕ награды 1/n: нигде
+///   ни NaN, ни деления на ноль — полюс заменён осмысленным пределом.
+pub fn softmax_reward_safe(rates: &[f32]) -> Vec<f32> {
+    let n = rates.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // численная стабильность: вычитание максимума (классика);
+    // гарантирует sum ≥ 1 для конечных входов — но вырожденные
+    // входы (−∞) всё же проходят через АЗУ-полюс:
+    let m = rates.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = rates.iter().map(|&x| (x - m).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    if sum == 0.0 || !sum.is_finite() {
+        // полюс Σ=0 → равномерный предел (АЗУ: полюс — точка, не сбой)
+        return vec![1.0 / n as f32; n];
+    }
+    exps.into_iter()
+        .map(|e| crate::asm::zero_asm::div_safe_f32(e, sum))
+        .collect()
+}
+
+#[cfg(test)]
+mod softmax_tests {
+    use super::softmax_reward_safe;
+
+    #[test]
+    fn softmax_reward_sums_to_one() {
+        let r = [0.1, 0.5, 0.3, 0.9];
+        let s = softmax_reward_safe(&r);
+        let sum: f32 = s.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "Σ = {sum}");
+        assert!(s[3] > s[0], "максимум не доминирует");
+    }
+
+    #[test]
+    fn softmax_reward_degenerate_is_uniform() {
+        // все −∞: классика дала бы NaN; АЗУ — равномерный предел
+        let r = [f32::NEG_INFINITY; 4];
+        let s = softmax_reward_safe(&r);
+        assert!(s.iter().all(|&x| (x - 0.25).abs() < 1e-6), "{s:?}");
+        assert!(softmax_reward_safe(&[]).is_empty());
+        // вырожденно-равные — тоже равномерные
+        let s2 = softmax_reward_safe(&[2.0, 2.0, 2.0, 2.0]);
+        assert!(s2.iter().all(|&x| (x - 0.25).abs() < 1e-6));
+    }
+}

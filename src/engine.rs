@@ -1000,10 +1000,13 @@ fn build_nexus(
             .map(str::to_string)
             .collect();
         keys.sort(); // детерминизм обхода
-        let mut weighted: Vec<(String, String, String, f64)> = Vec::new();
+        // v0.90.0 SYNAPSE-TRIT: ТОЧНЫЕ проективные веса [N:D] вместо
+        // f64-кастов — ранжирование и барьер LENS без погрешности (АЗУ).
+        let mut weighted: Vec<(String, String, String, crate::asm::zero_asm::Proj)> =
+            Vec::new();
         let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
         for key in &keys {
-            for quad in graph.extract_k_hop_weighted(
+            for quad in graph.extract_k_hop_proj(
                 key,
                 config.k_hop_depth,
                 config.temporal_filter.as_deref(),
@@ -1015,28 +1018,47 @@ fn build_nexus(
                 }
             }
         }
+        // ТОЧНОЕ ранжирование рёбер: cmp_canonical (128-битные перекрёстные
+        // произведения — ДЕЛЕНИЯ НЕТ), по убыванию lens-веса; затем top-K.
+        // Прежде порядок был порядком обхода (f64 truncate без сортировки).
+        weighted.sort_by(|a, b| {
+            crate::asm::zero_asm::cmp_canonical(&b.3, &a.3)
+        });
         weighted.truncate(config.max_relations);
-        // --- LENS: компакция выживших индексов микроядром ---
+        // --- LENS: точный барьер [N:D] + SIMD-компакция микроядром ---
         let n = weighted.len();
         let (relations, lens) = if n > 0 {
-            let mut lw: Vec<f32> = Vec::with_capacity(n);
-            for (_, _, _, w) in &weighted {
-                lw.push(*w as f32);
-            }
-            let flags = vec![0u64; n]; // маски не используются (весовой барьер)
-            let mut keep_idx = vec![0u32; n];
-            let kept = crate::asm::lens_asm::filter(
-                &lw,
-                &flags,
-                &mut keep_idx,
-                crate::asm::lens_asm::LENS_MIN_W,
-                0,
+            // точный барьер: lens > LENS_MIN_W как сравнение канонических
+            // дробей (LENS_MIN_W f32 = 13421773·2^-28 — разлагается той же
+            // схемой, сравнение БЕЗ деления и без f64→f32 округления)
+            let barrier = crate::graph::entity_graph::lens_weight_proj(
+                crate::asm::lens_asm::LENS_MIN_W as f64,
                 0,
             );
+            let survivors: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    crate::asm::zero_asm::cmp_canonical(&weighted[i].3, &barrier)
+                        == std::cmp::Ordering::Greater
+                })
+                .collect();
+            // SIMD-компакция выживших микроядром (барьер 0 — все w > 0
+            // прошли точный фильтр): LENS остаётся в конвейере, но решение
+            // теперь ТОЧНОЕ
+            let lw: Vec<f32> = survivors
+                .iter()
+                .map(|&i| weighted[i].3.value_f64() as f32)
+                .collect();
+            let flags = vec![0u64; survivors.len()];
+            let mut keep_idx = vec![0u32; survivors.len()];
+            let kept = if lw.is_empty() {
+                0
+            } else {
+                crate::asm::lens_asm::filter(&lw, &flags, &mut keep_idx, 0.0, 0, 0)
+            };
             let relations: Vec<(String, String, String)> = keep_idx[..kept]
                 .iter()
                 .map(|&i| {
-                    let (s, p, o, _) = &weighted[i as usize];
+                    let (s, p, o, _) = &weighted[survivors[i as usize]];
                     (s.clone(), p.clone(), o.clone())
                 })
                 .collect();
