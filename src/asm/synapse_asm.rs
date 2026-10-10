@@ -27,6 +27,10 @@
 //! 14 clamp, 15 parity. Трансцендентные — мантисса-полиномы по битам
 //! float (без libm): exp за 12 инструкций, tanh — рационал 27/9.
 //!
+//! Примитив 5 (`spike`) — ТРОИЧНЫЙ (v0.88.0): трит поляризации
+//! {+1 деполяризация, 0 рефрактерный стазис, −1 гиперполяризация}
+//! с мёртвой зоной [−0.5, 0.5] — не булево отсечение.
+//!
 //! ## Контракт паддинга (обязателен для прямых вызовов asm)
 //!
 //! * `w16` — до `n_pre·fanout` округлённого вверх кратного 8, +16 Б;
@@ -116,10 +120,18 @@ global_asm! {
     .long 0x80000000, 0x80000000, 0x80000000, 0x80000000
     .long 0x80000000, 0x80000000, 0x80000000, 0x80000000
     .p2align 5
-    # порог спайка 0.5
+    # порог спайка 0.5 / −0.5 (мёртвая зона тритного стазиса)
 .Lssn_thr:
     .long 0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000
     .long 0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000
+    .p2align 5
+.Lssn_nthr:
+    .long 0xBF000000, 0xBF000000, 0xBF000000, 0xBF000000
+    .long 0xBF000000, 0xBF000000, 0xBF000000, 0xBF000000
+    .p2align 5
+.Lssn_mone:
+    .long 0xBF800000, 0xBF800000, 0xBF800000, 0xBF800000
+    .long 0xBF800000, 0xBF800000, 0xBF800000, 0xBF800000
     .p2align 5
 .Lssn_c27:
     .float 27.0, 27.0, 27.0, 27.0, 27.0, 27.0, 27.0, 27.0
@@ -506,9 +518,16 @@ poler_ssn_step_i8:
     vmaxps ymm0, ymm0, [rip + .Lssn_n88]
     vminps ymm0, ymm0, ymm15
     jmp .Lssn_exp_body
-.Lssn_p05_spike:                 # 1.0 где x > 0.5
+.Lssn_p05_spike:                 # ТРОИЧНЫЙ спайк поляризации (v0.88):
+    # x > +0.5 → ⊕ +1 (деполяризация)
+    # x < −0.5 → ⊖ −1 (гиперполяризация)
+    # мёртвая зона → ⊙ 0 (рефрактерный стазис)
+    # СКРЕТЧ-контракт: только ymm0/ymm1/ymm4..ymm7 (ymm2 = acc!)
     vcmpgtps ymm1, ymm0, [rip + .Lssn_thr]
-    vblendvps ymm0, ymm15, [rip + .Lssn_one], ymm1
+    vandps ymm4, ymm1, [rip + .Lssn_one]
+    vcmpltps ymm5, ymm0, [rip + .Lssn_nthr]
+    vandps ymm6, ymm5, [rip + .Lssn_mone]
+    vorps ymm0, ymm4, ymm6
     jmp .Lssn_ret
 .Lssn_p06_gauss:                 # e^(-0.5x²)
     vmulps ymm0, ymm0, ymm0
@@ -820,8 +839,11 @@ pub fn apply_func_scalar(x: f32, func: u8, gate: f32, lane: usize) -> f32 {
         FUNC_TANH => tanh_r(x),
         FUNC_EXPDECAY => fast_exp(x.min(0.0).max(-87.3)),
         FUNC_SPIKE => {
+            // трит поляризации: ⊕/⊙/⊖ (зеркало .Lssn_p05_spike)
             if x > 0.5 {
                 1.0
+            } else if x < -0.5 {
+                -1.0
             } else {
                 0.0
             }
@@ -1006,6 +1028,35 @@ mod tests {
         // плотность payload
         assert_eq!(f.bytes_per_synapse(Density::F16), 2.0);
         assert_eq!(f.bytes_per_synapse(Density::I8), 1.0);
+    }
+
+    #[test]
+    fn ssn_ternary_spike_semantics() {
+        // трит поляризации: мёртвая зона [−0.5, 0.5] ⊙, пороги ⊕/⊖
+        let cases = [
+            (2.0f32, 1.0f32), (0.6, 1.0), (0.5, 0.0), (0.1, 0.0), (0.0, 0.0),
+            (-0.1, 0.0), (-0.5, 0.0), (-0.6, -1.0), (-2.0, -1.0),
+        ];
+        for &(x, e) in &cases {
+            assert_eq!(apply_func_scalar(x, FUNC_SPIKE, 0.5, 0), e, "spike({x})");
+        }
+        // и на ассемблерном пути: поле только из spike-источников
+        let mut f = SynapseField::synthetic(64, 8, 31337);
+        for fu in f.func.iter_mut() {
+            *fu = FUNC_SPIKE;
+        }
+        let pre: Vec<f32> = (0..f.pad_pre_len())
+            .map(|i| ((i % 7) as f32) * 0.3 - 0.9) // −0.9..0.9 через зону
+            .collect();
+        let mut post_a = vec![0.0f32; f.n_post];
+        let mut post_r = vec![0.0f32; f.n_post];
+        f.step_f16(&pre, &mut post_a, 0.9, 0.5);
+        f.step_scalar(Density::F16, &pre, &mut post_r, 0.9, 0.5);
+        let mut worst = 0.0f32;
+        for i in 0..f.n_post {
+            worst = worst.max((post_a[i] - post_r[i]).abs());
+        }
+        assert!(worst < 1e-5, "asm vs scalar spike: {worst}");
     }
 
     #[test]

@@ -11,6 +11,14 @@
 //! | [`cordic_asm`] | P3/CORDIC S¹ | SSE2 + целочисленный |
 //! | [`stdp_asm`] | LanguageCoreV2 (0601, STDP+WTA) | AVX2+FMA |
 //!
+//! v0.88.0 TRIT-ASM: троичная физика процессора — триты и кутриты
+//! подняты из Rust-слоя движка (calc/trits.rs, pqc) в машинный код:
+//!
+//! | Ядро | Физика | Базис |
+//! |------|--------|-------|
+//! | [`trit_asm`] | 𝕋={−1,0,+1}: Клини, vpsignb, LEA×3, magic-÷3, VPTERNLOGD | SSSE3/SSE4.1/AVX-512 |
+//! | [`qutrit_asm`] | ℤ₃ ω-ротор 120° + мост трит→S¹ | SSE2/AVX2+FMA |
+//!
 //! Каждое ядро имеет скалярный эталон (fallback для хостов без AVX2 и
 //! референс для тестов). CLI: `--asm-info`, `--asm-bench`.
 
@@ -21,9 +29,13 @@ pub mod fep_asm;
 #[cfg(target_arch = "x86_64")]
 pub mod lens_asm;
 #[cfg(target_arch = "x86_64")]
+pub mod qutrit_asm;
+#[cfg(target_arch = "x86_64")]
 pub mod stdp_asm;
 #[cfg(target_arch = "x86_64")]
 pub mod synapse_asm;
+#[cfg(target_arch = "x86_64")]
+pub mod trit_asm;
 
 use std::sync::OnceLock;
 
@@ -36,6 +48,12 @@ pub struct AsmCaps {
     pub popcnt: bool,
     pub avx512f: bool,
     pub sse2: bool,
+    /// AVX (VEX-кодировка) — базис vpsubb/vpsignb/vpminsb-ядер trit_asm.
+    pub avx: bool,
+    /// SSSE3 — vpsignb (тритное умножение знаком).
+    pub ssse3: bool,
+    /// SSE4.1 — vpminsb/vpmaxsb (Клини-вентили), vpmovsxbw.
+    pub sse41: bool,
 }
 
 impl AsmCaps {
@@ -47,12 +65,20 @@ impl AsmCaps {
             popcnt: is_x86_feature_detected!("popcnt"),
             avx512f: is_x86_feature_detected!("avx512f"),
             sse2: is_x86_feature_detected!("sse2"),
+            avx: is_x86_feature_detected!("avx"),
+            ssse3: is_x86_feature_detected!("ssse3"),
+            sse41: is_x86_feature_detected!("sse4.1"),
         }
     }
 
     /// Золотой набор VAULT-ASM (все ядра, кроме SSE2-базовых).
     pub fn golden(&self) -> bool {
         self.avx2 && self.fma && self.f16c
+    }
+
+    /// Троичный золотой набор TRIT-ASM (Клини + vpsignb + VPTERNLOGD).
+    pub fn trit_golden(&self) -> bool {
+        self.avx && self.ssse3 && self.sse41 && self.avx512f
     }
 }
 
@@ -68,7 +94,7 @@ pub fn info_report() -> String {
     let c = caps();
     let on = |b: bool| if b { "ON" } else { "—" };
     format!(
-        "VAULT-ASM x86_64 microkernels (v0.87.0)\n\
+        "VAULT-ASM x86_64 microkernels (v0.88.0 TRIT-ASM)\n\
          \n\
          CPU basis:\n\
            AVX2      : {}\n\
@@ -76,23 +102,35 @@ pub fn info_report() -> String {
            F16C      : {}\n\
            POPCNT    : {}\n\
            AVX-512F  : {}\n\
-           SSE2      : {} (baseline — LENS/CORDIC/WTA всегда)\n\
+           SSE2      : {} (baseline — LENS/CORDIC/QUTRIT-Q15 всегда)\n\
+           SSSE3     : {} (vpsignb — тритное умножение знаком)\n\
+           SSE4.1    : {} (Клини-вентили vpminsb/vpmaxsb)\n\
          \n\
          Kernels (source → engine):\n\
            fep_asm      poler-core/fep_loss.rs  → literary/engine.rs (F, ∇F)  [AVX2+FMA]\n\
            lens_asm     poler-lens/lens_index.rs → engine.rs Causal Nexus    [SSE2]\n\
            synapse_asm  vault 0986/0984 (1.7Б)  → SSN inference layer        [AVX2+FMA+F16C]\n\
-           cordic_asm   P3 CORDIC S¹             → детерминированный ротор    [SSE2+int]\n\
+           cordic_asm   P3 CORDIC S¹ (Q30)      → детерминированный ротор    [SSE2+int]\n\
            stdp_asm     LanguageCoreV2 0601      → трёхфакторный STDP + WTA   [AVX2+FMA]\n\
          \n\
-         Golden set: {}",
+         TRIT-ASM v0.88.0 (троичная физика процессора):\n\
+           trit_asm     𝕋={{−1,0,+1}} Клини-вентили / ⟨u,v⟩ vpsignb /\n\
+                       pack5 LEA×3 / unpack5 magic-÷3 / тернарный спайк ⊕⊙⊖\n\
+                       / VPTERNLOGD-мультиплексор (imm 0xE4, sel?a:b)   [SSSE3+SSE4.1, AVX-512]\n\
+           qutrit_asm   ℤ₃ ω-ротор 120° (f32 FMA + Q14 pmulhw) /\n\
+                       мост трит→S¹ (θ_t = t·2π/3)              [SSE2/AVX2]\n\
+         \n\
+         Golden set: {} | TRIT golden: {}",
         on(c.avx2),
         on(c.fma),
         on(c.f16c),
         on(c.popcnt),
         on(c.avx512f),
         on(c.sse2),
+        on(c.ssse3),
+        on(c.sse41),
         on(c.golden()),
+        on(c.trit_golden()),
     )
 }
 
@@ -114,10 +152,10 @@ fn gbs(bytes: f64, secs: f64) -> f64 {
 pub fn run_bench(synapses: usize, cycles: usize) -> std::process::ExitCode {
     use std::time::Instant;
     let c = caps();
-    println!("VAULT-ASM microkernel benchmark (v0.87.0)");
+    println!("VAULT-ASM microkernel benchmark (v0.88.0 TRIT-ASM)");
     println!(
-        "caps: avx2={} fma={} f16c={} popcnt={} avx512={}\n",
-        c.avx2, c.fma, c.f16c, c.popcnt, c.avx512f
+        "caps: avx2={} fma={} f16c={} popcnt={} avx512={} ssse3={} sse41={}\n",
+        c.avx2, c.fma, c.f16c, c.popcnt, c.avx512f, c.ssse3, c.sse41
     );
     let mut all_pass = true;
 
@@ -355,6 +393,179 @@ pub fn run_bench(synapses: usize, cycles: usize) -> std::process::ExitCode {
             mps(rates.len() as f64, dt),
             idx,
             pass(idx == wta_expected(&rates))
+        );
+    }
+
+    // ---------------- TRIT: троичная физика v0.88 ----------------
+    {
+        let n = 10_000_000;
+        let mut s = 4242u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let a: Vec<i8> = (0..n).map(|_| ((next() % 3) as i64 as i8) - 1).collect();
+        let b: Vec<i8> = (0..n).map(|_| ((next() % 3) as i64 as i8) - 1).collect();
+        // прогрев
+        let _ = trit_asm::dot(&a[..1024], &b[..1024]);
+        let t = Instant::now();
+        let d = trit_asm::dot(&a, &b);
+        let dt = t.elapsed().as_secs_f64();
+        let d_ref: i64 = a.iter().zip(&b).map(|(&x, &y)| x as i64 * y as i64).sum();
+        let ok = d == d_ref;
+        all_pass &= ok;
+        println!(
+            "TRIT dot vpsignb {:>9} trit    : {:8.1} M trit/s  ⟨u,v⟩={}  {}",
+            n,
+            mps(n as f64, dt),
+            d,
+            pass(ok)
+        );
+        // тернарный спайк
+        let x: Vec<f32> = (0..n)
+            .map(|_| ((next() % 200) as f32) / 100.0 - 1.0)
+            .collect();
+        let mut sp = vec![0.0f32; n];
+        trit_asm::spike_f32(&x[..1024], &mut sp[..1024], 0.4);
+        let t = Instant::now();
+        trit_asm::spike_f32(&x, &mut sp, 0.4);
+        let dt = t.elapsed().as_secs_f64();
+        let ok = x.iter().zip(&sp).all(|(&v, &o)| {
+            o == if v > 0.4 {
+                1.0
+            } else if v < -0.4 {
+                -1.0
+            } else {
+                0.0
+            }
+        });
+        all_pass &= ok;
+        println!(
+            "TRIT spike ⊕⊙⊖  {:>9} elem    : {:8.1} M elem/s  θ=0.4  {}",
+            n,
+            mps(n as f64, dt),
+            pass(ok)
+        );
+        // pack/unpack 5 трит/байт
+        let mut packed = vec![0u8; n / 5];
+        let mut unpacked = vec![0i8; n / 5 * 5];
+        let t = Instant::now();
+        let nb = trit_asm::pack5(&a, &mut packed);
+        let nt = trit_asm::unpack5(&packed, &mut unpacked);
+        let dt = t.elapsed().as_secs_f64();
+        let ok = nb == n / 5 && nt == nb * 5 && &a[..nb * 5] == &unpacked[..nb * 5];
+        all_pass &= ok;
+        println!(
+            "TRIT pack5 LEA×3 {:>9} trit    : {:8.1} M trit/s  5 трит/байт (3⁵<2⁸)  {}",
+            nb * 5,
+            mps((nb * 5) as f64, dt),
+            pass(ok)
+        );
+        // VPTERNLOGD-мультиплексор
+        if c.avx512f {
+            let sel: Vec<u32> = (0..1_000_000).map(|_| (next() % 3) as u32).collect();
+            let va: Vec<u32> = (0..1_000_000).map(|i| i as u32 * 7 + 1).collect();
+            let vb: Vec<u32> = (0..1_000_000).map(|i| i as u32 * 13 + 5).collect();
+            let mut out = vec![0u32; 1_000_000];
+            let t = Instant::now();
+            trit_asm::mux512(&va, &vb, &sel, &mut out);
+            let dt = t.elapsed().as_secs_f64();
+            let ok = out
+                .iter()
+                .zip(&sel)
+                .zip(&va)
+                .zip(&vb)
+                .all(|(((o, &s), &x), &y)| *o == (s & x) | (!s & y));
+            all_pass &= ok;
+            println!(
+                "TRIT mux VPTERNLOGD {:>9} lane   : {:8.1} M lane/s  bit-mux (imm 0xE4)  {}",
+                1_000_000,
+                mps(1e6, dt),
+                pass(ok)
+            );
+        }
+    }
+
+    // ---------------- QUTRIT: ℤ₃ ω-ротор v0.88 ----------------
+    {
+        let n = 2_000_000;
+        let mut s = 31415u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut re: Vec<f32> = (0..n)
+            .map(|_| ((next() % 200) as f32) / 100.0 - 1.0)
+            .collect();
+        let mut im: Vec<f32> = (0..n)
+            .map(|_| ((next() % 200) as f32) / 100.0 - 1.0)
+            .collect();
+        let (re0, im0) = (re.clone(), im.clone());
+        let t = Instant::now();
+        qutrit_asm::omega_f32(&mut re, &mut im);
+        let dt = t.elapsed().as_secs_f64();
+        // ℤ₃-цикл: три поворота = тождество
+        qutrit_asm::omega_f32(&mut re, &mut im);
+        qutrit_asm::omega_f32(&mut re, &mut im);
+        let mut worst = 0.0f32;
+        for i in 0..n {
+            worst = worst.max((re[i] - re0[i]).abs()).max((im[i] - im0[i]).abs());
+        }
+        let ok = worst < 1e-5;
+        all_pass &= ok;
+        println!(
+            "QUTRIT ω f32     {:>9} rot     : {:8.1} M rot/s   ω³=I err {:.2e}  {}",
+            n,
+            mps(n as f64, dt),
+            worst,
+            pass(ok)
+        );
+        // Q14-паритет
+        let mut x: Vec<i16> = (0..n / 10)
+            .map(|_| (((next() % 200) as i32 - 100) * 120 / 1000).clamp(-12000, 12000) as i16)
+            .collect();
+        let mut y: Vec<i16> = (0..n / 10)
+            .map(|_| (((next() % 200) as i32 - 100) * 120 / 1000).clamp(-12000, 12000) as i16)
+            .collect();
+        let mut re2: Vec<f32> = x.iter().map(|&v| v as f32 / 16384.0).collect();
+        let mut im2: Vec<f32> = y.iter().map(|&v| v as f32 / 16384.0).collect();
+        qutrit_asm::omega_q15(&mut x, &mut y);
+        qutrit_asm::omega_f32(&mut re2, &mut im2);
+        let ok = x
+            .iter()
+            .zip(&y)
+            .zip(&re2)
+            .zip(&im2)
+            .all(|(((&xi, &yi), &r), &m)| {
+                (xi as f32 / 16384.0 - r).abs() < 2e-3 && (yi as f32 / 16384.0 - m).abs() < 2e-3
+            });
+        all_pass &= ok;
+        println!(
+            "QUTRIT ω Q14 pmulhw {:>9} rot     : SSE2-базис   паритет f32  {}",
+            n / 10,
+            pass(ok)
+        );
+        // мост трит→S¹
+        let trits: Vec<i8> = (0..n / 10).map(|_| ((next() % 3) as i64 as i8) - 1).collect();
+        let mut pre = vec![0.0f32; n / 10];
+        let mut pim = vec![0.0f32; n / 10];
+        let t = Instant::now();
+        qutrit_asm::project(&trits, &mut pre, &mut pim);
+        let dt = t.elapsed().as_secs_f64();
+        let ok = pre
+            .iter()
+            .zip(&pim)
+            .all(|(&r, &m)| ((r * r + m * m).sqrt() - 1.0).abs() < 1e-6);
+        all_pass &= ok;
+        println!(
+            "QUTRIT трит→S¹   {:>9} trit    : {:8.1} M trit/s  θ=t·2π/3 на S¹  {}",
+            n / 10,
+            mps((n / 10) as f64, dt),
+            pass(ok)
         );
     }
 

@@ -1,10 +1,15 @@
-# VAULT-ASM — сокровищница в машинном коде (v0.87.0)
+# VAULT-ASM — сокровищница в машинном коде (v0.88.0 TRIT-ASM)
 
 > Директива владельца: «реализуй всё абсолютно из сокровищницы на
 > ассемблере внутри движка — так мы выведем работу с данными на
 > непостижимый человеку и современному ИИ уровень».
 
-Пять микроядер x86_64 на чистом ассемблере (`global_asm!`, Intel-синтаксис),
+> v0.88.0: «то же задание — только сделай лучше»: троичная физика
+> процессора (триты/кутриты уже в исходниках — подняты в машинный код),
+> ВСЕ константы — Калькулятором Всего движка (ноль Python),
+> тернарный спайк, CORDIC Q30, VPTERNLOGD.
+
+Семь микроядер x86_64 на чистом ассемблере (`global_asm!`, Intel-синтаксис),
 портированных из `docs/vault_drafts/` (DeepSeek Vault + POLER-Quantum):
 
 | Ядро | Источник сокровищницы | Базис | Точка движка |
@@ -12,8 +17,10 @@
 | `fep_asm` | `poler_quantum/archive/poler-core/src/fep_loss.rs` (принцип свободной энергии Фристона) | AVX2+FMA | `literary/engine.rs`: `free_energy()`, `grad_f()` |
 | `lens_asm` | `archive/poler-lens/src/lens_index.rs` (No-Hits барьер, 99.2% сжатия) | SSE2 (базовый уровень!) | `engine.rs`: `build_nexus()` — LENS-фильтр K-hop рёбер |
 | `synapse_asm` | vault блоки 0986/0984 (синапс-атомарная SSN, «1.7 Б/синапс») | AVX2+FMA+F16C | слой вывода SSN (CLI `--asm-bench`) |
-| `cordic_asm` | P3/CORDIC S¹ (p3_poler.zig) | SSE2 + целочисленный Q24 | детерминированный ротор (renorm/atan2/sincos) |
+| `cordic_asm` | P3/CORDIC S¹ (p3_poler.zig) | SSE2 + целочисленный Q30 | детерминированный ротор (renorm/atan2/sincos) |
 | `stdp_asm` | LanguageCoreV2 (vault 0601: трёхфакторный STDP + WTA) | AVX2+FMA | PlasticityCompiler-совместимое правило |
+| `trit_asm` | триты движка (calc/trits.rs — сбалансированная троичная арифметика) | SSSE3/SSE4.1/AVX-512 | троичный слой (Клини/⟨u,v⟩/pack5) |
+| `qutrit_asm` | кутриты ℤ₃ (pqc, математический корпус) | SSE2/AVX2+FMA | мост трит→S¹, ω-ротор 120° |
 
 ## FEP-контур (Фристон)
 
@@ -93,17 +100,78 @@ post[d] = decay·post[d] + acc + bias[d]
 * Контракт паддинга для прямых вызовов asm: `w16/w8` — до
   `n_pre·fanout` округлённого вверх кратного 8 +16 Б; `pre` —
   `n_pre + fanout + 8` элементов.
+* **v0.88: примитив 5 (spike) — ТРОИЧНЫЙ**: трит поляризации
+  {+1 деполяризация, 0 рефрактерный стазис, −1 гиперполяризация}
+  с мёртвой зоной [−0.5, 0.5] (5 инструкций без ветвлений) —
+  не булево отсечение v0.87. Контракт скретча примитивов:
+  ТОЛЬКО ymm0/ymm1/ymm4..ymm7 (ymm2 — аккумулятор! нарушение
+  гасило накопление источника — поймано parity-тестом).
 
-## CORDIC-ротор Q24
+## TRIT-ASM v0.88.0 — троичная физика процессора
 
-24 сдвигово-складывающие итерации по atan-таблице в `.rodata`
-(генератор: `scripts/gen_asm_consts.py`). Свойства:
+Сбалансированные триты 𝕋 = {−1, 0, +1} — знако-симметричный базис
+«истинного Буля»: умножение тритов — ЗНАК, а не произведение.
+
+| Ядро | Физика | Бенч (Xeon) |
+|------|--------|-------------|
+| `poler_trit_neg/and/or` | инверсия = 0−t (`vpsubb`); Клини AND/OR = min/max (`vpminsb`/`vpmaxsb`) | — |
+| `poler_trit_dot` | ⟨u,v⟩ БЕЗ умножителя: `vpsignb` = b·sign(a) = a·b; разворот `vpmovsxbw` + свёртка `vpmaddwd` | **5442.6 M трит/с** |
+| `poler_trit_pack5` | 5 трит → байт (3⁵=243<256): троичный Horner ×3 на `lea [r+r*2]` — БЕЗ imul | 705.4 M трит/с |
+| `poler_trit_unpack5` | байт → 5 трит: magic-деление на 3 (`mul 0x55555556`, high32) — БЕЗ div; v — в callee-сохранённом rbx (mul бьёт rdx!) | — |
+| `poler_trit_spike_f32` | тернарный спайк ⊕/⊙/⊖ с мёртвой зоной θ (голый SSE2, cmpps+andps+orps) | 590.0 M elem/с |
+| `poler_trit_spike_f32_avx512` | 16 lane за проход: `vcmpps` → k-маски + masked-blend | — |
+| `poler_trit_mux512` | **VPTERNLOGD — аппаратная ТРОИЧНАЯ логика**: битовый селектор out = (sel & a) | (¬sel & b) одной инструкцией | 467.6 M lane/с |
+
+VPTERNLOGD-конвенция (выведена и верифицирована тестом): индекс бита
+imm8 i = (A<<2)|(B<<1)|C, где A = ПЕРВЫЙ операнд (dst) — СТАРШИЙ бит.
+Мультиплексор `sel ? a : b` (sel — третий операнд) = imm **0xE4**;
+знаменитый 0xCA = `A?B:C`. Грабля v0.88: `vmovdqa32` с zmm требует
+64-Б выравнивания — `.p2align 5` (32Б) даёт #GP/SIGSEGV, потому
+константы читаются `vmovdqu32`.
+
+## QUTRIT-ASM v0.88.0 — ℤ₃-фазовая физика
+
+Кутрит — вектор ℂ³; фазовая симметрия — цикл ω = e^{i2π/3} (120°).
+
+| Ядро | Формат | Бенч |
+|------|--------|------|
+| `poler_qutrit_omega_f32` | x' = −0.5x − (√3/2)y; y' = (√3/2)x − 0.5y — 2 `vmulps` + 2 `vfnmadd231ps` на 8 lane | **2259.9 M rot/с, ω³=I err 2.4e-7** |
+| `poler_qutrit_omega_q15` | Q14 на ГОЛОМ SSE2: √3 = 2 − (2−√3) — константа 17560 ∈ ЗНАКОВЫЙ i16 (√3·2¹⁶=113512 НЕ влезает!); `pmulhw`+`psraw` | паритет f32 PASS |
+| `poler_qutrit_project` | мост трит→кутрит: θ_t = t·2π/3 → точка на S¹, таблица 3 ячеек (lea-индексация) | 337.4 M трит/с |
+
+Тесты-утверждения ℤ₃ прямо на ядрах: ω³ = тождество (float и Q14);
+унитарность |ω·z| = |z|; `ω·project(t) = project(t+1 mod 3)` —
+цикл трита через поворот фазы.
+
+## Константы — Калькулятор Всего (ноль Python)
+
+Директива владельца v0.88: «движок может рассчитать всё — пользуйся».
+Все константы v0.88 выведены нативным калькулятором движка,
+генератор `scripts/gen_asm_consts.py` (Q24/Python) пенсионирован:
+
+```text
+poler-engine --exec 'calc atan(2^-i)*2^30'          i = 0..29 — таблица CORDIC
+poler-engine --exec 'calc 1/sqrt((1+4^-0)*...*(1+4^-29))*2^30'
+                                                    → 652032874 (K30)
+poler-engine --exec 'calc (2-sqrt(3))*2^16'         → 17560 (Q14-ротор)
+poler-engine --exec 'calc sqrt(3)/2'                → 0.8660254037844386
+poler-engine --exec 'calc pi/2*2^30'                → 1686629713
+```
+
+## CORDIC-ротор Q30 (v0.88: Q24 → Q30)
+
+30 сдвигово-складывающих итераций по atan-таблице Q30 в `.rodata`
+(Калькулятор Всего). Свойства:
 
 * **битовая детерминированность** — целочисленные сдвиги/сложения дают
   идентичный результат на любом x86_64 (в отличие от libm);
+* точность **5.96e-8** (Q24 давал 6.6e-7 — ×11);
 * sincos: редукция mod 2π (`vroundss`+`vfnmadd`) + квадрантный фолд;
-* atan2: масштаб Q22 через `vrcpss`+Ньютон `r·(2−m·r)`, векторинг
-  с квадрантной предротацией ±π;
+* atan2: масштаб Q26 через `vrcpss`+Ньютон, квадрант — поворот ±90°,
+  НО z стартует с НУЛЯ, а сдвиг ±π/2 добавляется в FLOAT-домене
+  в конце: инициализация z = ±(π/2)·2³⁰ + остаток до 90°
+  ПЕРЕПОЛНЯЛА знаковый i32 (ошибка ровно 4.0 рад = 2³²/2³⁰ —
+  поймано и задокументировано);
 * `renorm(re, im)` — ренормализация массива фаз на S¹ (atan2 → sincos).
 
 ## STDP + WTA (LanguageCoreV2)
@@ -117,22 +185,31 @@ w_i     ← clamp(w_i + Δw_i, ±w_max)    (vminps/vmaxps)
 
 WTA-argmax — турнир `comiss` (первый максимум, голый SSE2).
 
-## Бенчмарк (Xeon, AVX2+FMA+F16C; `poler-engine --asm-bench`)
+## Бенчмарк (Xeon, AVX2+FMA+F16C+AVX-512; `poler-engine --asm-bench`)
 
 ```text
-FEP  step        1048576 ×100: 1383.9 M MAC8/s    parity PASS
-FEP  energy      10000000:     1571.3 M elem/s    (12.57 GB/s)
-LENS filter      10000000:      219.5 M cand/s    keep 11.8%
-LENS popcount    10000000:      949.1 M flags/s
-SSN  f16         10M syn ×10:    48.3 M syn/s     payload 20 МБ (2.0 Б/син)
-SSN  i8          10M syn ×10:    47.8 M syn/s     payload 10 МБ (1.0 Б/син)
-     parity 16 примитивов: 2396.1016 vs 2396.1013  PASS
-CORDIC renorm    2000000:       16.0 M elem/s      max‖·‖err 6.6e-7
-STDP step        10M ×10:      1988.2 M syn/s
-WTA  argmax      1000000:      1030.3 M rate/s
+FEP  step        1048576 ×100:  961.3 M MAC8/s    parity PASS
+FEP  energy      10000000:     1275.0 M elem/s    (10.20 GB/s)
+LENS filter      10000000:      201.2 M cand/s    keep 11.8%
+LENS popcount    10000000:      824.3 M flags/s
+SSN  f16         10M syn ×10:    43.7 M syn/s     payload 20 МБ (2.0 Б/син)
+SSN  i8          10M syn ×10:    43.2 M syn/s     payload 10 МБ (1.0 Б/син)
+     parity 16 примитивов (тернарный spike): PASS
+CORDIC renorm    2000000:        8.5 M elem/s      max‖·‖err 5.96e-8  (×11 точнее Q24)
+STDP step        10M ×10:      1424.0 M syn/s
+WTA  argmax      1000000:       862.5 M rate/s
+TRIT dot vpsignb  10M trit:     5442.6 M trit/s   ⟨u,v⟩ без умножителя
+TRIT spike ⊕⊙⊖   10M elem:      590.0 M elem/s    θ=0.4
+TRIT pack5 LEA×3  10M trit:      705.4 M trit/s    5 трит/байт
+TRIT mux VPTERNLOGD 1M lane:     467.6 M lane/s    imm 0xE4
+QUTRIT ω f32     2M rot:       2259.9 M rot/s     ω³=I err 2.38e-7
+QUTRIT ω Q14     200K rot:     SSE2-базис         паритет f32 PASS
+QUTRIT трит→S¹   200K trit:     337.4 M trit/s     θ=t·2π/3
 ```
 
-19/19 юнит-тестов: asm против скалярных эталонов и libm.
+45/45 юнит-тестов asm-модуля (v0.87 — 19): asm против скалярных
+эталонов и libm; паритет pack5/unpack5 с канонической `Trits`
+движка (calc/trits.rs); ℤ₃-утверждения на ядрах.
 
 ## Сборка
 
@@ -148,7 +225,7 @@ WTA  argmax      1000000:      1030.3 M rate/s
   (win_call64 и др.) — обходится `-C link-arg=-fuse-ld=bfd`
   (сами ядра и winpe не менялись).
 
-## Роадмап v0.88
+## Роадмап v0.89
 
 1. **FlyWire CSR-импорт** в SynapseField (реальный коннектом вместо
    хэш-адресации) + `--ssn-load`;
@@ -157,4 +234,6 @@ WTA  argmax      1000000:      1030.3 M rate/s
 3. `vdivps → vrcpps+Ньютон` в tanh/sigmoid/softplus (×3–5 SSN);
 4. AVX-512-вариант SSN (16 lanes, `vpermt2ps`-ротация delay);
 5. FEP-шаг в `poler.rs` (канонический POLER-цикл 2D);
-6. SubquantumEntangler (vault 0496): трёхчастичная сцепка на CORDIC-роторах.
+6. SubquantumEntangler (vault 0496): трёхчастичная сцепка на CORDIC-роторах;
+7. Трит-слой в триедином кристалле (`triune/`): Trit5-квантование через
+   `pack5` (1 Б на 5 трит вместо байта на трит) + `vpsignb`-резонанс.
