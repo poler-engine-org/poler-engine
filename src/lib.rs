@@ -138,6 +138,11 @@ pub mod universal_chem;
 pub mod universal_chem_asm;
 /// FFI-мост к No-Mul .s-роторам (буквы мира + химия), собираемым build.rs
 pub mod asm_rotors;
+
+/// v0.87.0 VAULT-ASM: микроядра сокровищницы (FEP/LENS/SSN/CORDIC/STDP)
+/// на чистом x86_64-ассемблере — docs/VAULT_ASM.md.
+#[cfg(target_arch = "x86_64")]
+pub mod asm;
 /// Голос учёного: токенизатор → роторы → химия → триединое ядро
 pub mod scivoice;
 

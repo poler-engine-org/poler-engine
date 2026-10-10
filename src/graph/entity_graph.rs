@@ -404,6 +404,86 @@ impl EntityGraph {
         out
     }
 
+    /// v0.87.0 VAULT-ASM (LENS): K-hop рёбра с весами барьера.
+    ///
+    /// Тот же BFS, что [`extract_k_hop`], но возвращает четвёрки
+    /// `(subject, predicate, object, lens_weight)`, где
+    ///
+    /// ```text
+    /// lens_weight = edge.weight · 0.5^depth
+    /// ```
+    ///
+    /// — вес рёбра затухает по K-hop дистанции (прямые соседи — полный
+    /// вес, дистанция 2 — половина, …). LENS-барьер сокровищницы
+    /// (`weight > 0.05`) отсекает связи глубже log2(w/0.05) хопов —
+    /// «No-Hits» защита от галлюцинаций дальних обходов
+    /// (archive/poler-lens/src/lens_index.rs).
+    pub fn extract_k_hop_weighted(
+        &self,
+        entity: &str,
+        k: usize,
+        temporal_filter: Option<&str>,
+        max_relations: usize,
+    ) -> Vec<(String, String, String, f64)> {
+        let mut out: Vec<(String, String, String, f64)> = Vec::new();
+        let start = match self.policy {
+            IdentityPolicy::Text => match self.find_node(entity) {
+                Some(i) => i,
+                None => return out,
+            },
+            IdentityPolicy::CodeSymbol => match self
+                .find_code_symbol(None, entity)
+                .or_else(|| self.find_node(entity))
+            {
+                Some(i) => i,
+                None => return out,
+            },
+        };
+
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        visited.insert(start);
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        queue.push_back((start, 0));
+        let mut seen_triples: HashSet<(String, String, String)> = HashSet::new();
+
+        while let Some((node, depth)) = queue.pop_front() {
+            if depth >= k || out.len() >= max_relations {
+                continue;
+            }
+            // затухание LENS: 0.5^depth (прямой сосед = 1.0)
+            let decay = 0.5f64.powi(depth as i32);
+            for dir in [Direction::Outgoing, Direction::Incoming] {
+                for edge in self.graph.edges_directed(node, dir) {
+                    let (src, dst) = match dir {
+                        Direction::Outgoing => (node, edge.target()),
+                        Direction::Incoming => (edge.source(), node),
+                    };
+                    if self.temporal_ok(src, dst, temporal_filter) {
+                        let s = self.display_name(src);
+                        let o = self.display_name(dst);
+                        let t = (s, edge.weight().predicate.clone(), o);
+                        if seen_triples.insert(self.triple_dedup_key(&t.0, &t.1, &t.2)) {
+                            let lens_w = edge.weight().weight * decay;
+                            out.push((t.0, t.1, t.2, lens_w));
+                            if out.len() >= max_relations {
+                                break;
+                            }
+                        }
+                    }
+                    let other = match dir {
+                        Direction::Outgoing => edge.target(),
+                        Direction::Incoming => edge.source(),
+                    };
+                    if !visited.contains(&other) {
+                        visited.insert(other);
+                        queue.push_back((other, depth + 1));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Граф символов кода из таблицы символов AST-скана (v0.21).
     ///
     /// * узлы — определения (module = stem файла, `node_type` = kind);

@@ -28,7 +28,7 @@
 
 use super::echo::TemporalEcho;
 use super::flybridge::{FieldProjection, FlyCast};
-use super::linalg::{dot, norm2, sub};
+use super::linalg::{norm2, sub};
 use super::prism::refract;
 use super::projector::CausalProjector;
 use super::qualia::{cosine_topology, perceive, Archetype, QualiaField, ARCHETYPES};
@@ -265,19 +265,23 @@ impl LiteraryEngine {
     /// Метрика G — единичная (мушиная диссипация входит отдельным
     /// членом D·p, а не в метрику нормы — сохраняем каноническую форму
     /// уравнения из манифеста).
+    ///
+    /// v0.87.0 VAULT-ASM: предиктивный член ‖p−o‖² считается микроядром
+    /// `poler_fep_energy` (AVX2+FMA, 8 lanes) — порт fep_loss.rs из
+    /// сокровищницы; λ-член остаётся в Rust (разреженный проектор J_c).
     pub fn free_energy(&self) -> f32 {
-        let d = sub(&self.p, &self.obs);
-        let pred = dot(&d, &d);
+        let pred = crate::asm::fep_asm::energy(&self.p, &self.obs, None, 0.0);
         let logic = self.projector.residual(&self.p);
         pred + self.params.lambda_rl * logic * logic
     }
 
     /// Градиент ∇F = 2(p − o) + 2λ·J_cᵀ(J_c·p).
+    ///
+    /// v0.87.0 VAULT-ASM: член 2(p−o) — микроядро `poler_fep_grad`
+    /// (G=I, λ=0 — точный контракт формулы).
     fn grad_f(&self) -> Vec<f32> {
-        let mut g = sub(&self.p, &self.obs);
-        for v in g.iter_mut() {
-            *v *= 2.0;
-        }
+        let mut g = vec![0.0f32; self.params.dims];
+        crate::asm::fep_asm::grad(&self.p, &self.obs, None, 0.0, &mut g);
         if self.projector.rank() > 0 {
             let jc_p = self.projector.j_c.matvec(&self.p);
             let mut corr = vec![0.0f32; self.params.dims];

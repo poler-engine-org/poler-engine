@@ -229,6 +229,40 @@ struct Cli {
     #[arg(long = "benchmark-json", value_name = "PATH", requires = "benchmark")]
     benchmark_json: Option<PathBuf>,
 
+    /// VAULT-ASM (v0.87.0): отчёт о микроядрах x86_64 сокровищницы —
+    /// CPUID-детекция (AVX2/FMA/F16C/AVX-512/POPCNT) и карта ядер
+    /// (FEP/LENS/SSN/CORDIC/STDP → точки движка).
+    #[arg(
+        long = "asm-info",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "semantic_expand", "benchmark"
+        ]
+    )]
+    asm_info: bool,
+
+    /// VAULT-ASM (v0.87.0): бенчмарк микроядер сокровищницы — пропускная
+    /// способность (M синапсов/с, GB/s) + сверка каждого ядра со
+    /// скалярным эталоном (PASS/FAIL).
+    #[arg(
+        long = "asm-bench",
+        conflicts_with_all = [
+            "web_search", "crawl", "web_stats", "mcp", "mcp_http", "shell", "exec", "tui",
+            "impact", "browser_index", "web_lens", "web_lens_install", "grep", "chunk",
+            "semantic_expand", "benchmark", "asm_info"
+        ]
+    )]
+    asm_bench: bool,
+
+    /// Число синапсов SSN-бенча (с --asm-bench) [default: 10_000_000].
+    #[arg(long = "asm-synapses", default_value_t = 10_000_000)]
+    asm_synapses: usize,
+
+    /// Число циклов SSN/STDP-бенча (с --asm-bench) [default: 10].
+    #[arg(long = "asm-cycles", default_value_t = 10)]
+    asm_cycles: usize,
+
     /// Краулинг: PATH трактуется как seed-URL, страницы индексируются
     /// в веб-индекс (robots.txt, sitemap, SimHash-дедуп, PageRank).
     #[arg(long, requires = "path")]
@@ -2678,6 +2712,15 @@ fn run(cli: Cli) -> ExitCode {
     // ---------- AI-API: самодокументирующийся манифест ----------
     if cli.schema {
         return print_schema_manifest();
+    }
+
+    // ---------- VAULT-ASM: микроядра сокровищницы (v0.87.0) ----------
+    if cli.asm_info {
+        poler_engine::asm::print_info();
+        return ExitCode::SUCCESS;
+    }
+    if cli.asm_bench {
+        return poler_engine::asm::run_bench(cli.asm_synapses, cli.asm_cycles);
     }
 
     // ---------- Веб-индекс: статистика ----------

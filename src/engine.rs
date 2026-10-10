@@ -982,7 +982,14 @@ fn build_nexus(
 
     // K-hop рёбра каждого узла: CodeSymbol-идентичность квалифицирована
     // (module::name) — bare-символ живёт в нескольких модулях/языках;
-    // нексус объединяет соседства всех его узлов в графе
+    // нексус объединяет соседства всех его узлов в графе.
+    //
+    // v0.87.0 VAULT-ASM: LENS No-Hits барьер сокровищницы
+    // (archive/poler-lens/src/lens_index.rs) — рёбра K-hop несут вес
+    // edge.weight · 0.5^depth; связи с весом ≤ 0.05 отсекаются
+    // микроядром poler_lens_filter (SSE2, работает на любом x86_64).
+    // Для дистанций ≤ 4 хопа (вес ≥ 0.0625) барьер прозрачен —
+    // поведение неглубоких K-hop обходов v0.86 сохранено в точности.
     let mut nexus: Vec<NexusNode> = Vec::with_capacity(node_order.len());
     for sym in node_order {
         let suffix = format!("::{sym}");
@@ -993,25 +1000,60 @@ fn build_nexus(
             .map(str::to_string)
             .collect();
         keys.sort(); // детерминизм обхода
-        let mut relations: Vec<(String, String, String)> = Vec::new();
+        let mut weighted: Vec<(String, String, String, f64)> = Vec::new();
         let mut seen_rel: HashSet<(String, String, String)> = HashSet::new();
         for key in &keys {
-            for triple in graph.extract_k_hop(
+            for quad in graph.extract_k_hop_weighted(
                 key,
                 config.k_hop_depth,
                 config.temporal_filter.as_deref(),
                 config.max_relations,
             ) {
-                if seen_rel.insert(triple.clone()) {
-                    relations.push(triple);
+                let triple = (quad.0.clone(), quad.1.clone(), quad.2.clone());
+                if seen_rel.insert(triple) {
+                    weighted.push(quad);
                 }
             }
         }
-        relations.truncate(config.max_relations);
+        weighted.truncate(config.max_relations);
+        // --- LENS: компакция выживших индексов микроядром ---
+        let n = weighted.len();
+        let (relations, lens) = if n > 0 {
+            let mut lw: Vec<f32> = Vec::with_capacity(n);
+            for (_, _, _, w) in &weighted {
+                lw.push(*w as f32);
+            }
+            let flags = vec![0u64; n]; // маски не используются (весовой барьер)
+            let mut keep_idx = vec![0u32; n];
+            let kept = crate::asm::lens_asm::filter(
+                &lw,
+                &flags,
+                &mut keep_idx,
+                crate::asm::lens_asm::LENS_MIN_W,
+                0,
+                0,
+            );
+            let relations: Vec<(String, String, String)> = keep_idx[..kept]
+                .iter()
+                .map(|&i| {
+                    let (s, p, o, _) = &weighted[i as usize];
+                    (s.clone(), p.clone(), o.clone())
+                })
+                .collect();
+            let lens = if kept < n {
+                Some((kept, n - kept))
+            } else {
+                None
+            };
+            (relations, lens)
+        } else {
+            (Vec::new(), None)
+        };
         nexus.push(NexusNode {
             symbol: sym.clone(),
             sites: node_sites.remove(&sym).unwrap_or_default(),
             relations,
+            lens,
         });
     }
 

@@ -66,6 +66,12 @@ pub struct NexusNode {
     /// (`caller`, `"calls"`, `callee`), EntityGraph на символьной
     /// таблице hit-файлов.
     pub relations: Vec<(String, String, String)>,
+    /// v0.87.0 VAULT-ASM (LENS): статистика No-Hits барьера —
+    /// `(прошло, отсечено)`. Барьер сокровищницы: вес K-hop рёбер
+    /// затухает 0.5^depth, связи с весом ≤ 0.05 отсекаются микроядром
+    /// `poler_lens_filter` (SSE2). `None` — ничего не отсечено.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens: Option<(usize, usize)>,
 }
 
 /// Один Context Anchor: самодостаточный контекст совпадения.
@@ -193,6 +199,15 @@ fn render_nexus_markdown(res: &SearchResult) -> String {
             node.sites.len(),
             node.relations.len()
         ));
+        // v0.87.0 VAULT-ASM: LENS No-Hits барьер (порог 0.05 сокровищницы)
+        if let Some((kept, blocked)) = node.lens {
+            out.push_str(&format!(
+                "> LENS-барьер 0.05: прошло {} из {} (тусклых K-hop связей отсечено: {})\n\n",
+                kept,
+                kept + blocked,
+                blocked
+            ));
+        }
         for s in &node.sites {
             let role = match s.role.as_str() {
                 "def" => "определение",
@@ -562,6 +577,8 @@ mod tests {
                 },
             ],
             relations: vec![("main".into(), "calls".into(), "sqlite3_step".into())],
+            // v0.87.0: LENS-статистика — None сериализуется как отсутствие поля
+            lens: None,
         }];
         // JSON-контракт: nexus сериализуется, якорь несёт nexus_symbol
         let v = serde_json::to_value(&res).unwrap();
@@ -571,7 +588,9 @@ mod tests {
         assert_eq!(nx["sites"][1]["file"], "ext/jni/CApi.java");
         assert_eq!(nx["sites"][2]["role"], "call");
         assert_eq!(v["anchors"][0]["nexus_symbol"], "sqlite3_step");
-        // simple-рендер: компактный блок нексуса
+        // v0.87.0: lens=None → поле скрыто (обратная совместимость JSON)
+        assert!(nx.get("lens").is_none());
+        // простой-рендер: компактный блок нексуса
         let s = render_simple(&res);
         assert!(s.contains("◇ Нексус «sqlite3_step»"), "нет заголовка нексуса: {s}");
         assert!(s.contains("src/vdbeapi.c:980"), "нет C-ядра: {s}");
@@ -580,5 +599,9 @@ mod tests {
         let md = render_markdown(&res);
         assert!(md.contains("## Causal Nexus: `sqlite3_step`"), "нет секции md: {md}");
         assert!(md.contains("**вызов** `shell.c:8123`"), "нет call-сайта md: {md}");
+        // v0.87.0: LENS-строка появляется только при отсечениях
+        res.nexus[0].lens = Some((7, 3));
+        let md2 = render_markdown(&res);
+        assert!(md2.contains("LENS-барьер 0.05: прошло 7 из 10"), "нет LENS-строки: {md2}");
     }
 }
